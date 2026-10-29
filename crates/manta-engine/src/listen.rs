@@ -23,8 +23,8 @@ const CHUNK_SAMPLES: usize = 2048;
 /// Seconds of audio buffered before the channelizer is built and streaming
 /// begins. This buffer is no longer a one-shot channel-pick calibration
 /// (`TrackManager` detects and tracks continuously, SPEC §2) -- it's fed
-/// through `TrackManager::process_hops` like any other chunk, just like the
-/// startup lead-in padding below it.
+/// through `TrackManager::process_hops` in `CHUNK_SAMPLES` pieces like
+/// steady-state reads (MAN-374), and its events emitted as one batch.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
 /// Optional live handles into a running `listen()` loop, for a caller that
@@ -382,6 +382,24 @@ struct Segment {
     pad_hops: u64,
     /// MAN-423: spliced losses this segment's hops still to come may precede.
     held: HeldLosses,
+}
+
+impl Segment {
+    /// The startup calibration fill, through `process_hops` one
+    /// `CHUNK_SAMPLES` piece at a time like steady-state reads (MAN-374):
+    /// `step_hop`'s timers read decoder evidence only `drain_pool` updates,
+    /// once per call, so one 2 s call let `Unkeyed` (and `Silent`) close a
+    /// track before its first drain and drop its queued input.
+    fn process_fill(&mut self, fill: &[Complex32], seg_base: u64) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for piece in fill.chunks(CHUNK_SAMPLES) {
+            let hops = self.ch.process(piece);
+            events.extend(self.tm.process_hops(&hops, |m| {
+                self.held.hop_ts(seg_base, self.pad_hops, self.hop, m)
+            }));
+        }
+        events
+    }
 }
 
 /// MAN-423: spliced losses (`IqSource::take_missing_samples`) that hops
@@ -863,12 +881,11 @@ pub fn listen_with_observers(
     }
     on_tracks(n_tracks);
     // `..filled`: the whole buffer unless a stop request cut the fill
-    // short. MAN-423: processed in one call; a loss held at its fill
-    // offset leaves every hop before it on its pre-loss timestamp, so a
-    // track or event originating before the loss keeps it.
-    let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
-        seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-    });
+    // short. MAN-374: processed in `CHUNK_SAMPLES` pieces, emitted as one
+    // batch. MAN-423: a loss held at its fill offset leaves every hop
+    // before it on its pre-loss timestamp, so a track or event originating
+    // before the loss keeps it.
+    let events = seg.process_fill(&calib[..filled], seg_base);
     emit(
         events,
         &mut validator,
@@ -1409,12 +1426,13 @@ pub(crate) fn run_input_front(
         }
         filled += n;
     }
-    // MAN-423: the fill is processed in one call, as
-    // `listen_with_observers` processes it, its losses held at their fill
-    // offsets. `seg_base` already carries them, so both batches end at the
-    // fill's true end, the replay merge orders them against the other
-    // inputs' batches as before, and `tick` still fires on the batch that
-    // closes the fill.
+    // MAN-374: the fill goes through `process_hops` in `CHUNK_SAMPLES`
+    // pieces, as `listen_with_observers` processes it, but is still sent
+    // as one `Batch`. MAN-423: its losses are held at their fill offsets.
+    // `seg_base` already carries them, so both batches end at the fill's
+    // true end, the replay merge orders them against the other inputs'
+    // batches as before, and `tick` still fires on the batch that closes
+    // the fill.
     let fill_end = seg_base + filled as u64;
     let events = seg.tm.process_hops(&seg.ch.process(&padding[..]), |m| {
         seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
@@ -1427,9 +1445,7 @@ pub(crate) fn run_input_front(
     if !send(b) {
         return Ok(());
     }
-    let events = seg.tm.process_hops(&seg.ch.process(&calib[..filled]), |m| {
-        seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-    });
+    let events = seg.process_fill(&calib[..filled], seg_base);
     let mut b = batch(events, fill_end, &seg.tm);
     tick(&mut b, &mut seg.tm, fill_end);
     report_active_tracks(b.n_tracks);
@@ -1840,6 +1856,138 @@ mod tests {
         assert_eq!(snap.chunks, 4);
         assert_eq!(snap.peak_active_tracks, 0);
         assert_eq!(snap.close_counts, crate::track::CloseCounts::default());
+    }
+
+    /// MAN-374: `TK1A` at 70 WPM keyed from t = 0 at 12.34 kHz, then a
+    /// steady carrier from 0.86 s to the end of a 3 s, 96 kHz scene, so a
+    /// 1000 ms unkeyed timeout runs out inside the 2 s calibration fill.
+    /// Not the ticket's `K5ARH`: to end by about 0.85 s it needs 75 WPM or
+    /// more, where this decoder misreads it at start-up (`EESARH`) even at
+    /// the default timeout. `TK1A` reads as the callsign `K1A` (the leading
+    /// `T` is lost at start-up).
+    fn k1a_then_carrier() -> Vec<Complex32> {
+        let fs = 96_000.0;
+        let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 3.0, Some(11)).unwrap();
+        manta_testkit::noncw::add_cw_then_carrier(&mut iq, fs, 12_340.0, 20.0, "TK1A", 70.0, 3.0);
+        iq
+    }
+
+    /// MAN-374: `[detector] unkeyed_close_ms = 1000` (its floor, 375 hops),
+    /// with the non-CW filter on, as by default.
+    fn short_unkeyed() -> PipelineConfig {
+        let mut cfg = PipelineConfig::default();
+        assert!(cfg.detector.non_cw_filter);
+        cfg.detector.unkeyed_close_hops = 375;
+        cfg
+    }
+
+    /// Every `CharDecoded` in `events`, concatenated.
+    fn decoded_text(events: &[DecoderEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { glyph, .. } => glyph.text_char(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The last `CharDecoded`'s track is closed after it, with the flush
+    /// a close after the track's first drain emits.
+    fn assert_closed_after_its_last_char(events: &[DecoderEvent]) {
+        let (last, track) = events
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, e)| match e {
+                DecoderEvent::CharDecoded { track_id, .. } => Some((i, *track_id)),
+                _ => None,
+            })
+            .expect("a decoded character");
+        assert!(
+            events[last..].iter().any(|e| matches!(
+                e,
+                DecoderEvent::TrackClosed {
+                    track_id,
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None
+                    },
+                } if *track_id == track
+            )),
+            "track {track} must close after its last character: {events:?}"
+        );
+    }
+
+    /// MAN-374: with the calibration fill in one `process_hops` call, the
+    /// `Unkeyed` close fired inside it, before the track's first
+    /// `drain_pool`, so the track was dropped with `K1A` still queued and
+    /// no `TrackClosed`. Fed in read-sized pieces, the decoder drains
+    /// first: the callsign comes out, and the close flushes the track.
+    #[test]
+    fn short_unkeyed_close_keeps_a_callsign_decoded_in_the_calibration_fill() {
+        let obs = Arc::new(crate::TrackLifecycleObserver::default());
+        let mut events = Vec::new();
+        listen_with_observers(
+            Box::new(FixedFreqSource {
+                samples: k1a_then_carrier(),
+                cursor: 0,
+                fs: 96_000.0,
+                center_freq_hz: 14_000_000.0,
+            }),
+            &short_unkeyed(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                track_lifecycle: Some(obs.clone()),
+                ..Default::default()
+            },
+            |ev| events.push(ev.clone()),
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let text = decoded_text(&events);
+        assert!(text.contains("K1A"), "decoded {text:?}");
+        assert_eq!(obs.snapshot().close_counts.unkeyed, 1);
+        assert_closed_after_its_last_char(&events);
+    }
+
+    /// MAN-374: the same scene through the multi-input path
+    /// (`run_input_front`), whose fill is chunked the same way and still
+    /// sent as one `Batch`.
+    #[test]
+    fn short_unkeyed_close_keeps_a_callsign_decoded_in_a_multi_input_fill() {
+        let mut src = Some(FixedFreqSource {
+            samples: k1a_then_carrier(),
+            cursor: 0,
+            fs: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+        });
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        crate::multi::listen_inputs(
+            opened,
+            &short_unkeyed(),
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers::default(),
+            |ev| events.push(ev.clone()),
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        let text = decoded_text(&events);
+        assert!(text.contains("K1A"), "decoded {text:?}");
+        assert_closed_after_its_last_char(&events);
     }
 
     #[test]
