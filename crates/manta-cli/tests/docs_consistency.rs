@@ -1998,17 +1998,11 @@ fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
         );
     }
 
-    let verdicts = |body: &str| {
-        (
-            body.lines().any(|line| line.trim() == "**Verdict: GO**"),
-            body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
-        )
-    };
-    let (go, stop) = verdicts(&raw);
+    let (go, stop) = verdict_lines(&raw);
     assert!(go ^ stop, "{rel} must carry exactly one verdict line");
     let any_go = records
         .iter()
-        .any(|name| verdicts(&doc(&format!("docs/DECISIONS/{name}"))).0);
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
     assert!(
         any_go || !repo_root().join("crates/manta-input/src/ubersdr").exists(),
         "UberSDR input code exists but no MAN-302 record says **Verdict: GO** (stop rule)"
@@ -2017,15 +2011,7 @@ fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
     // A future GO record must tie every observed transport fact to a trace.
     for name in &records {
         let body = doc(&format!("docs/DECISIONS/{name}"));
-        for row in body.lines().filter(|line| {
-            line.split('|')
-                .nth(1)
-                .map(str::trim)
-                .and_then(|id| id.strip_prefix('T'))
-                .is_some_and(|number| {
-                    !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit())
-                })
-        }) {
+        for row in id_rows(&body, 'T') {
             let status = row
                 .trim_end()
                 .trim_end_matches('|')
@@ -2042,6 +2028,109 @@ fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
             assert!(
                 repo_root().join(path).exists(),
                 "{name}: {row} cites a missing trace"
+            );
+        }
+    }
+}
+
+/// MAN-304: the add-on note pins the receiver documents it read and its gate,
+/// and the STOP verdict keeps add-on packaging out of the tree until a GO
+/// record exists, which itself needs MAN-302's GO.
+#[test]
+fn man304_addon_note_records_sources_gate_and_stop_rule() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man304-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man304-ubersdr-addon-gate.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-304 add-on gate note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No UberSDR source code was read.",
+        "5a261df82b5e491d9717239fb3e50dc49a4e93a6",
+        // addon_mqtt.md and static/extensions/cw-spots/README.md at that commit.
+        "686aadbfab614278efa6d51a600dac77fbc6ad2a1d74158858a3929c9a7467c6",
+        "a03991527a90fcab06d5643248056d4fa07a194b33fe7e7c9df5da36cc473392",
+        "2026-10-26-man302-ubersdr-iq-clean-room.md",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    let has_row = |id: &str| {
+        raw.lines()
+            .any(|line| line.starts_with(&format!("| {id} |")))
+    };
+    for id in ["A1", "A2", "A3", "A4", "A5", "A6"] {
+        assert!(has_row(id), "{rel} has no {id} gate row");
+    }
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(has_row(id), "{rel} has no {id} claim row");
+    }
+
+    let (go, stop) = verdict_lines(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let man302_go = md_files_in("docs/DECISIONS")
+        .iter()
+        .filter(|name| name.contains("-man302-"))
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    // A later GO record may sit beside this note, as MAN-302's test allows.
+    let mut any_go = false;
+    for name in &records {
+        if verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0 {
+            any_go = true;
+            assert!(
+                man302_go,
+                "docs/DECISIONS/{name} says **Verdict: GO** but no MAN-302 record does: the add-on needs the UberSDR input"
+            );
+        }
+    }
+    assert!(
+        any_go || !repo_root().join("packaging/ubersdr").exists(),
+        "packaging/ubersdr exists but {rel} says **Verdict: STOP** and no MAN-304 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A claim leaves `open` only by citing a pinned document or a trace in the repo.
+    for name in &records {
+        let rec = format!("docs/DECISIONS/{name}");
+        let body = doc(&rec);
+        for row in id_rows(&body, 'C') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            if let Some(path) = status.strip_prefix("observed: ") {
+                assert!(
+                    repo_root().join(path).exists(),
+                    "{rec}: {row} cites a missing trace"
+                );
+                continue;
+            }
+            let url = status.strip_prefix("documented: ").unwrap_or_else(|| {
+                panic!("{rec}: C-row status must be `open`, `documented: <url>` or `observed: <path>`: {row}")
+            });
+            // D1: only the receiver's published Markdown, at a pinned commit.
+            assert!(
+                url.starts_with("https://raw.githubusercontent.com/madpsy/")
+                    && url.ends_with(".md")
+                    && url
+                        .split('/')
+                        .any(|seg| seg.len() == 40 && seg.bytes().all(|c| c.is_ascii_hexdigit())),
+                "{rec}: {row} must cite a raw Markdown document at a pinned 40-hex commit"
             );
         }
     }
@@ -2956,6 +3045,26 @@ fn md_files_in(dir: &str) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Whether a decision record has a `**Verdict: GO**` line and a
+/// `**Verdict: STOP**` line, as `(go, stop)`.
+fn verdict_lines(body: &str) -> (bool, bool) {
+    (
+        body.lines().any(|line| line.trim() == "**Verdict: GO**"),
+        body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
+    )
+}
+
+/// The table rows whose first cell is `prefix` followed by one or more digits.
+fn id_rows(body: &str, prefix: char) -> impl Iterator<Item = &str> {
+    body.lines().filter(move |line| {
+        line.split('|')
+            .nth(1)
+            .map(str::trim)
+            .and_then(|id| id.strip_prefix(prefix))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    })
 }
 
 #[test]
