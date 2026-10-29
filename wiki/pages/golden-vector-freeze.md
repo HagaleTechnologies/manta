@@ -22,7 +22,7 @@ The freeze was *blocked* through most of design phase because coppa's Watterson 
 
 - Fading vectors are pinned to the workspace coppa rev (`f8a4d16d`, `Cargo.toml`/`Cargo.lock`; `docs/DECISIONS/2026-07-17-m1-implementation-pins.md` pin 2), so a coppa change can never silently invalidate CI.
 - SNR is quoted in 2500 Hz for these vectors; the 2500 Hz vs benchmark-3 kHz reconciliation is still live and tracked in CLAUDE.md.
-- Watterson uses coppa's one-shot `watterson_preset()`: the streaming `WattersonChannel` SPEC §7 names was never shipped in coppa, and offline vector generation does not need it (`crates/manta-testkit/src/scene.rs`, `WattersonFade`).
+- Watterson uses coppa's one-shot `watterson_preset()` applied per fading signal (`crates/manta-testkit/src/scene.rs`, `WattersonFade`): the streaming `WattersonChannel` the SPEC-watterson §6 design proposed was never shipped in coppa, and offline vector generation does not need it. SPEC §7 named that streaming API until MAN-370 aligned it with the shipped generator.
 
 For the exact vectors, seeds, `fs`, and pass criteria (e.g. V8w: 0 bogus, 0 cross-channel ghost decodes), read SPEC §7 — never restated here.
 
