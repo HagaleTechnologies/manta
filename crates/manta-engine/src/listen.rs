@@ -1868,7 +1868,7 @@ mod tests {
     fn k1a_then_carrier() -> Vec<Complex32> {
         let fs = 96_000.0;
         let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 3.0, Some(11)).unwrap();
-        manta_testkit::noncw::add_cw_then_carrier(&mut iq, fs, 12_340.0, 20.0, "TK1A", 70.0, 3.0);
+        manta_testkit::noncw::add_cw_then_carrier(&mut iq, fs, 12_340.0, 20.0, "HTK1A", 70.0, 3.0);
         iq
     }
 
@@ -1878,6 +1878,12 @@ mod tests {
         let mut cfg = PipelineConfig::default();
         assert!(cfg.detector.non_cw_filter);
         cfg.detector.unkeyed_close_hops = 375;
+        // This drain-order fixture must finish the call and its one-second
+        // timeout inside the two-second fill. Use the supported shorter
+        // integration windows so the opening training token fits.
+        cfg.detector.integrator_hops = [23, 38];
+        cfg.detector.on_snr_db = 10.0;
+        cfg.detector.confirm_hops = 2;
         cfg
     }
 
@@ -2966,12 +2972,26 @@ mod tests {
         BASELINE.get_or_init(|| lossy_event_ts_multi(LossySource::v1_192k(&[], true)))
     }
 
+    fn overlapping_loss_cut(after_calibration: bool) -> u64 {
+        let lower = if after_calibration { 384_000 } else { 192_000 };
+        let event = baseline_event_ts()
+            .iter()
+            .copied()
+            .find(|&t| t >= lower)
+            .expect("fixture has an event in the selected segment");
+        let cut = event + 6_000;
+        assert_eq!(cut >= 384_000, after_calibration, "fixture segment");
+        cut
+    }
+
     /// MAN-423: every baseline event before `cut` is in `lossy` at its own
-    /// time, `must_keep` among them (a hop whose window straddles the cut).
-    fn assert_pre_loss_kept(baseline: &[u64], lossy: &[u64], cut: u64, must_keep: u64) {
+    /// time, including an event whose filter window straddles the cut.
+    /// Select that event from the actual baseline: detector changes may move
+    /// promotion-dependent decoder events without changing clock mapping.
+    fn assert_pre_loss_kept(baseline: &[u64], lossy: &[u64], cut: u64) {
         assert!(
-            baseline.contains(&must_keep) && must_keep < cut && must_keep + 16_384 > cut,
-            "test setup: {must_keep} must be a baseline event inside the window before {cut}"
+            baseline.iter().any(|&t| t < cut && t + 16_384 > cut),
+            "test setup: a baseline event must straddle the cut at {cut}: {baseline:?}"
         );
         for &t in baseline.iter().filter(|&&t| t < cut) {
             assert!(
@@ -3183,16 +3203,19 @@ mod tests {
     /// keeps the loss-free time (before the fix: 409,212, 11,900 late).
     #[test]
     fn missing_samples_after_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 402_240, 397_312);
+        let cut = overlapping_loss_cut(true);
+        let lossy = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
     }
 
     /// MAN-423: the multi-input front end (`run_input_front`) keeps the
     /// same pre-loss event times.
     #[test]
     fn multi_input_missing_samples_after_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, 402_240, 397_312);
+        let cut = overlapping_loss_cut(true);
+        let lossy =
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, cut);
     }
 
     /// MAN-423: read one protocol-2 datagram at a time, the same loss gives
@@ -3201,20 +3224,26 @@ mod tests {
     /// timeline, so the fix cannot rely on it.
     #[test]
     fn one_datagram_reads_keep_pre_loss_event_times() {
-        let chunked = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true));
-        let split = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true).one_datagram_reads());
+        let cut = overlapping_loss_cut(true);
+        let chunked = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        let split = lossy_event_ts(
+            LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true).one_datagram_reads(),
+        );
         assert_eq!(split, chunked, "event times depend on how reads were split");
-        assert_pre_loss_kept(baseline_event_ts(), &split, 402_240, 397_312);
+        assert_pre_loss_kept(baseline_event_ts(), &split, cut);
     }
 
     /// MAN-423: the multi-input twin of the one-datagram-read test.
     #[test]
     fn multi_input_one_datagram_reads_keep_pre_loss_event_times() {
-        let chunked = lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true));
-        let split =
-            lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true).one_datagram_reads());
+        let cut = overlapping_loss_cut(true);
+        let chunked =
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        let split = lossy_event_ts_multi(
+            LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true).one_datagram_reads(),
+        );
         assert_eq!(split, chunked, "event times depend on how reads were split");
-        assert_pre_loss_kept(baseline_event_ts_multi(), &split, 402_240, 397_312);
+        assert_pre_loss_kept(baseline_event_ts_multi(), &split, cut);
     }
 
     /// MAN-423: two losses inside one filter length (50 datagrams at
@@ -3222,9 +3251,13 @@ mod tests {
     /// 397,312 came out 16,660 late), and the spot stays clock-true.
     #[test]
     fn two_losses_in_one_window_keep_pre_loss_event_times() {
-        let losses = [(400_000.0 / 192_000.0, 50), (404_000.0 / 192_000.0, 20)];
+        let cut = overlapping_loss_cut(true);
+        let losses = [
+            (cut as f64 / 192_000.0, 50),
+            ((cut + 4000) as f64 / 192_000.0, 20),
+        ];
         let lossy = lossy_event_ts(LossySource::v1_192k(&losses, true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 400_000, 397_312);
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
         assert_clock_true(
             &lossy_spots(LossySource::v1_192k(&losses, true)),
             lossless_baseline_ts(),
@@ -3237,16 +3270,18 @@ mod tests {
     /// the fix: 217,212).
     #[test]
     fn missing_samples_late_in_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts(LossySource::v1_192k(&[(211_312.0 / 192_000.0, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 211_312, 205_312);
+        let cut = overlapping_loss_cut(false);
+        let lossy = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
     }
 
     /// MAN-423: the multi-input twin of the late-calibration-loss test.
     #[test]
     fn multi_input_missing_samples_late_in_calibration_keep_pre_loss_event_times() {
+        let cut = overlapping_loss_cut(false);
         let lossy =
-            lossy_event_ts_multi(LossySource::v1_192k(&[(211_312.0 / 192_000.0, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, 211_312, 205_312);
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, cut);
     }
 
     /// MAN-423: two losses in the calibration fill keep the event before
@@ -3256,13 +3291,16 @@ mod tests {
     #[test]
     fn two_calibration_losses_keep_events_before_the_first() {
         let losses = [(0.5, 50), (211_312.0 / 192_000.0, 50)];
-        assert!(
-            baseline_event_ts().contains(&13_824),
-            "test setup: {:?}",
-            baseline_event_ts()
-        );
+        let before = baseline_event_ts()
+            .iter()
+            .copied()
+            .find(|&t| t < 96_000)
+            .expect("test setup: an event before the first loss");
         let lossy = lossy_event_ts(LossySource::v1_192k(&losses, true));
-        assert!(lossy.contains(&13_824), "13,824 re-timed: {lossy:?}");
+        assert!(
+            lossy.contains(&before),
+            "pre-loss event {before} re-timed: {lossy:?}"
+        );
     }
 
     /// MAN-423: a discontinuity while a loss is still held (11,900 samples

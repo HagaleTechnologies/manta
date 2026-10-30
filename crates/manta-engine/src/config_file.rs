@@ -9,7 +9,7 @@
 //! so every absent key falls back to the real `DetectorConfig::default()`
 //! this crate owns, rather than a hand-copied set of constants downstream
 //! that could drift from it. That matters here more than for `[decode]`:
-//! the default `on_snr_db` is 12.0, a measured deviation from SPEC §9's
+//! the default `on_snr_db` is 11.5, a measured deviation from SPEC §9's
 //! literal 6.0 (see `DetectorConfig`'s `Default` impl), so a downstream copy
 //! of SPEC's table would be wrong on day one.
 //!
@@ -28,8 +28,8 @@
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
 //! single normative rounding rule; SPEC's millisecond defaults
-//! (50/5000/30000/2000/30000) reproduce the hop defaults
-//! (19/1875/11250/750/11250) exactly.
+//! (8/5000/30000/25/30000) reproduce the hop defaults
+//! (3/1875/11250/9/11250) exactly.
 //!
 //! The bounds reject exactly the values the track manager treats as
 //! degenerate: `gc_hops = 0` closes every ACTIVE track immediately,
@@ -61,6 +61,7 @@ const MAX_SNR_DB: f64 = 100.0;
 #[serde(deny_unknown_fields)]
 pub struct DetectorConfigToml {
     pub on_snr_db: Option<f64>,
+    pub integrator_hops: Option<[u16; 2]>,
     pub off_snr_db: Option<f64>,
     pub confirm_ms: Option<f64>,
     pub hang_ms: Option<f64>,
@@ -91,7 +92,12 @@ impl DetectorConfigToml {
                 "detector.off_snr_db ({off_snr_db}) must not exceed detector.on_snr_db ({on_snr_db})"
             ));
         }
+        let integrator_hops = self.integrator_hops.unwrap_or(d.integrator_hops);
+        if integrator_hops.iter().any(|&m| m == 0 || m > 375) {
+            return Err("detector.integrator_hops must contain two lengths in 1..=375".into());
+        }
         Ok(DetectorConfig {
+            integrator_hops,
             on_snr_db,
             off_snr_db,
             confirm_hops: hops("confirm_ms", self.confirm_ms, d.confirm_hops, true)?,
@@ -218,6 +224,21 @@ mod tests {
     }
 
     #[test]
+    fn integrator_lengths_are_configurable_and_bounded() {
+        assert_eq!(
+            parse("integrator_hops = [23, 38]").unwrap().integrator_hops,
+            [23, 38]
+        );
+        for text in [
+            "integrator_hops = [0, 38]",
+            "integrator_hops = [23, 376]",
+            "integrator_hops = []",
+        ] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn empty_table_is_the_default() {
         assert_eq!(parse("").unwrap(), DetectorConfig::default());
         assert_eq!(parse("").unwrap().crash_filter, CrashFilter::Full);
@@ -248,9 +269,9 @@ mod tests {
     fn spec_millisecond_defaults_reproduce_the_hop_defaults() {
         let cfg = parse(
             r#"
-            on_snr_db = 12.0
+            on_snr_db = 11.5
             off_snr_db = 3.0
-            confirm_ms = 50.0
+            confirm_ms = 8.0
             hang_ms = 5000.0
             gc_ms = 30000.0
             warmup_ms = 25.0
@@ -264,7 +285,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg, DetectorConfig::default());
-        assert_eq!(cfg.confirm_hops, 19);
+        assert_eq!(cfg.confirm_hops, 3);
         assert_eq!(cfg.hang_hops, 1875);
         assert_eq!(cfg.gc_hops, 11250);
         assert_eq!(cfg.warmup_hops, 9);
@@ -390,7 +411,7 @@ mod tests {
         let e = err("off_snr_db = 13.0");
         assert_eq!(
             e,
-            "detector.off_snr_db (13) must not exceed detector.on_snr_db (12)"
+            "detector.off_snr_db (13) must not exceed detector.on_snr_db (11.5)"
         );
     }
 

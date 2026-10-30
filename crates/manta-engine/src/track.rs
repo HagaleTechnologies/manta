@@ -10,9 +10,11 @@ pub struct DetectorConfig {
     /// Rise threshold in dB SNR. **Deviation from SPEC §9's literal 6.0 dB
     /// default (see `impl Default`).**
     pub on_snr_db: f32,
+    /// Two dit-scale integration lengths, each in 1..=375 hops.
+    pub integrator_hops: [u16; 2],
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
-    /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
+    /// SPEC §2.3/§2.4: rise sustained this many hops (default three) before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED,
     /// or, for a track that decoded a character while qualified and
@@ -123,69 +125,14 @@ impl std::str::FromStr for CrashFilter {
 }
 
 impl Default for DetectorConfig {
-    /// **`on_snr_db` deviates from SPEC §9's literal 6.0 dB**, empirically
-    /// retuned to 12.0 dB (this repo's "measure, then pin the deviation"
-    /// convention -- cf. docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md
-    /// and .../2026-07-18-m2-pfb-channelizer-pins.md).
-    ///
-    /// SPEC §2.3's 6.0 dB / confirm_hops=19 pair was specified against an
-    /// implicit per-hop-independent noise model. The real channelizer output
-    /// `power[k] = |X[k]|^2` is a single complex-Gaussian magnitude-squared
-    /// per hop (SPEC §1.3): chi-squared, 2 DOF, dB-domain std ~5.57 dB raw,
-    /// and after the Gate's tau=40 ms EMA still ~1.7 dB std with a ~15-hop
-    /// autocorrelation time -- essentially confirm_hops=19 itself. So the
-    /// "19 sustained hops" window buys almost no *independent* looks at the
-    /// noise (once an EMA excursion crosses the threshold, autocorrelation
-    /// holds it there for nearly the whole window). Over V1's real
-    /// 1024-channel x 120 s render (~46 M channel-hop opportunities) the
-    /// literal 6.0 dB threshold produced 298 spurious ACTIVE tracks for a
-    /// single clean +20 dB signal.
-    ///
-    /// Raising `confirm_hops` instead was measured and rejected: CW elements
-    /// are short (a 20 WPM dit is ~22 hops), so a longer sustained-rise
-    /// window the noise must clear is also a window the *real* signal
-    /// struggles to fill -- confirm_hops in 40..150 gave both worse false-
-    /// track counts and worse decode accuracy. Raising `on_snr_db` is the
-    /// clean lever: 12.0 dB drives false tracks to 0 across all measured
-    /// noise seeds (empirical knee = 11.0 dB; +1 dB margin) while the
-    /// channelizer's ~14 dB processing gain (2500 Hz SNR -> 93.75 Hz channel
-    /// SNR) keeps even the weakest golden vector (V3, +6 dB-in-2500) ~14 dB
-    /// clear of the threshold, so it still promotes and decodes.
-    ///
-    /// **`confirm_hops` stays at SPEC §2.3/§2.4's literal 19 (~50.7ms) --
-    /// deliberately, after measuring a real problem with it and rejecting
-    /// the obvious fix.** MAN-166, 2026-09-09, investigated further in
-    /// `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`.
-    /// The above paragraph's own "20 WPM dit is ~22 hops" observation
-    /// already implies a real problem this never closed: 19 hops needs
-    /// 50.7ms of *unbroken* rise from a CANDIDATE's very first hop, and a
-    /// dit alone is shorter than that at any real contest speed above
-    /// ~20 WPM (30ms at 40 WPM, 34ms at 35 WPM, 40ms at 30 WPM) -- so on
-    /// real contest-speed CW, any word/character starting with a
-    /// dit-leading letter (E, I, S, H, 5, ...) structurally cannot promote
-    /// its own opening element, spawning a fresh CANDIDATE every dit-onset
-    /// that immediately dies `Unconfirmed`, over and over, until a
-    /// dah-leading element promotes it or the transmission ends.
-    /// Confirmed as the majority contributor to `unconfirmed` being 68.8%
-    /// of all real-recording track churn (`crates/manta-testkit`'s B2
-    /// golden vector) -- but **lowering `confirm_hops` to fix it breaks
-    /// V10** (a real, currently-passing golden vector at 15 WPM/Farnsworth
-    /// char_wpm=25): the decoder's Farnsworth gap-classifier bootstrap
-    /// (`manta_decode::timing::FARNS_MIN_COUNT`) is apparently sensitive
-    /// to *which hop* a track promotes on, and there's a hard cliff, not a
-    /// gradual tradeoff -- confirm_hops=17 reproduces the exact same
-    /// broken decode as confirm_hops=8 (CER 0.2368 either way, letter-by-
-    /// letter word-boundary corruption on the opening transmission),
-    /// confirm_hops=18 passes clean, and 18 vs 19 (48.0ms vs 50.7ms) is
-    /// too close to the original to meaningfully help any real
-    /// contest-speed dit (still needs >40 WPM headroom this doesn't give).
-    /// `track_cap` was verified independent of this (V10 passes at
-    /// `confirm_hops: 19` regardless of `track_cap`). This confirm_hops/
-    /// Farnsworth-bootstrap coupling needs a real manta-decode-level fix
-    /// (decouple the gap-classifier's bootstrap from detector promotion
-    /// timing) before `confirm_hops` can safely move -- out of scope for
-    /// this change; folded into the wider real-world decode-accuracy
-    /// investigation the same MAN-166 finding opened.
+    /// MAN-109 replaces EMA rise with two disjoint linear-power windows.
+    /// Default windows are 38 hops, threshold 11.5 dB over the quantile
+    /// floor, and confirmation is three consecutive pair-true hops.
+    /// The old 12 dB/19-hop EMA rule suppressed the 298 noise tracks seen
+    /// at 6 dB, but its correlated looks limited weak-signal detection.
+    /// MAN-166 found V10 Farnsworth bootstrap sensitive to promotion time;
+    /// the golden tests must still gate this new predicate.
+    /// See docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md.
     ///
     /// **`track_cap` deviates from its prior 500** (ARCHITECTURE §4, not a
     /// SPEC value), raised to 1200, same MAN-166 decision doc. 500 was
@@ -239,9 +186,10 @@ impl Default for DetectorConfig {
     /// `reacquire_ms = 0` restores the old behaviour.
     fn default() -> Self {
         DetectorConfig {
-            on_snr_db: 12.0,
+            on_snr_db: 11.5,
+            integrator_hops: [38, 38],
             off_snr_db: 3.0,
-            confirm_hops: 19,
+            confirm_hops: 3,
             hang_hops: 1875,
             gc_hops: 11250,
             warmup_hops: 9,
@@ -334,6 +282,8 @@ pub struct CloseCounts {
     pub not_cw: u64,
     /// MAN-313: closed because a qualified track stopped keying.
     pub unkeyed: u64,
+    /// Hops spent holding leases by tracks closed NotCw or Unkeyed.
+    pub false_lease_hops: u64,
 }
 
 impl std::ops::Add for CloseCounts {
@@ -349,6 +299,7 @@ impl std::ops::Add for CloseCounts {
             rtty: self.rtty + rhs.rtty,
             not_cw: self.not_cw + rhs.not_cw,
             unkeyed: self.unkeyed + rhs.unkeyed,
+            false_lease_hops: self.false_lease_hops + rhs.false_lease_hops,
         }
     }
 }
@@ -1947,7 +1898,12 @@ impl TrackManager {
     ) -> Self {
         TrackManager {
             floor: FloorBank::new(n_channels),
-            gate: Gate::new(n_channels, detector_cfg.on_snr_db, detector_cfg.off_snr_db),
+            gate: Gate::new(
+                n_channels,
+                detector_cfg.on_snr_db,
+                detector_cfg.off_snr_db,
+                &detector_cfg.integrator_hops,
+            ),
             tracks: BTreeMap::new(),
             owner_of: vec![None; n_channels],
             next_id: 1,
@@ -3032,6 +2988,15 @@ impl TrackManager {
                     self.channel_cooldown_until[ch] = until;
                 }
             }
+            if matches!(
+                close_reasons.get(id),
+                Some(CloseReason::NotCw | CloseReason::Unkeyed)
+            ) {
+                if let Some(ev) = &track.keying {
+                    self.close_counts.false_lease_hops +=
+                        self.hop_counter.saturating_sub(ev.promo_hop);
+                }
+            }
             if !track.has_emitted {
                 return false;
             }
@@ -3861,6 +3826,32 @@ mod tests {
     }
 
     #[test]
+    fn pair_true_confirmation_and_dormant_wake_use_configured_count() {
+        for count in [2, 19] {
+            let cfg = DetectorConfig {
+                confirm_hops: count,
+                ..DetectorConfig::default()
+            };
+            let mut life = Lifecycle::new(&cfg);
+            for _ in 1..count - 1 {
+                assert_eq!(life.on_hop(true, false, false), LifecycleEvent::None);
+            }
+            assert_eq!(life.on_hop(true, false, false), LifecycleEvent::Promoted);
+            life.state = LifecycleState::Dormant;
+            life.confirm_count = 0;
+            for _ in 1..count {
+                assert_eq!(life.on_hop(true, false, false), LifecycleEvent::None);
+            }
+            assert_eq!(life.on_hop(true, false, false), LifecycleEvent::Reacquired);
+            let mut missed = Lifecycle::new(&cfg);
+            assert_eq!(
+                missed.on_hop(false, true, false),
+                LifecycleEvent::Closed(CloseReason::Unconfirmed)
+            );
+        }
+    }
+
+    #[test]
     fn track_ids_interleave_by_input() {
         let mut tm = id_space_manager();
         tm.set_track_id_space(crate::multi::TrackIdSpace {
@@ -3927,6 +3918,7 @@ mod tests {
             rtty: 6,
             not_cw: 7,
             unkeyed: 8,
+            false_lease_hops: 9,
         };
         let b = CloseCounts {
             unconfirmed: 10,
@@ -3937,6 +3929,7 @@ mod tests {
             rtty: 60,
             not_cw: 70,
             unkeyed: 80,
+            false_lease_hops: 90,
         };
         assert_eq!(
             a + b,
@@ -3948,7 +3941,8 @@ mod tests {
                 evicted: 55,
                 rtty: 66,
                 not_cw: 77,
-                unkeyed: 88
+                unkeyed: 88,
+                false_lease_hops: 99,
             }
         );
     }
@@ -7464,6 +7458,8 @@ mod tests {
             DetectorConfig::default(),
             DecodeConfig::default(),
         );
+        // Match production startup: exclude the channelizer zero pre-roll.
+        tm.skip_preroll_hops((ch.filter_len() / ch.hop()) as u64);
         let mut all_events = Vec::new();
         for chunk in rendered.samples.chunks(4096) {
             let hops = ch.process(chunk);
@@ -8102,6 +8098,7 @@ mod tests {
         assert!(promoted.is_empty(), "{promoted:?}");
         assert_eq!(tm.close_counts().not_cw, 1);
         assert_eq!(closed_at.unwrap() - promo_hop.unwrap(), 1000);
+        assert_eq!(tm.close_counts().false_lease_hops, 1000);
         assert!(tm.confirmations() >= 1);
     }
 
@@ -9127,6 +9124,7 @@ mod tests {
     fn suppressed_crash_cannot_finish_dormant_wake_confirmation() {
         let cfg = DetectorConfig {
             hang_hops: 10,
+            confirm_hops: 19,
             non_cw_filter: false,
             rtty_filter: false,
             ..DetectorConfig::default()
@@ -9170,6 +9168,7 @@ mod tests {
     fn suppressed_crash_still_ages_the_dormant_expiry() {
         let cfg = DetectorConfig {
             hang_hops: 10,
+            confirm_hops: 19,
             non_cw_filter: false,
             reacquire_hops: 15,
             rtty_filter: false,

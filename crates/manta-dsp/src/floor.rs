@@ -320,16 +320,69 @@ impl FloorBank {
     }
 }
 
-/// Per-channel EMA-smoothed power + rise/drop hysteresis booleans. SPEC
-/// §2.3. Carries **no** persistence/timing state (confirm-hop-counting,
-/// hang-ms-counting) -- that's the track lifecycle's job
-/// (`manta-engine::track`). This struct is a pure function of its own
-/// per-channel EMA state.
+/// Per-channel two-look linear-power rise gate and EMA-based drop/SNR.
+/// Lifecycle confirmation and hang counters live in manta-engine.
 pub struct Gate {
     smoothed_db: Vec<f64>,
     initialized: Vec<bool>,
     on_snr_db: f32,
     off_snr_db: f32,
+    looks: Vec<PowerLooks>,
+}
+
+// One ring per length, shared cursor across channels. The recent and previous
+// sums always describe adjacent, disjoint M-hop windows. Storage is allocated
+// once; update does no per-look allocation.
+struct PowerLooks {
+    m: usize,
+    cursor: usize,
+    filled: usize,
+    ring: Vec<f64>,
+    recent: Vec<f64>,
+    previous: Vec<f64>,
+}
+
+impl PowerLooks {
+    fn new(n: usize, m: usize) -> Self {
+        assert!(
+            m > 0 && m <= 375,
+            "integrator length must be in 1..=375 hops"
+        );
+        Self {
+            m,
+            cursor: 0,
+            filled: 0,
+            ring: vec![0.0; n * 2 * m],
+            recent: vec![0.0; n],
+            previous: vec![0.0; n],
+        }
+    }
+    fn push(&mut self, k: usize, power: f64) {
+        let base = k * 2 * self.m;
+        let old = base + self.cursor;
+        let middle = base + (self.cursor + self.m) % (2 * self.m);
+        self.previous[k] += self.ring[middle] - self.ring[old];
+        self.recent[k] += power - self.ring[middle];
+        self.ring[old] = power;
+    }
+    fn advance(&mut self) {
+        self.cursor = (self.cursor + 1) % (2 * self.m);
+        self.filled = (self.filled + 1).min(2 * self.m);
+        // Subtraction can erase weak samples after a large level drop.
+        // Rebase once per ring revolution, bounding that error to 2*M hops.
+        // At cursor zero the oldest window occupies the first half.
+        if self.cursor == 0 {
+            for (k, samples) in self.ring.chunks_exact(2 * self.m).enumerate() {
+                self.previous[k] = samples[..self.m].iter().sum();
+                self.recent[k] = samples[self.m..].iter().sum();
+            }
+        }
+    }
+    fn rises(&self, k: usize, threshold: f64) -> bool {
+        self.filled == 2 * self.m
+            && self.recent[k] >= threshold * self.m as f64
+            && self.previous[k] >= threshold * self.m as f64
+    }
 }
 
 impl Gate {
@@ -337,18 +390,31 @@ impl Gate {
     /// `detector.on_snr_db`/`detector.off_snr_db` thresholds. All channels
     /// start uninitialized (the first `update` call seeds each channel's
     /// smoothed power directly from that hop's raw power, per SPEC §2.3).
-    pub fn new(n_channels: usize, on_snr_db: f32, off_snr_db: f32) -> Self {
+    pub fn new(n_channels: usize, on_snr_db: f32, off_snr_db: f32, lengths: &[u16]) -> Self {
+        assert!(
+            !lengths.is_empty(),
+            "at least one integration length is required"
+        );
+        let mut looks = Vec::new();
+        for &m in lengths {
+            if !looks
+                .iter()
+                .any(|look: &PowerLooks| look.m == usize::from(m))
+            {
+                looks.push(PowerLooks::new(n_channels, usize::from(m)));
+            }
+        }
         Gate {
             smoothed_db: vec![0.0; n_channels],
             initialized: vec![false; n_channels],
             on_snr_db,
             off_snr_db,
+            looks,
         }
     }
 
     /// One hop's rise/drop booleans per channel, against `floor`'s current
-    /// effective floor. SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F
-    /// + off_snr_db.
+    /// effective floor. Rise requires two full disjoint windows; drop uses the EMA.
     pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
         assert_eq!(
             power_db.len(),
@@ -359,13 +425,23 @@ impl Gate {
         );
         let mut rise = vec![false; power_db.len()];
         let mut drop = vec![false; power_db.len()];
-        for k in 0..power_db.len() {
+        for (k, &power) in power_db.iter().enumerate() {
             self.smoothed_db[k] = if self.initialized[k] {
-                self.smoothed_db[k] + GATE_EMA_ALPHA * (power_db[k] - self.smoothed_db[k])
+                self.smoothed_db[k] + GATE_EMA_ALPHA * (power - self.smoothed_db[k])
             } else {
                 self.initialized[k] = true;
-                power_db[k]
+                power
             };
+            // Inverse of channelizer::power_db, including its 1e-20 guard.
+            let linear = 10.0_f64.powf(power / 10.0);
+            for look in &mut self.looks {
+                look.push(k, linear);
+            }
+        }
+        for look in &mut self.looks {
+            look.advance();
+        }
+        for k in 0..power_db.len() {
             (rise[k], drop[k]) = self.judge(k, floor);
         }
         (rise, drop)
@@ -396,12 +472,24 @@ impl Gate {
         (rise, drop)
     }
 
-    /// SPEC §2.3: rise = S >= F + on_snr_db; drop = S < F + off_snr_db,
-    /// for channel `k`'s current smoothed power.
+    /// Judge frozen power windows for rise and the EMA for drop.
     fn judge(&self, k: usize, floor: &FloorBank) -> (bool, bool) {
         let f = floor.effective_floor_db(k);
+        // A channel quartile can underestimate noise relative to integrated
+        // means. Clamp rise to the block quartile and retain the same
+        // block seed for rise until the full ten-second ring is available.
+        // Drop and SNR continue to use the unmodified effective floor.
+        let block = k / BLOCK_CHANNELS;
+        let pushes = floor.seed_pushes[block];
+        let block_floor = f.max(floor.block_floor_db[block]);
+        let rise_floor = if floor.channels[k].usable_len() < RING_LEN && pushes > 0 {
+            block_floor.max(floor.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
+        } else {
+            block_floor
+        };
+        let threshold = 10.0_f64.powf((rise_floor + self.on_snr_db as f64) / 10.0);
         (
-            self.smoothed_db[k] >= f + self.on_snr_db as f64,
+            self.looks.iter().any(|look| look.rises(k, threshold)),
             self.smoothed_db[k] < f + self.off_snr_db as f64,
         )
     }
@@ -415,6 +503,173 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrated_rise_does_not_follow_a_low_channel_quartile_below_its_block() {
+        let mut floor = warmed_up_bank(32, -90.0);
+        let mut powers = [-90.0; 32];
+        powers[0] = -110.0;
+        for _ in 0..4000 {
+            floor.update(&powers);
+        }
+        assert!(floor.effective_floor_db(0) < -100.0);
+        let mut gate = Gate::new(32, 10.0, 3.0, &[23, 38]);
+        for _ in 0..500 {
+            let (rise, drop) = gate.update(&[-90.0; 32], &floor);
+            assert!(!rise[0], "the integrated mean must clear the block floor");
+            assert!(!drop[0], "drop must still use the channel's original floor");
+        }
+    }
+
+    #[test]
+    fn weak_signal_recovers_after_large_power_drop() {
+        let floor = warmed_up_bank(1, -140.0);
+        for m in [23, 38] {
+            let mut gate = Gate::new(1, 11.0, 3.0, &[m]);
+            for _ in 0..2 * m {
+                gate.update(&[80.0], &floor);
+            }
+            // Finite, supported powers separated by 180 dB. A bare rolling
+            // subtraction loses every weak sample and never rises again.
+            let mut rise = false;
+            for _ in 0..2 * m {
+                rise = gate.update(&[-100.0], &floor).0[0];
+            }
+            assert!(
+                rise,
+                "M={m}: weak signal lost after old power leaves the ring"
+            );
+            for _ in 0..1000 {
+                assert!(gate.update(&[-100.0], &floor).0[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_pairs_match_direct_disjoint_window_means() {
+        let bank = warmed_up_bank(1, -90.0);
+        let mut gate = Gate::new(1, 10.0, 3.0, &[23, 38]);
+        let threshold = 10.0_f64.powf((bank.effective_floor_db(0) + 10.0) / 10.0);
+        let mut history = Vec::new();
+        for hop in 0..1000 {
+            // An isolated short impulse, then repeated marks with gaps and
+            // several wraps exercise both OR branches and delayed subtraction.
+            let db = if hop == 40 || (hop > 100 && hop % 125 < 80) {
+                -77.0
+            } else {
+                -90.0
+            };
+            history.push(10.0_f64.powf(db / 10.0));
+            let n = history.len();
+            let expected = [23, 38].into_iter().any(|m| {
+                n >= 2 * m
+                    && history[n - m..].iter().sum::<f64>() >= threshold * m as f64
+                    && history[n - 2 * m..n - m].iter().sum::<f64>() >= threshold * m as f64
+            });
+            assert_eq!(gate.update(&[db], &bank).0[0], expected, "hop={hop}");
+        }
+    }
+
+    #[test]
+    fn seeded_exponential_noise_never_rises() {
+        let bank = warmed_up_bank(1, 10.0 * 0.288_f64.log10());
+        let mut gate = Gate::new(1, 10.0, 3.0, &[23, 38]);
+        let mut seed = 123u64;
+        for _ in 0..10_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let u = ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            assert!(!gate.update(&[10.0 * (-u.ln()).log10()], &bank).0[0]);
+        }
+    }
+
+    #[test]
+    fn channelized_noise_calibrates_linear_mean_against_quantile_floor() {
+        use crate::channelizer::{power_db, Channelizer};
+        use num_complex::Complex32;
+        for seed in 1..=3u64 {
+            let mut state = seed;
+            let mut uniform = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+            };
+            let mut channelizer = Channelizer::new(96_000.0, 14_000_000.0).unwrap();
+            let mut floor = FloorBank::new(1024);
+            let mut windows = [PowerLooks::new(1024, 23), PowerLooks::new(1024, 38)];
+            let mut offsets = [Vec::new(), Vec::new()];
+            for t in 0..11250 {
+                let iq: Vec<_> = (0..256)
+                    .map(|_| {
+                        let radius = (-uniform().ln()).sqrt();
+                        let angle = std::f64::consts::TAU * uniform();
+                        Complex32::new((radius * angle.cos()) as f32, (radius * angle.sin()) as f32)
+                    })
+                    .collect();
+                for hop in channelizer.process(&iq) {
+                    if t < 32 {
+                        continue;
+                    }
+                    let db: Vec<_> = hop.power.iter().map(|&p| power_db(p)).collect();
+                    floor.update(&db);
+                    for (j, w) in windows.iter_mut().enumerate() {
+                        for (k, &p) in hop.power.iter().enumerate() {
+                            w.push(k, f64::from(p));
+                        }
+                        w.advance();
+                        if t > 7500 && t % 38 == 0 {
+                            for k in (32..992).step_by(31) {
+                                offsets[j].push(
+                                    floor.effective_floor_db(k)
+                                        - 10.0 * (w.recent[k] / w.m as f64).log10(),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            for (m, values) in [23, 38].into_iter().zip(&mut offsets) {
+                values.sort_by(f64::total_cmp);
+                let offset = values[values.len() / 2];
+                eprintln!("seed={seed} M={m} floor-minus-linear-mean={offset:.3} dB");
+                assert!((offset + 5.41).abs() <= 1.0, "M={m}: offset {offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_looks_require_full_disjoint_windows_and_hold_freezes() {
+        let bank = warmed_up_bank(1, -90.0);
+        for m in [23, 38] {
+            let mut gate = Gate::new(1, 10.0, 3.0, &[m]);
+            for hop in 1..=2 * m {
+                let (rise, drop) = gate.update(&[-78.0], &bank);
+                assert_eq!(rise[0], hop == 2 * m, "m={m} hop={hop}");
+                assert!(!drop[0]);
+                for _ in 0..3 {
+                    assert_eq!(gate.hold(&bank), (rise.clone(), drop.clone()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integrator_preserves_ema_and_drop() {
+        let bank = warmed_up_bank(1, -90.0);
+        let mut gate = Gate::new(1, 10.0, 3.0, &[23, 38]);
+        let mut expected = -90.0;
+        for i in 0..500 {
+            let x = if (40..150).contains(&i) { -70.0 } else { -90.0 };
+            if i > 0 {
+                expected += GATE_EMA_ALPHA * (x - expected);
+            }
+            let (_, drop) = gate.update(&[x], &bank);
+            assert!((gate.smoothed_db(0) - expected).abs() < 1e-10);
+            assert_eq!(drop[0], expected < bank.effective_floor_db(0) + 3.0);
+        }
+    }
 
     #[test]
     fn raw_channel_floor_preserves_quartile_when_neighbors_lower_effective_floor() {
@@ -685,7 +940,7 @@ mod tests {
     #[test]
     fn rise_met_once_ema_settles_above_threshold() {
         let bank = warmed_up_bank(4, -90.0);
-        let mut gate = Gate::new(4, 6.0, 3.0);
+        let mut gate = Gate::new(4, 6.0, 3.0, &[23, 38]);
         let mut rise = vec![false; 4];
         // Feed a steady +10 dB-above-floor signal on channel 0 until the EMA settles.
         for _ in 0..200 {
@@ -702,7 +957,7 @@ mod tests {
     #[test]
     fn drop_met_when_below_off_threshold() {
         let bank = warmed_up_bank(1, -90.0);
-        let mut gate = Gate::new(1, 6.0, 3.0);
+        let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
         let mut drop = vec![false];
         for _ in 0..200 {
             let (_, d) = gate.update(&[-89.0], &bank); // 1 dB above floor, below off_snr=3
@@ -717,7 +972,7 @@ mod tests {
         // drop should be true once settled -- this is the hysteresis dead
         // band SPEC §2.3 depends on for QSB survival.
         let bank = warmed_up_bank(1, -90.0);
-        let mut gate = Gate::new(1, 6.0, 3.0);
+        let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
         let mut last = (false, false);
         for _ in 0..200 {
             let (r, d) = gate.update(&[-85.5], &bank);
@@ -735,7 +990,7 @@ mod tests {
         // Verifies S[k,m] genuinely follows the closed-form EMA recurrence
         // S_n = x - (x - S_0)*(1-alpha)^n, not an instant jump to the input.
         let bank = warmed_up_bank(1, -90.0);
-        let mut gate = Gate::new(1, 6.0, 3.0);
+        let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
         gate.update(&[-90.0], &bank); // hop 1: initializes S_0 = -90.0 exactly
         assert_eq!(gate.smoothed_db(0), -90.0);
 
@@ -829,7 +1084,7 @@ mod tests {
     /// not seeded reports neither rise nor drop.
     #[test]
     fn gate_hold_does_not_advance_the_ema() {
-        let fresh = Gate::new(2, 6.0, 3.0);
+        let fresh = Gate::new(2, 6.0, 3.0, &[23, 38]);
         assert_eq!(
             fresh.hold(&warmed_up_bank(2, -90.0)),
             (vec![false, false], vec![false, false]),
@@ -837,7 +1092,7 @@ mod tests {
         );
 
         let quiet = warmed_up_bank(2, -90.0);
-        let mut gate = Gate::new(2, 6.0, 3.0);
+        let mut gate = Gate::new(2, 6.0, 3.0, &[23, 38]);
         let mut last = (Vec::new(), Vec::new());
         for _ in 0..200 {
             last = gate.update(&[-80.0, -90.0], &quiet);

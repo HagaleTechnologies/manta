@@ -24,6 +24,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-109: integrate two disjoint power windows for detector rise; retain the EMA for drop and SNR.
 - MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
   `T0M`) now decodes as its own words. The speed tracker read five equal
   dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`
