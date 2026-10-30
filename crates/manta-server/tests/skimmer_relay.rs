@@ -37,6 +37,10 @@ fn spawn_relay(port: u16) -> Harness {
 }
 
 fn spawn_relay_on(port: u16, bus: Arc<SpotBus>) -> Harness {
+    spawn_relay_with(port, bus, skimmer::KEEPALIVE_INTERVAL)
+}
+
+fn spawn_relay_with(port: u16, bus: Arc<SpotBus>, keepalive_every: Duration) -> Harness {
     let metrics = Metrics::new();
     let stats = metrics.register_relay(format!("127.0.0.1:{port}"), RelayKind::Skimmer);
     let relay_rx = bus.subscribe_relay();
@@ -47,7 +51,14 @@ fn spawn_relay_on(port: u16, bus: Arc<SpotBus>) -> Harness {
         port,
         callsign: RELAY_CALL.to_string(),
     };
-    let task = tokio::spawn(skimmer::run(cfg, clock, bus, stats.clone(), shutdown_rx));
+    let task = tokio::spawn(skimmer::run_with_keepalive(
+        cfg,
+        keepalive_every,
+        clock,
+        bus,
+        stats.clone(),
+        shutdown_rx,
+    ));
     Harness {
         stats,
         relay_rx,
@@ -330,14 +341,24 @@ async fn a_second_skimmers_spot_reaches_the_collector_under_its_own_call() {
     let _ = up_tx.send(true);
 }
 
-/// D10: no idle timeout -- two silent hours keep the session (paused time
-/// auto-advances while the runtime is idle).
-#[tokio::test(start_paused = true)]
+/// D10: no idle timeout -- two silent hours keep the session.
+///
+/// MAN-478: the connect and login run in real time. Under `start_paused`
+/// tokio auto-advanced past `accept_and_login`'s 5 s deadlines before
+/// kqueue reported the loopback connect, so this failed on macOS. Time is
+/// paused only once the session is up. From then on no assertion waits on
+/// socket I/O: the keepalive writes land in an almost empty send buffer
+/// (the socket is already known writable), the drain reads' timeouts are
+/// ignored, and `up` is an atomic. The reconnect check runs after
+/// `resume`, in real time, so a reconnect made during the paused hours
+/// (already queued in the listener's backlog) is seen.
+#[tokio::test]
 async fn a_quiet_skimmer_is_not_disconnected() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let h = spawn_relay(listener.local_addr().unwrap().port());
     let (_login, mut r, _w) = accept_and_login(&listener).await;
     wait_for("up", || h.stats.up()).await;
+    tokio::time::pause();
     // Drain keepalives for two hours; the session never drops.
     let end = tokio::time::Instant::now() + Duration::from_secs(2 * 3600);
     while tokio::time::Instant::now() < end {
@@ -345,32 +366,49 @@ async fn a_quiet_skimmer_is_not_disconnected() {
         let _ = tokio::time::timeout(Duration::from_secs(600), r.read_line(&mut line)).await;
         assert!(h.stats.up(), "a quiet skimmer was disconnected");
     }
+    tokio::time::resume();
     assert!(
-        tokio::time::timeout(Duration::from_millis(10), listener.accept())
+        tokio::time::timeout(Duration::from_millis(500), listener.accept())
             .await
             .is_err(),
         "the relay reconnected"
     );
+    assert!(h.stats.up(), "a quiet skimmer was disconnected");
     let _ = h.shutdown_tx.send(true);
 }
 
-#[tokio::test(start_paused = true)]
-async fn sends_a_blank_keepalive_every_300_s() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let h = spawn_relay(listener.local_addr().unwrap().port());
-    let (_login, mut r, _w) = accept_and_login(&listener).await;
+/// D10: production sends a keepalive every 300 s.
+#[test]
+fn the_keepalive_interval_is_300_s() {
+    assert_eq!(skimmer::KEEPALIVE_INTERVAL, Duration::from_secs(300));
+}
+
+/// D10: a blank CRLF keepalive goes out every interval -- never early, and
+/// again and again. Real time with a 250 ms interval (MAN-478: under
+/// paused time the keepalive read raced the 400 s read deadline the same
+/// way the connect did). `start` is taken before the relay exists, so the
+/// relay's own interval can't start earlier and the lower bound is exact.
+#[tokio::test]
+async fn sends_a_blank_keepalive_every_interval() {
+    const EVERY: Duration = Duration::from_millis(250);
+    // A loaded CI runner may deliver late; it can never deliver early.
+    const LATE_OK: Duration = Duration::from_secs(3);
     let start = tokio::time::Instant::now();
-    for n in 1..=2u64 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    let bus = Arc::new(SpotBus::new(96_000.0, epoch, 0));
+    let h = spawn_relay_with(listener.local_addr().unwrap().port(), bus, EVERY);
+    let (_login, mut r, _w) = accept_and_login(&listener).await;
+    for n in 1..=3u32 {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(400), r.read_line(&mut line))
+        tokio::time::timeout(EVERY * n + LATE_OK, r.read_line(&mut line))
             .await
-            .expect("no keepalive")
+            .unwrap_or_else(|_| panic!("no keepalive {n}"))
             .unwrap();
         assert_eq!(line, "\r\n");
         let elapsed = start.elapsed();
         assert!(
-            elapsed >= skimmer::KEEPALIVE_INTERVAL * n as u32 - Duration::from_secs(1)
-                && elapsed < skimmer::KEEPALIVE_INTERVAL * n as u32 + Duration::from_secs(1),
+            elapsed >= EVERY * n && elapsed < EVERY * n + LATE_OK,
             "keepalive {n} at {elapsed:?}"
         );
     }
