@@ -51,9 +51,25 @@ enum SessionEnd {
 }
 
 /// Runs one skimmer relay until shutdown (or its sender is dropped).
-/// Reconnects forever otherwise.
+/// Reconnects forever otherwise. Keepalives go out every
+/// [`KEEPALIVE_INTERVAL`].
 pub async fn run(
     cfg: SkimmerRelay,
+    clock: Clock,
+    bus: Arc<SpotBus>,
+    stats: Arc<RelayStats>,
+    shutdown: watch::Receiver<bool>,
+) {
+    run_with_keepalive(cfg, KEEPALIVE_INTERVAL, clock, bus, stats, shutdown).await;
+}
+
+/// [`run`] with the keepalive cadence as a parameter. Production uses
+/// [`run`]; the tests use a sub-second cadence so they can check it in
+/// real time over real loopback TCP (MAN-478: paused tokio time and real
+/// sockets race on macOS). `keepalive_every` must be non-zero.
+pub async fn run_with_keepalive(
+    cfg: SkimmerRelay,
+    keepalive_every: Duration,
     clock: Clock,
     bus: Arc<SpotBus>,
     stats: Arc<RelayStats>,
@@ -73,6 +89,7 @@ pub async fn run(
         }
         let end = session(
             &cfg,
+            keepalive_every,
             &label,
             &clock,
             &bus,
@@ -124,6 +141,7 @@ fn lost(logged_in: bool, why: impl Into<String>) -> SessionEnd {
 #[allow(clippy::too_many_arguments)]
 async fn session(
     cfg: &SkimmerRelay,
+    keepalive_every: Duration,
     label: &str,
     clock: &Clock,
     bus: &SpotBus,
@@ -188,8 +206,8 @@ async fn session(
     let mut line = String::new();
     let mut warned_other_spotter = false;
     let mut keepalive = tokio::time::interval_at(
-        tokio::time::Instant::now() + KEEPALIVE_INTERVAL,
-        KEEPALIVE_INTERVAL,
+        tokio::time::Instant::now() + keepalive_every,
+        keepalive_every,
     );
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
