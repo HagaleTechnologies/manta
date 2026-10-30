@@ -949,9 +949,20 @@ fn git_in_repo(args: &[&str]) -> Option<std::process::Output> {
 /// generated from; each page was verified at its own `verified_commit`,
 /// which must therefore be in `head_commit`'s history. A merge kept main's own `de525d1` stamp on windows-build-setup
 /// while `head_commit` stayed at `d286147`, which does not contain it.
-/// Ordering commits needs git history: the test skips in a shallow clone
-/// (ci-full.yml's test checkout is one) and skips any commit this clone
-/// cannot resolve.
+///
+/// Every stamp must also be a commit on the default branch. MAN-475: MAN-271
+/// stamped `detector-tracks` with its own pre-squash branch commit `d0fd24d`
+/// (and `head_commit` with another branch commit); the squash merge left
+/// both unreachable, so a fresh clone could not resolve them and this test
+/// skipped them, while an older clone that still had the objects failed it.
+/// A stamp that does not resolve, or is not an ancestor of the default
+/// branch, now fails: stamp pages with a commit already on `main`, never one
+/// on the branch being reviewed.
+///
+/// Ordering commits needs git history, so a shallow checkout skips the whole
+/// test (ci-full.yml's native `pull_request` and `merge_group` test jobs are
+/// shallow). The dispatched PR runs check out full history with every branch
+/// (fetch-depth 0, MAN-340), so they enforce it.
 #[test]
 fn wiki_manifest_head_commit_contains_every_page_stamp() {
     let shallow = git_in_repo(&["rev-parse", "--is-shallow-repository"]);
@@ -966,16 +977,42 @@ fn wiki_manifest_head_commit_contains_every_page_stamp() {
         git_in_repo(&["cat-file", "-e", &format!("{commit}^{{commit}}")])
             .is_some_and(|out| out.status.success())
     };
+    let is_ancestor = |ancestor: &str, descendant: &str| {
+        git_in_repo(&["merge-base", "--is-ancestor", ancestor, descendant])
+            .is_some_and(|out| out.status.success())
+    };
+    // The default branch as this clone knows it: `origin/main` (present in a
+    // developer clone and in CI's fetch-depth 0 checkout, which fetches every
+    // branch), else HEAD for a clone without that remote-tracking ref.
+    let main = if resolves("refs/remotes/origin/main") {
+        "refs/remotes/origin/main"
+    } else {
+        eprintln!("no refs/remotes/origin/main in this clone; checking stamps against HEAD");
+        "HEAD"
+    };
+    let unreachable = |what: &str, commit: &str| {
+        format!(
+            "wiki/manifest.json's {what} {commit} {}: stamp it with a commit on main (a \
+             squash merge orphans a branch commit; MAN-475). If main has moved, run \
+             `git fetch origin` first.",
+            if resolves(commit) {
+                format!("is not an ancestor of {main}")
+            } else {
+                "does not resolve in this clone".to_owned()
+            }
+        )
+    };
 
     let manifest: serde_json::Value =
         serde_json::from_str(&doc("wiki/manifest.json")).expect("parse wiki/manifest.json");
     let head = manifest["head_commit"]
         .as_str()
         .expect("wiki/manifest.json has a string `head_commit`");
-    if !resolves(head) {
-        eprintln!("skipping: head_commit {head} is not in this clone");
-        return;
-    }
+    assert!(
+        resolves(head) && is_ancestor(head, main),
+        "{}",
+        unreachable("head_commit", head)
+    );
     for entry in manifest["pages"]
         .as_array()
         .expect("wiki/manifest.json has a `pages` array")
@@ -984,14 +1021,13 @@ fn wiki_manifest_head_commit_contains_every_page_stamp() {
         let stamp = entry["verified_commit"]
             .as_str()
             .unwrap_or_else(|| panic!("wiki/manifest.json entry `{id}` has no verified_commit"));
-        if !resolves(stamp) {
-            eprintln!("skipping `{id}`: verified_commit {stamp} is not in this clone");
-            continue;
-        }
-        let contained = git_in_repo(&["merge-base", "--is-ancestor", stamp, head])
-            .is_some_and(|out| out.status.success());
         assert!(
-            contained,
+            resolves(stamp) && is_ancestor(stamp, main),
+            "{}",
+            unreachable(&format!("verified_commit of entry `{id}`,"), stamp)
+        );
+        assert!(
+            is_ancestor(stamp, head),
             "wiki/manifest.json's head_commit {head} does not contain verified_commit {stamp} \
              of entry `{id}`: re-anchor head_commit on a commit that contains every page stamp"
         );
