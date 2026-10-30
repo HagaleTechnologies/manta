@@ -1,10 +1,7 @@
 //! SPEC-decode-core.md §4.6 per-callsign confidence, plus the cty/SCP
 //! adjustment the spec explicitly defers to this crate (ARCHITECTURE §6.3).
 //! MAN-106 adds the evidence predicate behind the zero-evidence
-//! abstention gate and the committed empirical calibration (see
-//! `calibration`).
-
-pub mod calibration;
+//! abstention gate.
 
 /// Geometric mean of per-character decoder confidences: `(prod cᵢ)^(1/n)`.
 /// Shared by `c_call` below and `support::SupportLedger` (MAN-100), which

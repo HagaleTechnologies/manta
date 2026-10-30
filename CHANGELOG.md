@@ -24,19 +24,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-- MAN-106: `decodeConfidence` is now a calibrated probability that the
-  callsign is correct (committed offline fit over character quality,
-  repetition count and MAN-95 pattern tier; values change scale), every
-  spot gains `emissionState` (`confirmed`/`tentative`) in CLI JSON, and a
-  candidate whose characters all carried zero decoder confidence is no
-  longer emitted at all (an abstention, reason `noEvidence` in the
-  live-state decision stream). The confidence multiplier `q` now reads
-  the engine-supplied floor-based SNR estimate instead of the saturated
-  keying-rail value, so confidence regains dynamic range across the SNR
-  band. `manta bench sensitivity --json` gains a per-point `confidence`
-  block (separation, reliability, Brier, log loss, risk-vs-coverage;
-  `format_version` 2) and a `--reliability` flag. See
-  docs/DECISIONS/2026-10-30-man106-confidence-calibration.md and
+- MAN-106 first slice: candidates with no finite positive character
+  confidence are withheld as `noEvidence`. CLI JSON spots gain
+  `emissionState`, based on whether the pattern tier's repetition
+  requirement is met. The character confidence multiplier `q` now uses
+  the engine-supplied floor-based SNR, with the rail estimate as standalone
+  fallback. Confidence remains an uncalibrated score; bench reporting and
+  fitted calibration are deferred to the next slice. See
   docs/DECISIONS/2026-10-30-man106-q-snr-input.md.
 - MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
   `T0M`) now decodes as its own words. The speed tracker read five equal

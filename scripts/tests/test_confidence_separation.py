@@ -1,4 +1,4 @@
-import csv, importlib.util, json, os, sys, tempfile, unittest
+import csv, importlib.util, json, os, sys, tempfile
 from datetime import datetime, timezone
 from contextlib import redirect_stdout
 from io import StringIO
@@ -73,53 +73,47 @@ def _run(*extra_args):
         return code, out.getvalue()
 
 
-class ConfidenceSeparationTest(unittest.TestCase):
-    def _run_checked(self):
-        code, output = _run()
-        self.assertTrue(code == 0 or code is None, f"exit {code}")
-        return code, output
+def test_true_bogus_split_and_separation():
+    code, output = _run()
+    assert code == 0 or code is None
+    assert "true positives: 2, bogus (false positives): 2" in output
+    # true confidences {0.95, 0.85} -> median 0.90; bogus {0.40, 0.30} -> median 0.35.
+    assert "confidence separation (median true - median bogus): 0.550" in output
 
-    def test_true_bogus_split_and_separation(self):
-        code, output = self._run_checked()
-        self.assertIn("true positives: 2, bogus (false positives): 2", output)
-        # true confidences {0.95, 0.85} -> median 0.90; bogus {0.40, 0.30} -> median 0.35.
-        self.assertIn("confidence separation (median true - median bogus): 0.550", output)
 
-    def test_min_separation_gate_passes_when_met(self):
-        code, _ = _run("--min-separation", "0.5")
-        self.assertTrue(code == 0 or code is None)
+def test_min_separation_gate_passes_when_met():
+    code, _ = _run("--min-separation", "0.5")
+    assert code == 0 or code is None
 
-    def test_min_separation_gate_fails_when_not_met(self):
-        code, _ = _run("--min-separation", "0.6")
-        self.assertEqual(code, 1)
 
-    def test_empty_class_exits_nonzero_not_silently_passing(self):
-        """Both spots claim to be N4RV/matched truth -> zero bogus spots. Must exit 2, not
-        silently treat an undefined separation as passing a --min-separation gate."""
-        with tempfile.TemporaryDirectory() as d:
-            report_path = os.path.join(d, "report.json")
-            truth_path = os.path.join(d, "truth.csv")
-            with open(report_path, "w") as f:
-                json.dump({"spots": SPOTS[:2]}, f)  # only the two true positives
-            _write_truth(truth_path)
-            argv = [
-                "confidence-separation.py", report_path, truth_path,
-                "--capture-start", "2025-11-29T00:00:00Z",
-                "--sample-rate-hz", str(SAMPLE_RATE_HZ),
-                "--min-separation", "0.0",  # would trivially "pass" if separation were nan
-            ]
-            old_argv = sys.argv
-            sys.argv = argv
+def test_min_separation_gate_fails_when_not_met():
+    code, _ = _run("--min-separation", "0.6")
+    assert code == 1
+
+
+def test_empty_class_exits_nonzero_not_silently_passing():
+    """Both spots claim to be N4RV/matched truth -> zero bogus spots. Must exit 2, not
+    silently treat an undefined separation as passing a --min-separation gate."""
+    with tempfile.TemporaryDirectory() as d:
+        report_path = os.path.join(d, "report.json")
+        truth_path = os.path.join(d, "truth.csv")
+        with open(report_path, "w") as f:
+            json.dump({"spots": SPOTS[:2]}, f)  # only the two true positives
+        _write_truth(truth_path)
+        argv = [
+            "confidence-separation.py", report_path, truth_path,
+            "--capture-start", "2025-11-29T00:00:00Z",
+            "--sample-rate-hz", str(SAMPLE_RATE_HZ),
+            "--min-separation", "0.0",  # would trivially "pass" if separation were nan
+        ]
+        old_argv = sys.argv
+        sys.argv = argv
+        try:
             try:
-                try:
-                    confsep.main()
-                    code = 0
-                except SystemExit as e:
-                    code = e.code
-            finally:
-                sys.argv = old_argv
-            self.assertEqual(code, 2)
-
-
-if __name__ == "__main__":
-    unittest.main()
+                confsep.main()
+                code = 0
+            except SystemExit as e:
+                code = e.code
+        finally:
+            sys.argv = old_argv
+        assert code == 2

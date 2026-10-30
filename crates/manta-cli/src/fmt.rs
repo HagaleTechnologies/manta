@@ -189,7 +189,6 @@ mod tests {
             text: String::new(),
             events: Vec::new(),
             spots: Vec::new(),
-            decisions: Vec::new(),
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,

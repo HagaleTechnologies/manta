@@ -519,7 +519,7 @@ B2/K5TR windows in ≤ 2 min on a laptop. Baseline to beat (legacy engine,
 |---|---|
 | 1 (front end feeding the legacy chain via a −6 dB decision) | oracle `as_word ≥ 45 %`, `wpm_ratio ∈ [0.95, 1.05]`; V1–V10 no regression; `CHAR_GAP_DITS` back to 2.0 with V2 passing |
 | 2 (hsmm) | oracle `as_word ≥ 60 %`, `framed ≥ 40 %`; V1–V10 + VR1–VR8 pass; determinism CI; criterion bench ≤ 25 % of one M-series core for 300 tracks at 192 kS/s including the PFB |
-| 3 (lattice) | MAN-106 separation: median confidence of true vs bogus spots differs by ≥ 0.3 on the V8w scene and on B2/K5TR (V8w leg automated in `manta-cli`'s `man106_separation_gate` test, bogus population = bench-truth-labeled withheld candidates; the B2/K5TR leg waits on the corpus behind `MANTA_CORPUS_BASE_URL` and is tracked with MAN-116) |
+| 3 (lattice) | MAN-106 separation: median confidence of true vs bogus spots differs by ≥ 0.3 on the V8w scene and on B2/K5TR |
 
 ---
 

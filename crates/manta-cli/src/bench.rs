@@ -17,18 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 
-mod confidence_report;
-use confidence_report::{label_point, render_reliability, summarize, ConfidenceRow};
-
 /// A spot or track counts for a station within this distance of its frequency.
 pub(crate) const MATCH_HZ: f64 = 150.0;
 /// A station is "copied cleanly" below this capped CER.
 pub(crate) const GOOD_COPY_CER: f64 = 0.10;
-/// Version of the `--json` report layout. 2 (MAN-106): every point gains
-/// the additive `confidence` block (separation, reliability, Brier, log
-/// loss, risk-vs-coverage, fit rows) and `per_station` gains
-/// `spot_confidences`.
-const FORMAT_VERSION: u32 = 2;
+/// Version of the `--json` report layout.
+const FORMAT_VERSION: u32 = 1;
 const COMMAND: &str = "manta bench sensitivity";
 
 const DEFAULT_CONDITIONS: &str = "awgn,good,poor";
@@ -132,11 +126,6 @@ pub(crate) struct SensitivityArgs {
     /// Print the table as Markdown, for a release note or a web page
     #[arg(long, help_heading = "Output")]
     pub markdown: bool,
-    /// Print each point's confidence reliability table to stderr (the
-    /// JSON report always carries the numbers; this only adds the
-    /// human-readable form)
-    #[arg(long, help_heading = "Output")]
-    pub reliability: bool,
 }
 
 /// `--conditions`, in canonical order.
@@ -333,8 +322,6 @@ pub(crate) struct StationScore {
     pub first_spot_s: Option<f64>,
     /// Mean SNR of the correct spots, in 500 Hz.
     pub spot_snr_db: Option<f64>,
-    /// The calibrated confidence of each correct spot (MAN-106).
-    pub spot_confidences: Vec<f64>,
     /// Capped at 1.
     pub cer: f64,
 }
@@ -344,9 +331,6 @@ pub(crate) struct StationScore {
 pub(crate) struct PointScore {
     pub stations: Vec<StationScore>,
     pub bogus_calls: BTreeSet<String>,
-    /// MAN-106: bench-truth-labeled confidence rows (emitted spots and
-    /// withheld candidates) for this decode.
-    pub confidence_rows: Vec<ConfidenceRow>,
 }
 
 /// One sweep point, pooled over every trial.
@@ -360,8 +344,6 @@ pub(crate) struct PointResult {
     pub stations: Vec<StationScore>,
     /// Each trial's distinct bogus calls, pooled and sorted.
     pub bogus_calls: Vec<String>,
-    /// Every trial's labeled confidence rows, pooled (MAN-106).
-    pub confidence_rows: Vec<ConfidenceRow>,
 }
 
 impl PointResult {
@@ -372,7 +354,6 @@ impl PointResult {
             snr_db,
             stations: Vec::new(),
             bogus_calls: Vec::new(),
-            confidence_rows: Vec::new(),
         }
     }
 
@@ -381,7 +362,6 @@ impl PointResult {
         self.stations.extend(score.stations);
         self.bogus_calls.extend(score.bogus_calls);
         self.bogus_calls.sort();
-        self.confidence_rows.extend(score.confidence_rows);
     }
 
     pub fn spotted(&self) -> usize {
@@ -462,9 +442,6 @@ pub(crate) fn sensitivity(args: SensitivityArgs) -> Result<()> {
     } else {
         render_table(&result, &header)
     };
-    if args.reliability {
-        eprintln!("{}", render_reliability(&result));
-    }
     let mut stdout = std::io::stdout().lock();
     stdout.write_all(out.as_bytes())?;
     stdout.flush()?;
@@ -644,12 +621,10 @@ pub(crate) fn score_point(stations: &[Station], report: Option<&DecodeReport>) -
                     spots: 0,
                     first_spot_s: None,
                     spot_snr_db: None,
-                    spot_confidences: Vec::new(),
                     cer: 1.0,
                 })
                 .collect(),
             bogus_calls: BTreeSet::new(),
-            confidence_rows: Vec::new(),
         };
     };
 
@@ -715,7 +690,6 @@ pub(crate) fn score_point(stations: &[Station], report: Option<&DecodeReport>) -
                         .iter()
                         .map(|sp| sp.snr_db as f64 + RBN_REF_BW_CORRECTION_DB as f64),
                 ),
-                spot_confidences: correct.iter().map(|sp| sp.confidence as f64).collect(),
                 cer,
             }
         })
@@ -730,14 +704,9 @@ pub(crate) fn score_point(stations: &[Station], report: Option<&DecodeReport>) -
         })
         .map(|sp| sp.callsign.clone())
         .collect();
-    // MAN-106: the labeled confidence rows -- emitted spots plus the
-    // validator's withheld/deferred candidates as hard negatives, truth
-    // from the stations the scene actually sent.
-    let confidence_rows = label_point(stations, &report.spots, &report.decisions);
     PointScore {
         stations: scores,
         bogus_calls,
-        confidence_rows,
     }
 }
 
@@ -971,21 +940,7 @@ struct JsonPoint<'a> {
     cer_mean: f64,
     good_copy: usize,
     spot_snr_db: Option<f64>,
-    /// MAN-106: the per-point confidence instrument — separation,
-    /// reliability, Brier, log loss, risk-vs-coverage, and the labeled
-    /// rows the offline calibration is fitted from.
-    confidence: ConfidenceBlock<'a>,
     per_station: &'a [StationScore],
-}
-
-/// The `confidence` block of one point: the summary plus the labeled
-/// fit rows (raw score, calibrated probability, reps, tier, bench-truth
-/// label).
-#[derive(serde::Serialize)]
-struct ConfidenceBlock<'a> {
-    #[serde(flatten)]
-    summary: confidence_report::ConfidenceSummary,
-    rows: &'a [ConfidenceRow],
 }
 
 /// Design §6: the full result as one line of JSON.
@@ -1021,10 +976,6 @@ pub(crate) fn render_json(result: &SweepResult, header: &Header) -> Result<Strin
                 cer_mean: p.cer_mean(),
                 good_copy: p.good_copy(),
                 spot_snr_db: p.spot_snr_db(),
-                confidence: ConfidenceBlock {
-                    summary: summarize(&p.confidence_rows),
-                    rows: &p.confidence_rows,
-                },
                 per_station: &p.stations,
             })
             .collect(),
@@ -1085,9 +1036,6 @@ pub(crate) fn regenerate(args: &SensitivityArgs) -> String {
     }
     if args.markdown {
         parts.push("--markdown".to_string());
-    }
-    if args.reliability {
-        parts.push("--reliability".to_string());
     }
     parts.join(" ")
 }
@@ -1250,7 +1198,6 @@ mod tests {
             text: String::new(),
             events,
             spots,
-            decisions: Vec::new(),
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,
@@ -1385,7 +1332,6 @@ mod tests {
             spots: usize::from(spotted),
             first_spot_s: spotted.then_some(1.0),
             spot_snr_db: spotted.then_some(10.0),
-            spot_confidences: spotted.then_some(0.8).into_iter().collect(),
             cer,
         }
     }
@@ -1396,12 +1342,10 @@ mod tests {
         p.add(PointScore {
             stations: (0..10).map(|_| station_score(0, true, 0.05)).collect(),
             bogus_calls: BTreeSet::from(["N0PE".to_string()]),
-            confidence_rows: Vec::new(),
         });
         p.add(PointScore {
             stations: (0..10).map(|_| station_score(1, false, 0.25)).collect(),
             bogus_calls: BTreeSet::from(["AA0AA".to_string()]),
-            confidence_rows: Vec::new(),
         });
         assert_eq!(p.stations.len(), 20);
         assert_eq!(p.spotted(), 10);
@@ -1454,7 +1398,6 @@ mod tests {
         a.add(PointScore {
             stations: vec![station_score(0, false, 1.0), station_score(0, false, 0.5)],
             bogus_calls: BTreeSet::new(),
-            confidence_rows: Vec::new(),
         });
         let mut b = PointResult::new(Condition::WattersonGood, 25, 4.5);
         let mut s = station_score(0, true, 0.05);
@@ -1462,7 +1405,6 @@ mod tests {
         b.add(PointScore {
             stations: vec![s, station_score(0, false, 0.15)],
             bogus_calls: BTreeSet::from(["N0PE".to_string()]),
-            confidence_rows: Vec::new(),
         });
         SweepResult {
             plan,
@@ -1618,8 +1560,7 @@ Regenerate: manta bench sensitivity --conditions awgn,good --wpm 25 --snr-db 4.5
         let v: serde_json::Value =
             serde_json::from_str(&render_json(&hand_built(), &h).unwrap()).unwrap();
         assert_eq!(v["report"], "manta bench sensitivity");
-        // MAN-106: the confidence block is additive; the version moved.
-        assert_eq!(v["format_version"], 2);
+        assert_eq!(v["format_version"], 1);
         assert_eq!(v["manta_version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(v["engine"], "legacy");
         assert_eq!(v["config_file"], "cfg.toml");
@@ -1639,58 +1580,6 @@ Regenerate: manta bench sensitivity --conditions awgn,good --wpm 25 --snr-db 4.5
             serde_json::from_str(&render_json(&hand_built(), &none).unwrap()).unwrap();
         assert!(v["config_file"].is_null());
         assert_eq!(v["engine"], "hsmm");
-    }
-
-    #[test]
-    fn json_points_carry_the_man106_confidence_block() {
-        let mut p = hand_built().points[1].clone();
-        p.confidence_rows = vec![
-            confidence_report::ConfidenceRow {
-                call: "W2ABC".into(),
-                score: 0.9,
-                p: 0.9,
-                reps: 2,
-                tier: "common",
-                correct: true,
-            },
-            confidence_report::ConfidenceRow {
-                call: "N0PE".into(),
-                score: 0.2,
-                p: 0.2,
-                reps: 1,
-                tier: "unlisted",
-                correct: false,
-            },
-        ];
-        let mut result = hand_built();
-        result.points[1] = p;
-        let v: serde_json::Value =
-            serde_json::from_str(&render_json(&result, &header(Engine::Legacy, None)).unwrap())
-                .unwrap();
-        let c = &v["points"][1]["confidence"];
-        assert_eq!(c["true_n"], 1);
-        assert_eq!(c["bogus_n"], 1);
-        assert_eq!(c["separation"], 0.7);
-        assert_eq!(c["reliability"].as_array().unwrap().len(), 10);
-        assert!(c["brier"].is_number() && c["log_loss"].is_number());
-        assert_eq!(c["risk_coverage"].as_array().unwrap().len(), 2);
-        let rows = c["rows"].as_array().unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1]["call"], "N0PE");
-        assert_eq!(rows[1]["correct"], false);
-        // An empty point reports None fields, never NaN.
-        let empty = &v["points"][0]["confidence"];
-        assert!(empty["true_median"].is_null() && empty["separation"].is_null());
-    }
-
-    #[test]
-    fn reliability_flag_parses_and_defaults_off() {
-        assert!(!parse(&[]).unwrap().reliability);
-        assert!(parse(&["--reliability"]).unwrap().reliability);
-        assert_eq!(
-            regenerate(&parse(&["--snr-db", "0", "--reliability"]).unwrap()),
-            "manta bench sensitivity --snr-db 0 --reliability"
-        );
     }
 
     #[test]

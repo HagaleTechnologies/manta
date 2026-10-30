@@ -59,7 +59,7 @@ fn transmission_events_at(
 }
 
 /// A word whose characters split between zero and positive confidence —
-/// the mixed-`?` case (research §4): calibration handles it, the gate
+/// the mixed-`?` case (research §4): future calibration handles it, the gate
 /// must not.
 fn mixed_word_events(track_id: u32, text: &str, start_ts: u64) -> (Vec<DecoderEvent>, u64) {
     let mut events = Vec::new();
@@ -139,31 +139,28 @@ fn v52_positive_evidence_still_spots_and_mixed_words_still_spot() {
     assert_eq!(spots.len(), 1, "normal evidence must still spot: {spots:?}");
 
     // Mixed zero/positive characters: the word HAS acoustic evidence, so
-    // it is calibration's problem (near-zero probability, `tentative`),
+    // it is future calibration's problem,
     // not the gate's.
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     seed_meta(&mut v, 1);
     let mut events = Vec::new();
-    let mut ts = 0u64;
-    for (i, word) in cq_words().iter().enumerate() {
-        let (mut w, next) = if i == 3 || i == 4 {
-            mixed_word_events(1, word, ts)
-        } else {
-            word_events_at(1, word, ts, 0.6)
-        };
-        events.append(&mut w);
-        ts = next;
+    for start_ts in [0, 100_000] {
+        let mut ts = start_ts;
+        for (i, word) in cq_words().iter().enumerate() {
+            let (mut w, next) = if i == 3 || i == 4 {
+                mixed_word_events(1, word, ts)
+            } else {
+                word_events_at(1, word, ts, 0.6)
+            };
+            events.append(&mut w);
+            ts = next;
+        }
     }
-    let mut spots: Vec<Spot> = events.iter().flat_map(|e| v.ingest(e)).collect();
-    spots.extend(
-        transmission_events_at(1, &cq_words(), 100_000, 0.6)
-            .iter()
-            .flat_map(|e| v.ingest(e)),
-    );
+    let spots: Vec<Spot> = events.iter().flat_map(|e| v.ingest(e)).collect();
     assert_eq!(
         spots.len(),
         1,
-        "a mixed-? word still spots (calibration's case), got {spots:?}"
+        "a mixed-? word still spots (positive evidence), got {spots:?}"
     );
 }
 
@@ -183,35 +180,20 @@ fn v52_two_repetition_cq_spot_is_confirmed() {
     let spot = &spots[0];
     assert_eq!(spot.spot_type, SpotType::Cq);
     assert_eq!(spot.emission_state, EmissionState::Confirmed);
-    assert!(spot.confidence >= 0.5, "confirmed implies the threshold");
 }
 
 #[test]
 fn v52_single_repetition_allowlisted_spot_is_tentative() {
-    // The Phase-4 rule: `confirmed` iff the calibrated probability
-    // reaches PUBLISH_CONFIRMED_THRESHOLD. An allowlisted single decode
-    // with degraded characters (0.3 per character) calibrates far below
-    // the threshold, so it publishes `tentative`.
+    // Exemption permits publication before the normal repetition requirement.
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
     v.allowlist("W1AW");
     seed_meta(&mut v, 1);
-    let spots: Vec<Spot> = transmission_events_at(1, &cq_words(), 0, 0.3)
+    let spots: Vec<Spot> = transmission_events_at(1, &cq_words(), 0, 0.95)
         .iter()
         .flat_map(|e| v.ingest(e))
         .collect();
     assert_eq!(spots.len(), 1, "allowlisted spots on one decode: {spots:?}");
     assert_eq!(spots[0].emission_state, EmissionState::Tentative);
-    assert!(spots[0].confidence < 0.5);
-    // And the state is exactly the threshold rule on the spot's own
-    // calibrated probability.
-    assert_eq!(
-        spots[0].emission_state,
-        if spots[0].confidence >= manta_spot::confidence::calibration::PUBLISH_CONFIRMED_THRESHOLD {
-            EmissionState::Confirmed
-        } else {
-            EmissionState::Tentative
-        }
-    );
 }
 
 #[test]
@@ -240,4 +222,44 @@ fn v52_emission_state_serializes_camel_case_and_documented_labels() {
     };
     let json = serde_json::to_string(&tentative).unwrap();
     assert!(json.contains(r#""emissionState":"tentative""#), "{json}");
+}
+
+#[test]
+fn v52_allowlist_and_beacon_exemptions_cannot_supply_absent_evidence() {
+    use manta_decode::events::ClosureKind;
+
+    for allowlisted in [false, true] {
+        for confidence in [0.0, 0.95] {
+            let mut v = Validator::new(FS, CTY_FIXTURE, Some("W1AW\n"));
+            if allowlisted {
+                v.allowlist("W1AW");
+            }
+            v.record_decisions(true);
+            seed_meta(&mut v, 1);
+            let mut spots: Vec<Spot> =
+                transmission_events_at(1, &["V", "V", "V", "W1AW"], 0, confidence)
+                    .iter()
+                    .flat_map(|e| v.ingest(e))
+                    .collect();
+            spots.extend(v.ingest(&DecoderEvent::SpeedUpdate {
+                track_id: 1,
+                wpm: 22.0,
+            }));
+            spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+                track_id: 1,
+                closure: ClosureKind::SignalEnded,
+            }));
+            if confidence == 0.0 {
+                assert!(spots.is_empty(), "allowlisted={allowlisted}: {spots:?}");
+                assert!(v
+                    .take_decisions()
+                    .iter()
+                    .any(|d| d.call == "W1AW" && d.reason == Some(Reason::NoEvidence)));
+            } else {
+                assert_eq!(spots.len(), 1, "allowlisted={allowlisted}: {spots:?}");
+                assert_eq!(spots[0].spot_type, SpotType::Beacon);
+                assert_eq!(spots[0].emission_state, EmissionState::Tentative);
+            }
+        }
+    }
 }

@@ -691,7 +691,6 @@ pub(crate) mod tests {
             required_reps: 2,
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
-            confidence: None,
             spot: None,
         }
     }

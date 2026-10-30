@@ -272,7 +272,6 @@ mod tests {
             required_reps: 2,
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
-            confidence: None,
             spot: None,
         });
         assert_eq!(
@@ -314,7 +313,6 @@ mod tests {
             required_reps: 2,
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
-            confidence: Some(0.75),
             spot: Some(s.clone()),
         });
         let (_, line) = render(&spotted, "W1AW", &bus);

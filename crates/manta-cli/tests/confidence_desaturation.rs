@@ -80,6 +80,10 @@ fn median_confidence_rises_with_snr_and_leaves_the_pinned_floor() {
     // Before the fix, 83 of 100 spots at 9 dB sat exactly on the
     // 0.225 = 0.3 (q floor) × 0.75 (r=2) pin.
     let pinned = at_9.iter().filter(|c| (**c - 0.225).abs() < 1e-6).count();
+    eprintln!(
+        "medians 3/9/15 dB: {m3}/{m9}/{m15}; pinned at 9 dB: {pinned}/{}",
+        at_9.len()
+    );
     assert!(
         (pinned as f64) < 0.10 * at_9.len() as f64,
         "{pinned} of {} spots still pinned at exactly 0.225 at 9 dB",

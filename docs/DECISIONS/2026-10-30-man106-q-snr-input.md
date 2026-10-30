@@ -16,7 +16,7 @@ pushed the MAN-102 floor-based peak-hold estimate into every
 `manta-engine/src/track.rs`) and `tick_meta` already preferred it for
 the *reported* `TrackMeta.snr_2500_db`.
 
-The research phase for this ticket (same commit as this change)
+The research phase for this ticket (commit 65ad1bb, before this change)
 measured the consequence end to end:
 
 | scene | characters at the 0.3 `q` floor | spot confidences |
@@ -73,3 +73,38 @@ reporting semantics do not move.
   investigation 11's M2/§2.3 front-end work, explicitly out of scope
   for this ticket; the floor-based estimate is the measured non-saturating
   input the decoder already receives.
+
+## First-slice boundary
+
+The previous attempt changed 55 files. This slice keeps phases 1 and 2
+of the MAN-106 plan, including zero-evidence abstention and the interim
+repetition-based emission state. Phases 3 and 4 move together to one
+follow-up: the bench measurement instrument, decision confidence capture,
+fit data and calibration, probability-based state threshold, and the
+V8w separation gate. The confidence score is not yet a calibrated
+probability. The separation acceptance criterion remains outstanding.
+
+`Reason::NoEvidence` maps to `noEvidence` in the live-state stream. The
+gate covers ordinary candidates, allowlisted candidates and deferred
+beacons at track close. `emissionState` is `confirmed` when the configured
+pattern tier's repetition requirement is met, otherwise `tentative`.
+Both states publish; the :7301 spot message does not gain this field.
+The support ledger remains unchanged.
+
+The decision index is generated after landing under MAN-440; this record
+therefore does not rewrite its generated row.
+
+## First-slice measurements
+
+`cargo test -p manta-cli --test confidence_desaturation --locked --
+--nocapture` passed on the 30 s, seed 1, 25 WPM, ten-station AWGN
+recipe. Correct-spot medians at 3/9/15 dB were respectively
+0.22495812 / 0.22498953 / 0.34301296. At 9 dB, 0 of 5 correct spots
+were within 1e-6 of 0.225. The low-SNR medians remain near the floor;
+this input correction alone does not establish empirical calibration
+or the true/bogus separation bar.
+
+`cargo test -p manta-spot --test golden_v52_zero_evidence --locked`
+passed all six tests, including the all-zero CQ stream with and without
+SCP, allowlisted and deferred-beacon paths, positive and mixed-evidence
+controls, repetition-based states and the serialized field labels.

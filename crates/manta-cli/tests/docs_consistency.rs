@@ -3476,7 +3476,6 @@ fn cli_json_doc_lists_every_field_both_ways() {
             rst: Some("599".into()),
             qrl_query: true,
         }],
-        decisions: Vec::new(),
         timing: Some(timing),
         rtty: vec![RttySignalReport {
             mark_hz: 14_080_170.0,

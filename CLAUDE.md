@@ -19,8 +19,8 @@ cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --w
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestry.test.sh
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
-packaging,package_release,score_against_rbn_replay,confidence_separation,fit_calibration,\
-ci_gates,verify_dependabot_diff_safe,decisions_index}
+packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_diff_safe,\
+decisions_index}
 cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
 cargo test -p manta-input -p manta-cli --features hpsdr --locked
 ```

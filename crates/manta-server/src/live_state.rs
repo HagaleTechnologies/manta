@@ -467,7 +467,6 @@ mod tests {
             required_reps: 5,
             pattern_tier: Some(PatternTier::Unlisted),
             rival: None,
-            confidence: None,
             spot: None,
         }
     }

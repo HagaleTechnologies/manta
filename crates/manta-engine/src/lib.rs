@@ -240,12 +240,6 @@ pub struct DecodeReport {
     /// Validated spots (`manta-spot::Validator`, ARCHITECTURE §6), run
     /// over the full multi-track event stream above.
     pub spots: Vec<Spot>,
-    /// The validator's decision log (MAN-324 opt-in, MAN-106: recorded
-    /// on every offline decode so `manta bench` can label withheld
-    /// candidates as hard negatives). Not serialized -- the CLI JSON
-    /// surface is unchanged.
-    #[serde(skip)]
-    pub decisions: Vec<manta_spot::Decision>,
     /// The primary track's last `TimingUpdate` (its learned dot, dash and
     /// gap timing), or `None` when it emitted none (MAN-315).
     pub timing: Option<TimingEstimates>,
@@ -658,18 +652,10 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     let text = events_to_text(&this_track);
     let timing = last_timing(&this_track);
     let mut validator = cfg.validator(fs)?;
-    // MAN-106: the offline decode records the validator's decision log so
-    // consumers (`manta bench sensitivity`, the separation gate) see the
-    // withheld candidates as labeled hard negatives. The live `listen`
-    // path gates this on a live-state subscriber (listen.rs); offline
-    // there is exactly one consumer and it always wants the log. Drained
-    // once at finish; `take_decisions` empties it, so no growth.
-    validator.record_decisions(true);
     let mut spots = Vec::new();
     for ev in &events {
         spots.extend(validator.ingest(ev));
     }
-    let decisions = validator.take_decisions();
     // Mutated in place, after the validator above has already ingested the
     // raw values (validator.ingest() applied its own correction to its
     // internal spot output, so this must not run before that loop) --
@@ -692,7 +678,6 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         text,
         events,
         spots,
-        decisions,
         timing,
         rtty,
         bad_samples,
@@ -1013,7 +998,6 @@ mod tests {
             text: "CQ".into(),
             events: Vec::new(),
             spots: Vec::new(),
-            decisions: Vec::new(),
             timing: Some(TimingEstimates {
                 dit_ms: 60.0,
                 dot: None,
