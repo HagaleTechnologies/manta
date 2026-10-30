@@ -561,7 +561,12 @@ impl Validator {
         spots
     }
 
-    /// MAN-318: decides the held spots of each settled call.
+    /// MAN-318: decides the held spots of each settled call. The operator's
+    /// lists can be replaced (MAN-78, SIGHUP) while a spot is held, so each
+    /// one is checked against the current lists first: a newly blocklisted
+    /// call or notched frequency is withheld and counted as such, and a
+    /// newly allowlisted call spots whatever the lookup said, as it would
+    /// have had it been allowlisted at capture.
     fn release(&mut self, settled: Vec<(String, Existence)>) -> Vec<Spot> {
         let mut spots = Vec::new();
         for (key, existence) in settled {
@@ -569,7 +574,11 @@ impl Validator {
                 continue;
             };
             for HeldSpot { spot, reps } in held {
-                if existence == Existence::NotFound {
+                if let Some(reason) = self.held_operator_suppressed(&spot) {
+                    self.decide(|| lookup_decision(&spot, reason, reps));
+                } else if existence == Existence::NotFound
+                    && !self.allowlist.contains(&spot.callsign)
+                {
                     self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
                 } else {
                     self.decide(|| Decision::spotted(&spot, reps));
@@ -578,6 +587,21 @@ impl Validator {
             }
         }
         spots
+    }
+
+    /// MAN-318: like `operator_suppressed`, for a spot held on its lookup:
+    /// counts and reports one the current lists suppress. A no-op when the
+    /// lists were not replaced, since capture already passed the same checks.
+    fn held_operator_suppressed(&mut self, spot: &Spot) -> Option<Reason> {
+        if self.blocklist.contains(&spot.callsign) {
+            self.suppression_counts.blocklist += 1;
+            return Some(Reason::Blocklist);
+        }
+        if self.notch.contains(spot.freq_hz) {
+            self.suppression_counts.notch += 1;
+            return Some(Reason::Notch);
+        }
+        None
     }
 
     /// MAN-13: the number of inputs whose interleaved track ids feed this
@@ -2312,6 +2336,67 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(log[0].verdict, Verdict::Withheld);
         assert_eq!(log[0].reason, Some(Reason::LookupNotFound));
         assert_eq!(lookup.asked(), ["K5ARH"]);
+    }
+
+    /// Codex review, PR #442: a reload while a spot is held must not let it
+    /// leak past a blocklist or notch it now falls under.
+    #[test]
+    fn a_held_spot_newly_blocklisted_or_notched_is_withheld_on_release() {
+        for (blocklist, notch, reason) in [
+            (
+                Blocklist::parse("K5ARH\n"),
+                NotchList::default(),
+                Reason::Blocklist,
+            ),
+            (
+                Blocklist::default(),
+                NotchList::parse("13999900-14000100\n"),
+                Reason::Notch,
+            ),
+        ] {
+            for existence in [Existence::Exists, Existence::Unknown] {
+                let lookup = Arc::new(ScriptedLookup::default());
+                let (mut v, spots) = k5arh_with(Some(lookup.clone()));
+                assert!(spots.is_empty());
+                v.take_decisions();
+                v.replace_operator_lists(&[], blocklist.clone(), notch.clone());
+                lookup.settle("K5ARH", existence);
+                assert!(v.poll_lookups().is_empty(), "{reason:?} {existence:?}");
+                let d = last_k5arh_decision(&mut v);
+                assert_eq!(d.verdict, Verdict::Withheld);
+                assert_eq!(d.reason, Some(reason));
+                let counts = v.suppression_counts();
+                assert_eq!(
+                    (counts.blocklist, counts.notch),
+                    if reason == Reason::Blocklist {
+                        (1, 0)
+                    } else {
+                        (0, 1)
+                    }
+                );
+            }
+        }
+        // finish_lookups (shutdown) applies the same check.
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        assert!(v.finish_lookups().is_empty());
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn a_held_spot_newly_allowlisted_spots_even_if_not_found() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(
+            &["k5arh".to_string()],
+            Blocklist::default(),
+            NotchList::default(),
+        );
+        lookup.settle("K5ARH", Existence::NotFound);
+        let released = v.poll_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "K5ARH");
     }
 
     #[test]
