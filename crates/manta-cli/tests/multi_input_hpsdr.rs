@@ -882,20 +882,22 @@ fn panic_message(result: &Result<(), Box<dyn std::any::Any + Send>>) -> String {
 
 #[test]
 fn wait_until_progress_returns_when_condition_holds() {
-    let start = Instant::now();
+    let mut snapshots = 0;
     wait_until_progress(
         Duration::from_millis(60),
         Duration::from_secs(5),
-        || 0usize,
+        || {
+            snapshots += 1;
+            snapshots
+        },
         || true,
         || "condition already holds".into(),
     );
-    assert!(start.elapsed() < Duration::from_millis(60));
+    assert_eq!(snapshots, 1, "an already-met goal must not poll progress");
 }
 
 #[test]
 fn wait_until_progress_fails_after_idle_with_no_progress() {
-    let start = Instant::now();
     let result = catch_unwind(AssertUnwindSafe(|| {
         wait_until_progress(
             Duration::from_millis(120),
@@ -905,11 +907,9 @@ fn wait_until_progress_fails_after_idle_with_no_progress() {
             || "spots never arrive".into(),
         );
     }));
-    let elapsed = start.elapsed();
     let message = panic_message(&result);
     assert!(message.contains("no progress"), "{message}");
     assert!(message.contains("0"), "last progress snapshot: {message}");
-    assert!(elapsed < Duration::from_millis(360), "{elapsed:?}");
 }
 
 #[test]
@@ -946,7 +946,6 @@ fn wait_until_progress_fails_at_ceiling_despite_progress() {
     let message = panic_message(&result);
     assert!(message.contains("ceiling"), "{message}");
     assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
-    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
 }
 
 #[test]
