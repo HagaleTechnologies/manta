@@ -1400,6 +1400,47 @@ fn bands_from_the_environment() {
     );
 }
 
+#[test]
+fn environment_bands_replace_the_file_frequency() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "m.toml", &format!("{KIWI}freq_hz = 7040000\n"));
+    let checked = manta()
+        .current_dir(dir.path())
+        .env("MANTA_INPUT_BANDS", "7030")
+        .args(["config", "check", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let out = succeeds(&checked);
+    assert!(out.contains("freq_hz=7030000"), "{out}");
+    assert!(out.contains("environment: MANTA_INPUT_BANDS\n"), "{out}");
+    assert_eq!(
+        stderr(&checked),
+        "note: [input]: bands = [\"7030\"] plans 1 stream: 7030 kHz\n"
+    );
+}
+
+#[test]
+fn environment_frequency_replaces_the_file_bands_and_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "m.toml",
+        &format!("{KIWI}bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n"),
+    );
+    let checked = manta()
+        .current_dir(dir.path())
+        .env("MANTA_INPUT_FREQ_HZ", "7040000")
+        .args(["config", "check", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let out = succeeds(&checked);
+    assert!(out.contains("freq_hz=7040000"), "{out}");
+    assert!(out.contains("environment: MANTA_INPUT_FREQ_HZ\n"), "{out}");
+    assert!(stderr(&checked).is_empty(), "{}", stderr(&checked));
+}
+
 /// MAN-306: config check prints the canonical MAC without opening a radio.
 #[test]
 fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
