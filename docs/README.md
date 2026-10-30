@@ -25,6 +25,9 @@ Then:
 - [GUIDES/multiple-receivers.md](GUIDES/multiple-receivers.md): one daemon
   reading several SDRs, or several channels of one SDR, into one spot
   output (MAN-13).
+- [GUIDES/iq-recording.md](GUIDES/iq-recording.md): recording a session's
+  IQ with `run --record-iq`, replaying it, and reading headerless cf32/ci16
+  files (MAN-309).
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed
@@ -76,6 +79,7 @@ Then:
 | [CONFIG.md](CONFIG.md) | What a config key does, its default, and whether it is wired to behaviour yet. |
 | [METRICS.md](METRICS.md) | What a `/metrics` family measures, its labels, and when it has samples. |
 | [SPOT-SCHEMA.md](SPOT-SCHEMA.md) | Every field of the `:7301` JSON Lines / WebSocket spot message. |
+| [CLI-JSON.md](CLI-JSON.md) | Every field of `manta decode --json`, `manta run --json` and `manta doctor --json`, for scripts. |
 | [LIVE-STATE.md](LIVE-STATE.md) | The opt-in live-state stream on `[server].live_port` for dashboards: band noise floor and activity, each track's text and candidates, and why each candidate was or was not spotted. |
 | [SPEC-decode-core.md §9](SPEC-decode-core.md#9-configuration-keys) | The normative decode-core defaults and the keys that are still compile-time constants. |
 | [COMPARISON.md](COMPARISON.md) | Neutral links to SparkSDR, sdroxide, OpenWebRX+/csdr-skimmer and sdrainer — manta makes no capability claims about them (MAN-360). |

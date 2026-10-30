@@ -271,6 +271,20 @@ than 10 MS/s (`MAX_IQ_WAV_RATE_HZ`) before reading samples, so a shape-valid
 but absurd header rate cannot reach the rate-sized allocations downstream.
 See `docs/DECISIONS/2026-10-10-man269-paced-looping-replay.md`.
 
+IQ files and recordings (MAN-309): `open_iq_file` picks a manta recording
+(`RecordedIqSource`, found by its `PATH.meta.jsonl`), headerless cf32/ci16
+(`RawIqSource`, rate and centre from the command line or `[input]
+iq_format`/`sample_rate_hz`) or an IQ WAV. A recording restores the
+recorded source's rate, centre, passband, trusted band and analytic guard,
+and replays each recorded gap once through `take_discontinuity`, which
+both `listen` and the offline `decode_source` turn into a new segment
+(fresh channelizer and track manager, clock advanced past the outage). `RecordingSource` wraps the final source `run` hands
+to `listen` (`--record-iq`): reads pass through unchanged while a bounded,
+non-blocking queue feeds one writer thread per recording, which stops the
+recording rather than make the decoder wait. Format and failure handling:
+`docs/GUIDES/iq-recording.md` and
+`docs/DECISIONS/2026-10-19-man309-iq-recording-and-replay.md`.
+
 ## 4. Channelizer (`manta-dsp`)
 
 **Implemented** as of M2 sub-project 1 (`manta-dsp::channelizer`) -- the
@@ -661,7 +675,32 @@ validation (MAN-28). Dedupe (step 5) still applies.
   the telnet server above behind an RBN Aggregator (broad-review D1, MAN-86).
   The open claims and the capture that would settle them are in
   `docs/DECISIONS/2026-10-11-man90-uplink-protocol-verification.md` and
-  `docs/RUNBOOKS/aggregator-rbn-capture.md`.
+  `docs/RUNBOOKS/aggregator-rbn-capture.md`. The uplink also forwards relayed
+  spots (MAN-320): each one passes the same `spot_types` → `dry_run` →
+  `max_spots_per_minute` gates as manta's own spots, shares the target's one
+  ceiling, and is rendered by `rbn::format_relay_line` with its own spotter
+  call (`DX de W3XYZ-2-#:`), never the target's login call. An FT8/FT4 line
+  carries `FT8`/`FT4` in the mode column, WSJT-X's own SNR and a blank speed
+  field (MAN-90 claims C12 and C13, both open).
+- **Relays (MAN-320)** (`relay/`): two optional workers put another local
+  decoder's finished spots on a fourth `SpotBus` channel (`publish_relay`/
+  `subscribe_relay`, capacity 1024, no history), which only the uplink reads;
+  telnet, the JSON/WebSocket stream, stdout, the live-state stream and
+  `[rbn_compare]` never see a relayed spot, and the decode pipeline never
+  feeds it, so file-input determinism is untouched. `relay::skimmer` is a
+  telnet client per `[[skimmer_relay]]`: it logs in with the relay's
+  `callsign` (the tolerant login read shared with `rbn_compare::feed`,
+  `telnet_client.rs`), reads `DX de` lines in either the RBN or the
+  `skimmer` layout, forwards only CW lines whose spotter equals `callsign`,
+  writes a blank keepalive line every 300 s and reconnects with 1 s→60 s
+  backoff. `relay::wsjtx` listens per `[[wsjtx_relay]]` on a UDP socket
+  `manta-cli` binds (unicast, or an IPv4 multicast group), decodes WSJT-X's
+  `Status` and `Decode` messages, keeps each instance's dial frequency and
+  mode, and forwards new FT8/FT4 `CQ` decodes, dropping replays, off-air and
+  low-confidence decodes and the same call, mode and band within 600 s.
+  Relayed spots skip manta's validator, keep the source's SNR verbatim and
+  are timed by arrival. `docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md`
+  records the design.
 - Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -708,7 +747,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
   bind address; ports),
   `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
-  feed; needs `[server]`), `[input]` (source type and its keys, dial frequency,
+  feed; needs `[server]`), `[[skimmer_relay]]` and `[[wsjtx_relay]]`
+  (MAN-320: relay a local skimmer's or WSJT-X's spots through an enabled
+  `[[rbn_uplink]]`), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else

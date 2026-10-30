@@ -8,8 +8,12 @@ fn one() -> f32 {
 }
 
 /// Decoder output events, in emission order. SPEC §5.
+///
+/// The JSON form (`decode --json`, `run --json`) has camelCase fields, with
+/// the JSON stream's names for shared concepts (MAN-139,
+/// docs/CLI-JSON.md); the `event` tag keeps SPEC §5's variant names.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "event")]
+#[serde(tag = "event", rename_all_fields = "camelCase")]
 pub enum DecoderEvent {
     CharDecoded {
         track_id: u32,
@@ -53,8 +57,13 @@ pub enum DecoderEvent {
         /// field replaces.
         #[serde(default)]
         sample_ts: u64,
+        /// `snr` in JSON, the stream's name; still 2500 Hz-referenced
+        /// (MAN-139).
+        #[serde(rename = "snr")]
         snr_2500_db: f32,
         /// The track's centroid at the hop `sample_ts` names (MAN-211).
+        /// `frequency` in JSON (MAN-139).
+        #[serde(rename = "frequency")]
         freq_hz: f64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,
@@ -92,6 +101,8 @@ pub enum DecoderEvent {
     TrackPromoted {
         track_id: u32,
         sample_ts: u64,
+        /// `frequency` in JSON (MAN-139).
+        #[serde(rename = "frequency")]
         freq_hz: f64,
     },
     /// A track has closed (any `CloseReason`: Unconfirmed/HangExpired/
@@ -109,13 +120,13 @@ pub enum DecoderEvent {
         /// Round 9 (PR #154): whether a consumer holding deferred,
         /// per-identity evidence for this track_id may treat this closure
         /// as the identity's true final state. See `ClosureKind`.
-        /// `#[serde(default)]` (SPEC v2 §5 merge, MAN-166, 2026-09-09):
-        /// PR #154 predates this branch's `Deserialize` derive on
-        /// `DecoderEvent`, so old `TrackClosed` JSON without this field
-        /// must still deserialize -- defaults to the conservative
-        /// `SignalEnded` reading, matching every consumer's implicit
-        /// assumption before `ClosureKind` existed.
-        #[serde(default)]
+        /// Flattened to `closure` + `survivorTrackId`, the live-state
+        /// `trackClosed` spelling (MAN-139). A missing `closure` still
+        /// reads as the conservative `SignalEnded` (SPEC v2 §5 merge,
+        /// MAN-166), matching every consumer's implicit assumption before
+        /// `ClosureKind` existed; that default now lives in
+        /// `ClosureFields`.
+        #[serde(flatten)]
         closure: ClosureKind,
     },
 }
@@ -130,7 +141,11 @@ pub enum DecoderEvent {
 /// entirely (still transmitting, just no longer followed), and treating
 /// that moment as "final" reopens exactly the WPM-oscillation false-
 /// positive risk the deferred-judgment design exists to close.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// JSON: `"closure":"signalEnded"|"bookkeeping"` beside
+/// `"survivorTrackId"`, flattened into `TrackClosed` (MAN-139), the
+/// live-state `trackClosed` spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureKind {
     /// A genuine, observed end of signal: overall stream EOF
     /// (`TrackManager::finish`) or a sustained observed power drop
@@ -148,9 +163,56 @@ pub enum ClosureKind {
 }
 
 impl Default for ClosureKind {
-    /// See `TrackClosed::closure`'s `#[serde(default)]` doc comment.
+    /// See `TrackClosed::closure`'s doc comment.
     fn default() -> Self {
         ClosureKind::SignalEnded
+    }
+}
+
+/// `ClosureKind`'s JSON label (MAN-139).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ClosureLabel {
+    #[default]
+    SignalEnded,
+    Bookkeeping,
+}
+
+/// `ClosureKind`'s JSON fields, flattened into `TrackClosed` (MAN-139).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClosureFields {
+    #[serde(default)]
+    closure: ClosureLabel,
+    #[serde(default)]
+    survivor_track_id: Option<u32>,
+}
+
+impl serde::Serialize for ClosureKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let fields = match *self {
+            ClosureKind::SignalEnded => ClosureFields {
+                closure: ClosureLabel::SignalEnded,
+                survivor_track_id: None,
+            },
+            ClosureKind::Bookkeeping { survivor_track_id } => ClosureFields {
+                closure: ClosureLabel::Bookkeeping,
+                survivor_track_id,
+            },
+        };
+        fields.serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ClosureKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let fields = ClosureFields::deserialize(d)?;
+        Ok(match fields.closure {
+            ClosureLabel::SignalEnded => ClosureKind::SignalEnded,
+            ClosureLabel::Bookkeeping => ClosureKind::Bookkeeping {
+                survivor_track_id: fields.survivor_track_id,
+            },
+        })
     }
 }
 
@@ -176,31 +238,153 @@ impl DecoderEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Glyph;
+    use crate::tree::{Glyph, Prosign};
 
+    /// The additive fields still take their defaults when absent, now
+    /// under the MAN-139 camelCase names.
     #[test]
-    fn legacy_json_without_new_fields_still_deserializes() {
-        let json = r#"{"event":"CharDecoded","track_id":1,"sample_ts":10,"glyph":{"Char":"A"},"confidence":0.5}"#;
+    fn json_without_additive_fields_still_deserializes() {
+        let json =
+            r#"{"event":"CharDecoded","trackId":1,"sampleTs":10,"glyph":"A","confidence":0.5}"#;
         let e: DecoderEvent = serde_json::from_str(json).unwrap();
         match e {
             DecoderEvent::CharDecoded { alternatives, .. } => assert!(alternatives.is_empty()),
             _ => panic!(),
         }
-        let json = r#"{"event":"WordBoundary","track_id":1,"sample_ts":10}"#;
+        let json = r#"{"event":"WordBoundary","trackId":1,"sampleTs":10}"#;
         let e: DecoderEvent = serde_json::from_str(json).unwrap();
         match e {
             DecoderEvent::WordBoundary { confidence, .. } => assert_eq!(confidence, 1.0),
             _ => panic!(),
         }
-        // PR #154's `ClosureKind` predates this branch's `Deserialize` derive --
-        // old `TrackClosed` JSON without `closure` must still deserialize.
-        let json = r#"{"event":"TrackClosed","track_id":1}"#;
+        // A `TrackClosed` without `closure` reads as `SignalEnded`.
+        let json = r#"{"event":"TrackClosed","trackId":1}"#;
         let e: DecoderEvent = serde_json::from_str(json).unwrap();
         match e {
             DecoderEvent::TrackClosed { closure, .. } => {
                 assert_eq!(closure, ClosureKind::SignalEnded)
             }
             _ => panic!(),
+        }
+        let json = r#"{"event":"TrackMeta","trackId":1,"snr":3.0,"frequency":7000000.0}"#;
+        let e: DecoderEvent = serde_json::from_str(json).unwrap();
+        match e {
+            DecoderEvent::TrackMeta { sample_ts, .. } => assert_eq!(sample_ts, 0),
+            _ => panic!(),
+        }
+    }
+
+    /// MAN-139: no alias for the old snake_case / enum-shaped JSON; a saved
+    /// report regenerates with `manta decode --json`.
+    #[test]
+    fn old_snake_case_event_json_is_rejected() {
+        let json = r#"{"event":"CharDecoded","track_id":1,"sample_ts":10,"glyph":{"Char":"A"},"confidence":0.5}"#;
+        assert!(serde_json::from_str::<DecoderEvent>(json).is_err());
+    }
+
+    fn assert_no_snake_keys(v: &serde_json::Value, json: &str) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    assert!(!k.contains('_'), "snake_case key {k:?} in {json}");
+                    assert_no_snake_keys(v, json);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for v in items {
+                    assert_no_snake_keys(v, json);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// MAN-139: every variant's keys are camelCase, the shared concepts use
+    /// the JSON stream's names, and every event round-trips.
+    #[test]
+    fn every_event_is_camel_case_and_round_trips() {
+        let events = [
+            (
+                DecoderEvent::CharDecoded {
+                    track_id: 3,
+                    sample_ts: 720_000,
+                    glyph: Glyph::Prosign(Prosign::Ar),
+                    confidence: 0.5,
+                    alternatives: vec![(Glyph::Char('D'), 0.41)],
+                },
+                Some(
+                    r#"{"event":"CharDecoded","trackId":3,"sampleTs":720000,"glyph":"<AR>","confidence":0.5,"alternatives":[["D",0.41]]}"#,
+                ),
+            ),
+            (DecoderEvent::word_boundary(1, 10), None),
+            (
+                DecoderEvent::SpeedUpdate {
+                    track_id: 1,
+                    wpm: 20.0,
+                },
+                None,
+            ),
+            (
+                DecoderEvent::TrackMeta {
+                    track_id: 1,
+                    sample_ts: 102_656,
+                    snr_2500_db: 22.5,
+                    freq_hz: 14_012_341.5,
+                },
+                Some(
+                    r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5}"#,
+                ),
+            ),
+            (timing_update(), None),
+            (
+                DecoderEvent::TrackPromoted {
+                    track_id: 1,
+                    sample_ts: 6912,
+                    freq_hz: 14_012_340.0,
+                },
+                None,
+            ),
+            (
+                DecoderEvent::TrackClosed {
+                    track_id: 1,
+                    closure: ClosureKind::SignalEnded,
+                },
+                Some(
+                    r#"{"event":"TrackClosed","trackId":1,"closure":"signalEnded","survivorTrackId":null}"#,
+                ),
+            ),
+            (
+                DecoderEvent::TrackClosed {
+                    track_id: 2,
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: Some(1),
+                    },
+                },
+                Some(
+                    r#"{"event":"TrackClosed","trackId":2,"closure":"bookkeeping","survivorTrackId":1}"#,
+                ),
+            ),
+            (
+                DecoderEvent::TrackClosed {
+                    track_id: 4,
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None,
+                    },
+                },
+                Some(
+                    r#"{"event":"TrackClosed","trackId":4,"closure":"bookkeeping","survivorTrackId":null}"#,
+                ),
+            ),
+        ];
+        for (e, expected) in &events {
+            let json = serde_json::to_string(e).unwrap();
+            if let Some(expected) = expected {
+                assert_eq!(&json, expected);
+            }
+            let back: DecoderEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(&back, e, "{json}");
+            let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_no_snake_keys(&value, &json);
         }
     }
 
@@ -232,7 +416,7 @@ mod tests {
     fn timing_update_json_shape() {
         assert_eq!(
             serde_json::to_string(&timing_update()).unwrap(),
-            r#"{"event":"TimingUpdate","track_id":2,"sample_ts":4128768,"dit_ms":54.5,"dot":{"mean_dits":0.875,"var_dits2":0.0625,"n":118},"dash":{"mean_dits":4.0,"var_dits2":0.25,"n":131},"element_gap":{"mean_dits":1.125,"var_dits2":0.03125,"n":176},"char_gap":{"mean_dits":4.5,"var_dits2":0.5,"n":61},"word_gap":null}"#
+            r#"{"event":"TimingUpdate","trackId":2,"sampleTs":4128768,"ditMs":54.5,"dot":{"meanDits":0.875,"varDits2":0.0625,"n":118},"dash":{"meanDits":4.0,"varDits2":0.25,"n":131},"elementGap":{"meanDits":1.125,"varDits2":0.03125,"n":176},"charGap":{"meanDits":4.5,"varDits2":0.5,"n":61},"wordGap":null}"#
         );
     }
 
@@ -249,12 +433,12 @@ mod tests {
         let e = DecoderEvent::char_decoded(1, 10, Glyph::Char('A'), 0.5);
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"event":"CharDecoded","track_id":1,"sample_ts":10,"glyph":{"Char":"A"},"confidence":0.5,"alternatives":[]}"#
+            r#"{"event":"CharDecoded","trackId":1,"sampleTs":10,"glyph":"A","confidence":0.5,"alternatives":[]}"#
         );
         let e = DecoderEvent::word_boundary(1, 10);
         assert_eq!(
             serde_json::to_string(&e).unwrap(),
-            r#"{"event":"WordBoundary","track_id":1,"sample_ts":10,"confidence":1.0}"#
+            r#"{"event":"WordBoundary","trackId":1,"sampleTs":10,"confidence":1.0}"#
         );
     }
 }

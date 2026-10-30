@@ -58,7 +58,7 @@ fn v1_passes_end_to_end_from_wav() {
     // for the original widening's rationale and
     // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md for this
     // re-measurement.
-    let freq = report["freq_hz"].as_f64().unwrap();
+    let freq = report["frequency"].as_f64().unwrap();
     assert!(
         (freq - manifest.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",
@@ -69,7 +69,7 @@ fn v1_passes_end_to_end_from_wav() {
 
     // 1 track: every event carries track_id 1 (single hardwired channel).
     for ev in report["events"].as_array().unwrap() {
-        assert_eq!(ev["track_id"].as_u64(), Some(1));
+        assert_eq!(ev["trackId"].as_u64(), Some(1));
     }
 
     // WPM sanity (V1 is 20 WPM; SPEC only gates WPM at V2 but it's free
@@ -116,7 +116,7 @@ fn v1_passes_end_to_end_with_hsmm_engine() {
         manifest.keyed_texts[0],
         decoded
     );
-    let freq = report["freq_hz"].as_f64().unwrap();
+    let freq = report["frequency"].as_f64().unwrap();
     assert!(
         (freq - manifest.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",

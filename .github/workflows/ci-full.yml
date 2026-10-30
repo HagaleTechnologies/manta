@@ -318,6 +318,10 @@ jobs:
       # and DenyPolicyTests needs tomllib (Python 3.11+), which ubuntu-latest's python3 has.
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_ci_gates -v
+      # MAN-440: the decision-record index generator, the committed index (lag-tolerant), and the
+      # Decisions Index workflow's shape and behaviour. Linux only: pure Python over temp files.
+      - if: runner.os == 'Linux'
+        run: python3 -m unittest scripts.tests.test_decisions_index -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.

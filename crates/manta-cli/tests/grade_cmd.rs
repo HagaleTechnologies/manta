@@ -630,3 +630,184 @@ fn grade_skips_hello_records_without_counting_them_as_grades() {
     assert_success(&out);
     assert_lines_eq(&stdout(&out), &read_fixture("expected-all.jsonl"));
 }
+
+/// MAN-343: a tempdir holding `dumps/20261011.csv` and `spots.jsonl`,
+/// copies of the fixture RBN CSV and spot log.
+fn named_twice_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dumps")).unwrap();
+    std::fs::copy(
+        fixture("rbn-20261011.csv"),
+        dir.path().join("dumps/20261011.csv"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fixture("spots-2026-10-11.jsonl"),
+        dir.path().join("spots.jsonl"),
+    )
+    .unwrap();
+    dir
+}
+
+/// `manta grade <args>` run in `dir`, once with `--json` and once without:
+/// both stdouts, each from a successful run.
+fn grade_in(dir: &Path, args: &[&str]) -> (String, String) {
+    let run = |json: bool| {
+        let mut cmd = manta();
+        cmd.current_dir(dir).arg("grade").args(args);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().unwrap();
+        assert_success(&out);
+        stdout(&out)
+    };
+    (run(true), run(false))
+}
+
+#[test]
+fn grade_reads_a_file_named_directly_and_through_its_directory_once() {
+    let dir = named_twice_dir();
+    for args in [
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "dumps/",
+            "--rbn",
+            "dumps/20261011.csv",
+        ][..],
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "dumps/20261011.csv",
+            "dumps",
+        ][..],
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "dumps",
+            "./dumps/../dumps/20261011.csv",
+        ][..],
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--spots",
+            "./spots.jsonl",
+            "--rbn",
+            "dumps/",
+        ][..],
+    ] {
+        let (json, summary) = grade_in(dir.path(), args);
+        println!("{args:?}");
+        // One record per spot id, each the one-file grade; the summary
+        // counts one spots file and one RBN file.
+        assert_lines_eq(&json, &read_fixture("expected-all.jsonl"));
+        assert_lines_eq(&summary, &read_fixture("expected-summary.txt"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn grade_reads_a_symlinked_file_or_directory_once() {
+    let dir = named_twice_dir();
+    std::os::unix::fs::symlink("dumps/20261011.csv", dir.path().join("link.csv")).unwrap();
+    std::os::unix::fs::symlink("dumps", dir.path().join("dumplink")).unwrap();
+    for args in [
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "link.csv",
+            "dumps/20261011.csv",
+        ][..],
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "dumps/20261011.csv",
+            "link.csv",
+        ][..],
+        &["--spots", "spots.jsonl", "--rbn", "dumps/", "dumplink/"][..],
+    ] {
+        let (json, summary) = grade_in(dir.path(), args);
+        println!("{args:?}");
+        assert_lines_eq(&json, &read_fixture("expected-all.jsonl"));
+        assert_lines_eq(&summary, &read_fixture("expected-summary.txt"));
+    }
+}
+
+#[test]
+fn grade_does_not_reweigh_one_rbn_file_named_twice() {
+    // Two skimmers hear W1AW at 14026.0 kHz and 22 WPM, three at 14025.0
+    // kHz and 25 WPM: the node's 14025.1 kHz, 25 WPM spot is a match. Read
+    // twice, the first file would outvote the second (four reports to
+    // three) and flip it to a frequency disagreement.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("dumps")).unwrap();
+    let csv = read_fixture("rbn-20261011.csv");
+    let header = csv.lines().next().unwrap();
+    let rows = |calls: &[&str], khz: &str, wpm: u32| {
+        calls
+            .iter()
+            .map(|c| format!("{c},K,NA,{khz},20m,W1AW,K,NA,CQ,20,2026-10-11 12:00:10,{wpm},CW\n"))
+            .collect::<String>()
+    };
+    std::fs::write(
+        dir.path().join("dumps/rbn-a.csv"),
+        format!("{header}\n{}", rows(&["K1AA", "K2BB"], "14026.0", 22)),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("dumps/rbn-b.csv"),
+        format!(
+            "{header}\n{}",
+            rows(&["K3CC", "K4DD", "K5EE"], "14025.0", 25)
+        ),
+    )
+    .unwrap();
+    let spot = read_fixture("spots-2026-10-11.jsonl");
+    let first = spot.lines().next().unwrap();
+    assert!(first.contains(":7:960000:W1AW"), "{first}");
+    std::fs::write(dir.path().join("spots.jsonl"), format!("{first}\n")).unwrap();
+
+    let (once, _) = grade_in(dir.path(), &["--spots", "spots.jsonl", "--rbn", "dumps"]);
+    assert_eq!(grade_of(&once, ":7:960000:W1AW"), "\"match\"");
+    let (twice, _) = grade_in(
+        dir.path(),
+        &[
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "dumps",
+            "dumps/rbn-a.csv",
+        ],
+    );
+    assert_eq!(twice, once);
+}
+
+#[test]
+fn grade_names_a_missing_input_as_typed_once() {
+    let dir = named_twice_dir();
+    let out = manta()
+        .current_dir(dir.path())
+        .args([
+            "grade",
+            "--spots",
+            "spots.jsonl",
+            "--rbn",
+            "nope.csv",
+            "nope.csv",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "a missing --rbn file was accepted");
+    let err = stderr(&out);
+    assert_eq!(
+        err.matches("cannot read nope.csv").count(),
+        1,
+        "stderr: {err}"
+    );
+}

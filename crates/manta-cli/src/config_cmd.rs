@@ -534,6 +534,26 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         Some(rc) => rbn_compare_summary(rc, station),
     });
 
+    // MAN-320: one line per relay block, in table order (devex 2).
+    if loaded.skimmer_relay.is_empty() {
+        lines.push("skimmer_relay: none".to_string());
+    }
+    for r in &loaded.skimmer_relay {
+        lines.push(format!(
+            "skimmer_relay: host={} port={} callsign={} enabled={}",
+            r.host, r.port, r.callsign, r.enabled
+        ));
+    }
+    if loaded.wsjtx_relay.is_empty() {
+        lines.push("wsjtx_relay: none".to_string());
+    }
+    for r in &loaded.wsjtx_relay {
+        lines.push(format!(
+            "wsjtx_relay: listen={} callsign={} enabled={}",
+            r.listen, r.callsign, r.enabled
+        ));
+    }
+
     lines.push(match &loaded.callsign_lookup {
         None => "callsign_lookup: none".to_string(),
         Some(cl) => callsign_lookup_summary(cl),
@@ -615,9 +635,14 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             iq,
             realtime,
             looped,
+            raw,
         }) => {
             // MAN-269: shown only when set, so existing summaries are unchanged.
             let mut line = format!("input: type=file path={} iq={iq}", path.display());
+            // MAN-309: only for headerless IQ.
+            if let Some((format, rate)) = raw {
+                line.push_str(&format!(" iq_format={format} sample_rate_hz={rate}"));
+            }
             if *realtime {
                 line.push_str(" realtime=true");
             }
@@ -697,6 +722,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             shared.capture_rate_hz.map(|v| v.to_string()),
         ),
         ("replay_epoch", shared.replay_epoch.map(|v| v.to_string())),
+        (
+            "record_iq",
+            shared.record_iq.as_ref().map(|p| p.display().to_string()),
+        ),
     ] {
         if let Some(v) = value {
             input.push_str(&format!(" {key}={v}"));
@@ -1073,6 +1102,31 @@ mod tests {
             "server: none (manta run starts no servers)"
         );
         assert_eq!(line(&lines, "rbn_uplink:"), "rbn_uplink: none");
+    }
+
+    #[test]
+    fn config_check_prints_relay_summaries() {
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W1ABC\"\n[[rbn_uplink]]\nenabled = true\n\
+             target_host = \"127.0.0.1\"\ntarget_port = 7550\n\
+             [[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"w1abc-2\"\n\
+             [[wsjtx_relay]]\ncallsign = \"W1ABC\"\n",
+        );
+        assert_eq!(
+            line(&lines, "skimmer_relay:"),
+            "skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true"
+        );
+        assert_eq!(
+            line(&lines, "wsjtx_relay:"),
+            "wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true"
+        );
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+        assert!(at("rbn_compare:") < at("skimmer_relay:"));
+        assert!(at("skimmer_relay:") < at("wsjtx_relay:"));
+        assert!(at("wsjtx_relay:") < at("input:"));
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "skimmer_relay:"), "skimmer_relay: none");
+        assert_eq!(line(&lines, "wsjtx_relay:"), "wsjtx_relay: none");
     }
 
     #[test]
@@ -1833,6 +1887,10 @@ mod tests {
         ("rbn_uplink", "target_port"),
         ("rbn_uplink", "login_callsign"),
         ("rbn_compare", "login_callsign"),
+        ("skimmer_relay", "host"),
+        ("skimmer_relay", "port"),
+        ("skimmer_relay", "callsign"),
+        ("wsjtx_relay", "callsign"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -1850,6 +1908,9 @@ mod tests {
         ("input", "center_freq_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
+        ("input", "record_iq"),
+        ("input", "iq_format"),
+        ("input", "sample_rate_hz"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
         ("spot", "cty_path"),
@@ -1895,8 +1956,8 @@ mod tests {
     /// The loader's own key list for `table`: serde's `expected one of ...`
     /// for an unknown key (every table is `deny_unknown_fields`).
     fn loader_keys(table: &str) -> BTreeSet<String> {
-        let header = if table == "rbn_uplink" {
-            "[[rbn_uplink]]".to_string()
+        let header = if matches!(table, "rbn_uplink" | "skimmer_relay" | "wsjtx_relay") {
+            format!("[[{table}]]")
         } else {
             format!("[{table}]")
         };
@@ -1951,6 +2012,15 @@ mod tests {
             ("rbn_uplink", _) => format!(
                 "{SERVER}[[rbn_uplink]]\nenabled = false\ntarget_host = \"h\"\ntarget_port = 1\n"
             ),
+            // MAN-320: an enabled relay needs an enabled uplink.
+            ("skimmer_relay", _) => format!(
+                "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"h\"\ntarget_port = 1\n\
+                 [[skimmer_relay]]\nhost = \"h\"\nport = 1\ncallsign = \"W1AW-2\"\n"
+            ),
+            ("wsjtx_relay", _) => format!(
+                "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"h\"\ntarget_port = 1\n\
+                 [[wsjtx_relay]]\ncallsign = \"W1AW\"\n"
+            ),
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
@@ -1978,6 +2048,8 @@ mod tests {
             "server" => a.server == b.server,
             "rbn_uplink" => a.rbn_uplink == b.rbn_uplink,
             "rbn_compare" => a.rbn_compare == b.rbn_compare,
+            "skimmer_relay" => a.skimmer_relay == b.skimmer_relay,
+            "wsjtx_relay" => a.wsjtx_relay == b.wsjtx_relay,
             "callsign_lookup" => a.callsign_lookup == b.callsign_lookup,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
@@ -2138,6 +2210,39 @@ mod tests {
             uncommented("rbn_uplink", |_| true)
         );
         assert_eq!(loaded(&uplink).rbn_uplink.len(), 1);
+        // MAN-320: a relay needs an enabled uplink, so each relay block is
+        // uncommented together with [[rbn_uplink]]. The scaffold's own
+        // placeholder host and example call are load errors (devex 3), so
+        // the example is checked for exactly those, then with them filled.
+        let skimmer = format!(
+            "{uplink}[[skimmer_relay]]\n{}",
+            uncommented("skimmer_relay", |_| true)
+        );
+        let err = format!("{:#}", load_text(&skimmer).unwrap_err());
+        assert!(
+            err.ends_with(
+                ": [[skimmer_relay]]: host \"<skimmer-host>\" is the scaffold placeholder -- \
+                 set the skimmer's host name or address"
+            ),
+            "{err}"
+        );
+        let filled = skimmer
+            .replace("<skimmer-host>", "192.168.1.20")
+            .replace("N0CALL-2", "W1AW-2");
+        assert_eq!(loaded(&filled).skimmer_relay.len(), 1);
+        let wsjtx = format!(
+            "{uplink}[[wsjtx_relay]]\n{}",
+            uncommented("wsjtx_relay", |_| true)
+        );
+        let err = format!("{:#}", load_text(&wsjtx).unwrap_err());
+        assert!(
+            err.contains("[[wsjtx_relay]]: callsign \"N0CALL\" is still the example"),
+            "{err}"
+        );
+        let filled = wsjtx.replace("\"N0CALL\"", "\"W1AW\"");
+        let l = loaded(&filled);
+        assert_eq!(l.wsjtx_relay.len(), 1);
+        assert_eq!(l.wsjtx_relay[0].label(), "127.0.0.1:2237");
 
         for kind in [
             InputKind::Audio,
@@ -2148,6 +2253,7 @@ mod tests {
             InputKind::Ka9q,
         ] {
             // MAN-310: `bands` replaces `freq_hz`, so each is tried alone.
+            // MAN-309: the headerless-IQ keys need `iq = true`; checked below.
             for skip in ["bands", "freq_hz"] {
                 let body = format!(
                     "[input]\ntype = \"{}\"\n{}",
@@ -2155,11 +2261,21 @@ mod tests {
                     uncommented("input", |k| kind.keys().contains(&k)
                         && k != skip
                         && !(kind == InputKind::Hpsdr && k == "mac")
-                        && !(skip == "bands" && k == "tuning_range_hz"))
+                        && !(skip == "bands" && k == "tuning_range_hz")
+                        && !RAW_IQ.contains(&k))
                 );
                 let l = loaded(&body);
                 assert_eq!(l.input.source.map(|s| s.kind()), Some(kind), "{body}");
             }
+        }
+        const RAW_IQ: [&str; 2] = ["iq_format", "sample_rate_hz"];
+        let body = format!(
+            "[input]\ntype = \"file\"\npath = \"x.cf32\"\niq = true\n{}",
+            uncommented("input", |k| RAW_IQ.contains(&k))
+        );
+        match loaded(&body).input.source {
+            Some(SourceFromFile::File { raw: Some(_), .. }) => {}
+            other => panic!("{body}: {other:?}"),
         }
         let shared = [
             "freq_correction_ppm",

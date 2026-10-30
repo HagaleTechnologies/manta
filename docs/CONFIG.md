@@ -27,7 +27,10 @@ A value comes from the first of these that sets it:
 `--config FILE` names the file. Without it, `run`, `soak`, `doctor`, `check`,
 `status`, `health` and `config check` read the path from `MANTA_CONFIG`. The
 same seven commands apply the `MANTA_*` variables, though `status` and `health`
-apply them only when `--config` or `MANTA_CONFIG` names a file. `decode`,
+apply them only when `--config` or `MANTA_CONFIG` names a file. Given
+`--addr`, `status` and `health` load no config file and apply no `MANTA_*`
+variable: they dial that address even when `MANTA_CONFIG` names a missing or
+invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
 the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
 set from the environment. `[callsign_lookup]` can, through
@@ -54,13 +57,13 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all eight | yes |
+| `run` (alias `listen`) | all ten | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all eight, resolved exactly as `run` resolves them | yes |
+| `config check` | all ten, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
-| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file |
-| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file |
+| `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
+| `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm`; several `[[input]]` entries that disagree on it need `--freq-correction-ppm` | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
@@ -144,7 +147,7 @@ the config for both. The table needs `station_callsign`.
 | `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, `status` and `health` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
 | `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
-| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG`. |
+| `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG` and no `--addr`. |
 | `live_port` | none; example `7303`; unset runs no live-state listener | live: `run` with `[server]`; restart required | Live-state stream port; see [LIVE-STATE.md](LIVE-STATE.md). |
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
@@ -198,6 +201,95 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 | `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
 | `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
 | `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+
+## [[skimmer_relay]]
+
+Forwards the spots of another CW skimmer on your network (CW Skimmer, SkimSrv
+or a second manta) through `[[rbn_uplink]]`, under that skimmer's own call
+(MAN-320). One block per skimmer. manta connects to `host:port` by telnet,
+sends `callsign` plus CRLF when the skimmer's prompt arrives (with or without
+a trailing newline), and then only reads, writing a blank line every 300 s to
+notice a vanished peer. It reads `DX de` lines in the RBN layout (with the
+mode column) and in CW Skimmer's and manta's `skimmer` layout (without it),
+and forwards a line only when it is a CW spot whose `DX de` spotter, with
+`-#` stripped, equals `callsign`. It sends no `SKIMMER/SETT` and no password.
+Failed or dropped connections are retried with 1 s→60 s backoff.
+
+An enabled block needs an enabled `[[rbn_uplink]]` (which needs `[server]`),
+and the environment cannot set these keys. Every key needs a restart; a
+SIGHUP never applies them. The uplink's `dry_run`, `spot_types` and
+`max_spots_per_minute` apply to relayed spots as to manta's own, and
+relayed spots never appear on manta's telnet, JSON or stdout output. The
+SNR is forwarded as the skimmer quoted it (500 Hz). `doctor` does not
+check this table. See `manta_relay_*` in [METRICS.md](METRICS.md).
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `true` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `false` keeps the block but does not connect. |
+| `host` | none; example `"<skimmer-host>"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | The skimmer's host name or address. `config check` rejects the `<...>` placeholder. |
+| `port` | none; example `7300`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | The skimmer's telnet port: CW Skimmer 7300 and SkimSrv 7310 by default; for a second manta, its `telnet_port`. |
+| `callsign` | none; example `"N0CALL-2"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `CALL` or `CALL-N` (`-1` through `-99`), uppercased. Sent as the login and used as the spotter on every forwarded line; only lines the skimmer spotted under this call are forwarded. It may not be `[server].station_callsign` or any `[[rbn_uplink]].login_callsign`, since manta already forwards its own spots. `N0CALL` is rejected. |
+
+Load errors (`check`, `run`, `doctor`, `config check` and a SIGHUP reload all
+raise them, exit 1):
+
+```
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 forwards spots only through [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = false on this relay
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 has callsign = "W1ABC", this station's own call -- a skimmer relay forwards another skimmer's spots under that skimmer's own call (e.g. "W1ABC-2"); manta already forwards its own
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 is listed twice
+manta.toml: skimmer_relay must be written [[skimmer_relay]] (an array of tables)
+manta.toml: [[skimmer_relay]]: callsign "W1ABC-100" is not a plausible callsign (an SSID must be -1 through -99)
+manta.toml: [[skimmer_relay]]: host "<skimmer-host>" is the scaffold placeholder -- set the skimmer's host name or address
+```
+
+## [[wsjtx_relay]]
+
+Listens for WSJT-X or JTDX decodes by UDP and forwards new FT8/FT4 `CQ`
+decodes through `[[rbn_uplink]]` as digital spots (MAN-320). In WSJT-X, set
+Settings > Reporting > UDP Server to the `listen` address. manta never sends a
+datagram back. It learns each WSJT-X instance's dial frequency and mode from
+its `Status` messages (several instances can share one listener), adds the
+decode's audio offset to the dial frequency, and drops replays, `.wav`
+playback, low-confidence decodes, decodes from an instance it has no dial
+frequency for yet, modes other than FT8 and FT4, messages that are not a
+`CQ`, hashed `<...>` calls, and the same call, mode and band within 600 s.
+The SNR is WSJT-X's own figure (2500 Hz), not converted to 500 Hz. The spot
+is timed by its arrival.
+
+An enabled block needs an enabled `[[rbn_uplink]]` (which needs `[server]`),
+and the environment cannot set these keys. Every key needs a restart; a
+SIGHUP never applies them. The uplink's `dry_run`, `spot_types` and
+`max_spots_per_minute` apply. `doctor` does not check this table.
+
+**The listener is unauthenticated.** Anything that can send a UDP datagram to
+`listen` can put spots on the uplink under `callsign`. Keep it on
+`127.0.0.1` unless WSJT-X runs on another machine; see
+[RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md).
+
+**Multicast.** Only one program can own a unicast UDP port. If another program
+(GridTracker, JTAlert, a logger) already listens on WSJT-X's port, set WSJT-X's
+UDP Server to an IPv4 multicast group (e.g. `224.0.0.1`) and point every
+listener, manta included, at it: `listen = "224.0.0.1:2237"` binds
+`0.0.0.0:2237` with address reuse and joins the group. IPv6 multicast is
+rejected. A taken unicast port stops `manta run` at startup:
+
+```
+error: [[wsjtx_relay]] cannot listen on 127.0.0.1:2237: Address already in use (os error 98) -- another program may own the port; set WSJT-X's UDP Server to a multicast group (e.g. 224.0.0.1) and listen there
+```
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `true` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `false` keeps the block but does not listen. |
+| `listen` | `"127.0.0.1:2237"` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `IP:port`; `127.0.0.1:2237` is WSJT-X's default UDP server. An IPv4 multicast group binds `0.0.0.0:port` with address reuse and joins the group; IPv6 multicast is rejected. Port `0` picks a free port, which the startup log names. |
+| `callsign` | none; example `"N0CALL"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `CALL` or `CALL-N` (`-1` through `-99`), uppercased. The spotter on every forwarded FT8/FT4 line. The station's own call is allowed here, since FT8 spots are a different mode from manta's CW. `N0CALL` is rejected. |
+
+Load errors (exit 1, from the same entry points as `[[skimmer_relay]]`'s):
+
+```
+manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = false on this relay
+manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 is listed twice
+manta.toml: [[wsjtx_relay]]: listen "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
+```
 
 ## [callsign_lookup]
 
@@ -253,7 +345,10 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `name` | none; example `"20m"`; unset uses the input's `type` (`audio` when untyped) | live: `run`, `soak`, `doctor`, `calibrate`, `check` | The input's name in log lines and in `--input NAME`. Letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 32 characters. Required on every entry when there are several `[[input]]` entries (MAN-13). |
 | `device` | none; example `"USB Audio"`; unset uses the system's default input | live: `type = "audio"` | Part of the device's name; `manta devices` lists them. `--device` overrides it. |
 | `path` | none; example `"capture.wav"`; required for `type = "file"` | live: `type = "file"` | WAV recording replayed as if live. A relative path set in the file is relative to the file's directory; from `--source`, which overrides it, or `MANTA_INPUT_PATH` it is relative to the working directory. |
-| `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording. `--source-iq` sets it. |
+| `record_iq` | none; example `"captures/session.cf32"`; unset records nothing | `run` only; any type | Records this input's IQ while decoding: little-endian cf32 at this path plus `PATH.meta.jsonl`. Never overwrites, so a restart needs a new name; the directory must exist. A relative path set in the file is relative to the file's directory; from `MANTA_INPUT_RECORD_IQ` or `--record-iq`, which overrides it for a single input, it is relative to the working directory. Each `[[input]]` takes its own; two inputs, or the streams of one `bands` plan, cannot share one. See [GUIDES/iq-recording.md](GUIDES/iq-recording.md). |
+| `iq` | `false` | live: `type = "file"` | `true` for a two-channel IQ recording or a manta IQ recording (`run --record-iq`, found by its `PATH.meta.jsonl`). `--source-iq` sets it. See [GUIDES/iq-recording.md](GUIDES/iq-recording.md). |
+| `iq_format` | none; example `"cf32"`; unset reads a WAV or a manta recording | live: `type = "file"` with `iq = true` | Reads `path` as headerless little-endian IQ: `cf32` (float32 I, Q) or `ci16` (int16 I, Q, divided by 32768). Needs `sample_rate_hz` and a centre (`center_freq_hz` or `--dial-freq-hz`). `--iq-format` overrides it. Omit it for a manta recording, whose metadata describes it. |
+| `sample_rate_hz` | none; example `96000`; required with `iq_format` | live: `type = "file"` with `iq_format` | The headerless file's stored sample rate, above 0 and at most 10 MS/s; `capture_rate_hz` still decimates after it. `--sample-rate-hz` overrides it. |
 | `realtime` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` paces the replay to the recording's own clock, so telnet/JSON clients can watch it. `--realtime` sets it; a live source refuses it. See [DECISIONS/2026-10-10-man269-paced-looping-replay.md](DECISIONS/2026-10-10-man269-paced-looping-replay.md). |
 | `loop` | `false` | live: `run`, `type = "file"`; `soak` and `doctor` ignore it with a note | `true` replays the file again from the start each time it ends, until stopped; implies `realtime`. `--loop` sets it; a live source refuses it. |
 | `host` | none; example `"<your-receiver-host>"`; required for kiwi; optional for hpsdr | live: `type = "kiwi"` or `"hpsdr"` | Receiver host name. `--kiwi-host` or `--hpsdr-host` overrides it. For hpsdr, set host or mac, or neither to discover the only available radio. An explicit host skips the LAN broadcast, though under `protocol = "auto"` the protocol probe still goes to that host; host and mac together are refused. |

@@ -19,7 +19,10 @@ are. See `docs/RUNBOOKS/uplink-health.md`.
 Everything above is inbound. manta's *outbound* connections are the
 `[[rbn_uplink]]` targets (covered by
 [MAN-23's threat model](../DECISIONS/2026-09-02-man23-threat-model.md)),
-the `[rbn_compare]` telnet feed, the MAN-316 cty.dat/MASTER.SCP
+the `[rbn_compare]` telnet feed, each `[[skimmer_relay]]` (MAN-320: a
+plaintext telnet login to the operator's own skimmer at `host:port`; manta
+writes only its `callsign` login line and a blank keepalive line every
+300 s, and never echoes received text back), the MAN-316 cty.dat/MASTER.SCP
 refresh (plain `http://`, see `docs/CONFIG.md`'s `refresh_lists`), the
 `[callsign_lookup]` QRZ.com client (MAN-318: HTTPS to `xmldata.qrz.com:443`,
 honouring `HTTPS_PROXY`; allow that egress when the table is enabled) —
@@ -32,6 +35,20 @@ for the full disposition set (clean closes, protocol violations and
 oversized frames reconnect instead of killing the daemon; unknown-tag
 and too-short frames are discarded in place; the plaintext password is
 accepted risk).
+
+**The WSJT-X relay is manta's one inbound UDP listener that is not an SDR
+stream.** Each `[[wsjtx_relay]]` (MAN-320) binds its own `listen` address,
+`127.0.0.1:2237` by default, independent of `bind_addr`. It is
+unauthenticated, and UDP source addresses are trivially spoofed: anything
+that can send a datagram to `listen` can put FT8/FT4 CQ spots on every
+enabled `[[rbn_uplink]]` under the relay's `callsign`. The guards are the
+loopback default, the relay's own gates (FT8/FT4 `CQ` decodes only,
+600 s per-call dedupe), the per-target `max_spots_per_minute` ceiling and
+the uplink's `dry_run` (default `true`). Keep `listen` on `127.0.0.1` when
+WSJT-X runs on the same machine. If it runs elsewhere, bind the LAN
+interface's address (or a multicast group), not a public one, and firewall
+the port to the WSJT-X host. manta never replies to a datagram. See
+[CONFIG.md's `[[wsjtx_relay]]`](../CONFIG.md#wsjtx_relay).
 
 The telnet and JSON listeners bind `[server].bind_addr`, which defaults to
 `0.0.0.0`: both ports are reachable from any network that can route to

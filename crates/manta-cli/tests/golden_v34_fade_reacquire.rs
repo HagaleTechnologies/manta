@@ -66,8 +66,8 @@ fn promoted_near(report: &serde_json::Value) -> BTreeSet<u64> {
         .unwrap()
         .iter()
         .filter(|ev| ev["event"] == "TrackPromoted")
-        .filter(|ev| (ev["freq_hz"].as_f64().unwrap() - EXPECTED_HZ).abs() <= NEAR_HZ)
-        .map(|ev| ev["track_id"].as_u64().unwrap())
+        .filter(|ev| (ev["frequency"].as_f64().unwrap() - EXPECTED_HZ).abs() <= NEAR_HZ)
+        .map(|ev| ev["trackId"].as_u64().unwrap())
         .collect()
 }
 
@@ -75,12 +75,12 @@ fn promoted_near(report: &serde_json::Value) -> BTreeSet<u64> {
 fn track_text(report: &serde_json::Value, track_id: u64) -> String {
     let mut text = String::new();
     for ev in report["events"].as_array().unwrap() {
-        if ev["track_id"].as_u64() != Some(track_id) {
+        if ev["trackId"].as_u64() != Some(track_id) {
             continue;
         }
         match ev["event"].as_str().unwrap() {
             "CharDecoded" => {
-                if let Some(c) = ev["glyph"]["Char"].as_str() {
+                if let Some(c) = ev["glyph"].as_str().filter(|g| g.chars().count() == 1) {
                     text.push_str(c);
                 }
             }
@@ -114,8 +114,8 @@ fn v34_fading_signal_stays_on_one_track() {
         .iter()
         .map(|s| {
             (
-                s["callsign"].as_str().unwrap().to_string(),
-                s["track_id"].as_u64().unwrap(),
+                s["dxCall"].as_str().unwrap().to_string(),
+                s["trackId"].as_u64().unwrap(),
             )
         })
         .collect();

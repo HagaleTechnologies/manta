@@ -220,10 +220,16 @@ impl Default for PipelineConfig {
 }
 
 /// Result of decoding one signal from an IQ scene. SPEC §5.
+///
+/// `decode --json` prints it; its keys are camelCase (MAN-139,
+/// docs/CLI-JSON.md).
 #[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecodeReport {
     /// Absolute spot frequency (center + estimated offset), full precision.
     /// SPEC §1.4: full Hz precision belongs to the JSON surface.
+    /// `frequency` in JSON (MAN-139).
+    #[serde(rename = "frequency")]
     pub freq_hz: f64,
     /// Most recently reported speed, if any.
     pub wpm: Option<f32>,
@@ -241,7 +247,7 @@ pub struct DecodeReport {
     /// for input without RTTY or with `rtty_filter` off.
     pub rtty: Vec<RttySignalReport>,
     /// MAN-234: input samples replaced with silence (SPEC §1.3 step 0).
-    /// Omitted from JSON when 0, so a clean decode's `--json` is unchanged.
+    /// `badSamples` in JSON, omitted when 0.
     #[serde(skip_serializing_if = "is_zero")]
     pub bad_samples: u64,
     /// Input sample rate, for turning `rtty` sample timestamps into
@@ -278,7 +284,9 @@ fn bad_samples_suffix(n: u64) -> String {
 /// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
 /// like `TrackMeta::freq_hz`. `marked_sample_ts`/`cleared_sample_ts` are
 /// stream sample timestamps; `cleared_sample_ts` is `None` while marked.
+/// JSON keys are camelCase (MAN-139).
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RttySignalReport {
     /// Upper tone.
     pub mark_hz: f64,
@@ -352,11 +360,123 @@ impl IqSource for SliceSource<'_> {
     }
 }
 
+/// One gap-free stretch of an offline decode (MAN-309): its own channelizer
+/// and track manager, as `listen`'s `Segment`, whose sample clock starts at
+/// `base` on the source's timeline.
+struct OfflineSegment {
+    ch: manta_dsp::channelizer::Channelizer,
+    tm: track::TrackManager,
+    hop: u64,
+    pad_hops: u64,
+    pad_samples: usize,
+    base: u64,
+}
+
+/// The source's passband, trusted band and analytic guard, read once and
+/// applied to every offline segment (MAN-309), as `listen` applies them.
+#[derive(Clone, Copy)]
+struct SourceBands {
+    fs: f64,
+    center_freq_hz: f64,
+    rf_passband_hz: (f64, f64),
+    trusted_band_hz: Option<(f64, f64)>,
+    guard_hz: f64,
+    analytic: bool,
+}
+
+impl SourceBands {
+    fn of(src: &dyn IqSource, cfg: &PipelineConfig) -> Self {
+        SourceBands {
+            fs: src.sample_rate(),
+            center_freq_hz: src.center_freq_hz(),
+            rf_passband_hz: src.rf_passband_hz(),
+            trusted_band_hz: src.trusted_band_hz(),
+            guard_hz: cfg.detector.guard_hz.max(src.analytic_guard_hz()),
+            analytic: src.analytic_guard_hz() > 0.0,
+        }
+    }
+
+    /// A fresh segment starting at `base`, numbering tracks from `next_id`.
+    /// The band setters are no-ops for a plain complex source (full
+    /// Nyquist, no trusted band, zero guard), so a WAV or slice decode is
+    /// unchanged while `DetectorConfig::guard_hz` is 0 (the config loader
+    /// rejects `[detector] guard_hz`, so only code can raise it).
+    fn segment(&self, cfg: &PipelineConfig, base: u64, next_id: u32) -> Result<OfflineSegment> {
+        let ch = manta_dsp::channelizer::Channelizer::new(self.fs, self.center_freq_hz)
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("channelizer")?;
+        let hop = ch.hop() as u64;
+        debug_assert!(
+            (self.fs / hop as f64 - manta_decode::FO_HZ).abs() < 0.01,
+            "channelizer hop rate {} Hz diverges from manta_decode::FO_HZ {}",
+            self.fs / hop as f64,
+            manta_decode::FO_HZ
+        );
+        let pad_samples = ch.filter_len();
+        let pad_hops = (pad_samples as u64).div_ceil(hop);
+        let mut tm = track::TrackManager::new(
+            ch.n_channels(),
+            self.fs,
+            self.center_freq_hz,
+            cfg.detector,
+            cfg.decode.clone(),
+        );
+        tm.resume_track_ids_from(next_id);
+        tm.skip_preroll_hops(pad_hops);
+        tm.set_rf_passband_hz(self.rf_passband_hz.0, self.rf_passband_hz.1);
+        if let Some((lo, hi)) = self.trusted_band_hz {
+            tm.set_trusted_band_hz(lo, hi);
+        }
+        if self.guard_hz > 0.0 {
+            tm.set_guard_hz(self.guard_hz);
+        }
+        tm.set_mirror_image_guard(self.analytic);
+        // MAN-314: `DecodeReport::rtty` lists every marked signal, so the
+        // streaming cap on the RTTY log does not apply to a file decode.
+        tm.keep_full_rtty_history();
+        Ok(OfflineSegment {
+            ch,
+            tm,
+            hop,
+            pad_hops,
+            pad_samples,
+            base,
+        })
+    }
+}
+
+/// Appends `tm`'s marked RTTY signals to `rtty` (MAN-309): each segment's
+/// detector numbers its signals from 1, so a later segment's ids continue
+/// after the largest already reported. One segment's ids are unchanged.
+/// At a discontinuity, active marks clear where the segment's samples end.
+fn append_rtty(
+    rtty: &mut Vec<RttySignalReport>,
+    tm: &track::TrackManager,
+    calibration_factor: f64,
+    gap_end: Option<u64>,
+) {
+    let base = rtty.iter().map(|r| r.id).max().unwrap_or(0);
+    rtty.extend(tm.rtty_signals().iter().map(|e| {
+        let mut row = RttySignalReport::from_entry(e, calibration_factor);
+        row.id += base;
+        row.cleared_sample_ts = row.cleared_sample_ts.or(gap_end);
+        row
+    }));
+}
+
 /// `decode_samples` over a source (MAN-119): reads `src` to EOF in
 /// `CHUNK_SAMPLES` chunks of the zero-padded stream and holds no copy of the
 /// input, so memory does not grow with the recording. Its output is identical
 /// to `decode_samples` over the same samples, whatever sizes `src`'s reads
 /// return. SPEC §1.3–§1.4, §3–§5.
+///
+/// MAN-309: a discontinuity the source reports (`take_discontinuity`, as a
+/// replayed IQ recording's gaps) closes the current segment as `listen`
+/// does -- `finish_for_discontinuity`, not an end of signal -- and starts a
+/// fresh channelizer and track manager whose clock is advanced past the
+/// missing samples and whose track ids continue. Missing samples are never
+/// synthesized; the validator spans every segment. A gap-free source
+/// decodes exactly as before.
 pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<DecodeReport> {
     // Validated up front so a bad config value (NaN, infinite, or ppm so
     // negative it flips the factor negative/zero) fails fast rather than
@@ -364,34 +484,10 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     let calibration_factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let fs = src.sample_rate();
-    let center_freq_hz = src.center_freq_hz();
-    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("channelizer")?;
-    let hop = ch.hop() as u64;
-
-    debug_assert!(
-        (fs / hop as f64 - manta_decode::FO_HZ).abs() < 0.01,
-        "channelizer hop rate {} Hz diverges from manta_decode::FO_HZ {}",
-        fs / hop as f64,
-        manta_decode::FO_HZ
-    );
-
-    let pad_samples = ch.filter_len();
-    let pad_hops = (pad_samples as u64).div_ceil(hop);
-
-    let mut tm = track::TrackManager::new(
-        ch.n_channels(),
-        fs,
-        center_freq_hz,
-        cfg.detector,
-        cfg.decode.clone(),
-    );
-    tm.skip_preroll_hops(pad_hops);
-    // MAN-314: `DecodeReport::rtty` lists every marked signal, so the
-    // streaming cap on the RTTY log does not apply to a file decode.
-    tm.keep_full_rtty_history();
+    let bands = SourceBands::of(src, cfg);
+    let fs = bands.fs;
+    let center_freq_hz = bands.center_freq_hz;
+    let mut seg = bands.segment(cfg, 0, 1)?;
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&whole_input)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
@@ -410,19 +506,37 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     // silently truncating to ~30 s of text. Chunking keeps `process_hops`
     // (and so `note_char_decoded`) running frequently enough that a
     // continuously-decoding track's GC timer never falsely expires. The
-    // chunks are those of the zero-padded stream, whatever sizes `src`'s
-    // reads return (MAN-119).
+    // chunks are those of each segment's zero-padded stream, whatever sizes
+    // `src`'s reads return (MAN-119).
     const CHUNK_SAMPLES: usize = 4096;
     let mut events = Vec::new();
+    let mut rtty: Vec<RttySignalReport> = Vec::new();
+    let mut bad_samples = 0u64;
     let mut any_hops = false;
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
-    let (mut pad_left, mut nonzero, mut eof) = (pad_samples, false, false);
-    while !eof {
-        // The zero pre-roll first, then the source's samples.
+    // Samples read after a gap, held for the next segment while the
+    // previous one processes its partial chunk (MAN-309).
+    let mut carry: Vec<Complex32> = Vec::new();
+    let mut carry_at = 0usize;
+    let (mut pad_left, mut nonzero, mut eof) = (seg.pad_samples, false, false);
+    let mut consumed = 0u64;
+    loop {
+        // The segment's zero pre-roll first, then held samples, then the
+        // source's.
         let mut filled = pad_left.min(CHUNK_SAMPLES);
         chunk[..filled].fill(Complex32::new(0.0, 0.0));
         pad_left -= filled;
-        while filled < CHUNK_SAMPLES {
+        let held = (carry.len() - carry_at).min(CHUNK_SAMPLES - filled);
+        chunk[filled..filled + held].copy_from_slice(&carry[carry_at..carry_at + held]);
+        carry_at += held;
+        filled += held;
+        consumed += held as u64;
+        if carry_at == carry.len() {
+            carry.clear();
+            carry_at = 0;
+        }
+        let mut gap = None;
+        while !eof && filled < CHUNK_SAMPLES && carry.is_empty() {
             let n = src.read(&mut chunk[filled..])?;
             if n == 0 {
                 eof = true;
@@ -431,31 +545,73 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             nonzero |= chunk[filled..filled + n]
                 .iter()
                 .any(|s| s.re != 0.0 || s.im != 0.0);
+            if let Some(missing) = src.take_discontinuity() {
+                // These samples follow the outage: they open the next
+                // segment, after this one's partial chunk.
+                carry.extend_from_slice(&chunk[filled..filled + n]);
+                gap = Some(missing);
+                break;
+            }
             filled += n;
+            consumed += n as u64;
         }
-        if filled == 0 {
-            break;
+        if filled > 0 {
+            let hops = seg.ch.process(&chunk[..filled]);
+            any_hops |= !hops.is_empty();
+            let (base, pad_hops, hop) = (seg.base, seg.pad_hops, seg.hop);
+            events.extend(
+                seg.tm
+                    .process_hops(&hops, |m| base + m.saturating_sub(pad_hops) * hop),
+            );
         }
-        let hops = ch.process(&chunk[..filled]);
-        any_hops |= !hops.is_empty();
-        events.extend(tm.process_hops(&hops, |m| (m.saturating_sub(pad_hops)) * hop));
+        let Some(missing) = gap else {
+            if eof || filled == 0 {
+                break;
+            }
+            continue;
+        };
+        // Not `finish()`: an outage is not an end of signal (MAN-73).
+        let end = seg
+            .base
+            .checked_add(consumed)
+            .context("input discontinuity overflows the sample clock")?;
+        append_rtty(&mut rtty, &seg.tm, calibration_factor, Some(end));
+        events.extend(seg.tm.finish_for_discontinuity());
+        bad_samples += seg.ch.bad_samples();
+        let base = end
+            .checked_add(missing)
+            .context("input discontinuity overflows the sample clock")?;
+        seg = bands.segment(cfg, base, seg.tm.next_track_id())?;
+        pad_left = seg.pad_samples;
+        consumed = 0;
     }
+    // MAN-258: a stream that ended during an outage is not an end of signal.
+    let terminal_gap = src.take_discontinuity().is_some();
     if !nonzero {
         bail!("input is digital silence");
     }
-    let bad_samples = ch.bad_samples();
+    bad_samples += seg.ch.bad_samples();
     if !any_hops {
         bail!(
             "no signal found (input shorter than one filter length or empty){}",
             bad_samples_suffix(bad_samples)
         );
     }
-    let rtty: Vec<RttySignalReport> = tm
-        .rtty_signals()
-        .iter()
-        .map(|e| RttySignalReport::from_entry(e, calibration_factor))
-        .collect();
-    events.extend(tm.finish());
+    let end = seg
+        .base
+        .checked_add(consumed)
+        .context("input sample clock overflows")?;
+    append_rtty(
+        &mut rtty,
+        &seg.tm,
+        calibration_factor,
+        terminal_gap.then_some(end),
+    );
+    events.extend(if terminal_gap {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    });
 
     // MAN-314: a marked RTTY signal is a finding on its own, so input with
     // RTTY but no CW decoder output still returns a report (empty CW
@@ -543,6 +699,36 @@ pub fn decode_wav(
         None => WavIqSource::open(path)?,
     };
     decode_source(&mut src, cfg)
+}
+
+/// A JSON object's top-level keys in document order (the workspace's
+/// `serde_json` has no `preserve_order`, so `Map` sorts them).
+#[cfg(test)]
+pub(crate) fn json_keys_in_order(json: &str) -> Vec<String> {
+    struct Keys(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> serde::de::Visitor<'de> for V {
+                type Value = Keys;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((k, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                        keys.push(k);
+                    }
+                    Ok(Keys(keys))
+                }
+            }
+            d.deserialize_map(V)
+        }
+    }
+    serde_json::from_str::<Keys>(json).unwrap().0
 }
 
 #[cfg(test)]
@@ -796,10 +982,68 @@ mod tests {
         )
         .unwrap();
         let v = serde_json::to_value(&report).unwrap();
-        assert!(v.get("bad_samples").is_none(), "clean JSON: {v}");
+        assert!(v.get("badSamples").is_none(), "clean JSON: {v}");
         report.bad_samples = 3;
         let s = serde_json::to_string(&report).unwrap();
-        assert!(s.contains("\"bad_samples\":3"), "{s}");
+        assert!(s.contains("\"badSamples\":3"), "{s}");
+    }
+
+    /// MAN-139: `decode --json`'s top-level and `rtty[]` keys are camelCase,
+    /// with the stream's `frequency` for the spot frequency.
+    #[test]
+    fn decode_report_json_is_camel_case() {
+        let report = DecodeReport {
+            freq_hz: 14_012_341.5,
+            wpm: Some(20.0),
+            text: "CQ".into(),
+            events: Vec::new(),
+            spots: Vec::new(),
+            timing: Some(TimingEstimates {
+                dit_ms: 60.0,
+                dot: None,
+                dash: None,
+                element_gap: None,
+                char_gap: None,
+                word_gap: None,
+            }),
+            rtty: vec![RttySignalReport {
+                mark_hz: 14_080_170.0,
+                space_hz: 14_080_000.0,
+                shift_hz: 170.0,
+                measured_shift_hz: 170.5,
+                marked_sample_ts: 96_000,
+                cleared_sample_ts: None,
+                id: 7,
+            }],
+            bad_samples: 1,
+            sample_rate_hz: 96_000.0,
+        };
+        let s = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            json_keys_in_order(&s),
+            [
+                "frequency",
+                "wpm",
+                "text",
+                "events",
+                "spots",
+                "timing",
+                "rtty",
+                "badSamples"
+            ]
+        );
+        let rtty = serde_json::to_string(&report.rtty[0]).unwrap();
+        assert_eq!(
+            json_keys_in_order(&rtty),
+            [
+                "markHz",
+                "spaceHz",
+                "shiftHz",
+                "measuredShiftHz",
+                "markedSampleTs",
+                "clearedSampleTs"
+            ]
+        );
     }
 
     #[test]

@@ -62,13 +62,13 @@ fn run_spots(stdout: &[u8]) -> Vec<serde_json::Value> {
 }
 
 /// Asserts a `run --json` exited 0 with exactly one spot, and returns that
-/// spot's `freq_hz`.
+/// spot's `frequency`.
 fn single_spot_freq(out: &Output) -> f64 {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "stderr: {stderr}");
     let spots = run_spots(&out.stdout);
     assert_eq!(spots.len(), 1, "spots: {spots:?}; stderr: {stderr}");
-    spots[0]["freq_hz"].as_f64().unwrap()
+    spots[0]["frequency"].as_f64().unwrap()
 }
 
 /// Asserts `freq_hz == base * (1 + ppm * 1e-6)` to within 1 mHz.
@@ -293,7 +293,7 @@ fn decode_prints_timing_line_for_primary_track() {
         .unwrap();
     assert!(out.status.success());
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(report["timing"]["dash"]["mean_dits"].as_f64().is_some());
+    assert!(report["timing"]["dash"]["meanDits"].as_f64().is_some());
     assert!(report["events"]
         .as_array()
         .unwrap()
@@ -882,7 +882,7 @@ fn doctor_accepts_and_applies_dial_freq_hz_for_an_audio_source() {
         panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
     });
     assert_eq!(
-        report["center_freq_hz"].as_f64(),
+        report["centerFreqHz"].as_f64(),
         Some(14_030_000.0),
         "report: {report}"
     );
@@ -1056,7 +1056,7 @@ fn dial_freq_hz_rejects_non_finite_and_non_positive_values() {
 ///
 /// `DecoderEvent` is internally tagged (`#[serde(tag = "event")]`,
 /// crates/manta-decode/src/events.rs), so each JSON line looks like
-/// `{"event":"TrackMeta","track_id":..,"freq_hz":..}` -- not serde's
+/// `{"event":"TrackMeta","trackId":..,"frequency":..}` -- not serde's
 /// default externally-tagged `{"TrackMeta": {...}}` shape.
 #[test]
 fn listen_with_dial_freq_hz_reports_absolute_frequency_for_an_audio_source() {
@@ -1104,7 +1104,7 @@ fn listen_with_dial_freq_hz_reports_absolute_frequency_for_an_audio_source() {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("TrackMeta"))
-        .filter_map(|v| v.get("freq_hz").and_then(|f| f.as_f64()))
+        .filter_map(|v| v.get("frequency").and_then(|f| f.as_f64()))
         .collect();
     assert!(
         !freqs.is_empty(),
@@ -1203,7 +1203,7 @@ fn json_output_is_valid_and_deterministic_across_three_runs() {
     assert_eq!(runs[1], runs[2]);
     let v: serde_json::Value = serde_json::from_slice(&runs[0]).unwrap();
     assert!(v["text"].is_string());
-    assert!(v["freq_hz"].is_f64());
+    assert!(v["frequency"].is_f64());
     assert!(v["events"].is_array());
 }
 
@@ -1225,7 +1225,7 @@ fn decode_freq_correction_ppm_shifts_the_reported_freq_hz() {
         .unwrap();
     assert!(uncalibrated_out.status.success());
     let uncalibrated: serde_json::Value = serde_json::from_slice(&uncalibrated_out.stdout).unwrap();
-    let uncalibrated_freq = uncalibrated["freq_hz"].as_f64().unwrap();
+    let uncalibrated_freq = uncalibrated["frequency"].as_f64().unwrap();
 
     let calibrated_out = manta()
         .args(["decode", "--json", "--freq-correction-ppm", "10"])
@@ -1238,12 +1238,12 @@ fn decode_freq_correction_ppm_shifts_the_reported_freq_hz() {
         String::from_utf8_lossy(&calibrated_out.stderr)
     );
     let calibrated: serde_json::Value = serde_json::from_slice(&calibrated_out.stdout).unwrap();
-    let calibrated_freq = calibrated["freq_hz"].as_f64().unwrap();
+    let calibrated_freq = calibrated["frequency"].as_f64().unwrap();
 
     let expected = uncalibrated_freq * (1.0 + 10.0 * 1e-6);
     assert!(
         (calibrated_freq - expected).abs() < 1e-3,
-        "--freq-correction-ppm 10 should scale freq_hz {uncalibrated_freq} to {expected}, got {calibrated_freq}"
+        "--freq-correction-ppm 10 should scale frequency {uncalibrated_freq} to {expected}, got {calibrated_freq}"
     );
 }
 
@@ -1349,8 +1349,8 @@ fn decode_json_has_rtty_array() {
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     let rtty = report["rtty"].as_array().unwrap();
     assert_eq!(rtty.len(), 1, "{report}");
-    assert_eq!(rtty[0]["shift_hz"], 170.0);
-    assert!(rtty[0]["cleared_sample_ts"].is_null());
+    assert_eq!(rtty[0]["shiftHz"], 170.0);
+    assert!(rtty[0]["clearedSampleTs"].is_null());
 }
 
 #[test]
@@ -1434,7 +1434,7 @@ fn decode_allowlist_spots_a_call_that_fails_cty_validation() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["callsign"] == "QQ9ZZZ"),
+            .any(|s| s["dxCall"] == "QQ9ZZZ"),
         "QQ9ZZZ (unallocated cty prefix) must not spot without --allowlist, got: {report}"
     );
 
@@ -1454,7 +1454,7 @@ fn decode_allowlist_spots_a_call_that_fails_cty_validation() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|s| s["callsign"] == "QQ9ZZZ"),
+            .any(|s| s["dxCall"] == "QQ9ZZZ"),
         "--allowlist QQ9ZZZ should force a spot for QQ9ZZZ, got: {report}"
     );
 }
@@ -2246,7 +2246,7 @@ fn spot_blocklist_path_from_config_suppresses_a_callsign() {
         "manta.toml",
         "[spot]\nblocklist_path = \"bad-calls.txt\"\n",
     );
-    let is_w1aw = |s: &serde_json::Value| s["callsign"] == "W1AW";
+    let is_w1aw = |s: &serde_json::Value| s["dxCall"] == "W1AW";
 
     let control = manta()
         .current_dir(cwd.path())
@@ -2675,7 +2675,7 @@ fn doctor_reports_center_freq_hz_from_the_config_file() {
         panic!("doctor --json not JSON ({e}): stdout={stdout} stderr={stderr}")
     });
     assert_eq!(
-        report["center_freq_hz"].as_f64(),
+        report["centerFreqHz"].as_f64(),
         Some(7_030_000.0),
         "report: {report}"
     );
@@ -2759,7 +2759,7 @@ fn soak_notes_an_ignored_server_table_and_doctor_checks_its_ports() {
             .iter()
             .find(|c| c["name"] == name)
             .unwrap_or_else(|| panic!("no {name} row in {report}"));
-        assert_eq!(row["status"], "skip", "{row}");
+        assert_eq!(row["status"], "SKIP", "{row}");
     }
 }
 
@@ -2819,7 +2819,7 @@ fn manta_config_env_is_the_config_fallback() {
         "[spot]\nblocklist_path = \"bad-calls.txt\"\n",
     );
     let other = write_cfg(dir.path(), "other.toml", "[decode]\nengine = \"legacy\"\n");
-    let is_w1aw = |s: &serde_json::Value| s["callsign"] == "W1AW";
+    let is_w1aw = |s: &serde_json::Value| s["dxCall"] == "W1AW";
 
     let from_env = manta()
         .args(["run", "--json", "--source"])
@@ -2950,6 +2950,50 @@ fn status_against_a_dead_address_fails_with_exit_code_two_and_a_plain_message() 
     );
 }
 
+/// MAN-332: given `--addr`, `run_status` skips `daemon_server_config`, so
+/// `MANTA_CONFIG` is never read and no `MANTA_*` variable is applied or
+/// validated -- as docs/CONFIG.md's Precedence section says. An
+/// unparseable file fails the load before the variables are checked, so a
+/// valid file pins the variables on their own. Same never-accepted
+/// listener as the test above.
+#[test]
+fn status_with_addr_ignores_manta_config_and_manta_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = write_cfg(dir.path(), "bad.toml", "garbage not toml [[[\n");
+    let good = write_cfg(dir.path(), "good.toml", SERVER_TOML);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    for config in [&bad, &good] {
+        let out = manta()
+            .env("MANTA_CONFIG", config)
+            .env("MANTA_SERVER_METRICS_PORT", "notaport")
+            .env("MANTA_NO_SUCH_TABLE_KEY", "1")
+            .args(["status", "--addr", &addr.to_string(), "--timeout-secs", "1"])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let config = config.display();
+        assert_eq!(out.status.code(), Some(2), "{config}: stderr: {stderr}");
+        assert!(
+            stderr.contains(&addr.to_string()),
+            "{config}: expected the --addr address in the error message, got: {stderr}"
+        );
+        for unread in [
+            "bad.toml",
+            "good.toml",
+            "MANTA_SERVER_METRICS_PORT",
+            "MANTA_NO_SUCH_TABLE_KEY",
+        ] {
+            assert!(
+                !stderr.contains(unread),
+                "{config}: --addr must not read MANTA_CONFIG or MANTA_*, but stderr names {unread}: {stderr}"
+            );
+        }
+    }
+    drop(listener);
+}
+
 /// MAN-44 CR-A regression: an invalid `--addr` must exit 2 ("couldn't
 /// ask"), not 1 -- exit 1 is the documented "reached the daemon, uplink is
 /// unhealthy" code (`docs/RUNBOOKS/uplink-health.md`), and a typo'd
@@ -3062,7 +3106,7 @@ fn decode_cty_flag_lets_a_newly_allocated_prefix_spot() {
         .unwrap();
     let spots = decode_spots(&after);
     assert_eq!(spots.len(), 1);
-    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+    assert_eq!(spots[0]["dxCall"], "QQ9ZZZ");
 }
 
 #[test]
@@ -3085,7 +3129,7 @@ fn decode_cty_path_in_a_config_file_lets_a_newly_allocated_prefix_spot() {
         .unwrap();
     let spots = decode_spots(&out);
     assert_eq!(spots.len(), 1);
-    assert_eq!(spots[0]["callsign"], "QQ9ZZZ");
+    assert_eq!(spots[0]["dxCall"], "QQ9ZZZ");
 }
 
 #[test]
@@ -3109,7 +3153,7 @@ fn run_reads_cty_path_from_the_environment() {
     );
     assert!(run_spots(&out.stdout)
         .iter()
-        .any(|s| s["callsign"] == "QQ9ZZZ"));
+        .any(|s| s["dxCall"] == "QQ9ZZZ"));
 }
 
 #[test]
@@ -3123,7 +3167,7 @@ fn decode_scp_flag_is_accepted_and_still_spots() {
         .arg(wav)
         .output()
         .unwrap();
-    assert!(decode_spots(&out).iter().any(|s| s["callsign"] == "W1AW"));
+    assert!(decode_spots(&out).iter().any(|s| s["dxCall"] == "W1AW"));
 }
 
 #[test]
@@ -3404,7 +3448,7 @@ fn decode_minimal_config_spots_an_unlisted_pattern() {
         .unwrap();
     assert!(decode_spots(&minimal_out)
         .iter()
-        .any(|s| s["callsign"] == "QQ9ZZZ"));
+        .any(|s| s["dxCall"] == "QQ9ZZZ"));
 }
 
 #[test]

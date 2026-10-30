@@ -74,9 +74,9 @@ def write_rbn_csv(path):
 
 def decode_report(rate=192000):
     """N4RV matches truth; W9ZZZ is a false positive."""
-    def s(call, freq_hz, t):
-        return {"callsign": call, "freq_hz": freq_hz, "snr_db": 12.0, "wpm": 28.0,
-                "spot_type": "Cq", "confidence": 0.9, "track_id": 1, "sample_ts": int(t * rate)}
+    def s(call, frequency, t):
+        return {"dxCall": call, "frequency": frequency, "snr": 12.0, "wpm": 28.0,
+                "spotType": "cq", "decodeConfidence": 0.9, "trackId": 1, "sampleTs": int(t * rate)}
     return {"events": [], "spots": [s("N4RV", 7021000.0, 35.0), s("W9ZZZ", 7040000.0, 50.0)]}
 
 
@@ -89,8 +89,8 @@ class ScoreReportTests(unittest.TestCase):
         self.csv = os.path.join(self.tmp, "t.csv")
         rbn_tests.write_csv(self.csv)  # test_score_against_rbn.py's fixture rows
         self.report = os.path.join(self.tmp, "r.json")
-        spots = [{"callsign": c, "freq_hz": f, "snr_db": 10.0, "confidence": 0.8,
-                  "spot_type": "Cq", "sample_ts": 0}
+        spots = [{"dxCall": c, "frequency": f, "snr": 10.0, "decodeConfidence": 0.8,
+                  "spotType": "cq", "sampleTs": 0}
                  for c, f in (("N4RV", 7021000.0), ("N3RS", 7049400.0), ("W9ZZZ", 7040000.0))]
         with open(self.report, "w") as f:
             json.dump({"spots": spots}, f)
@@ -154,7 +154,11 @@ class ManifestTests(unittest.TestCase):
                     self.assertRegex(rec["sha256"], r"^[0-9a-f]{64}$")
                 if rec["kind"] == "iq":
                     self.assertIn(rec["bits_per_sample"], {16, 24, 32})
-                if rec.get("truth"):
+                # RBN truth is third-party data, rebuilt locally and ignored by git
+                # (MAN-249), so only its path is checked; transcripts are tracked.
+                if (rec.get("truth") or {}).get("kind") == "rbn":
+                    self.assertRegex(rec["truth"]["path"], r"^ground-truth/[^/]+\.rbn\.csv$")
+                elif rec.get("truth"):
                     self.assertTrue(os.path.isfile(os.path.join(CORPUS, rec["truth"]["path"])),
                                     rec["truth"]["path"])
 
@@ -166,7 +170,7 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(b2["capture_start"], "2025-11-29T00:00:00Z")
         self.assertEqual(b2["truth"]["kind"], "rbn")
         self.assertEqual(b2["truth"]["spotter"], "K5TR")
-        self.assertTrue(os.path.isfile(os.path.join(CORPUS, b2["truth"]["path"])))
+        self.assertEqual(b2["truth"]["path"], "ground-truth/B2_20251129_000000_7080kHz.rbn.csv")
         self.assertEqual(b2["floors"], {"min_spots": 50, "min_precision": 0.20, "min_recall": 0.02})
 
     def test_wpx_and_vp8geo_are_unpinned(self):
@@ -505,7 +509,8 @@ class ScoreTests(ScriptTest):
         # Move the one spot 60 s past its row: spot precision drops to 0.
         with open(self.run_jsonl) as f:
             text = f.read()
-        moved = text.replace('"track_id":1,"sample_ts":700800}}', '"track_id":1,"sample_ts":3600000}}')
+        moved = text.replace('"sampleTs":700800,"rst":null,"qrlQuery":false}}',
+                             '"sampleTs":3600000,"rst":null,"qrlQuery":false}}')
         self.assertNotEqual(moved, text)
         with open(self.run_jsonl, "w") as f:
             f.write(moved)

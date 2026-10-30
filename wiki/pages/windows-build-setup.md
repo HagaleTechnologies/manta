@@ -149,11 +149,14 @@ reliability comparison against the macOS baseline in issues #166/#167/
   client reads the reply (os error 10054, "forcibly closed"), which made
   `health_command` flake on about 1 in 8 Windows merge-queue runs (MAN-156).
 - A test that needs several free ports must hold every listener until it
-  has read them all (`free_ports::<N>()` in `doctor_checks.rs`,
-  `node_health_acceptance.rs`, `hpsdr_metrics_acceptance.rs` and
-  `ka9q_input.rs`). Windows hands a just-released port straight back out,
-  so picking ports one at a time can pick the same port twice and the
-  config is rejected (#302, MAN-371). Delete the single-port helper once
+  has read them all (`free_ports::<N>()` in `node_health_acceptance.rs`,
+  `hpsdr_metrics_acceptance.rs` and `ka9q_input.rs`). Windows hands a
+  just-released port straight back out, so picking ports one at a time
+  can pick the same port twice and the config is rejected (#302, MAN-371).
+  `tests/doctor_checks.rs` and the unit tests instead draw "nothing here"
+  ports from private claimed bands (`tests/doctor_checks.rs`,
+  `src/test_ports.rs`; MAN-333, MAN-410, MAN-383), because a held listener
+  reads as "in use" to doctor's probe. Delete the single-port helper once
   nothing calls it, or `clippy -D warnings` fails on dead code.
 
 ## Known gaps

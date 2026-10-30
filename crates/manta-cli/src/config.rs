@@ -15,7 +15,9 @@ use manta_decode::config_file::DecodeConfigToml;
 use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
-use manta_server::config::{RbnCompareConfig, RbnUplinkConfig, ServerConfig};
+use manta_server::config::{
+    RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig, WsjtxRelayConfig,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::net::Ipv4Addr;
@@ -26,6 +28,8 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "server",
     "rbn_uplink",
     "rbn_compare",
+    "skimmer_relay",
+    "wsjtx_relay",
     "callsign_lookup",
     "input",
     "spot",
@@ -89,6 +93,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
+    ("input", "record_iq"),
+    ("input", "iq_format"),
     ("input", "host"),
     ("input", "mac"),
     ("input", "password"),
@@ -151,6 +157,12 @@ pub(crate) struct Loaded {
     /// --config` reads its tolerances. `run` merges `--rbn-compare`/
     /// `--rbn-spotter` over it in `resolve`.
     pub rbn_compare: Option<RbnCompareConfig>,
+    /// MAN-320: `[[skimmer_relay]]` blocks as written, validated
+    /// (disabled ones included). Restart-only.
+    pub skimmer_relay: Vec<SkimmerRelayConfig>,
+    /// MAN-320: `[[wsjtx_relay]]` blocks as written, validated (disabled
+    /// ones included). Restart-only.
+    pub wsjtx_relay: Vec<WsjtxRelayConfig>,
     /// MAN-318: `[callsign_lookup]` as written, validated (`None` when the
     /// table is absent; present even when `enabled = false`).
     pub callsign_lookup: Option<CallsignLookupConfig>,
@@ -408,7 +420,14 @@ impl InputKind {
     pub(crate) fn keys(self) -> &'static [&'static str] {
         match self {
             InputKind::Audio => &["device"],
-            InputKind::File => &["path", "iq", "realtime", "loop"],
+            InputKind::File => &[
+                "path",
+                "iq",
+                "realtime",
+                "loop",
+                "iq_format",
+                "sample_rate_hz",
+            ],
             InputKind::Kiwi => &[
                 "host",
                 "port",
@@ -454,6 +473,9 @@ struct InputToml {
     realtime: Option<bool>,
     #[serde(rename = "loop")]
     looped: Option<bool>,
+    /// MAN-309: headerless IQ (`cf32`/`ci16`) and its stored sample rate.
+    iq_format: Option<String>,
+    sample_rate_hz: Option<f64>,
     host: Option<String>,
     mac: Option<String>,
     port: Option<u16>,
@@ -479,6 +501,8 @@ struct InputToml {
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
+    /// MAN-309: `run` records this input's IQ here.
+    record_iq: Option<PathBuf>,
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -542,6 +566,8 @@ pub(crate) struct SharedInput {
     pub center_freq_hz: Option<f64>,
     pub capture_rate_hz: Option<f64>,
     pub replay_epoch: Option<i64>,
+    /// MAN-309: `run` records this input's IQ to this path.
+    pub record_iq: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -556,6 +582,10 @@ pub(crate) enum SourceFromFile {
         iq: bool,
         realtime: bool,
         looped: bool,
+        /// MAN-309: `iq_format`/`sample_rate_hz` -- a headerless IQ file
+        /// in this layout at this stored rate, centred on
+        /// `input.center_freq_hz`. `None`: a WAV or a manta recording.
+        raw: Option<(manta_input::RawIqFormat, f64)>,
     },
     Kiwi {
         host: String,
@@ -682,6 +712,15 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             }
         }
     }
+    let skimmer_relay = take_relays::<SkimmerRelayConfig>(&doc, "skimmer_relay", &origin)?;
+    let wsjtx_relay = take_relays::<WsjtxRelayConfig>(&doc, "wsjtx_relay", &origin)?;
+    check_relays(
+        &origin,
+        server.as_ref(),
+        &rbn_uplink,
+        &skimmer_relay,
+        &wsjtx_relay,
+    )?;
     let mut notes = Vec::new();
     let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
     if let Some(rc) = &rbn_compare {
@@ -749,7 +788,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         Some(toml::Value::Array(entries)) if !entries.is_empty() => take_input_array(
             entries,
             &origin,
-            &|p| resolve_path("input", "path", p),
+            &|key, p| resolve_path("input", key, p),
             &mut notes,
         )?,
         _ => {
@@ -762,8 +801,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
                 }
                 None => input_toml.kind.map_or("audio", InputKind::name).to_string(),
             };
-            let (inputs, entry_notes) = take_entry(input_toml, name, None, "[input]", &|p| {
-                resolve_path("input", "path", p)
+            let (inputs, entry_notes) = take_entry(input_toml, name, None, "[input]", &|key, p| {
+                resolve_path("input", key, p)
             })
             .map_err(|e| anyhow!("{origin}: [input]: {e}{}", overlay.suffix("input")))?;
             notes.extend(entry_notes);
@@ -792,6 +831,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         server,
         rbn_uplink,
         rbn_compare,
+        skimmer_relay,
+        wsjtx_relay,
         callsign_lookup,
         decode,
         detector,
@@ -824,7 +865,7 @@ fn known_tables_list() -> String {
     KNOWN_TABLES
         .iter()
         .map(|t| match *t {
-            "rbn_uplink" => format!("[[{t}]]"),
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" => format!("[[{t}]]"),
             _ => format!("[{t}]"),
         })
         .collect::<Vec<_>>()
@@ -866,9 +907,9 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
             );
         }
         match (key.as_str(), value) {
-            ("rbn_uplink", toml::Value::Array(_)) => {}
-            ("rbn_uplink", _) => {
-                bail!("{origin}: rbn_uplink must be written [[rbn_uplink]] (an array of tables)")
+            ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay", toml::Value::Array(_)) => {}
+            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay"), _) => {
+                bail!("{origin}: {name} must be written [[{name}]] (an array of tables)")
             }
             // MAN-13: several receivers, one entry each.
             ("input", toml::Value::Array(_)) => {}
@@ -922,6 +963,85 @@ fn take_typed<T: serde::de::DeserializeOwned>(
         .try_into::<T>()
         .map(Some)
         .map_err(|e| anyhow!("{origin}: [{table}]: {e}{}", overlay.suffix(table)))
+}
+
+/// MAN-320: a `[[skimmer_relay]]`/`[[wsjtx_relay]]` array, typed, as
+/// `take_uplinks` reads `[[rbn_uplink]]`.
+fn take_relays<T: serde::de::DeserializeOwned>(
+    doc: &toml::Table,
+    table: &str,
+    origin: &str,
+) -> Result<Vec<T>> {
+    let Some(value) = doc.get(table) else {
+        return Ok(Vec::new());
+    };
+    value
+        .clone()
+        .try_into::<Vec<T>>()
+        .map_err(|e| anyhow!("{origin}: [[{table}]]: {e}"))
+}
+
+/// MAN-320 (D3/D12): the cross-table rules for both relay tables.
+fn check_relays(
+    origin: &str,
+    server: Option<&ServerConfig>,
+    rbn_uplink: &[RbnUplinkConfig],
+    skimmer_relay: &[SkimmerRelayConfig],
+    wsjtx_relay: &[WsjtxRelayConfig],
+) -> Result<()> {
+    for r in skimmer_relay {
+        r.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+    }
+    for r in wsjtx_relay {
+        r.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+    }
+    let uplink_on = server.is_some() && rbn_uplink.iter().any(|u| u.enabled);
+    let needs_uplink = |table: &str, label: &str| {
+        anyhow!(
+            "{origin}: [[{table}]] {label} forwards spots only through [[rbn_uplink]] -- add an \
+             enabled [[rbn_uplink]] block, or set enabled = false on this relay"
+        )
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for r in skimmer_relay {
+        let label = r.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[skimmer_relay]] {label} is listed twice");
+        }
+        if r.enabled && !uplink_on {
+            return Err(needs_uplink("skimmer_relay", &label));
+        }
+        if let Some(server) = server {
+            let own = std::iter::once(server.station_callsign.as_str()).chain(
+                rbn_uplink
+                    .iter()
+                    .filter_map(|u| u.login_callsign.as_deref()),
+            );
+            for call in own {
+                if call.eq_ignore_ascii_case(&r.callsign) {
+                    bail!(
+                        "{origin}: [[skimmer_relay]] {label} has callsign = \"{}\", this \
+                         station's own call -- a skimmer relay forwards another skimmer's spots \
+                         under that skimmer's own call (e.g. \"{}-2\"); manta already forwards \
+                         its own",
+                        r.callsign,
+                        manta_server::config::strip_ssid(&r.callsign),
+                    );
+                }
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for r in wsjtx_relay {
+        let label = r.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[wsjtx_relay]] {label} is listed twice");
+        }
+        if r.enabled && !uplink_on {
+            return Err(needs_uplink("wsjtx_relay", &label));
+        }
+    }
+    Ok(())
 }
 
 fn take_uplinks(doc: &toml::Table, origin: &str) -> Result<Vec<RbnUplinkConfig>> {
@@ -1013,11 +1133,12 @@ fn check_input_name(name: &str) -> Result<()> {
 }
 
 /// MAN-13: `[[input]]` with two or more entries: each typed, named and
-/// validated like `[input]`, then the cross-entry rules.
+/// validated like `[input]`, then the cross-entry rules. `load()` has
+/// already turned a one-entry array into `[input]` (MAN-393).
 fn take_input_array(
     entries: &[toml::Value],
     origin: &str,
-    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
     notes: &mut Vec<String>,
 ) -> Result<Vec<NamedInput>> {
     if entries.len() > manta_engine::MAX_INPUTS {
@@ -1216,7 +1337,7 @@ fn take_entry(
     name: String,
     entry: Option<String>,
     section: &str,
-    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<(Vec<NamedInput>, Vec<String>), String> {
     use manta_server::band_plan;
     check_input_keys(&t)?;
@@ -1303,6 +1424,15 @@ fn take_entry(
         return Err(format!(
             "input.bands plans {} ({}), but input.center_freq_hz fixes one centre for all of \
              them; drop center_freq_hz, or list bands that fit one stream",
+            band_plan::count_streams(n),
+            plan.band_list()
+        ));
+    }
+    // MAN-309: one recording file holds one stream's IQ.
+    if n > 1 && t.record_iq.is_some() {
+        return Err(format!(
+            "input.bands plans {} ({}), but input.record_iq names one file for all of them; \
+             drop record_iq, or list bands that fit one stream",
             band_plan::count_streams(n),
             plan.band_list()
         ));
@@ -1464,6 +1594,31 @@ fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
     Ok(())
 }
 
+/// MAN-309: `input.iq_format` and `input.sample_rate_hz` describe a
+/// headerless IQ file together, and only an IQ one (`iq = true`). Its centre
+/// is `input.center_freq_hz` or `--dial-freq-hz`, checked once merged.
+fn raw_iq(t: &InputToml) -> std::result::Result<Option<(manta_input::RawIqFormat, f64)>, String> {
+    let (format, rate) = match (&t.iq_format, t.sample_rate_hz) {
+        (None, None) => return Ok(None),
+        (Some(format), Some(rate)) => (format, rate),
+        (Some(_), None) => return Err("input.iq_format needs input.sample_rate_hz".to_string()),
+        (None, Some(_)) => return Err("input.sample_rate_hz needs input.iq_format".to_string()),
+    };
+    if t.iq != Some(true) {
+        return Err("input.iq_format needs input.iq = true".to_string());
+    }
+    let format = format
+        .parse::<manta_input::RawIqFormat>()
+        .map_err(|e| format!("input.iq_format: {e}"))?;
+    if !rate.is_finite() || rate <= 0.0 || rate > manta_input::MAX_IQ_WAV_RATE_HZ {
+        return Err(format!(
+            "input.sample_rate_hz must be above 0 and at most {} Hz, got {rate}",
+            manta_input::MAX_IQ_WAV_RATE_HZ as u64
+        ));
+    }
+    Ok(Some((format, rate)))
+}
+
 fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
         "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
@@ -1474,7 +1629,7 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
 
 fn validate_input(
     t: InputToml,
-    resolve_path: &dyn Fn(PathBuf) -> PathBuf,
+    resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
         freq_correction_ppm: t
@@ -1493,6 +1648,7 @@ fn validate_input(
             .replay_epoch
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
+        record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
     };
     check_input_keys(&t)?;
     let Some(kind) = t.kind else {
@@ -1523,10 +1679,11 @@ fn validate_input(
             device: t.device.clone(),
         },
         InputKind::File => SourceFromFile::File {
-            path: resolve_path(req(t.path.clone(), "path", name)?),
+            path: resolve_path("path", req(t.path.clone(), "path", name)?),
             iq: t.iq.unwrap_or(false),
             realtime: t.realtime.unwrap_or(false),
             looped: t.looped.unwrap_or(false),
+            raw: raw_iq(&t)?,
         },
         InputKind::Kiwi => SourceFromFile::Kiwi {
             port: port(8073)?,
@@ -1593,13 +1750,15 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 20] = [
+    let set: [(&str, bool); 22] = [
         ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
         ("iq", t.iq.is_some()),
         ("realtime", t.realtime.is_some()),
         ("loop", t.looped.is_some()),
+        ("iq_format", t.iq_format.is_some()),
+        ("sample_rate_hz", t.sample_rate_hz.is_some()),
         ("host", t.host.is_some()),
         ("mac", t.mac.is_some()),
         ("port", t.port.is_some()),
@@ -1675,6 +1834,16 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         if rest.starts_with("RBN_UPLINK_") {
             bail!("{name}: [[rbn_uplink]] cannot be set from the environment; use the config file");
         }
+        for (prefix, table) in [
+            ("SKIMMER_RELAY_", "skimmer_relay"),
+            ("WSJTX_RELAY_", "wsjtx_relay"),
+        ] {
+            if rest.starts_with(prefix) {
+                bail!(
+                    "{name}: [[{table}]] cannot be set from the environment; use the config file"
+                );
+            }
+        }
         let Some((table, key)) = ENV_TABLES.iter().find_map(|(prefix, table)| {
             rest.strip_prefix(prefix)
                 .filter(|k| !k.is_empty())
@@ -1711,6 +1880,8 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
     }
 
     // MAN-13: one variable cannot say which of several receivers it sets.
+    // `load()` turned a one-entry `[[input]]` into the table before this
+    // point, so an array of tables here has two or more entries (MAN-393).
     if let Some(toml::Value::Array(inputs)) = doc.get("input") {
         if let Some((name, _, key, _)) = entries.iter().find(|(_, table, _, _)| *table == "input") {
             bail!(
@@ -1869,6 +2040,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.inputs.len(), 1);
+    }
+
+    #[test]
+    fn a_multi_stream_plan_refuses_one_recording_file() {
+        // MAN-309: every generated stream would otherwise record to the
+        // same destination.
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"60m\"]\n\
+             record_iq = \"s.cf32\"\n",
+        );
+        assert!(
+            err.contains("input.record_iq names one file for all of them"),
+            "{err}"
+        );
+        // One stream keeps its recording.
+        let l = load_file(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"7030\"]\n\
+             record_iq = \"s.cf32\"\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert!(l.inputs[0].input.shared.record_iq.is_some());
     }
 
     #[test]
@@ -2081,6 +2274,28 @@ mod tests {
         assert_eq!(array.input, table.input);
         assert_eq!(array.inputs, table.inputs);
         assert_eq!(array.inputs[0].name, "audio");
+    }
+
+    #[test]
+    fn a_named_one_entry_audio_input_array_needs_no_center_freq_hz() {
+        let array = load_file("[[input]]\nname = \"rig\"\ntype = \"audio\"\n").unwrap();
+        let table = load_file("[input]\nname = \"rig\"\ntype = \"audio\"\n").unwrap();
+        assert_eq!(array.inputs, table.inputs);
+        assert_eq!(array.inputs[0].name, "rig");
+        assert_eq!(array.inputs[0].input.shared.center_freq_hz, None);
+    }
+
+    #[test]
+    fn manta_input_env_applies_to_a_one_entry_input_array() {
+        let v = vars(&[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.25")]);
+        let f = write_cfg("[[input]]\ntype = \"audio\"\nfreq_correction_ppm = 0.5\n");
+        let l = load(Some(f.path()), Env::Read(&v)).unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert_eq!(l.inputs[0].input.shared.freq_correction_ppm, Some(1.25));
+        assert_eq!(
+            l.env_vars,
+            vec!["MANTA_INPUT_FREQ_CORRECTION_PPM".to_string()]
+        );
     }
 
     #[test]
@@ -2334,6 +2549,13 @@ mod tests {
             "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 3 [[input]] entries it \
              sets; set freq_correction_ppm in that entry instead"
         );
+        let two = write_cfg(&format!("{KA9Q_40}{KA9Q_20}"));
+        let err = format!("{:#}", load(Some(two.path()), Env::Read(&v)).unwrap_err());
+        assert_eq!(
+            err,
+            "MANTA_INPUT_FREQ_CORRECTION_PPM cannot say which of the 2 [[input]] entries it \
+             sets; set freq_correction_ppm in that entry instead"
+        );
     }
 
     #[test]
@@ -2356,6 +2578,182 @@ mod tests {
              14030000.0\nssrc = 5\n"
         ));
         assert!(err.contains(": [[input]] \"b\": input.ssrc"), "{err}");
+    }
+
+    // ---- MAN-320: [[skimmer_relay]] / [[wsjtx_relay]]
+
+    const UPLINK_ON: &str =
+        "[[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 7550\n";
+    const SKIMMER: &str =
+        "[[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1AW-2\"\n";
+    const WSJTX: &str = "[[wsjtx_relay]]\ncallsign = \"W1AW\"\n";
+
+    #[test]
+    fn load_accepts_both_relay_tables() {
+        let loaded = load_file(&format!("{SERVER}{UPLINK_ON}{SKIMMER}{WSJTX}")).unwrap();
+        assert_eq!(loaded.skimmer_relay.len(), 1);
+        assert_eq!(loaded.wsjtx_relay.len(), 1);
+        assert_eq!(loaded.skimmer_relay[0].callsign, "W1AW-2");
+        assert_eq!(loaded.wsjtx_relay[0].label(), "127.0.0.1:2237");
+    }
+
+    #[test]
+    fn an_enabled_relay_without_an_enabled_uplink_is_rejected() {
+        let uplink_off = UPLINK_ON.replace("enabled = true", "enabled = false");
+        for uplink in ["", uplink_off.as_str()] {
+            let err = err_of(&format!("{SERVER}{uplink}{SKIMMER}"));
+            assert!(
+                err.ends_with(
+                    ": [[skimmer_relay]] 192.168.1.20:7300 forwards spots only through \
+                     [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = \
+                     false on this relay"
+                ),
+                "{err}"
+            );
+            let err = err_of(&format!("{SERVER}{uplink}{WSJTX}"));
+            assert!(
+                err.ends_with(
+                    ": [[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through \
+                     [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = \
+                     false on this relay"
+                ),
+                "{err}"
+            );
+        }
+        // Without [server] either.
+        let err = err_of(WSJTX);
+        assert!(
+            err.contains("forwards spots only through [[rbn_uplink]]"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_disabled_relay_without_an_uplink_loads() {
+        let loaded = load_file(&format!(
+            "{}{}",
+            SKIMMER.replace("callsign", "enabled = false\ncallsign"),
+            WSJTX.replace("callsign", "enabled = false\ncallsign"),
+        ))
+        .unwrap();
+        assert!(!loaded.skimmer_relay[0].enabled);
+        assert!(!loaded.wsjtx_relay[0].enabled);
+    }
+
+    #[test]
+    fn a_skimmer_relay_may_not_use_the_station_call_or_an_uplink_login_call() {
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("W1AW-2", "w1aw")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[skimmer_relay]] 192.168.1.20:7300 has callsign = \"W1AW\", this station's \
+                 own call -- a skimmer relay forwards another skimmer's spots under that \
+                 skimmer's own call (e.g. \"W1AW-2\"); manta already forwards its own"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}login_callsign = \"W1AW-5\"\n{}",
+            SKIMMER.replace("W1AW-2", "W1AW-5")
+        ));
+        assert!(
+            err.contains("has callsign = \"W1AW-5\", this station's own call"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_wsjtx_relay_may_use_the_station_call() {
+        let loaded = load_file(&format!("{SERVER}{UPLINK_ON}{WSJTX}")).unwrap();
+        assert_eq!(loaded.wsjtx_relay[0].callsign, "W1AW");
+    }
+
+    #[test]
+    fn duplicate_relays_are_rejected() {
+        let err = err_of(&format!("{SERVER}{UPLINK_ON}{SKIMMER}{SKIMMER}"));
+        assert!(
+            err.ends_with(": [[skimmer_relay]] 192.168.1.20:7300 is listed twice"),
+            "{err}"
+        );
+        let err = err_of(&format!("{SERVER}{UPLINK_ON}{WSJTX}{WSJTX}"));
+        assert!(
+            err.ends_with(": [[wsjtx_relay]] 127.0.0.1:2237 is listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_tables_must_be_arrays() {
+        let err = err_of(&format!(
+            "{SERVER}[skimmer_relay]\nhost = \"h\"\nport = 1\ncallsign = \"W1AW-2\"\n"
+        ));
+        assert!(
+            err.ends_with(": skimmer_relay must be written [[skimmer_relay]] (an array of tables)"),
+            "{err}"
+        );
+        let err = err_of(&format!("{SERVER}[wsjtx_relay]\ncallsign = \"W1AW\"\n"));
+        assert!(
+            err.ends_with(": wsjtx_relay must be written [[wsjtx_relay]] (an array of tables)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_table_message_lists_the_relay_tables() {
+        let err = err_of("[relay_source]\nx = 1\n");
+        assert!(
+            err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_field_errors_name_the_table() {
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("W1AW-2", "W1AW-100")
+        ));
+        assert!(
+            err.contains(
+                ": [[skimmer_relay]]: callsign \"W1AW-100\" is not a plausible callsign (an \
+                 SSID must be -1 through -99)"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}{}",
+            SKIMMER.replace("192.168.1.20", "<skimmer-host>")
+        ));
+        assert!(
+            err.ends_with(
+                ": [[skimmer_relay]]: host \"<skimmer-host>\" is the scaffold placeholder -- set \
+                 the skimmer's host name or address"
+            ),
+            "{err}"
+        );
+        let err = err_of(&format!(
+            "{SERVER}{UPLINK_ON}[[wsjtx_relay]]\ncallsign = \"W1AW\"\nlisten = \"[ff02::1]:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_relay]]: listen \"[ff02::1]:2237\" is an IPv6 multicast group -- use \
+                 an IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_tables_cannot_be_set_from_env() {
+        for var in ["MANTA_SKIMMER_RELAY_HOST", "MANTA_WSJTX_RELAY_LISTEN"] {
+            let err = format!("{:#}", load_env(None, &[(var, "x")]).unwrap_err());
+            assert!(
+                err.contains("cannot be set from the environment; use the config file"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -3257,6 +3655,7 @@ mod tests {
                 iq: false,
                 realtime: false,
                 looped: false,
+                raw: None,
             })
         );
     }
@@ -3361,6 +3760,7 @@ mod tests {
                 iq: true,
                 realtime: false,
                 looped: false,
+                raw: None,
             })
         );
     }
@@ -3383,6 +3783,7 @@ mod tests {
                 iq: false,
                 realtime: true,
                 looped: true,
+                raw: None,
             })
         );
         let err = err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nloop = true\n");
@@ -3413,7 +3814,72 @@ mod tests {
                 iq: false,
                 realtime: false,
                 looped: true,
+                raw: None,
             })
+        );
+    }
+
+    /// MAN-309: `iq_format`/`sample_rate_hz` describe a headerless IQ file
+    /// together, on an IQ file input only, and the environment's
+    /// `MANTA_INPUT_IQ_FORMAT` is a string.
+    #[test]
+    fn headerless_iq_keys_are_validated_together() {
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "file"),
+                ("MANTA_INPUT_PATH", "x.ci16"),
+                ("MANTA_INPUT_IQ", "true"),
+                ("MANTA_INPUT_IQ_FORMAT", "ci16"),
+                ("MANTA_INPUT_SAMPLE_RATE_HZ", "96000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.source,
+            Some(SourceFromFile::File {
+                path: PathBuf::from("x.ci16"),
+                iq: true,
+                realtime: false,
+                looped: false,
+                raw: Some((manta_input::RawIqFormat::Ci16, 96_000.0)),
+            })
+        );
+        let file = "[input]\ntype = \"file\"\npath = \"x.cf32\"\n";
+        for (extra, want) in [
+            (
+                "iq = true\niq_format = \"cf32\"\n",
+                "input.iq_format needs input.sample_rate_hz",
+            ),
+            (
+                "iq = true\nsample_rate_hz = 96000\n",
+                "input.sample_rate_hz needs input.iq_format",
+            ),
+            (
+                "iq_format = \"cf32\"\nsample_rate_hz = 96000\n",
+                "input.iq_format needs input.iq = true",
+            ),
+            (
+                "iq = true\niq_format = \"cs8\"\nsample_rate_hz = 96000\n",
+                "unknown IQ format `cs8`; expected cf32 or ci16",
+            ),
+            (
+                "iq = true\niq_format = \"cf32\"\nsample_rate_hz = 0\n",
+                "input.sample_rate_hz must be above 0 and at most 10000000 Hz",
+            ),
+            (
+                "iq = true\niq_format = \"cf32\"\nsample_rate_hz = 2e7\n",
+                "input.sample_rate_hz must be above 0 and at most 10000000 Hz",
+            ),
+        ] {
+            let err = err_of(&format!("{file}{extra}"));
+            assert!(err.contains(want), "{extra}: {err}");
+        }
+        let err =
+            err_of("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\niq_format = \"cf32\"\n");
+        assert!(
+            err.contains("input.iq_format does not apply to input.type = \"kiwi\""),
+            "{err}"
         );
     }
 
@@ -3566,6 +4032,7 @@ mod tests {
                 iq: false,
                 realtime: false,
                 looped: false,
+                raw: None,
             })
         );
         assert_eq!(loaded.input.shared.freq_correction_ppm, None);
@@ -3778,8 +4245,8 @@ mod tests {
         let err = err_of("[telemetry]\nx = 1\n");
         assert!(
             err.ends_with(
-                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [callsign_lookup], \
-                 [input], [spot], [detector], [decode]"
+                "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [[skimmer_relay]], \
+                 [[wsjtx_relay]], [callsign_lookup], [input], [spot], [detector], [decode]"
             ),
             "{err}"
         );

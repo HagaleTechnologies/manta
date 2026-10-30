@@ -1000,7 +1000,10 @@ impl ClassStats {
 
 /// One class's learned duration: mean and variance in dits, and how many
 /// observations they rest on. SPEC §4.1b / §5 `TimingUpdate`.
+///
+/// JSON keys are camelCase (`meanDits`, `varDits2`, MAN-139).
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClassEstimate {
     pub mean_dits: f32,
     pub var_dits2: f32,
@@ -1010,8 +1013,10 @@ pub struct ClassEstimate {
 /// A track's five learned duration classes, in dits of `dit_ms` (the
 /// symmetric dit period `SpeedTracker::dit_estimate_ms`, the one WPM is
 /// reported from). `None` for a class with no observations yet. SPEC §5
-/// `TimingUpdate` (MAN-315 D8).
+/// `TimingUpdate` (MAN-315 D8). JSON keys are camelCase (`ditMs`,
+/// `elementGap`, …, MAN-139).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TimingEstimates {
     pub dit_ms: f32,
     pub dot: Option<ClassEstimate>,

@@ -161,6 +161,35 @@ station_callsign = "N0CALL"
 #exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
 
 
+# --- Relay another skimmer's spots ---------------------------------------------
+# Forwards the spots of another CW skimmer on your network (CW Skimmer,
+# SkimSrv or a second manta) through [[rbn_uplink]], under that skimmer's own
+# call. Only lines the skimmer spotted under `callsign` are forwarded. Needs an
+# enabled [[rbn_uplink]]; the uplink's dry_run, spot_types and
+# max_spots_per_minute apply. Restart-only. Repeat the block per skimmer.
+
+#[[skimmer_relay]]
+
+#host = "<skimmer-host>"              # no default: the skimmer's host name or address
+#port = 7300                          # no default: the skimmer's telnet port
+#callsign = "N0CALL-2"                # no default: the call that skimmer spots under
+#enabled = true                       # false keeps the block but does not connect
+
+
+# --- Relay WSJT-X FT8/FT4 decodes ----------------------------------------------
+# Listens for WSJT-X/JTDX decodes by UDP (in WSJT-X: Settings > Reporting >
+# UDP Server) and forwards new FT8/FT4 CQ decodes through [[rbn_uplink]] as
+# digital spots. Anything that can send to `listen` can put spots on the
+# uplink under `callsign`, so keep it on 127.0.0.1 unless WSJT-X runs
+# elsewhere. Needs an enabled [[rbn_uplink]]. Restart-only.
+
+#[[wsjtx_relay]]
+
+#callsign = "N0CALL"                  # no default: the call these spots go out under
+#listen = "127.0.0.1:2237"            # WSJT-X's default UDP server; or a multicast group such as 224.0.0.1:2237
+#enabled = true                       # false keeps the block but does not listen
+
+
 # --- Callsign lookup (QRZ.com) ------------------------------------------------
 # Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
 # spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
@@ -202,6 +231,8 @@ station_callsign = "N0CALL"
 #iq = false                          # true for a two-channel IQ recording, not mono audio
 #realtime = false                    # true to replay at the recording's own pace, so clients can watch (run only)
 #loop = false                        # true to replay again from the start each time it ends; implies realtime (run only)
+#iq_format = "cf32"                  # headerless little-endian IQ, cf32 or ci16 (needs iq = true and center_freq_hz); omit for WAV or a manta recording
+#sample_rate_hz = 96000              # the headerless file's stored sample rate, with iq_format
 
 # type = "kiwi", a KiwiSDR web receiver, and type = "hpsdr", an
 # HPSDR/Hermes radio (both inputs are included in every build):
@@ -250,6 +281,11 @@ station_callsign = "N0CALL"
 # WAV replay only: the time, in Unix seconds, that the recording's first
 # sample stands for. No default: the file's modification time.
 #replay_epoch = 1700000000
+
+# `manta run` only: record this input's IQ while decoding, as little-endian
+# complex float32 plus FILE.meta.jsonl. Existing files are never
+# overwritten, so a restart needs a new name. No default: no recording.
+#record_iq = "captures/session.cf32"
 
 
 # --- Spot filters ------------------------------------------------------------

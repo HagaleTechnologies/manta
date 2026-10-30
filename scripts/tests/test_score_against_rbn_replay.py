@@ -159,8 +159,8 @@ class ReplayTest(unittest.TestCase):
     def test_positional_decode_report_mode_still_parses(self):
         report = os.path.join(self.tmp, "report.json")
         with open(report, "w") as f:
-            json.dump({"spots": [{"callsign": "W1AW", "freq_hz": 14025000.0, "sample_ts": 3840000,
-                                  "snr_db": 20.0, "confidence": 0.9, "spot_type": "CQ"}]}, f)
+            json.dump({"spots": [{"dxCall": "W1AW", "frequency": 14025000.0, "sampleTs": 3840000,
+                                  "snr": 20.0, "decodeConfidence": 0.9, "spotType": "cq"}]}, f)
         csv_path = os.path.join(self.tmp, "truth.csv")
         with open(csv_path, "w") as f:
             f.write(CSV.replace("2026-10-11 12:00:20", "2026-10-11 12:00:00"))

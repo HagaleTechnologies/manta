@@ -60,6 +60,7 @@ use manta_server::bus::SpotBus;
 use manta_server::config::{RbnUplinkConfig, UplinkSpotTypes};
 use manta_server::metrics::Metrics;
 use manta_server::rbn;
+use manta_server::relay::{RelayMode, RelaySpot};
 use manta_spot::{Spot, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1182,5 +1183,193 @@ async fn the_uplink_session_bytes_match_the_man90_reference() {
         .unwrap();
     assert_eq!(line, MAN90_REFERENCE_SPOT);
 
+    let _ = harness.shutdown_tx.send(true);
+}
+
+// MAN-320 acceptance scenario (the uplink half of Scenario 1):
+//   Scenario: A second skimmer's spots reach RBN under its own call
+//     Given manta's uplink is connected and logged in as its own call
+//     When a relay publishes a spot another local skimmer made
+//     Then the uplink forwards it under that skimmer's call, not the login
+//     And the uplink's spot_types, dry_run and ceiling apply to it (D6)
+
+fn relay_spot(spotter: &str, call: &str, mode: RelayMode, spot_type: SpotType) -> RelaySpot {
+    RelaySpot {
+        spotter: Arc::from(spotter),
+        callsign: call.to_string(),
+        freq_hz: 14_027_100.0,
+        mode,
+        snr_db: 30,
+        spot_type,
+        unix_ts: 1_700_000_000,
+    }
+}
+
+fn cw_relay(call: &str, spot_type: SpotType) -> RelaySpot {
+    relay_spot("W3XYZ-2", call, RelayMode::Cw { wpm: 28 }, spot_type)
+}
+
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !done() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_relayed_spot_goes_out_under_its_own_spotter_not_the_login_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+    let (login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    assert_eq!(login_line.trim_end(), STATION_CALL);
+
+    let spot = cw_relay("JA1ABC", SpotType::Cq);
+    let expected = rbn::format_relay_line(&spot);
+    assert!(harness.bus.publish_relay(spot));
+    let line = read_forwarded_line(&mut reader).await;
+    assert_eq!(line, expected);
+    assert!(line.starts_with("DX de W3XYZ-2-#:"), "{line}");
+    assert_eq!(harness.metrics.uplink_sent_total(), 1);
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn a_relayed_ft8_cq_is_forwarded_as_a_digital_line() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+    let (_login, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    harness
+        .bus
+        .publish_relay(relay_spot("W3XYZ", "K2DEF", RelayMode::Ft8, SpotType::Cq));
+    let line = read_forwarded_line(&mut reader).await;
+    assert!(line.starts_with("DX de W3XYZ-#:"), "{line}");
+    assert!(line.contains(" FT8 "), "{line}");
+    assert!(!line.contains("WPM"), "{line}");
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn dry_run_holds_back_relayed_spots() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), true);
+    let (_login, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    harness.bus.publish_relay(cw_relay("JA1ABC", SpotType::Cq));
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(result.is_err(), "dry-run must not transmit, got: {line:?}");
+    assert_eq!(harness.metrics.uplink_sent_total(), 0);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 1);
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn the_default_spot_types_filter_applies_to_relayed_spots() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+    let (_login, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    let spots = [
+        cw_relay("JA1DE", SpotType::De),
+        cw_relay("JA1UNK", SpotType::Unknown),
+        cw_relay("JA1CQ", SpotType::Cq),
+        cw_relay("JA1BCN", SpotType::Beacon),
+    ];
+    let expected: Vec<String> = spots[2..].iter().map(rbn::format_relay_line).collect();
+    for spot in spots {
+        harness.bus.publish_relay(spot);
+    }
+    let received = vec![
+        read_forwarded_line(&mut reader).await,
+        read_forwarded_line(&mut reader).await,
+    ];
+    assert_eq!(received, expected);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 2);
+    assert_eq!(harness.metrics.uplink_sent_total(), 2);
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn relayed_and_own_spots_share_one_ceiling() {
+    use manta_server::metrics::UplinkHealth;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = uplink_config(listener.local_addr().unwrap().port(), false);
+    cfg.max_spots_per_minute = 2;
+    let harness = spawn_uplinks(vec![cfg]);
+    let (_login, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    // Own, relay, own, one at a time: the two channels are read by one
+    // select!, so only a read-back pins the order.
+    harness.bus.publish(sample_spot());
+    read_forwarded_line(&mut reader).await;
+    let relay = cw_relay("JA1REL", SpotType::Cq);
+    let expected_relay = rbn::format_relay_line(&relay);
+    harness.bus.publish_relay(relay);
+    assert_eq!(read_forwarded_line(&mut reader).await, expected_relay);
+    harness.bus.publish(Spot {
+        callsign: "JA1OVER".to_string(),
+        ..sample_spot()
+    });
+    wait_for("the third spot to be ceiling-suppressed", || {
+        harness.metrics.uplink_ceiling_suppressed_total() == 1
+    })
+    .await;
+    assert_eq!(harness.metrics.uplink_sent_total(), 2);
+    assert_eq!(harness.metrics.uplink_reconnects_total(), 0);
+    assert_eq!(
+        harness.metrics.uplink_snapshot()[0].health,
+        UplinkHealth::Connected
+    );
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn own_spots_are_unchanged_when_relayed_spots_flow() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplink(listener.local_addr().unwrap().port(), false);
+    let (_login, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+
+    for i in 0..3 {
+        let own = Spot {
+            callsign: format!("JA1OWN{i}"),
+            ..sample_spot()
+        };
+        let expected_own = rbn::format_line(
+            &own,
+            STATION_CALL,
+            harness.bus.unix_ts_for(own.sample_ts),
+            rbn::LineFormat::Rbn,
+        );
+        harness.bus.publish(own);
+        assert_eq!(read_forwarded_line(&mut reader).await, expected_own);
+        let relay = cw_relay(&format!("JA1REL{i}"), SpotType::Cq);
+        let expected_relay = rbn::format_relay_line(&relay);
+        harness.bus.publish_relay(relay);
+        assert_eq!(read_forwarded_line(&mut reader).await, expected_relay);
+    }
+    assert_eq!(harness.metrics.uplink_sent_total(), 6);
+    let _ = harness.shutdown_tx.send(true);
+}
+
+#[tokio::test]
+async fn a_relayed_spot_reaches_every_target() {
+    let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let harness = spawn_uplinks(vec![
+        uplink_config(l1.local_addr().unwrap().port(), false),
+        uplink_config(l2.local_addr().unwrap().port(), false),
+    ]);
+    let (_a, mut r1, _w1) = mock_rbn_accept_and_login(&l1).await;
+    let (_b, mut r2, _w2) = mock_rbn_accept_and_login(&l2).await;
+
+    let spot = cw_relay("JA1ABC", SpotType::Cq);
+    let expected = rbn::format_relay_line(&spot);
+    harness.bus.publish_relay(spot);
+    assert_eq!(read_forwarded_line(&mut r1).await, expected);
+    assert_eq!(read_forwarded_line(&mut r2).await, expected);
     let _ = harness.shutdown_tx.send(true);
 }

@@ -51,13 +51,23 @@ const MAX_PENDING_BEACONS: usize = 8;
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
+///
+/// Serialized only by the CLI (`decode --json`'s `spots`, `run --json`'s
+/// `{"spot": …}`); field names follow the JSON spot stream (MAN-139,
+/// docs/CLI-JSON.md). manta-server builds its own `SpotMessage` instead.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Spot {
+    #[serde(rename = "dxCall")]
     pub callsign: String,
+    #[serde(rename = "frequency")]
     pub freq_hz: f64,
+    /// 2500 Hz-referenced; `snr` in JSON.
+    #[serde(rename = "snr")]
     pub snr_db: f32,
     pub wpm: f32,
     pub spot_type: SpotType,
+    #[serde(rename = "decodeConfidence")]
     pub confidence: f32,
     pub track_id: u32,
     pub sample_ts: u64,

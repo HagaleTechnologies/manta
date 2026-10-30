@@ -356,6 +356,10 @@ rejected with `unsupported sample rate …: fs/93.75 must be a power of two`.
 That list is examples, not the whole set: divide your own rate by 93.75,
 and it replays if the answer is a power of two of at least 4 and the rate
 is at most 10 MS/s.
+`--source-iq` also reads a manta IQ recording (`run --record-iq PATH`
+writes one while it decodes, from any input) and headerless cf32/ci16
+files given `--iq-format`, `--sample-rate-hz` and `--dial-freq-hz`; see
+[docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 `--capture-rate-hz` decimates by a power of two into a *lower* table rate
 (`--capture-rate-hz 48000` on a 192 kS/s capture, to spend less CPU on a
 narrower passband); it is not a general resampler and cannot rescue an
@@ -777,9 +781,11 @@ SIGINT or SIGTERM twice: the second ends manta at once, without the drain
 See [closed or stalled output](docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md).
 
 `decode` prints decoded text on stdout and a measurement summary on stderr.
-`run --json` and `decode --json` keep full-precision JSON on stdout. This
-terminal output is a debugging aid, not a stable interface — the servers above
-are. Human units, report streams and error conventions are defined in the
+`run --json` and `decode --json` keep full-precision JSON on stdout. Their
+fields, and those of `doctor --json`, are listed in
+[docs/CLI-JSON.md](docs/CLI-JSON.md). This terminal output is a debugging
+aid, not a stable interface — the servers above are. Human units, report
+streams and error conventions are defined in the
 [command output style decision](docs/DECISIONS/2026-10-10-man270-cli-output-style.md).
 
 The decode path is deterministic: the same file in produces byte-identical
@@ -827,6 +833,18 @@ The capture that would settle it is described in
 That is also why dry-run is the default. manta logs which mode each target is
 in at startup.
 
+The uplink can also carry the spots of your own other local decoders. A
+`[[skimmer_relay]]` block logs in to another CW skimmer on your network (CW
+Skimmer, SkimSrv or a second manta) by telnet and forwards the CW spots it
+makes under its own call, such as `W3XYZ-2`. A `[[wsjtx_relay]]` block
+listens for WSJT-X or JTDX decodes by UDP (in WSJT-X: Settings > Reporting >
+UDP Server) and forwards new FT8/FT4 CQ decodes as digital spots. Relayed
+spots go only to `[[rbn_uplink]]`, through its `dry_run`, `spot_types` and
+`max_spots_per_minute`; they never appear on manta's own telnet or JSON
+output. Both tables are described in [docs/CONFIG.md](docs/CONFIG.md), and the
+decision behind them in
+[docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md](docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md).
+
 ## Status
 
 **Pre-stability alpha, expect breakage.** manta has not cleared its own
@@ -871,11 +889,15 @@ criteria.
 
 - Not an interactive receiver or panadapter. Use SDR++ or similar for a
   waterfall.
-- Not a general digital-mode skimmer. FT8 and RTTY are out of scope for 1.0,
-  though the channelizer architecture does not preclude them later.
-  Decoding RTTY stays a non-goal for now; recognising it so that its tones
-  never become CW tracks is in scope (MAN-314).
-- Not a cluster network. `manta` is a spot source, not an aggregator.
+- Not a general digital-mode skimmer. manta decodes no FT8 or RTTY (FT8 and
+  RTTY decoding are out of scope for 1.0, though the channelizer
+  architecture does not preclude them later). It can forward WSJT-X's
+  FT8/FT4 CQ decodes through its uplink (MAN-320). Decoding RTTY stays a
+  non-goal for now; recognising it so that its tones never become CW tracks
+  is in scope (MAN-314).
+- Not a cluster network. `manta` relays its own spots, and those of the
+  operator's own local skimmers and WSJT-X (MAN-320), to RBN; it takes no
+  spots from other stations and serves no relayed spots to clients.
 - Not a logger. No QSO state.
 - Not a multi-process orchestrator. `manta` is a single Rust binary, not a
   stack of programs to sequence-launch.

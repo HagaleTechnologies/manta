@@ -97,6 +97,18 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-309: `manta run --record-iq PATH` (or `record_iq` in each `[input]`/
+  `[[input]]`) records the IQ it decodes, from any input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
+  centre, start time, source passband and guards, input gaps). `decode`
+  and `run --source PATH --source-iq` replay it to the same output on every
+  run, and both reproduce its input gaps: `decode` now closes its tracks
+  at each gap and continues on a fresh segment timed after the missing
+  samples. Both commands also read headerless cf32/ci16 files with
+  `--iq-format` and `--sample-rate-hz` (or `[input] iq_format`/
+  `sample_rate_hz`). Decoder output for existing gap-free WAV inputs is
+  unchanged; only sources that report gaps gain the segmented behaviour,
+  and a recording of rig audio keeps its analytic guard under `decode`. See
+  [docs/GUIDES/iq-recording.md](docs/GUIDES/iq-recording.md).
 - MAN-307: several HPSDR inputs can share one radio, with one independently
   tuned receiver per band, capacity probing for HL2, and an optional
   `receivers` declaration for other gateware. Each radio reconnects as a
@@ -145,7 +157,7 @@ the git history and `docs/DECISIONS/`.
 - MAN-272: each spot carries its track's latest RST (`5NN` read as `599`)
   and whether it sent `QRL?`, as CW Skimmer's band map shows. JSON spots
   gain `rst` (string or `null`) and `qrlQuery` (boolean), `run --json` and
-  `decode --json` spot objects gain `rst`/`qrl_query`, and the `SPOT:` line
+  `decode --json` spot objects gain `rst`/`qrlQuery`, and the `SPOT:` line
   ends with ` rst=599` and ` QRL?` when present. Telnet and the RBN uplink
   are unchanged. A track merge does not carry the losing track's values.
 - `manta-linux-x86_64-soapy.tar.gz`, a release archive whose binary has
@@ -163,13 +175,14 @@ the git history and `docs/DECISIONS/`.
 
 - MAN-235: `manta doctor --strict` exits 3 when no check failed but the
   verdict is not `DECODING`; without it every verdict still exits 0.
-- MAN-234: a `bad_samples` field in `decode --json`, `doctor --json` and
-  `calibrate --json` (omitted when 0); a `warning: … bad sample(s) …`
-  stderr line from `decode`, `calibrate` and `run`/`listen` (at the first
-  bad sample, plus a total at the end if more followed); an `input: N bad
-  sample(s) … replaced with silence` line in the `doctor` and `soak`
-  reports; and the `manta_input_bad_samples_total{source}` counter, at 0
-  from startup with a `[server]` table.
+- MAN-234: a `badSamples` field in `decode --json` and `doctor --json` and
+  a `bad_samples` field in `calibrate --json` (omitted when 0); a
+  `warning: … bad sample(s) …` stderr line from `decode`, `calibrate` and
+  `run`/`listen` (at the first bad sample, plus a total at the end if more
+  followed); an `input: N bad sample(s) … replaced with silence` line in
+  the `doctor` and `soak` reports; and the
+  `manta_input_bad_samples_total{source}` counter, at 0 from startup with
+  a `[server]` table.
 - MAN-315: a `TimingUpdate` event per track (each class's mean, variance
   and count, in dits), a top-level `timing` object in `decode --json`, and
   `manta decode --timing` for a `timing (dits, mean ± sd): …` stderr line.
@@ -198,8 +211,8 @@ the git history and `docs/DECISIONS/`.
 - `[detector] non_cw_filter` (default `true`) and `unkeyed_close_ms`
   (default 10000, at least 1000), also as `MANTA_DETECTOR_NON_CW_FILTER`/
   `MANTA_DETECTOR_UNKEYED_CLOSE_MS`; a `NOT_CW` verdict and a
-  `detector_confirmations` count in `manta doctor` for a band with signals
-  but no keyed CW (MAN-313).
+  `detectorConfirmations` count in `manta doctor --json` for a band with
+  signals but no keyed CW (MAN-313).
 - A Grafana dashboard (spot rate, active tracks, source health, per-target
   uplink status) and Prometheus alert rules (node down, node unhealthy, no
   spots for 30 minutes, uplink target down or flapping) for a node's
@@ -214,6 +227,29 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-139: **breaking for scripts that parse `--json`.**
+  `manta decode --json`, `manta run --json`/`listen --json` and
+  `manta doctor --json` name fields as the JSON spot stream does:
+  camelCase, with the stream's names for shared concepts. `freq_hz` is
+  `frequency`. The SNR is `snr` on events and spots (it was `snr_2500_db`
+  and `snr_db`) and `snrMin`/`snrMedian`/`snrMax` in doctor, still
+  2500 Hz-referenced. A spot's `callsign` is
+  `dxCall` and its `confidence` is `decodeConfidence`. `track_id`,
+  `sample_ts`, `spot_type` and the other snake_case keys are camelCase. A
+  glyph is its character or prosign token (`"A"`, `"<AR>"`) instead of
+  `{"Char":"A"}`; `closure` is `signalEnded` or `bookkeeping` beside
+  `survivorTrackId`; `spotType` is `cq`, `de`, `beacon` or `unknown`.
+  doctor's `duration` is `durationS`, a number of seconds; its verdict and
+  check statuses use the text report's spelling (`WEAK_NO_DECODE`, `PASS`);
+  `checks_status` is `checksStatus`. Event names and the `{"spot": …}`
+  wrapper are unchanged. Every field, and the old names, are in
+  `docs/CLI-JSON.md`; the scripts under `scripts/` read the new names, and
+  `examples/replay_spots.rs` needs a report regenerated with this build.
+  The JSON spot stream (`source` is still `"skimmer"`), the live-state
+  stream, telnet and the RBN uplink are unchanged.
+- MAN-249: `manta oracle --spotter` has no default and must name the
+  reference skimmer's callsign; without it `oracle` exits 2 with a usage
+  error.
 - MAN-319: a live `[[rbn_uplink]]` (`dry_run = false`) also needs
   `[server].operator_grid` set to a 6-character Maidenhead locator (e.g.
   `"FN03ab"`). `config check`, `run`, `doctor` and a SIGHUP reload refuse a
@@ -244,6 +280,20 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-343: `manta grade` reads each `--spots`/`--rbn` file once, however it
+  is named (directly and through its directory, with `./` or `..`, or
+  through a symlink). Before, a file named twice was graded twice, and a
+  partly duplicated RBN archive could move the modal frequency or median
+  WPM and flip a grade. A hard link is still a different file.
+- MAN-423: with a protocol-2 openHPSDR radio, decodes from just before a
+  lost datagram run are no longer stamped late by the lost samples (up to
+  ~11,900 samples, 62 ms, for 50 datagrams at 192 kS/s); only events at or
+  after the loss carry it, on both single- and multi-input runs and during
+  startup calibration. A protocol-2 receiver that sat unread while another
+  input opened, long enough for its socket buffer to overflow, now counts
+  the overflow as dropped datagrams and moves its clock by them, instead of
+  reading it as a radio restart of zero length that left later spots early
+  by the dropped span.
 - MAN-285: `manta status --json` now prints every field the daemon served,
   including fields newer than this build, with object keys in alphabetical
   order. The human-readable `manta status` summary and exit codes are unchanged.

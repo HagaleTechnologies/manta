@@ -118,8 +118,15 @@ The 6936.0, 6944.0, 6968.0, and 7064.0 kHz clusters sit well inside the
 6930-7120 kHz passband, not at either edge. The dial-shift test was
 never repeated against any of them, so grouping them under the same
 "passband-edge artifact" label is not established. Every 40m window
-used the same 7025 kHz center and 192 kS/s, so the 93.75 Hz channel
-boundaries sat at the same absolute frequencies in every window.
+ran 192 kS/s, so windows sharing a center shared one channel grid:
+the 7025 kHz windows' 93.75 Hz channel boundaries sat at the same
+absolute frequencies throughout, while the retuned 7075 kHz window's
+grid was shifted -- the 50 kHz move is 533 1/3 channels, a 31.25 Hz
+offset, so its boundaries sat at different absolute frequencies.
+6936.0, 6944.0 and 6968.0 kHz lie outside the retuned passband, so
+only 7025-centered windows can have produced them; 7064.0 kHz was
+in-band under either center, and the record does not log which
+window each cluster came from.
 Whether each interior cluster lies near one is untested here, and the
 0.1 kHz frequencies above are too coarse to tell. A cluster near a
 boundary would be closer to MAN-7/103's per-channel mechanism than the
@@ -184,10 +191,18 @@ track, `track_id` 5700 at 7076576 Hz, appeared in the final partial
 window right as the session was cut short for a band switch to 20m --
 zero characters decoded on that track before it was interrupted, so it's
 unresolved either way, not confirmed real or confirmed artifact). No
-track this session produced a callsign with non-floor confidence. These
-runs cannot say whether any track carried above-noise signal power,
-because the recorded `snr_2500_db` is rail contrast and the detector's
-S−F was not recorded.
+track this session produced a callsign with non-floor confidence. The
+recorded `snr_2500_db` is rail contrast and the detector's numeric
+S−F was not recorded, so no magnitude is recoverable -- but these
+runs are not silent on above-floor power. At the cited revision
+(`f48e980`) every `TrackPromoted` required the gate's EMA-smoothed
+channel power to hold at or above that channel's adaptive estimated
+floor + 12 dB for 19 consecutive hops (~51 ms at the 375 Hz hop
+rate), and a spot can only come from a promoted track -- so each
+emitted spot's track, and the ~1400 tracks per 40m window these runs
+already count, cleared that detector-estimated threshold. That is
+evidence of above-estimated-floor power at manta's detector, not
+proof of a genuine on-air signal and not an exact S−F.
 
 Same open question as 2026-09-08: antenna/feedline/band conditions vs.
 something else remains undiagnosable from software alone -- manta still
@@ -251,3 +266,8 @@ further.
 Revised 2026-10-23 for MAN-170 (deferred PR #151 review findings) to
 narrow claims the recorded data does not support. No reported
 measurement changed.
+
+Revised 2026-10-29 for MAN-437 (deferred PR #389 review findings)
+to make the center-frequency and above-floor statements consistent
+with the retune note above and with what the `TrackPromoted` gate
+proves at the cited revision. No reported measurement changed.

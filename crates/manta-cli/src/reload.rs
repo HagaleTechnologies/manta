@@ -798,6 +798,60 @@ blocklist_path = \"bl.txt\"
         assert!(f.ctx.lists.take().is_some());
     }
 
+    /// MAN-320 (D12): both relay tables are restart-only.
+    #[test]
+    fn relay_changes_need_a_restart() {
+        let old = table(
+            "[[skimmer_relay]]\nhost = 'h'\nport = 7300\ncallsign = 'W1ABC-2'\n\
+             [[wsjtx_relay]]\ncallsign = 'W1ABC'\nlisten = '127.0.0.1:2237'\n",
+        );
+        let new = table(
+            "[[skimmer_relay]]\nhost = 'h'\nport = 7300\ncallsign = 'W1ABC-3'\n\
+             [[wsjtx_relay]]\ncallsign = 'W1ABC'\nlisten = '127.0.0.1:2238'\n",
+        );
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["skimmer_relay[0].callsign", "wsjtx_relay[0].listen"]
+        );
+        let added = table(
+            "[[skimmer_relay]]\nhost = 'h'\nport = 7300\ncallsign = 'W1ABC-2'\n\
+             [[wsjtx_relay]]\ncallsign = 'W1ABC'\nlisten = '127.0.0.1:2237'\n\
+             [[wsjtx_relay]]\ncallsign = 'W1ABC'\nlisten = '224.0.0.1:2237'\n",
+        );
+        let changes = restart_only_changes(&old, &added);
+        assert!(
+            !changes.is_empty() && changes.iter().all(|p| p.starts_with("wsjtx_relay")),
+            "{changes:?}"
+        );
+    }
+
+    /// MAN-320: `dry_run_skipped` looks only at `rbn_uplink*` paths, so a
+    /// relay edit in the same reload does not hold back a dry-run flip.
+    #[test]
+    fn a_relay_change_does_not_block_a_dry_run_flip() {
+        let relay = |call: &str| {
+            format!(
+                "\n[[skimmer_relay]]\nhost = \"127.0.0.1\"\nport = 7300\ncallsign = \"{call}\"\n"
+            )
+        };
+        let f = start(
+            &format!("{BASE}{}{}", uplink_block(true, 7000), relay("W3XYZ-2")),
+            CliOverrides::none(),
+        );
+        write(
+            &f.path("manta.toml"),
+            &format!("{BASE}{}{}", uplink_block(false, 7000), relay("W3XYZ-3")),
+        );
+        let report = applied(&f.ctx);
+        assert_eq!(flags(&f.ctx), vec![false]);
+        assert!(!report.dry_run_skipped);
+        assert_eq!(
+            report.dry_run_changes,
+            vec![("127.0.0.1:7000".to_string(), false)]
+        );
+        assert_eq!(report.restart_needed, vec!["skimmer_relay[0].callsign"]);
+    }
+
     /// MAN-310: a band plan decides which streams are open, so it is
     /// restart-only like every other `input.*` key.
     #[test]

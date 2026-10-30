@@ -110,11 +110,11 @@ class WordAssemblyTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         path = os.path.join(tmp, "r.jsonl")
         with open(path, "w") as f:
-            for ev in ({"event": "CharDecoded", "track_id": 7, "sample_ts": 48000, "glyph": {"Char": "R"},
+            for ev in ({"event": "CharDecoded", "trackId": 7, "sampleTs": 48000, "glyph": "R",
                         "confidence": 1.0},
-                       {"event": "WordBoundary", "track_id": 7, "sample_ts": 96000},
-                       {"event": "TrackMeta", "track_id": 7, "sample_ts": 96000, "snr_2500_db": 0.0,
-                        "freq_hz": 655.0}):
+                       {"event": "WordBoundary", "trackId": 7, "sampleTs": 96000},
+                       {"event": "TrackMeta", "trackId": 7, "sampleTs": 96000, "snr": 0.0,
+                        "frequency": 655.0}):
                 f.write(json.dumps(ev) + "\n")
         (word,) = st.load_run(path, RATE)["words"]
         self.assertEqual((word["text"], word["pitch_hz"]), ("R", 655.0))
@@ -124,7 +124,7 @@ class WordAssemblyTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, tmp)
         path = os.path.join(tmp, "r.jsonl")
         with open(path, "w") as f:
-            f.write('{"event":"SpeedUpdate","track_id":1,"wpm":20}\nSPOT: W1AW\n')
+            f.write('{"event":"SpeedUpdate","trackId":1,"wpm":20}\nSPOT: W1AW\n')
         with self.assertRaisesRegex(ValueError, "r.jsonl:2:"):
             st.load_run(path, RATE)
 

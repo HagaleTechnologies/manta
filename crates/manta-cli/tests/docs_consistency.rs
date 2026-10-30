@@ -41,6 +41,21 @@ fn section<'a>(md: &'a str, heading: &str) -> &'a str {
     &rest[..end]
 }
 
+/// Text between a `### <heading>` and the next `### ` or `## ` heading.
+fn subsection<'a>(md: &'a str, heading: &str) -> &'a str {
+    let start = md
+        .find(&format!("\n### {heading}"))
+        .unwrap_or_else(|| panic!("no `### {heading}` subsection"));
+    let rest = &md[start + 1..];
+    let end = ["\n## ", "\n### "]
+        .iter()
+        .filter_map(|h| rest[4..].find(h))
+        .min()
+        .map(|i| i + 4)
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
 fn workspace_members() -> Vec<String> {
     let manifest: toml::Value = toml::from_str(&doc("Cargo.toml")).expect("parse Cargo.toml");
     manifest["workspace"]["members"]
@@ -1961,6 +1976,181 @@ fn man319_decision_record_rescopes_the_wire_scenarios_on_man90() {
     );
 }
 
+/// MAN-302: the clean-room note pins the allowed inputs and gate, and the STOP
+/// verdict keeps UberSDR input code out of the tree until a GO record exists.
+#[test]
+fn man302_clean_room_note_records_inputs_gate_and_spec_pin() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man302-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man302-ubersdr-iq-clean-room.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-302 clean-room note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No AGPL/GPL source was read.",
+        "a26ebc87ac6e83d743d7f223c3ba953c7aba5615",
+        "1f2b38ed571c1144f5dac471cca1e5dbd1fe549014bd72b088d5964423ca2aab",
+        "CC BY-SA 4.0",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    for id in ["G1", "G2", "G3", "G4", "G5"] {
+        assert!(
+            raw.lines()
+                .any(|line| line.starts_with(&format!("| {id} |"))),
+            "{rel} has no {id} gate row"
+        );
+    }
+
+    let (go, stop) = verdict_lines(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let any_go = records
+        .iter()
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    assert!(
+        any_go || !repo_root().join("crates/manta-input/src/ubersdr").exists(),
+        "UberSDR input code exists but no MAN-302 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A future GO record must tie every observed transport fact to a trace.
+    for name in &records {
+        let body = doc(&format!("docs/DECISIONS/{name}"));
+        for row in id_rows(&body, 'T') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            let path = status.strip_prefix("observed: ").unwrap_or_else(|| {
+                panic!("{name}: T-row status must be `open` or `observed: <path>`: {row}")
+            });
+            assert!(
+                repo_root().join(path).exists(),
+                "{name}: {row} cites a missing trace"
+            );
+        }
+    }
+}
+
+/// MAN-304: the add-on note pins the receiver documents it read and its gate,
+/// and the STOP verdict keeps add-on packaging out of the tree until a GO
+/// record exists, which itself needs MAN-302's GO.
+#[test]
+fn man304_addon_note_records_sources_gate_and_stop_rule() {
+    let records: Vec<String> = md_files_in("docs/DECISIONS")
+        .into_iter()
+        .filter(|name| name.contains("-man304-"))
+        .collect();
+    let notes: Vec<&String> = records
+        .iter()
+        .filter(|name| name.ends_with("-man304-ubersdr-addon-gate.md"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "want one MAN-304 add-on gate note, found {notes:?}"
+    );
+
+    let rel = format!("docs/DECISIONS/{}", notes[0]);
+    let raw = doc(&rel);
+    let text = squash_whitespace(&raw);
+    for needle in [
+        "No UberSDR source code was read.",
+        "5a261df82b5e491d9717239fb3e50dc49a4e93a6",
+        // addon_mqtt.md and static/extensions/cw-spots/README.md at that commit.
+        "686aadbfab614278efa6d51a600dac77fbc6ad2a1d74158858a3929c9a7467c6",
+        "a03991527a90fcab06d5643248056d4fa07a194b33fe7e7c9df5da36cc473392",
+        "2026-10-26-man302-ubersdr-iq-clean-room.md",
+    ] {
+        assert!(text.contains(needle), "{rel} does not contain {needle:?}");
+    }
+    let has_row = |id: &str| {
+        raw.lines()
+            .any(|line| line.starts_with(&format!("| {id} |")))
+    };
+    for id in ["A1", "A2", "A3", "A4", "A5", "A6"] {
+        assert!(has_row(id), "{rel} has no {id} gate row");
+    }
+    for id in ["C1", "C2", "C3", "C4", "C5", "C6", "C7"] {
+        assert!(has_row(id), "{rel} has no {id} claim row");
+    }
+
+    let (go, stop) = verdict_lines(&raw);
+    assert!(go ^ stop, "{rel} must carry exactly one verdict line");
+    let man302_go = md_files_in("docs/DECISIONS")
+        .iter()
+        .filter(|name| name.contains("-man302-"))
+        .any(|name| verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0);
+    // A later GO record may sit beside this note, as MAN-302's test allows.
+    let mut any_go = false;
+    for name in &records {
+        if verdict_lines(&doc(&format!("docs/DECISIONS/{name}"))).0 {
+            any_go = true;
+            assert!(
+                man302_go,
+                "docs/DECISIONS/{name} says **Verdict: GO** but no MAN-302 record does: the add-on needs the UberSDR input"
+            );
+        }
+    }
+    assert!(
+        any_go || !repo_root().join("packaging/ubersdr").exists(),
+        "packaging/ubersdr exists but {rel} says **Verdict: STOP** and no MAN-304 record says **Verdict: GO** (stop rule)"
+    );
+
+    // A claim leaves `open` only by citing a pinned document or a trace in the repo.
+    for name in &records {
+        let rec = format!("docs/DECISIONS/{name}");
+        let body = doc(&rec);
+        for row in id_rows(&body, 'C') {
+            let status = row
+                .trim_end()
+                .trim_end_matches('|')
+                .rsplit('|')
+                .next()
+                .unwrap()
+                .trim();
+            if status == "open" {
+                continue;
+            }
+            if let Some(path) = status.strip_prefix("observed: ") {
+                assert!(
+                    repo_root().join(path).exists(),
+                    "{rec}: {row} cites a missing trace"
+                );
+                continue;
+            }
+            let url = status.strip_prefix("documented: ").unwrap_or_else(|| {
+                panic!("{rec}: C-row status must be `open`, `documented: <url>` or `observed: <path>`: {row}")
+            });
+            // D1: only the receiver's published Markdown, at a pinned commit.
+            assert!(
+                url.starts_with("https://raw.githubusercontent.com/madpsy/")
+                    && url.ends_with(".md")
+                    && url
+                        .split('/')
+                        .any(|seg| seg.len() == 40 && seg.bytes().all(|c| c.is_ascii_hexdigit())),
+                "{rec}: {row} must cite a raw Markdown document at a pinned 40-hex commit"
+            );
+        }
+    }
+}
+
 /// MAN-319: the four new claims sit in MAN-90's table, all still open.
 #[test]
 fn man90_claims_table_carries_the_man319_claims() {
@@ -1973,6 +2163,53 @@ fn man90_claims_table_carries_the_man319_claims() {
         assert!(
             row.trim_end().ends_with("| open |"),
             "{id} row is not open: {row}"
+        );
+    }
+}
+
+/// MAN-320 D13: the two relay claims (a per-spot spotter other than the
+/// login call on one connection, and the FT8/FT4 line layout) are open rows
+/// in MAN-90's table until a capture settles them.
+#[test]
+fn man90_claims_table_carries_the_man320_claims() {
+    let decision = doc(MAN90_DECISION);
+    for id in ["C12", "C13"] {
+        let row = decision
+            .lines()
+            .find(|l| l.contains(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("decision record has no {id} row"));
+        assert!(
+            row.trim_end().ends_with("| open |"),
+            "{id} row is not open: {row}"
+        );
+    }
+}
+
+/// MAN-320 D1: the relays narrowed two README non-goals rather than
+/// deleting them. Both lines must stay, and both must name MAN-320, so the
+/// narrowing stays visible.
+#[test]
+fn readme_non_goals_name_the_relay_scope() {
+    let readme = doc("README.md");
+    let start = readme
+        .find("\n## Non-goals\n")
+        .expect("README has a ## Non-goals section");
+    let rest = &readme[start + 1..];
+    let end = rest[1..].find("\n## ").map_or(rest.len(), |i| i + 1);
+    let section = &rest[..end];
+    // Each bullet runs to the next "\n- " (bullets wrap over several lines).
+    let bullets: Vec<&str> = section.split("\n- ").collect();
+    for lead in [
+        "Not a cluster network",
+        "Not a general digital-mode skimmer",
+    ] {
+        let bullet = bullets
+            .iter()
+            .find(|b| b.starts_with(lead))
+            .unwrap_or_else(|| panic!("README Non-goals has no \"{lead}\" bullet"));
+        assert!(
+            bullet.contains("MAN-320"),
+            "README Non-goals \"{lead}\" bullet does not name MAN-320: {bullet}"
         );
     }
 }
@@ -2509,6 +2746,33 @@ fn config_reference_names_health_as_a_server_reader() {
     }
 }
 
+/// MAN-332 (PR #251 review): run_status and health_cmd::probe skip
+/// daemon_server_config when given --addr, so neither resolves
+/// MANTA_CONFIG nor applies or validates any MANTA_* variable. The
+/// reference must say so in Precedence and in both matrix rows.
+#[test]
+fn config_reference_says_addr_skips_config_and_environment() {
+    let md = doc(CONFIG_REF);
+    let precedence = squash_whitespace(section(&md, "Precedence"));
+    assert!(
+        precedence.contains(
+            "Given `--addr`, `status` and `health` load no config file and apply no `MANTA_*` variable"
+        ),
+        "{CONFIG_REF} Precedence must say --addr skips the config file and MANTA_*"
+    );
+    let matrix = backticked_rows(section(&md, "Which commands read which tables"));
+    for command in ["`status`", "`health`"] {
+        let row = matrix
+            .iter()
+            .find(|r| r[0] == command)
+            .unwrap_or_else(|| panic!("{CONFIG_REF} command matrix has no {command} row"));
+        assert!(
+            row[2].contains("`--addr` loads no config file and applies no `MANTA_*` variable"),
+            "{CONFIG_REF} {command} row must say --addr skips the config file and MANTA_*"
+        );
+    }
+}
+
 /// MAN-149 PR #251 review: config::load joins a relative path to the
 /// config file's directory only when the file set it; a `MANTA_*` value
 /// or a flag stays relative to the working directory.
@@ -2872,6 +3136,26 @@ fn md_files_in(dir: &str) -> Vec<String> {
     names
 }
 
+/// Whether a decision record has a `**Verdict: GO**` line and a
+/// `**Verdict: STOP**` line, as `(go, stop)`.
+fn verdict_lines(body: &str) -> (bool, bool) {
+    (
+        body.lines().any(|line| line.trim() == "**Verdict: GO**"),
+        body.lines().any(|line| line.trim() == "**Verdict: STOP**"),
+    )
+}
+
+/// The table rows whose first cell is `prefix` followed by one or more digits.
+fn id_rows(body: &str, prefix: char) -> impl Iterator<Item = &str> {
+    body.lines().filter(move |line| {
+        line.split('|')
+            .nth(1)
+            .map(str::trim)
+            .and_then(|id| id.strip_prefix(prefix))
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+    })
+}
+
 #[test]
 fn docs_index_links_every_runbook() {
     let targets = link_targets(&doc(DOCS_INDEX));
@@ -2888,15 +3172,35 @@ fn docs_index_links_every_runbook() {
     }
 }
 
+/// MAN-440: scripts/decisions-index.py builds each docs/DECISIONS/README.md row from the
+/// record's file name (date, ticket) and its one-line `# ` heading (title), so a record PR
+/// adds only its file. Keep this equal to NAME in scripts/decisions-index.py;
+/// scripts/tests/test_decisions_index.py checks the two match.
+const DECISION_RECORD_NAME: &str =
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2})-(?:man-?([0-9]+)-)?[a-z0-9][a-z0-9-]*\.md$";
+
 #[test]
-fn decisions_index_links_every_record() {
-    let targets = link_targets(&doc(DECISIONS_INDEX));
+fn decision_records_have_indexable_names_and_headings() {
+    let name = regex::Regex::new(DECISION_RECORD_NAME).unwrap();
     let records = md_files_in("docs/DECISIONS");
     assert!(!records.is_empty(), "docs/DECISIONS has no records");
-    for name in records {
+    for file in records {
         assert!(
-            targets.iter().any(|t| t.split('#').next() == Some(name.as_str())),
-            "{DECISIONS_INDEX} does not link {name}: add a `| date | ticket | [title]({name}) |` row"
+            name.is_match(&file),
+            "docs/DECISIONS/{file}: name it YYYY-MM-DD-manNNN-slug.md (lowercase slug); the index reads the date and ticket from the name"
+        );
+        let md = doc(&format!("docs/DECISIONS/{file}"));
+        let mut lines = md.lines();
+        let first = lines.next().unwrap_or("");
+        assert!(
+            first
+                .strip_prefix("# ")
+                .is_some_and(|title| !title.trim().is_empty()),
+            "docs/DECISIONS/{file}: line 1 must be the record's `# ` title"
+        );
+        assert!(
+            lines.next().is_none_or(|l| l.trim().is_empty()),
+            "docs/DECISIONS/{file}: line 2 must be blank; a `# ` heading is one line and the index title is that line"
         );
     }
 }
@@ -2908,6 +3212,7 @@ fn reference_docs_relative_links_resolve() {
         METRICS_REF,
         "docs/SPOT-SCHEMA.md",
         "docs/LIVE-STATE.md",
+        CLI_JSON_REF,
         "docs/COMPARISON.md",
         DOCS_INDEX,
         DECISIONS_INDEX,
@@ -3036,6 +3341,210 @@ fn spot_schema_transport_points_at_the_stream_contract() {
         .unwrap();
     assert!(transport.contains("contracts/spots/stream.v1.md"));
     assert!(!transport.contains("no history"));
+}
+
+// ---- MAN-139: docs/CLI-JSON.md lists every field of the CLI JSON ----
+
+const CLI_JSON_REF: &str = "docs/CLI-JSON.md";
+
+/// The keys of one serialized JSON object (not its children's).
+fn object_keys(v: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    v.as_object()
+        .unwrap_or_else(|| panic!("not a JSON object: {v}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// Every serialized key has a `` | `key` | `` row in `md`, and every such
+/// row names a serialized key.
+fn assert_cli_json_rows(where_: &str, md: &str, serialized: &std::collections::BTreeSet<String>) {
+    let rows: std::collections::BTreeSet<String> = backticked_rows(md)
+        .iter()
+        .map(|row| {
+            first_code_span(&row[0])
+                .unwrap_or_else(|| panic!("{CLI_JSON_REF} {where_}: a row with no field name"))
+                .to_string()
+        })
+        .collect();
+    for key in serialized {
+        assert!(
+            rows.contains(key),
+            "{CLI_JSON_REF} {where_} has no `| `{key}` |` row"
+        );
+    }
+    for row in &rows {
+        assert!(
+            serialized.contains(row),
+            "{CLI_JSON_REF} documents `{row}` under {where_}, which is not serialized"
+        );
+    }
+}
+
+/// MAN-139: `decode --json`, `run --json` and `doctor --json` print these
+/// types' serde form, and docs/CLI-JSON.md lists every key of it. A key the
+/// page lacks, or a row for a key no longer printed, fails here, as
+/// `every_live_record_field_is_documented` does for docs/LIVE-STATE.md.
+#[test]
+fn cli_json_doc_lists_every_field_both_ways() {
+    use manta_decode::events::{ClosureKind, DecoderEvent};
+    use manta_decode::timing::{ClassEstimate, TimingEstimates};
+    use manta_decode::tree::{Glyph, Prosign};
+    use manta_engine::{DecodeReport, DoctorReport, RttySignalReport, Spot, SpotType};
+
+    let class = Some(ClassEstimate {
+        mean_dits: 1.0,
+        var_dits2: 0.01,
+        n: 3,
+    });
+    let timing = TimingEstimates {
+        dit_ms: 60.0,
+        dot: class,
+        dash: class,
+        element_gap: class,
+        char_gap: class,
+        word_gap: class,
+    };
+    let events = vec![
+        DecoderEvent::CharDecoded {
+            track_id: 1,
+            sample_ts: 59_392,
+            glyph: Glyph::Prosign(Prosign::Ar),
+            confidence: 0.9,
+            alternatives: vec![(Glyph::Char('D'), 0.41)],
+        },
+        DecoderEvent::WordBoundary {
+            track_id: 1,
+            sample_ts: 151_552,
+            confidence: 1.0,
+        },
+        DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 20.0,
+        },
+        DecoderEvent::TrackMeta {
+            track_id: 1,
+            sample_ts: 102_656,
+            snr_2500_db: 22.6,
+            freq_hz: 14_012_341.5,
+        },
+        DecoderEvent::TimingUpdate {
+            track_id: 1,
+            sample_ts: 102_656,
+            timing: timing.clone(),
+        },
+        DecoderEvent::TrackPromoted {
+            track_id: 1,
+            sample_ts: 6_912,
+            freq_hz: 14_012_340.0,
+        },
+        DecoderEvent::TrackClosed {
+            track_id: 2,
+            closure: ClosureKind::Bookkeeping {
+                survivor_track_id: Some(1),
+            },
+        },
+    ];
+    // Exhaustive on purpose: a new variant stops this compiling until it
+    // has a sample above, and so a subsection on the page.
+    for event in &events {
+        match event {
+            DecoderEvent::CharDecoded { .. }
+            | DecoderEvent::WordBoundary { .. }
+            | DecoderEvent::SpeedUpdate { .. }
+            | DecoderEvent::TrackMeta { .. }
+            | DecoderEvent::TimingUpdate { .. }
+            | DecoderEvent::TrackPromoted { .. }
+            | DecoderEvent::TrackClosed { .. } => {}
+        }
+    }
+    let report = DecodeReport {
+        freq_hz: 14_012_341.0,
+        wpm: Some(20.0),
+        text: "CQ".into(),
+        events: events[..1].to_vec(),
+        spots: vec![Spot {
+            callsign: "W1AW".into(),
+            freq_hz: 14_012_341.0,
+            snr_db: 21.0,
+            wpm: 20.0,
+            spot_type: SpotType::Cq,
+            confidence: 0.55,
+            track_id: 1,
+            sample_ts: 2_006_272,
+            rst: Some("599".into()),
+            qrl_query: true,
+        }],
+        timing: Some(timing),
+        rtty: vec![RttySignalReport {
+            mark_hz: 14_080_170.0,
+            space_hz: 14_080_000.0,
+            shift_hz: 170.0,
+            measured_shift_hz: 170.5,
+            marked_sample_ts: 96_000,
+            cleared_sample_ts: Some(192_000),
+            id: 1,
+        }],
+        bad_samples: 1,
+        sample_rate_hz: 96_000.0,
+    };
+    let doctor = DoctorReport {
+        sample_rate_hz: 96_000.0,
+        center_freq_hz: 14_000_000.0,
+        duration: std::time::Duration::from_secs(10),
+        tracks_promoted: 1,
+        detector_confirmations: 1,
+        track_meta_count: 9,
+        tracks_closed: 1,
+        snr_db_min: Some(21.0),
+        snr_db_median: Some(21.5),
+        snr_db_max: Some(22.6),
+        chars_decoded: 12,
+        distinct_chars: 9,
+        spots_confirmed: 0,
+        bad_samples: 1,
+    };
+
+    let md = doc(CLI_JSON_REF);
+    let events_md = section(&md, "Events");
+    let mut names = std::collections::BTreeSet::new();
+    for event in &events {
+        let v = serde_json::to_value(event).unwrap();
+        let name = v["event"].as_str().expect("an `event` name").to_string();
+        let heading = format!("`{name}`");
+        assert_cli_json_rows(
+            &format!("`### {heading}`"),
+            subsection(events_md, &heading),
+            &object_keys(&v),
+        );
+        names.insert(heading);
+    }
+    let subsections: std::collections::BTreeSet<String> = events_md
+        .lines()
+        .filter_map(|l| l.strip_prefix("### "))
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        subsections, names,
+        "{CLI_JSON_REF} `## Events` must have one `### `<Event>`` subsection per event"
+    );
+
+    let report = serde_json::to_value(&report).unwrap();
+    let doctor = serde_json::to_value(&doctor).unwrap();
+    let mut doctor_keys = object_keys(&doctor);
+    doctor_keys.extend(["verdict", "checks", "checksStatus"].map(String::from));
+    let checks_keys = ["name", "status", "detail", "fix"].map(String::from).into();
+    for (heading, keys) in [
+        ("`decode --json`", object_keys(&report)),
+        ("Spots", object_keys(&report["spots"][0])),
+        ("`timing`", object_keys(&report["timing"])),
+        ("Timing classes", object_keys(&report["timing"]["dot"])),
+        ("`rtty` entries", object_keys(&report["rtty"][0])),
+        ("`doctor --json`", doctor_keys),
+        ("`checks` entries", checks_keys),
+    ] {
+        assert_cli_json_rows(&format!("`## {heading}`"), section(&md, heading), &keys);
+    }
 }
 
 /// SPEC §5 is the normative event schema, and `TrackClosed` carries a
@@ -3354,4 +3863,85 @@ fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline
     assert!(doc("docs/METRICS.md").contains("| `manta_input_queue_dropped_samples_total` |"));
     assert!(guide.contains("has 4 receivers; 6 bands are configured"));
     assert!(guide.contains("not a measured"));
+}
+
+// ---- MAN-249: internal machine names stay out of the public docs ----
+
+/// FNV-1a 64 of each internal fleet host name, lowercase. The names are kept
+/// out of the tree: a plain-text deny-list would publish what it guards.
+const INTERNAL_HOST_FNV1A: [u64; 5] = [
+    0xa0a3_3c22_a179_5c43,
+    0x76cf_9c53_5733_dc78,
+    0x61e7_8d4c_2055_7f92,
+    0x66fd_ea01_023f_f308,
+    0x602c_5552_1693_98cc,
+];
+
+fn fnv1a_64(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The 1-based line of each ASCII-alphanumeric word whose lowercase FNV-1a
+/// is in `deny`.
+fn denied_word_lines(text: &str, deny: &[u64]) -> Vec<usize> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|w| !w.is_empty() && deny.contains(&fnv1a_64(&w.to_ascii_lowercase())))
+        })
+        .map(|(i, _)| i + 1)
+        .collect()
+}
+
+/// Every file under a directory, recursively.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display())) {
+        let p = e.expect("dir entry").path();
+        if p.is_dir() {
+            out.extend(files_under(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn deny_list_matches_whole_words_in_any_case() {
+    let deny = [fnv1a_64("examplehost")];
+    assert_eq!(
+        denied_word_lines("ok\nran on ExampleHost.local\n", &deny),
+        [2]
+    );
+    assert!(denied_word_lines("examplehosts, example host", &deny).is_empty());
+}
+
+#[test]
+fn public_docs_name_no_internal_machine() {
+    let root = repo_root();
+    let mut found = Vec::new();
+    for dir in ["docs", "wiki"] {
+        for path in files_under(&root.join(dir)) {
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in denied_word_lines(&text, &INTERNAL_HOST_FNV1A) {
+                found.push(format!(
+                    "{}:{line}",
+                    path.strip_prefix(&root).unwrap().display()
+                ));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "an internal machine name is in the public docs (MAN-249); name its role \
+         instead (\"the CI host\", \"the Pi 4 under test\"):\n{}",
+        found.join("\n")
+    );
 }
