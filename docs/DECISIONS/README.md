@@ -26,6 +26,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
 | 2026-10-27 | MAN-343 | [MAN-343: `manta grade` reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
 | 2026-10-27 | MAN-320 | [MAN-320: manta relays a local skimmer's own spots and WSJT-X's FT8/FT4 CQs through the uplink](2026-10-27-man320-relay-local-skimmers-and-wsjtx.md) |
+| 2026-10-27 | MAN-308 | [MAN-308: automatic step attenuation on a protocol-2 openHPSDR radio's ADC overload](2026-10-27-man308-hpsdr-auto-attenuation.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
 | 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
 | 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |

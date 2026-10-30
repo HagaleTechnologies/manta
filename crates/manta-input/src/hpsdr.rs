@@ -399,6 +399,9 @@ pub struct HpsdrConfig {
     /// Per-DDC center frequency, reported by the corresponding
     /// `HpsdrIqSource::center_freq_hz()` and sent in the receiver's tuning word.
     pub center_freq_hz: Vec<f64>,
+    /// MAN-308: automatic step attenuation, shared across reopens; only a
+    /// protocol-2 open uses it. `None` leaves the attenuator at 0 dB.
+    pub auto_attenuation: Option<Arc<AutoAttenuation>>,
 }
 
 impl HpsdrConfig {
@@ -1080,6 +1083,9 @@ impl HpsdrDevice {
 pub mod proto2;
 
 pub use discovery::{Discovery, DiscoveryReply};
+pub use proto2::attenuator::{
+    AttenuationCause, AttenuationChange, AttenuationNotice, AttenuationSnapshot, AutoAttenuation,
+};
 pub use proto2::Protocol2IqSource;
 
 /// Which openHPSDR protocol to speak (MAN-305 D2). `Auto` asks the radio
@@ -1322,6 +1328,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 48000.0,
             center_freq_hz: vec![7e6],
+            auto_attenuation: None,
         };
         let mut old = HpsdrDevice::open(cfg.clone()).unwrap();
         drain_initial_open_packets(&socket, 1);
@@ -1452,6 +1459,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 48000.0,
             center_freq_hz: vec![7e6, 14e6],
+            auto_attenuation: None,
         })
         .unwrap();
         let shared = sources[0].inner.clone();
@@ -1793,6 +1801,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 44_100.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1808,6 +1817,7 @@ mod tests {
             ddc_count: 9,
             sample_rate_hz: 48_000.0,
             center_freq_hz: vec![14_025_000.0; 9],
+            auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1831,6 +1841,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0], // only one, need two
+            auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1847,6 +1858,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![u32::MAX as f64 + 1.0],
+            auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1860,6 +1872,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.5],
+            auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
     }
@@ -1882,6 +1895,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
         assert_eq!(sources.len(), 2);
@@ -1938,6 +1952,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2007,6 +2022,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
         assert_eq!(sources.len(), 1);
@@ -2070,6 +2086,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
         let client_addr = drain_initial_open_packets(&device_socket, 1);
@@ -2117,6 +2134,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let sources = HpsdrDevice::open(cfg).unwrap();
         let a = sources[0].health_counters().unwrap();
@@ -2150,6 +2168,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2208,6 +2227,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2308,6 +2328,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let _sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2368,6 +2389,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let _sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2414,6 +2436,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let _sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2456,6 +2479,7 @@ mod tests {
             ddc_count: 2,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).unwrap();
 
@@ -2510,6 +2534,7 @@ mod tests {
             ddc_count: 1,
             sample_rate_hz: 192_000.0,
             center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
         };
         let mut sources = HpsdrDevice::open(cfg).expect("connect to a real HPSDR device");
         let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
@@ -2663,6 +2688,20 @@ mod open_receiver_tests {
     }
 
     #[test]
+    fn auto_open_of_a_protocol_1_radio_leaves_the_handle_unengaged() {
+        let fake = FakeP2Radio::with_discovery(vec![(Duration::ZERO, p1_reply())]);
+        let handle = Arc::new(AutoAttenuation::new(Box::new(|_| {})));
+        let cfg = HpsdrConfig {
+            auto_attenuation: Some(handle.clone()),
+            ..fake.cfg()
+        };
+        let opened = open_receiver_with(&cfg, HpsdrProtocol::Auto, &fast(), Instant::now())
+            .expect("open_receiver");
+        assert_eq!(opened.protocol, HpsdrProtocol::One);
+        assert_eq!(handle.snapshot(), None, "protocol 1 never engages");
+    }
+
+    #[test]
     fn auto_falls_back_to_protocol_1_after_one_second_of_silence() {
         let fake = FakeP2Radio::start();
         let start = Instant::now();
@@ -2738,6 +2777,7 @@ mod open_receiver_tests {
                 ddc_count: 1,
                 sample_rate_hz: 192_000.0,
                 center_freq_hz: vec![7_030_000.0],
+                auto_attenuation: None,
             }
         }
 

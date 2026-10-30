@@ -1296,6 +1296,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "mac",
                 "port",
                 "protocol",
+                "auto_attenuation",
                 "freq_hz",
                 "password",
                 "driver",

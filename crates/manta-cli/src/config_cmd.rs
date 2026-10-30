@@ -654,6 +654,7 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             freq_hz,
             rate_hz,
             receivers,
+            auto_attenuation,
         }) => {
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
@@ -669,6 +670,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             );
             if let Some(mac) = mac {
                 line.push_str(&format!(" mac={mac}"));
+            }
+            // MAN-308: only when on, so every existing summary is unchanged.
+            if *auto_attenuation {
+                line.push_str(" auto_attenuation=true");
             }
             line
         }
@@ -1119,6 +1124,12 @@ mod tests {
             line(&lines_of(&body), "input:"),
             "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
              rate_hz=192000"
+        );
+        let body = format!("{body}auto_attenuation = true\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
+             rate_hz=192000 auto_attenuation=true"
         );
     }
 
@@ -1982,7 +1993,7 @@ mod tests {
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
-            ("input", "protocol") => {
+            ("input", "protocol" | "auto_attenuation") => {
                 "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n"
                     .to_string()
             }

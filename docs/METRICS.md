@@ -68,7 +68,7 @@ in `RUNBOOKS/monitoring/`; see
 
 ## Metric families
 
-All 76 families, in the order `/metrics` renders them. Every family's
+All 79 families, in the order `/metrics` renders them. Every family's
 `# HELP` and `# TYPE` lines are always rendered, except two groups at the
 end of the table: the ten RBN comparison families (MAN-301), rendered only
 when `[rbn_compare]` is enabled, and the three live-state families
@@ -105,6 +105,8 @@ missing series as "no loss" or "no traffic".
 | `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR stays at 0 (no malformed-packet concept; MAN-233). Other sources: absent, not zero. |
 | `manta_input_queue_dropped_samples_total` | counter | `source` | Complex IQ samples evicted from this input's bounded queue because its consumer fell behind, at the hardware rate before decimation. Exact sample count, not packets, network loss or outage duration. Cumulative across reconnects; resets on process restart. Reduce load or configured rate if it grows. | Inputs with `InputHealthCounters`; zero if no queue samples have been lost, including other packet sources. Sources without counters omit the series. |
 | `manta_input_bad_samples_total` | counter | `source` | Input samples replaced with silence (`0+0j`) because a component was NaN, infinite, or larger than 1e17 in magnitude, counted where they enter the channelizer. Decoding continues. A filter that runs before the channelizer can turn one bad source sample into several replaced ones: up to about 64 per halfband stage with `--capture-rate-hz`, or about 257 through a sound card's Hilbert filter (511 taps, 256 of them nonzero: that many outputs' imaginary parts, plus one delay-matched real part; MAN-273). See [SPEC §1.3](SPEC-decode-core.md#13-structure-and-per-hop-processing-wola-form) step 0 and [MAN-234](DECISIONS/2026-10-15-man234-bad-input-samples.md). | Every source; 0 from startup with a `[server]` table; summed across reconnects. |
+| `manta_input_attenuation_db` | gauge | `source` | The step attenuation, in dB, that automatic attenuation has set on the radio's ADC0 (0 to 30, in 6 dB steps). This is the value manta writes to high-priority byte 1443, not a readback from the radio. See [Automatic attenuation](CONFIG.md#automatic-attenuation) and [MAN-308](DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md). | Only for a `type = "hpsdr"` input with `auto_attenuation = true`, once it has opened as protocol 2; sampled every second. Other inputs get the `# TYPE` line and no samples. |
+| `manta_input_attenuation_changes_total` | counter | `source` | How many times automatic attenuation changed the step attenuator, raises and lowers together, since the daemon started. Counts across reconnects. | As `manta_input_attenuation_db`; starts at 0. |
 | `manta_input_spots_total` | counter | `source` | Spots this input decoded and published, attributed by the emitting track's id (MAN-13's interleaved ids). With several `[[input]]` entries the series sum to `manta_spots_total`; with one entry there is no series, and `manta_spots_total` is that input's count. See [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md). | Only with two or more `[[input]]` entries: one series per entry's `name`, 0 from startup. With one input, the `# TYPE` line but no samples. |
 | `manta_input_distinct_calls_total` | counter | `source` | Distinct callsigns this input decoded spots for since the daemon started. Kept as a set of 64-bit FNV-1a hashes, at most 20,000 per input: past that, new calls are not counted (a one-time warning says so), so the value is then a floor. | As `manta_input_spots_total`. |
 | `manta_input_cross_input_dupes_total` | counter | `source` | Candidate spots this input had withheld because another input had already spotted the same signal (MAN-13's cross-input dedupe: within 600 s, in the same 300 Hz bucket or within one channel across a bucket edge). `source` is the withheld input, the one that lost: each count shows that it heard the station too. | As `manta_input_spots_total`. |
@@ -170,6 +172,12 @@ because protocol 1 carries no sequence number. For a protocol-2 radio (ANAN):
 | `manta_input_gaps_detected_total{source="hpsdr"}` | Loss events: one per sequence jump, plus one per radio restart (sequence back to 0). | `record_gap` |
 | `manta_input_malformed_packets_total{source="hpsdr"}` | Datagrams discarded unread: a wrong length or header on the IQ port, an unknown source port from the radio, or any datagram from another address. | `record_malformed` |
 | `manta_source_health{source="hpsdr"}` | Unchanged: 1 once a valid IQ datagram has arrived since the last open, else 0. | `confirmed_live_handle` |
+| `manta_input_attenuation_db{source="hpsdr"}` | With `auto_attenuation = true`: the dB manta last wrote to ADC0's step attenuator (high-priority byte 1443). ADC overload reported for 2 s adds 6 dB, up to 30; 10 minutes with none removes 6 dB. A reconnect keeps the level. | `Protocol2IqSource` controller → `AutoAttenuation` → 1 Hz poller |
+| `manta_input_attenuation_changes_total{source="hpsdr"}` | With `auto_attenuation = true`: raises and lowers made since the daemon started, across reconnects. | `AutoAttenuation::record` → 1 Hz poller |
+
+Protocol 1 has no automatic attenuation: an input whose radio answers as
+protocol 1 publishes neither attenuation family. See
+[MAN-308](DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md).
 
 On the decoder side, a gap shorter than 0.5 s is spliced and the spot clock
 jumps by the lost samples, so spot timestamps stay true and tracks stay open;
@@ -385,6 +393,8 @@ For what each uplink state means and what to do about it, see
   and the flapping classification.
 - [MAN-56](DECISIONS/2026-09-04-man56-input-health-metrics.md): the input
   packet counters and why they are absent rather than zero.
+- [MAN-308](DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md): the
+  automatic attenuation families.
 - [MAN-96](DECISIONS/2026-10-07-man96-secondary-skimmer-field-node.md): the
   source outage counters.
 - [MAN-132](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md): the

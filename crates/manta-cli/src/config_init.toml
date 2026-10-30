@@ -220,6 +220,7 @@
 #mac = "02:11:22:33:44:55"           # hpsdr only: pin a discovered radio; cannot be combined with host
 #port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #protocol = "auto"                   # hpsdr: "auto" asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking
+#auto_attenuation = false            # hpsdr protocol 2: raise the radio's attenuator on ADC overload, lower it after 10 min quiet
 #password = ""                       # kiwi only; leave empty for public receivers
 
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):

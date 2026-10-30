@@ -343,6 +343,7 @@ impl InputKind {
                 "receivers",
                 "bands",
                 "tuning_range_hz",
+                "auto_attenuation",
             ],
             InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
@@ -385,6 +386,8 @@ struct InputToml {
     ssrc: Option<i64>,
     receivers: Option<toml::Value>,
     interface: Option<String>,
+    /// MAN-308: hpsdr protocol 2's automatic step attenuation.
+    auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
     freq_correction_ppm: Option<f64>,
     center_freq_hz: Option<f64>,
@@ -497,6 +500,9 @@ pub(crate) enum SourceFromFile {
         protocol: manta_input::hpsdr::HpsdrProtocol,
         freq_hz: f64,
         rate_hz: f64,
+        /// MAN-308: `input.auto_attenuation`, `false` when absent; never
+        /// `true` with `protocol = "1"`.
+        auto_attenuation: bool,
     },
     /// MAN-140: one ka9q-radio (radiod) IQ channel. `group` passed
     /// `check_group` at load; a host name is resolved at open.
@@ -1129,6 +1135,7 @@ pub(crate) fn hpsdr_allocations(inputs: &[NamedInput]) -> Vec<HpsdrAllocation> {
             rate_hz,
             freq_hz,
             receivers,
+            ..
         }) = &input.input.source
         {
             // MAN-306 x MAN-307: entries naming one radio the same way share
@@ -1171,6 +1178,22 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         {
             bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
         }
+        // MAN-308 D1: several receivers on one radio run protocol 1, which
+        // has no attenuator manta drives.
+        if group.members.len() > 1 {
+            if let Some(&index) = group.members.iter().find(|&&i| {
+                matches!(
+                    inputs[i].input.source,
+                    Some(SourceFromFile::Hpsdr {
+                        auto_attenuation: true,
+                        ..
+                    })
+                )
+            }) {
+                let name = &inputs[index].name;
+                bail!("{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta");
+            }
+        }
         for &index in group.members.iter().skip(1) {
             let name = &inputs[index].name;
             if let Some(SourceFromFile::Hpsdr {
@@ -1203,6 +1226,7 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             ddc_count: group.members.len(),
             sample_rate_hz: group.rate,
             center_freq_hz: group.frequencies.clone(),
+            auto_attenuation: None,
         }
         .validate()
         .map_err(|e| anyhow!("{origin}: [[input]] \"{first}\": {e}"))?;
@@ -1611,6 +1635,21 @@ fn validate_input(
                 .unwrap_or_default(),
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+            // MAN-308 D1: `protocol` parsed above, so this re-read cannot fail.
+            auto_attenuation: match t.auto_attenuation {
+                Some(true)
+                    if matches!(
+                        t.protocol
+                            .as_ref()
+                            .map(ProtocolValue::protocol)
+                            .transpose()?,
+                        Some(manta_input::hpsdr::HpsdrProtocol::One)
+                    ) =>
+                {
+                    return Err("input.auto_attenuation needs openHPSDR protocol 2 (protocol = \"2\" or \"auto\"); manta drives no attenuator over protocol 1".into());
+                }
+                on => on.unwrap_or(false),
+            },
         },
         InputKind::Ka9q => SourceFromFile::Ka9q {
             port: port(manta_input::ka9q::wire::DATA_PORT)?,
@@ -1632,7 +1671,7 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 22] = [
+    let set: [(&str, bool); 23] = [
         ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
@@ -1655,6 +1694,7 @@ fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
         ("interface", t.interface.is_some()),
         ("bands", t.bands.is_some()),
         ("tuning_range_hz", t.tuning_range_hz.is_some()),
+        ("auto_attenuation", t.auto_attenuation.is_some()),
     ];
     let Some(kind) = t.kind else {
         if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
@@ -3255,6 +3295,7 @@ mod tests {
                 freq_hz: 7_030_000.0,
                 rate_hz: 192_000.0,
                 receivers: None,
+                auto_attenuation: false,
             })
         );
     }
@@ -3289,6 +3330,115 @@ mod tests {
             hpsdr_protocol_of(&loaded.input.source),
             manta_input::hpsdr::HpsdrProtocol::Two
         );
+    }
+
+    fn hpsdr_auto_attenuation_of(source: &Option<SourceFromFile>) -> bool {
+        match source {
+            Some(SourceFromFile::Hpsdr {
+                auto_attenuation, ..
+            }) => *auto_attenuation,
+            other => panic!("expected an hpsdr input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hpsdr_auto_attenuation_defaults_off_and_reads_true() {
+        let loaded = load_file(HPSDR_BODY).unwrap();
+        assert!(!hpsdr_auto_attenuation_of(&loaded.input.source));
+        let loaded = load_file(&format!("{HPSDR_BODY}auto_attenuation = true\n")).unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
+    }
+
+    #[test]
+    fn auto_attenuation_does_not_apply_to_kiwi() {
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nauto_attenuation = true\n",
+        );
+        assert!(
+            err.ends_with(
+                "input.auto_attenuation does not apply to input.type = \"kiwi\" (kiwi takes \
+                 host, port, freq_hz, password, bands, tuning_range_hz)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn auto_attenuation_needs_protocol_2() {
+        for value in ["\"1\"", "1"] {
+            let err = err_of(&format!(
+                "{HPSDR_BODY}protocol = {value}\nauto_attenuation = true\n"
+            ));
+            assert!(
+                err.ends_with(
+                    "input.auto_attenuation needs openHPSDR protocol 2 (protocol = \"2\" or \
+                     \"auto\"); manta drives no attenuator over protocol 1"
+                ),
+                "{value}: {err}"
+            );
+        }
+        for value in ["\"2\"", "\"auto\""] {
+            let loaded = load_file(&format!(
+                "{HPSDR_BODY}protocol = {value}\nauto_attenuation = true\n"
+            ))
+            .unwrap_or_else(|e| panic!("{value}: {e:#}"));
+            assert!(hpsdr_auto_attenuation_of(&loaded.input.source), "{value}");
+        }
+        // Off, protocol 1 still loads.
+        assert!(load_file(&format!(
+            "{HPSDR_BODY}protocol = \"1\"\nauto_attenuation = false\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn auto_attenuation_is_refused_on_a_shared_radio() {
+        let on = "protocol = \"auto\"\nauto_attenuation = true\n";
+        let off = "protocol = \"auto\"\n";
+        let err = err_of(&(hpsdr_entry("a", "radio", on) + &hpsdr_entry("b", "radio", off)));
+        assert!(
+            err.ends_with(
+                "[[input]] \"a\": auto_attenuation needs a radio with one receiver; several \
+                 receivers on one radio speak protocol 1 in manta"
+            ),
+            "{err}"
+        );
+        let err = err_of(&(hpsdr_entry("a", "radio", off) + &hpsdr_entry("b", "radio", on)));
+        assert!(
+            err.ends_with(
+                "[[input]] \"b\": auto_attenuation needs a radio with one receiver; several \
+                 receivers on one radio speak protocol 1 in manta"
+            ),
+            "{err}"
+        );
+        let loaded =
+            load_file(&(hpsdr_entry("a", "radio1", on) + &hpsdr_entry("b", "radio2", on))).unwrap();
+        assert!(loaded
+            .inputs
+            .iter()
+            .all(|i| hpsdr_auto_attenuation_of(&i.input.source)));
+    }
+
+    #[test]
+    fn env_sets_hpsdr_auto_attenuation() {
+        let loaded = load_env(
+            Some(HPSDR_BODY),
+            &[("MANTA_INPUT_AUTO_ATTENUATION", "true")],
+        )
+        .unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "hpsdr"),
+                ("MANTA_INPUT_HOST", "192.0.2.10"),
+                ("MANTA_INPUT_FREQ_HZ", "7030000"),
+                ("MANTA_INPUT_RATE_HZ", "192000"),
+                ("MANTA_INPUT_AUTO_ATTENUATION", "true"),
+            ],
+        )
+        .unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
     }
 
     #[test]
