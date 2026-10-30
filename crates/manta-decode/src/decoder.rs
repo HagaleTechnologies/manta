@@ -1095,11 +1095,18 @@ impl TrackDecoder {
         if self.cur_marks.is_empty() {
             return;
         }
-        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy reads the
-        // keying-rail SNR directly; EdgeLegacy/Hsmm use the evidence-derived
-        // estimate (SPEC v2 §2.3) stashed in `last_snr`.
+        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy prefers
+        // the engine-supplied floor-based estimate (§2.3 / MAN-102,
+        // pushed down by `set_snr_2500_db` on every queued hop), falling
+        // back to the keying-rail estimate when driven standalone;
+        // EdgeLegacy/Hsmm use the evidence-derived estimate (SPEC v2
+        // §2.3) stashed in `last_snr`. Same precedence `tick_meta` uses
+        // for the reported value. Before MAN-106 the Legacy branch read
+        // the rail estimate directly, which sits ~8 dB under the floor
+        // value and pins `q` at its 0.3 floor across the operating band
+        // (see docs/DECISIONS/2026-10-30-man106-q-snr-input.md).
         let snr = if self.cfg.engine == Engine::Legacy {
-            self.demod.snr_2500_db()
+            self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
         } else {
             self.last_snr
         };
@@ -2160,6 +2167,71 @@ mod tests {
             meta,
             Some(rail_snr),
             "TrackMeta must carry the rail estimate exactly when no engine-supplied SNR is set"
+        );
+    }
+
+    /// MAN-106: Legacy `q` must read the engine-supplied floor-based SNR
+    /// when one is set (the production path), so a 12 dB estimate yields
+    /// q = 0.6 and character confidence regains dynamic range instead of
+    /// pinning at the 0.3 rail floor.
+    fn char_confidences_with(snr: Option<f32>) -> (Vec<f32>, Option<f32>) {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        let env = rect_envelope("CQ TEST W5AU W5AU TEST", 18);
+        for (i, a) in env.into_iter().enumerate() {
+            if let Some(snr) = snr {
+                dec.set_snr_2500_db(snr);
+            }
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let confs = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    glyph: Glyph::Char(_),
+                    confidence,
+                    ..
+                } => Some(*confidence),
+                _ => None,
+            })
+            .collect();
+        (confs, dec.demod.snr_2500_db())
+    }
+
+    #[test]
+    fn legacy_q_follows_the_engine_supplied_snr() {
+        let (confs, _) = char_confidences_with(Some(12.0));
+        assert!(!confs.is_empty());
+        // q = clamp(12/20, 0.3, 1.0) = 0.6; a clean character's softmax
+        // is 1.0 for a single surviving hypothesis, so its confidence is
+        // exactly q, and no character can exceed it.
+        let q = 0.6f32;
+        let max = confs.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            (max - q).abs() < 1e-3,
+            "some clean character must carry softmax*q = {q}, got max {max} of {confs:?}"
+        );
+        assert!(
+            confs.iter().all(|c| *c <= q + 1e-3),
+            "no character confidence may exceed q, got {confs:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_q_falls_back_to_the_rail_estimate_when_standalone() {
+        let (confs, rail) = char_confidences_with(None);
+        let rail = rail.expect("keyed envelope brings the demod to Running");
+        let q = (rail / 20.0).clamp(0.3, 1.0);
+        assert!(!confs.is_empty());
+        assert!(
+            confs.iter().all(|c| *c <= q + 1e-3),
+            "standalone confidence must follow the rail-derived q {q} (rail {rail} dB), got {confs:?}"
+        );
+        let max = confs.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            (max - q).abs() < 1e-3,
+            "rail-derived q {q} (rail {rail} dB) must be reached, got max {max} of {confs:?}"
         );
     }
 

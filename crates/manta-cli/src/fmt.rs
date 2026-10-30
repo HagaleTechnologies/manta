@@ -189,6 +189,7 @@ mod tests {
             text: String::new(),
             events: Vec::new(),
             spots: Vec::new(),
+            decisions: Vec::new(),
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,
@@ -211,6 +212,7 @@ mod tests {
             snr_db: 29.2,
             wpm: 19.9,
             confidence: 0.794,
+            emission_state: manta_spot::EmissionState::Confirmed,
             spot_type: SpotType::Cq,
             track_id: 1,
             sample_ts: 0,
@@ -233,7 +235,7 @@ mod tests {
         // MAN-139: the JSON spot stream's names, in declaration order.
         assert_eq!(
             serde_json::to_string(&annotated).unwrap(),
-            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"trackId":1,"sampleTs":0,"rst":"599","qrlQuery":true}"#
+            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"emissionState":"confirmed","trackId":1,"sampleTs":0,"rst":"599","qrlQuery":true}"#
         );
         // The live-state `spotType` and `/metrics` `type` labels.
         for (value, human, json) in [
@@ -259,6 +261,7 @@ mod tests {
             snr_db: 20.995_895,
             wpm: 19.565_216,
             confidence: 0.551_824_33,
+            emission_state: manta_spot::EmissionState::Confirmed,
             spot_type: SpotType::Cq,
             track_id: 1,
             sample_ts: 2_006_272,

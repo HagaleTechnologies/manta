@@ -77,3 +77,20 @@
   consistency test fails if the two drift apart. Operators override this list
   separately with `--patterns` or `[spot] pattern_path`; neither `--scp` nor
   a `refresh_lists` download (MAN-316) changes it.
+
+## calibration/
+
+- Source: fitted in-repo by `scripts/fit-confidence-calibration.py`
+  (MAN-106) from `manta bench sensitivity --json` reports on
+  deterministic testkit scenes (fixed seeds; the exact recipe is in
+  docs/DECISIONS/2026-10-30-man106-confidence-calibration.md).
+- Contents: `fit.csv` / `heldout.csv` (the labeled measurement pair:
+  rows `c_call_raw,reps,tier,correct`) and `constants.json` (the fitted
+  constants, which must equal the Rust literals in
+  `src/confidence/calibration.rs`; a unit test enforces the match, and
+  `scripts.tests.test_fit_calibration` enforces the constants reproduce
+  from the CSVs byte-for-byte).
+- Refresh: rerun the bench recipe, then
+  `fit-confidence-calibration.py extract <reports>` and
+  `fit-confidence-calibration.py fit --write`, and copy the emitted knot
+  block into `src/confidence/calibration.rs` if it changed.

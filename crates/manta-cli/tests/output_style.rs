@@ -369,13 +369,12 @@ fn run_spots_are_stdout_only_repeatable_and_json_stays_raw() {
         "{raw}"
     );
     assert_eq!(spot["spotType"], "cq");
-    for key in ["frequency", "wpm", "snr", "decodeConfidence"] {
+    // MAN-106: `decodeConfidence` is a calibrated probability and a
+    // boosted spot can land exactly on the 1.0 cap, so it no longer
+    // serves as an "unwidened f32" proxy; the other measurements do.
+    for key in ["frequency", "wpm", "snr"] {
         assert_ne!(spot[key].as_f64().unwrap().fract(), 0.0, "{key}: {spot}");
     }
-    assert_ne!(
-        spot["decodeConfidence"].as_f64().unwrap() * 100.0,
-        (spot["decodeConfidence"].as_f64().unwrap() * 100.0).round()
-    );
 }
 
 #[test]

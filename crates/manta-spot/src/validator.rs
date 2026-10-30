@@ -47,6 +47,19 @@ const MAX_PLAUSIBLE_WPM: f32 = 45.0;
 /// exists to cap pathological growth, not to hold a meaningful backlog.
 const MAX_PENDING_BEACONS: usize = 8;
 
+/// Whether a published spot's calibrated confidence cleared the publish
+/// threshold (MAN-106). `confirmed`: calibrated probability ≥
+/// `PUBLISH_CONFIRMED_THRESHOLD`. `tentative`: published below it. The
+/// third state, abstained, never appears on a `Spot` -- a candidate with
+/// zero acoustic evidence is withheld (`Reason::NoEvidence`) and exists
+/// only in the decision stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmissionState {
+    Confirmed,
+    Tentative,
+}
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -66,8 +79,17 @@ pub struct Spot {
     pub snr_db: f32,
     pub wpm: f32,
     pub spot_type: SpotType,
+    /// The calibrated probability the callsign is correct (MAN-106):
+    /// the committed calibration of geo-mean character confidence,
+    /// repetition count and pattern tier, times the SCP boost when the
+    /// call is in `master.scp`, capped at 1.0. `decodeConfidence` in
+    /// JSON.
     #[serde(rename = "decodeConfidence")]
     pub confidence: f32,
+    /// `confirmed` when `confidence` reached
+    /// `PUBLISH_CONFIRMED_THRESHOLD`, else `tentative` (MAN-106). CLI
+    /// JSON only -- the :7301 stream does not carry it.
+    pub emission_state: EmissionState,
     pub track_id: u32,
     pub sample_ts: u64,
     /// The most recent RST signal report this spot's track decoded before
@@ -1361,14 +1383,20 @@ impl Validator {
         let withheld = |reason: Reason| {
             Decision::withheld(track_id, sample_ts, &candidate, freq_hz, spot_type, reason)
         };
+        // The candidate's word already exists by here, so every early
+        // withhold below can carry its raw per-word evidence (MAN-106:
+        // the hard negatives investigation 11 wants labeled; `geo_mean`,
+        // pre-`c_call`, since no repetition count exists yet).
+        let word_geo_mean =
+            (!char_confidences.is_empty()).then(|| confidence::geo_mean(&char_confidences));
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
-            self.decide(|| withheld(Reason::Blocklist));
+            self.decide(|| withheld(Reason::Blocklist).with_confidence(word_geo_mean));
             return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
-            self.decide(|| withheld(Reason::Notch));
+            self.decide(|| withheld(Reason::Notch).with_confidence(word_geo_mean));
             return None;
         }
 
@@ -1378,11 +1406,11 @@ impl Validator {
 
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
-                self.decide(|| withheld(Reason::Grammar));
+                self.decide(|| withheld(Reason::Grammar).with_confidence(word_geo_mean));
                 return None;
             }
             if !self.cty.is_allocated(&candidate) {
-                self.decide(|| withheld(Reason::Cty));
+                self.decide(|| withheld(Reason::Cty).with_confidence(word_geo_mean));
                 return None;
             }
         }
@@ -1427,21 +1455,46 @@ impl Validator {
                 word.last_reps = reps;
             }
         }
-        let mut confidence = confidence::c_call(&char_confidences, reps);
+        // MAN-106 zero-evidence abstention gate: a candidate whose every
+        // character carried zero decoder confidence (the `?`-placeholder
+        // contract) has no acoustic evidence, so no public emission --
+        // regardless of database membership. Investigation 11: "Do not
+        // let a callsign database overwhelm contradictory sound" -- here,
+        // absent sound. Deliberately an evidence gate, NOT a confidence
+        // threshold: there is no numeric cutoff to argue with, and
+        // calibration never gets a chance to rescue pure silence.
+        // Applied before `c_call`'s non-empty assertion and before the
+        // repetition gate; allowlist, SCP and Beacon exemptions do not
+        // bypass it.
+        if !confidence::has_acoustic_evidence(&char_confidences) {
+            self.decide(|| withheld(Reason::NoEvidence).with_reps(reps));
+            return None;
+        }
+        let tier = self.patterns.tier(&candidate);
+        let mut confidence =
+            confidence::calibration::c_call_calibrated(&char_confidences, reps, tier);
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
         }
+        let emission_state = if confidence >= confidence::calibration::PUBLISH_CONFIRMED_THRESHOLD {
+            EmissionState::Confirmed
+        } else {
+            EmissionState::Tentative
+        };
+        let raw_c_call = crate::confidence::c_call(&char_confidences, reps);
         // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
         // repetition requirement: NCDXF-style beacons ID once per cycle,
         // so a single decode must still spot (MAN-28). Only reachable
         // here for an ALLOWLISTED Beacon candidate -- non-allowlisted
         // ones never reach this function body at all (see the early
         // dispatch above).
-        if !is_allowlisted
-            && spot_type != SpotType::Beacon
-            && reps < self.level.required_reps(self.patterns.tier(&candidate))
+        if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
         {
-            self.decide(|| withheld(Reason::Repetition).with_reps(reps));
+            self.decide(|| {
+                withheld(Reason::Repetition)
+                    .with_reps(reps)
+                    .with_confidence(Some(raw_c_call))
+            });
             return None;
         }
 
@@ -1478,7 +1531,9 @@ impl Validator {
         if let Some((rival_call, rival_support)) = rival {
             self.suppression_counts.variant += 1;
             self.decide(|| {
-                let mut d = withheld(Reason::Variant).with_reps(reps);
+                let mut d = withheld(Reason::Variant)
+                    .with_reps(reps)
+                    .with_confidence(Some(raw_c_call));
                 d.rival = Some(Rival {
                     call: rival_call,
                     support: rival_support,
@@ -1494,7 +1549,11 @@ impl Validator {
             .assess(&candidate, freq_hz, snr_db, spot_type, sample_ts, input);
         if outcome != DedupeOutcome::Emit {
             self.count_cross_input_dedupe(outcome, input);
-            self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
+            self.decide(|| {
+                withheld(Reason::Dedupe)
+                    .with_reps(reps)
+                    .with_confidence(Some(raw_c_call))
+            });
             return None;
         }
 
@@ -1506,12 +1565,13 @@ impl Validator {
             wpm,
             spot_type,
             confidence,
+            emission_state,
             track_id,
             sample_ts,
             rst,
             qrl_query,
         };
-        self.decide(|| Decision::spotted(&spot, reps));
+        self.decide(|| Decision::spotted(&spot, reps).with_confidence(Some(raw_c_call)));
         Some(spot)
     }
 
@@ -1779,11 +1839,29 @@ impl Validator {
                     pb.word_seq,
                     |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
                 ) as u32;
-                let mut confidence = confidence::c_call(&pb.char_confidences, reps);
+                // MAN-106: the zero-evidence abstention gate applies to
+                // beacons exactly as to every other candidate -- absent
+                // sound is absent sound (see `try_spot`'s gate).
+                if !confidence::has_acoustic_evidence(&pb.char_confidences) {
+                    self.decide(|| {
+                        beacon_decision(track_id, &pb, Reason::NoEvidence).with_reps(reps)
+                    });
+                    return None;
+                }
+                let tier = self.patterns.tier(&pb.candidate);
+                let raw_c_call = confidence::c_call(&pb.char_confidences, reps);
+                let mut confidence =
+                    confidence::calibration::c_call_calibrated(&pb.char_confidences, reps, tier);
                 if let Some(scp) = &self.scp {
                     confidence =
                         confidence::apply_scp_boost(confidence, scp.contains(&pb.candidate));
                 }
+                let emission_state =
+                    if confidence >= confidence::calibration::PUBLISH_CONFIRMED_THRESHOLD {
+                        EmissionState::Confirmed
+                    } else {
+                        EmissionState::Tentative
+                    };
                 // ARCHITECTURE §6.4 exempts BEACON-tagged messages from
                 // the repetition requirement -- no `reps < 2` gate here,
                 // by design.
@@ -1811,7 +1889,9 @@ impl Validator {
                     if pb.sample_ts < last_ts {
                         self.suppression_counts.pending_beacon_stale += 1;
                         self.decide(|| {
-                            beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps)
+                            beacon_decision(track_id, &pb, Reason::Dedupe)
+                                .with_reps(reps)
+                                .with_confidence(Some(raw_c_call))
                         });
                         return None;
                     }
@@ -1826,7 +1906,11 @@ impl Validator {
                 );
                 if outcome != DedupeOutcome::Emit {
                     self.count_cross_input_dedupe(outcome, input);
-                    self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
+                    self.decide(|| {
+                        beacon_decision(track_id, &pb, Reason::Dedupe)
+                            .with_reps(reps)
+                            .with_confidence(Some(raw_c_call))
+                    });
                     return None;
                 }
                 let spot = Spot {
@@ -1836,12 +1920,13 @@ impl Validator {
                     wpm,
                     spot_type: SpotType::Beacon,
                     confidence,
+                    emission_state,
                     track_id,
                     sample_ts: pb.sample_ts,
                     rst: rst.clone(),
                     qrl_query,
                 };
-                self.decide(|| Decision::spotted(&spot, reps));
+                self.decide(|| Decision::spotted(&spot, reps).with_confidence(Some(raw_c_call)));
                 Some(spot)
             })
             .collect()
@@ -1869,6 +1954,9 @@ fn beacon_decision(track_id: u32, pb: &PendingBeacon, reason: Reason) -> Decisio
         pb.freq_hz,
         SpotType::Beacon,
         reason,
+    )
+    .with_confidence(
+        (!pb.char_confidences.is_empty()).then(|| confidence::geo_mean(&pb.char_confidences)),
     )
 }
 
@@ -2020,6 +2108,68 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
         assert_eq!(spots.len(), 1);
         assert!(v.take_decisions().is_empty());
+    }
+
+    // ---- MAN-106: decision confidence (raw evidence, every stage) ----
+
+    #[test]
+    fn a_repetition_withheld_decision_carries_the_raw_c_call() {
+        let mut v = recording(CTY_FIXTURE);
+        assert!(run(&transmission_events(1, &["DE", "K5ARH", "K"], 0), &mut v).is_empty());
+        let log = v.take_decisions();
+        let rep = decisions_for(&log, "K5ARH")[0];
+        assert_eq!(rep.reason, Some(Reason::Repetition));
+        // word_events emits 0.95 per character; K5ARH has 5.
+        let expected = crate::confidence::c_call(&[0.95; 5], 1);
+        assert_eq!(rep.confidence, Some(expected));
+    }
+
+    #[test]
+    fn a_spotted_decision_carries_the_raw_c_call_and_the_spot_its_calibration() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let spots = run(&transmission_events(1, &words, 100_000), &mut v);
+        assert_eq!(spots.len(), 1);
+        let log = v.take_decisions();
+        let spotted = log
+            .iter()
+            .find(|d| d.verdict == Verdict::Spotted)
+            .expect("the second decode spots");
+        let expected = crate::confidence::c_call(&[0.95; 5], 2);
+        assert_eq!(spotted.confidence, Some(expected));
+        // The published spot carries the calibrated map of exactly that
+        // raw value (SCP boost: K5ARH is not in the None scp fixture).
+        assert_eq!(
+            spots[0].confidence,
+            crate::confidence::calibration::c_call_calibrated(
+                &[0.95; 5],
+                2,
+                crate::PatternTier::Common
+            )
+        );
+    }
+
+    #[test]
+    fn a_grammar_withheld_word_carries_its_geo_mean() {
+        let mut v = recording(CTY_FIXTURE);
+        assert!(run(&transmission_events(1, &["DE", "12345", "K"], 0), &mut v).is_empty());
+        let log = v.take_decisions();
+        let grammar = decisions_for(&log, "12345")[0];
+        assert_eq!(grammar.reason, Some(Reason::Grammar));
+        assert_eq!(
+            grammar.confidence,
+            Some(crate::confidence::geo_mean(&[0.95; 5]))
+        );
+    }
+
+    #[test]
+    fn a_decision_before_any_word_exists_carries_no_confidence() {
+        // The constructor default: a withhold that had no word (no
+        // character confidences at all) records `None`, never a guess.
+        let d = Decision::withheld(1, 0, "K5ARH", 14_000_000.0, SpotType::Cq, Reason::Blocklist);
+        assert_eq!(d.confidence, None);
+        assert_eq!(d.spot, None);
     }
 
     #[test]

@@ -265,10 +265,11 @@ dashboard can drop the track's row on this record.
 | `withheld` | `"beaconSpeed"` | A deferred beacon rejected when its track ended: its speed was never confirmed, or is above 45 WPM. |
 | `withheld` | `"beaconOverflow"` | A deferred beacon evicted, oldest first, because a ninth was deferred on its track (at most 8 wait at once). |
 | `withheld` | `"beaconDiscarded"` | A deferred beacon dropped because its track closed for bookkeeping with no survivor. |
+| `withheld` | `"noEvidence"` | Every character of the candidate carried zero decoder confidence — no acoustic evidence, so no public emission regardless of database membership (MAN-106). |
 
-The twelve `reason` strings are `blocklist`, `notch`, `grammar`, `cty`,
+The thirteen `reason` strings are `blocklist`, `notch`, `grammar`, `cty`,
 `repetition`, `variant`, `dedupe`, `powerStepGuard`, `beaconPending`,
-`beaconSpeed`, `beaconOverflow` and `beaconDiscarded`.
+`beaconSpeed`, `beaconOverflow`, `beaconDiscarded` and `noEvidence`.
 
 A beacon candidate first gets `deferred`/`beaconPending` (or a `blocklist`,
 `notch`, `grammar` or `cty` withhold). Its later decision is `spotted`, or

@@ -50,6 +50,9 @@ pub enum Reason {
     /// A deferred beacon dropped when its track closed for bookkeeping
     /// with no survivor.
     BeaconDiscarded,
+    /// A candidate whose characters all carried zero decoder confidence --
+    /// no acoustic evidence, so no public emission (MAN-106).
+    NoEvidence,
 }
 
 /// The variant that beat a candidate withheld for `Reason::Variant`.
@@ -79,6 +82,17 @@ pub struct Decision {
     /// None for an allowlisted call or a beacon.
     pub pattern_tier: Option<crate::PatternTier>,
     pub rival: Option<Rival>,
+    /// The candidate's raw callsign evidence as the validator computed it
+    /// when this decision was made (MAN-106): the un-boosted `c_call`
+    /// composition `geo_mean · (1 − 0.5^r)` once a repetition count
+    /// exists, the word's `geo_mean` for early withholds that already
+    /// had a word, `None` before any word existed. Raw, not calibrated:
+    /// the published spot's calibrated probability is `Spot.confidence`
+    /// (recoverable from these fields via
+    /// `calibration::Calibration::calibrated_from_raw`). Present on
+    /// withheld and deferred decisions too, so a consumer can label hard
+    /// negatives.
+    pub confidence: Option<f32>,
     /// The emitted spot, `Verdict::Spotted` only.
     pub spot: Option<Spot>,
 }
@@ -112,6 +126,7 @@ impl Decision {
             required_reps: 1,
             pattern_tier: None,
             rival: None,
+            confidence: None,
             spot: None,
         }
     }
@@ -131,12 +146,20 @@ impl Decision {
             required_reps: 1,
             pattern_tier: None,
             rival: None,
+            // The call site fills the raw c_call evidence via
+            // `with_confidence` (MAN-106).
+            confidence: None,
             spot: Some(spot.clone()),
         }
     }
 
     pub(crate) fn with_reps(mut self, reps: u32) -> Self {
         self.reps = Some(reps);
+        self
+    }
+
+    pub(crate) fn with_confidence(mut self, confidence: Option<f32>) -> Self {
+        self.confidence = confidence;
         self
     }
 }

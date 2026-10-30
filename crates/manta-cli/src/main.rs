@@ -10684,6 +10684,7 @@ mod tests {
                 wpm: 28.0,
                 spot_type: manta_spot::SpotType::Cq,
                 confidence: 0.9,
+                emission_state: manta_spot::EmissionState::Confirmed,
                 track_id: 7,
                 sample_ts: 12_345,
                 rst: None,

@@ -1430,10 +1430,16 @@ c_char ← c_char · q,  q = clamp(SNR_2500 / 20 dB, 0.3, 1.0)
 `q` folds channel quality in so that a clean-timed character in the mud never
 reaches full confidence. Emitted per character in the decoder output stream.
 
-`q`'s `SNR_2500` is still the demod's own §3.2 keying-rail estimate
-(`Demod::snr_2500_db`), not `TrackMeta.snr_2500_db`'s §2.3 floor-based value
-below — deliberately (MAN-102 / decision D3): the two were the same value by
-coincidence before MAN-102, and are now intentionally decoupled, not merged.
+`q`'s `SNR_2500` is the engine-supplied floor-based estimate (§2.3 /
+MAN-102, pushed down via `set_snr_2500_db` on every queued hop), with the
+demod's own §3.2 keying-rail estimate (`Demod::snr_2500_db`) as the
+fallback when the decoder is driven standalone. Amended by MAN-106
+(docs/DECISIONS/2026-10-30-man106-q-snr-input.md), which reversed MAN-102
+decision D3's pin for the confidence path only: the rail estimate sits
+~8 dB under the floor value across the operating band, pinning `q` at its
+0.3 floor (100% of decoded characters at AWGN 3/6 dB, 69% on the V8w
+scene), so spot confidence carried no dynamic range. `TrackMeta`'s
+reported value was already the floor-based one; the two now agree.
 
 ### 4.6 Per-callsign confidence (consumed by `manta-spot`)
 
@@ -1461,7 +1467,29 @@ c_call = (Π cᵢ)^(1/n) · (1 − 0.5^r)
 Geometric mean (one garbled character tanks it, correctly) times a
 repetition factor: `r=1 → 0.5`, `r=2 → 0.75`, `r=3 → 0.875`. The validator's
 own adjustments (cty/SCP hits, per ARCHITECTURE §6) multiply on top of this
-and are specified in `manta-spot`, not here. The first-spot gate requires
+and are specified in `manta-spot`, not here.
+
+**[MAN-106 amendment — calibrated per-callsign confidence and emission
+state]** the published `decodeConfidence` is a calibrated probability, not
+the raw composition above: `geo_mean · (1 − 0.5^r)^rep_scale ·
+tier_factor[tier]` mapped through a committed monotone piecewise-linear
+calibration (≤ 8 knots, anchored at raw 0 → 0), with the repetition
+exponent and the MAN-95 pattern-tier factors fitted jointly offline on
+labeled bench scenes (correct spots plus withheld candidates as hard
+negatives) and committed from `scripts/fit-confidence-calibration.py`
+(constants and provenance: `manta-spot`'s `confidence::calibration`, fit
+and held-out quality in docs/DECISIONS/2026-10-30-man106-confidence-
+calibration.md). The SCP boost still multiplies on top, capped at 1.0. A
+candidate whose characters ALL carry zero decoder confidence has no
+acoustic evidence and is never emitted — an abstention recorded in the
+decision stream as `Reason::NoEvidence`, with no numeric threshold to
+argue with. Every published spot carries an emission state:
+`confirmed` when the calibrated probability reaches
+`PUBLISH_CONFIRMED_THRESHOLD` (0.5, chosen from the calibration's
+risk-vs-coverage table at risk ≤ 5%), else `tentative` (still published).
+The zero-evidence gate is an evidence gate, not a confidence threshold:
+calibration never rescues pure silence, and no threshold suppresses a
+published-but-tentative spot. The first-spot gate requires
 the pattern tier's count (2 for a common
 pattern, 3 for a listed pattern, 5 for an unlisted pattern at the default
 `normal` level; `minimal` requires 2 for every pattern, MAN-95); a
@@ -1745,6 +1773,7 @@ in the fixture manifest. Text payload (unless stated):
 | V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz |
 | V34 | fade-good-reacquire | 20 WPM, +3 dB, offset +9.1 kHz, W1AW, 120 s; fade seed `0x0BAD`, noise seed `0x4D41_4E01_3B95` (MAN-108) | Watterson CCIR-good, no jitter | 1 promoted track within 300 Hz; W1AW spotted, every W1AW spot on that track; CER ≤ 0.20; with `detector.reacquire_ms = 0` the same WAV promotes ≥ 2 tracks (the scene still fades past the hang) |
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
+| V52 | zero-evidence | `CQ DE W1AW W1AW K` event sequences at the validator event contract, every `char_decoded` confidence 0.0 (with and without SCP), plus positive-control and mixed-`?` variants | n/a (event stream, not audio) | no spot from the all-zero streams and a withheld `NoEvidence` decision; positive evidence still spots; a mixed word still spots; a two-rep clean CQ spot is `confirmed`, a degraded single-rep allowlisted spot `tentative`; `emissionState` serializes `confirmed`/`tentative` (MAN-106) |
 
 V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
 frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz

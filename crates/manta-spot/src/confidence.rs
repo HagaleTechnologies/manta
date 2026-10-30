@@ -1,5 +1,10 @@
 //! SPEC-decode-core.md §4.6 per-callsign confidence, plus the cty/SCP
 //! adjustment the spec explicitly defers to this crate (ARCHITECTURE §6.3).
+//! MAN-106 adds the evidence predicate behind the zero-evidence
+//! abstention gate and the committed empirical calibration (see
+//! `calibration`).
+
+pub mod calibration;
 
 /// Geometric mean of per-character decoder confidences: `(prod cᵢ)^(1/n)`.
 /// Shared by `c_call` below and `support::SupportLedger` (MAN-100), which
@@ -17,6 +22,15 @@ pub fn geo_mean(char_confidences: &[f32]) -> f32 {
         .map(|c| c.max(f32::EPSILON).ln())
         .sum();
     (log_sum / n).exp()
+}
+
+/// Whether a candidate carries any acoustic evidence at all: at least one
+/// finite, strictly positive per-character confidence (MAN-106). An
+/// all-zero word (every character a `?` placeholder, which the decoder
+/// emits with confidence exactly 0.0) has none, and no database
+/// membership can substitute for absent sound.
+pub fn has_acoustic_evidence(char_confidences: &[f32]) -> bool {
+    char_confidences.iter().any(|c| c.is_finite() && *c > 0.0)
 }
 
 /// SPEC §4.6: geometric mean of per-character confidences times a
@@ -71,5 +85,15 @@ mod tests {
     #[test]
     fn scp_boost_is_capped_at_one() {
         assert_eq!(apply_scp_boost(0.95, true), 1.0);
+    }
+
+    #[test]
+    fn evidence_predicate_requires_one_finite_positive_confidence() {
+        assert!(!has_acoustic_evidence(&[]));
+        assert!(!has_acoustic_evidence(&[0.0, 0.0]));
+        assert!(has_acoustic_evidence(&[0.0, 0.31]));
+        assert!(has_acoustic_evidence(&[0.95]));
+        assert!(!has_acoustic_evidence(&[f32::NAN, 0.0]));
+        assert!(!has_acoustic_evidence(&[f32::INFINITY]));
     }
 }

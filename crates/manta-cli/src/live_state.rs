@@ -180,6 +180,7 @@ mod tests {
             wpm: 20.0,
             spot_type: SpotType::Cq,
             confidence: 0.9,
+            emission_state: manta_spot::EmissionState::Confirmed,
             track_id: 1,
             sample_ts: 2_006_272,
             rst: None,
@@ -271,6 +272,7 @@ mod tests {
             required_reps: 2,
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
+            confidence: None,
             spot: None,
         });
         assert_eq!(
@@ -312,6 +314,7 @@ mod tests {
             required_reps: 2,
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
+            confidence: Some(0.75),
             spot: Some(s.clone()),
         });
         let (_, line) = render(&spotted, "W1AW", &bus);
