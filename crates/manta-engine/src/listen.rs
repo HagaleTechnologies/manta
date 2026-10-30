@@ -1196,6 +1196,7 @@ impl<'a> Back<'a> {
                 | DecoderEvent::WordBoundary { track_id, .. }
                 | DecoderEvent::SpeedUpdate { track_id, .. }
                 | DecoderEvent::TrackMeta { track_id, .. }
+                | DecoderEvent::ReadingsHeld { track_id, .. }
                 | DecoderEvent::TimingUpdate { track_id, .. } => {
                     self.open.insert(*track_id);
                 }
@@ -1297,6 +1298,7 @@ fn to_common(
                 DecoderEvent::CharDecoded { sample_ts, .. }
                 | DecoderEvent::WordBoundary { sample_ts, .. }
                 | DecoderEvent::TrackMeta { sample_ts, .. }
+                | DecoderEvent::ReadingsHeld { sample_ts, .. }
                 | DecoderEvent::TimingUpdate { sample_ts, .. }
                 | DecoderEvent::TrackPromoted { sample_ts, .. } => {
                     *sample_ts = clock.to_common(*sample_ts);
@@ -2892,6 +2894,7 @@ mod tests {
             | DecoderEvent::WordBoundary { sample_ts, .. }
             | DecoderEvent::TrackPromoted { sample_ts, .. }
             | DecoderEvent::TrackMeta { sample_ts, .. }
+            | DecoderEvent::ReadingsHeld { sample_ts, .. }
             | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
             _ => None,
         }

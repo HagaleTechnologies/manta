@@ -348,6 +348,7 @@ fn open_planned(
 /// not compile until it is classified here.
 fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<String> {
     let CliOverrides {
+        prior: _,
         device,
         source,
         source_iq,

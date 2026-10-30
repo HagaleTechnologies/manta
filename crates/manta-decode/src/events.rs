@@ -15,6 +15,13 @@ fn one() -> f32 {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all_fields = "camelCase")]
 pub enum DecoderEvent {
+    /// Acoustically viable word readings and gaps to the combined-score leader.
+    ReadingsHeld {
+        track_id: u32,
+        sample_ts: u64,
+        readings: Vec<(String, f32)>,
+        settled: bool,
+    },
     CharDecoded {
         track_id: u32,
         sample_ts: u64,
@@ -239,6 +246,29 @@ impl DecoderEvent {
 mod tests {
     use super::*;
     use crate::tree::{Glyph, Prosign};
+
+    #[test]
+    fn readings_held_json_shape_and_additivity() {
+        let event = DecoderEvent::ReadingsHeld {
+            track_id: 17,
+            sample_ts: 7123400,
+            readings: vec![("W1AW".into(), 0.0), ("R1AW".into(), 1.24)],
+            settled: false,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"event":"ReadingsHeld", "trackId":17,
+            "sampleTs":7123400, "readings":[["W1AW",0.0],["R1AW",1.24]], "settled":false})
+        );
+        assert_eq!(serde_json::from_value::<DecoderEvent>(json).unwrap(), event);
+        let old = r#"{"event":"WordBoundary","trackId":17,"sampleTs":7123400}"#;
+        assert!(matches!(
+            serde_json::from_str::<DecoderEvent>(old).unwrap(),
+            DecoderEvent::WordBoundary { .. }
+        ));
+    }
 
     /// The additive fields still take their defaults when absent, now
     /// under the MAN-139 camelCase names.

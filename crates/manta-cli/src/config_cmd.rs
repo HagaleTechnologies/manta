@@ -584,6 +584,12 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("bundled".to_string(), |p| p.display().to_string()),
     ));
 
+    if let Some(path) = &spot.calls_heard_path {
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" calls_heard_path={}", path.display()));
+        }
+    }
+
     let detector = set_keys(loaded, "detector", &[]);
     lines.push(if detector.is_empty() {
         "detector: defaults".to_string()
@@ -1873,6 +1879,7 @@ mod tests {
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "calls_heard_path"),
         ("spot", "list_cache_dir"),
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),

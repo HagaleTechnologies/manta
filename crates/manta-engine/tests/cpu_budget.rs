@@ -48,6 +48,7 @@ fn track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::ReadingsHeld { track_id, .. }
         | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
@@ -61,6 +62,7 @@ fn event_sample_ts(e: &DecoderEvent) -> Option<u64> {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
         | DecoderEvent::TrackPromoted { sample_ts, .. }
+        | DecoderEvent::ReadingsHeld { sample_ts, .. }
         | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
         DecoderEvent::SpeedUpdate { .. }
         | DecoderEvent::TrackMeta { .. }
