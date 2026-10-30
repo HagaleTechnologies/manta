@@ -318,7 +318,7 @@ fn scenario_2_an_unanswered_lookup_spots_anyway_and_counts_the_failure() {
         .spot_rx
         .recv_timeout(Duration::from_secs(90))
         .unwrap_or_else(|_| panic!("no spot within 90 s; stderr:\n{}", run.stderr()));
-    assert_eq!(spot["callsign"].as_str(), Some("W1AW"));
+    assert_eq!(spot["dxCall"].as_str(), Some("W1AW"));
     let lookups = mock.lookups();
     assert_eq!(lookups.len(), 1, "{:?}", mock.seen());
     let held = at.duration_since(lookups[0].2);

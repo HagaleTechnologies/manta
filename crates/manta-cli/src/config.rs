@@ -2704,7 +2704,9 @@ mod tests {
     fn unrecognized_table_message_lists_the_relay_tables() {
         let err = err_of("[relay_source]\nx = 1\n");
         assert!(
-            err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+            err.contains(
+                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+            ),
             "{err}"
         );
     }

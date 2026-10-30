@@ -1447,7 +1447,8 @@ fn check_prints_the_relay_summary_lines() {
     let skimmer = at("skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true");
     let wsjtx = at("wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true");
     assert_eq!((skimmer, wsjtx), (compare + 1, compare + 2), "{out}");
-    assert!(lines[wsjtx + 1].starts_with("input: "), "{out}");
+    assert_eq!(lines[wsjtx + 1], "callsign_lookup: none", "{out}");
+    assert!(lines[wsjtx + 2].starts_with("input: "), "{out}");
 
     let path = write_cfg(dir.path(), "plain.toml", RELAY_BASE);
     let out = succeeds(&check_file(&path));
@@ -1528,7 +1529,9 @@ fn check_rejects_each_relay_error_with_its_message() {
     let path = write_cfg(dir.path(), "unknown.toml", "[relay_source]\nx = 1\n");
     let err = fails(&check_file(&path));
     assert!(
-        err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+        err.contains(
+            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+        ),
         "{err}"
     );
 }
