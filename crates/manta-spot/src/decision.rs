@@ -15,7 +15,8 @@ pub enum Verdict {
     Spotted,
     /// Not published (this time); see the `Reason`.
     Withheld,
-    /// A beacon candidate captured now and judged when its track ends.
+    /// A beacon candidate captured now and judged when its track ends, or
+    /// (MAN-318) a candidate held until the callsign lookup answers.
     Deferred,
 }
 
@@ -50,6 +51,11 @@ pub enum Reason {
     /// A deferred beacon dropped when its track closed for bookkeeping
     /// with no survivor.
     BeaconDiscarded,
+    /// A candidate held until the callsign lookup answers (MAN-318); a
+    /// later decision settles it.
+    LookupPending,
+    /// The callsign lookup service does not list the call (MAN-318).
+    LookupNotFound,
 }
 
 /// The variant that beat a candidate withheld for `Reason::Variant`.
@@ -84,7 +90,7 @@ pub struct Decision {
 }
 
 impl Decision {
-    /// A `Withheld` (or `Deferred`, for `BeaconPending`) decision with no
+    /// A `Withheld` (or `Deferred`, for `BeaconPending`/`LookupPending`) decision with no
     /// repetition count, rival or spot yet.
     pub(crate) fn withheld(
         track_id: u32,
@@ -94,7 +100,7 @@ impl Decision {
         spot_type: SpotType,
         reason: Reason,
     ) -> Self {
-        let verdict = if reason == Reason::BeaconPending {
+        let verdict = if matches!(reason, Reason::BeaconPending | Reason::LookupPending) {
             Verdict::Deferred
         } else {
             Verdict::Withheld

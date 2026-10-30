@@ -23,6 +23,7 @@ mod band_streams;
 mod bench;
 mod build_info;
 mod calibrate_cmd;
+mod callsign_lookup;
 mod cli_docs;
 mod clock_check;
 mod config;
@@ -40,6 +41,7 @@ mod list_refresh;
 mod live_state;
 mod logging;
 mod multi_run;
+mod qrz;
 mod reconnect;
 mod relay_socket;
 mod reload;
@@ -4383,6 +4385,26 @@ fn prepare_run_lists(
 
 /// MAN-316: publishes the lists in use to `manta_list_info` (every daemon),
 /// prints the startup lines, and starts the `manta-lists` thread when a
+/// MAN-318: starts the `manta-lookup` thread when `[callsign_lookup]` is
+/// enabled and the source is live; a file replay notes that lookups are off
+/// (D3), so it stays repeatable. `None` skips the validator's lookup step.
+fn start_callsign_lookup(
+    cfg: Option<&config::CallsignLookupConfig>,
+    live: bool,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+) -> Result<Option<std::sync::Arc<dyn manta_spot::CallsignLookup>>> {
+    let Some(cfg) = cfg.filter(|c| c.enabled) else {
+        return Ok(None);
+    };
+    if !live {
+        logging::note(callsign_lookup::FILE_REPLAY_NOTE);
+        return Ok(None);
+    }
+    logging::note(&callsign_lookup::startup_line(cfg));
+    let lookup = callsign_lookup::start(cfg, metrics)?;
+    Ok(Some(lookup))
+}
+
 /// live source has refresh on and a list to manage. Returns the handle the
 /// decode loop watches, `None` when nothing can change the lists.
 fn start_list_refresh(
@@ -5202,6 +5224,8 @@ struct Resolved {
     /// MAN-301: `[rbn_compare]` with `--rbn-compare`/`--rbn-spotter`
     /// merged over it; `None` when neither the file nor the flags set it.
     rbn_compare: Option<manta_server::config::RbnCompareConfig>,
+    /// MAN-318: `[callsign_lookup]` from the config (`None` when absent).
+    callsign_lookup: Option<config::CallsignLookupConfig>,
     /// Printed to stderr by the caller, never stdout.
     notes: Vec<String>,
     /// The flag that replaced a typed `[input]` from the file, if one did:
@@ -5384,6 +5408,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                 replay_epoch,
                 spot,
                 rbn_compare,
+                callsign_lookup: loaded.callsign_lookup.clone(),
                 notes,
                 replaced_file_source: Some(flag),
                 inputs: Vec::new(),
@@ -5465,6 +5490,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
         replay_epoch: replay_epoch.or(shared.replay_epoch),
         spot,
         rbn_compare,
+        callsign_lookup: loaded.callsign_lookup.clone(),
         notes,
         replaced_file_source,
         inputs,
@@ -6956,6 +6982,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     server,
                     run_lists,
                     spot: &resolved.spot,
+                    callsign_lookup: resolved.callsign_lookup.as_ref(),
                     reload,
                 });
             }
@@ -7306,6 +7333,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 spot_server.as_ref().map(|server| server.metrics.clone()),
                 stop.clone(),
             )?;
+            // MAN-318: live sources only; a replay notes it and looks
+            // nothing up.
+            let callsign_lookup = start_callsign_lookup(
+                resolved.callsign_lookup.as_ref(),
+                spec.is_reconnectable(),
+                spot_server.as_ref().map(|server| server.metrics.clone()),
+            )?;
 
             // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]`
             // lists and each `[[rbn_uplink]]` `dry_run` (D2). The thread
@@ -7545,6 +7579,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     decode_quality: decode_quality.clone(),
                     operator_lists: reload_enabled.then(|| operator_lists.clone()),
                     reference_lists,
+                    callsign_lookup,
                     static_crashes: Some(static_crashes.clone()),
                     bad_samples: Some(bad_samples.clone()),
                     rtty: Some(rtty_observer.clone()),

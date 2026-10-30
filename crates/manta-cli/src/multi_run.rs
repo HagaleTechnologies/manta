@@ -78,6 +78,8 @@ pub(crate) struct MultiRun<'a> {
     /// refresher to start once the servers are up.
     pub run_lists: RunLists,
     pub spot: &'a SpotResolved,
+    /// MAN-318: `[callsign_lookup]`, started for live inputs only.
+    pub callsign_lookup: Option<&'a crate::config::CallsignLookupConfig>,
     /// MAN-78: what a SIGHUP reload re-resolves with; `Some` on Unix.
     pub reload: Option<ReloadSetup>,
 }
@@ -807,6 +809,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         m.spot,
         server.as_ref().map(|(_, server)| server.metrics.clone()),
         stop.clone(),
+    )?;
+    // MAN-318: as with one input.
+    shared.callsign_lookup = crate::start_callsign_lookup(
+        m.callsign_lookup,
+        live,
+        server.as_ref().map(|(_, server)| server.metrics.clone()),
     )?;
     // MAN-78: with a `[server]` table, SIGHUP reloads the `[spot]` lists
     // every input's spots are checked against and each `dry_run`.

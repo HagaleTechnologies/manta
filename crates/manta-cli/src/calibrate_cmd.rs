@@ -986,6 +986,7 @@ mod tests {
                 &Default::default(),
             ),
             rbn_compare: None,
+            callsign_lookup: None,
             notes: Vec::new(),
             replaced_file_source: None,
             replay: crate::ReplayMode::default(),

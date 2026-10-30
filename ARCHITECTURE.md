@@ -513,6 +513,14 @@ transmission may never produce again).
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
    WPM, type, confidence.
+6. **Callsign lookup (MAN-318, opt-in, live only)**: with `[callsign_lookup]`
+   on, a spot that passed every step above is checked against QRZ.com
+   through `manta_spot::CallsignLookup`. A call QRZ.com does not list is
+   withheld (`lookupNotFound`); one without an answer yet is held
+   (`lookupPending`) for at most 10 s, then published, unverified if QRZ.com
+   never answered. Answers are cached 24 h; `[spot].allowlist` calls skip
+   the step. A file replay never runs it. See
+   `docs/DECISIONS/2026-10-27-man318-callsign-lookup.md`.
 
 **Operator allowlist (Watch List)**: a callsign the operator explicitly lists
 bypasses step 1's context-parse requirement too — not just steps 2
@@ -736,7 +744,7 @@ validation (MAN-28). Dedupe (step 5) still applies.
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with seven
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with eight
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
@@ -1138,7 +1146,11 @@ non-blocking send plus shared atomics and short locks between them.
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
   `ReferenceLists`). The decode thread picks those up before it feeds the
-  validator its next event. During a live source's outage,
+  validator its next event. `manta-lookup` (`[callsign_lookup]`, MAN-318)
+  does QRZ.com's HTTPS requests and hands answers back through a channel
+  the decode thread polls once per batch, never waiting on it; only after
+  decoding ends does the decode thread wait for answers still in flight,
+  for at most 10 s. During a live source's outage,
   `ReconnectingSource` opens the replacement source on a short-lived
   `reopen-<kind>` thread (MAN-252) while `read()` waits for it in slices,
   checking the stop flag; a stop request mid-reopen returns EOF at once and
