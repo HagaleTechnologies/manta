@@ -26,15 +26,12 @@ fn backwards_commits(spec: &manta_testkit::vectors::VectorSpec) -> Vec<String> {
     let mut bad = Vec::new();
     for ev in report["events"].as_array().unwrap() {
         let label = match ev["event"].as_str().unwrap() {
-            "CharDecoded" => ev["glyph"]["Char"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| ev["glyph"].to_string()),
+            "CharDecoded" => ev["glyph"].as_str().unwrap().to_string(),
             "WordBoundary" => "_".to_string(),
             _ => continue,
         };
-        let tid = ev["track_id"].as_u64().unwrap();
-        let ts = ev["sample_ts"].as_u64().unwrap();
+        let tid = ev["trackId"].as_u64().unwrap();
+        let ts = ev["sampleTs"].as_u64().unwrap();
         if let Some((prev, prev_ts)) = last.get(&tid) {
             if ts < *prev_ts {
                 bad.push(format!("track {tid}: {label}@{ts} after {prev}@{prev_ts}"));

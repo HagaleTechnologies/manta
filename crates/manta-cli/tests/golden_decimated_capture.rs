@@ -64,7 +64,7 @@ fn clean_signal_decodes_correctly_after_192khz_to_48khz_decimation() {
     // parabola's weak neighbour bin, at every table size, not the channel
     // table or the decimator; the phase estimator measures 1.41 Hz. See
     // docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md.
-    let freq = report["freq_hz"].as_f64().unwrap();
+    let freq = report["frequency"].as_f64().unwrap();
     assert!(
         (freq - rendered.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",
@@ -74,7 +74,7 @@ fn clean_signal_decodes_correctly_after_192khz_to_48khz_decimation() {
     );
 
     for ev in report["events"].as_array().unwrap() {
-        assert_eq!(ev["track_id"].as_u64(), Some(1));
+        assert_eq!(ev["trackId"].as_u64(), Some(1));
     }
 }
 
@@ -130,7 +130,7 @@ fn rim_inside_the_trusted_band_still_decodes_at_the_golden_standard() {
     );
 
     // V1's 10 Hz (MAN-114; measured 0.02 Hz, a bin-centred offset).
-    let freq = report["freq_hz"].as_f64().unwrap();
+    let freq = report["frequency"].as_f64().unwrap();
     assert!(
         (freq - rendered.expected_freq_hz).abs() <= 10.0,
         "freq {} expected {} (err {})",
@@ -140,6 +140,6 @@ fn rim_inside_the_trusted_band_still_decodes_at_the_golden_standard() {
     );
 
     for ev in report["events"].as_array().unwrap() {
-        assert_eq!(ev["track_id"].as_u64(), Some(1));
+        assert_eq!(ev["trackId"].as_u64(), Some(1));
     }
 }

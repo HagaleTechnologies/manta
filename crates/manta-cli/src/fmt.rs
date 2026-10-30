@@ -27,6 +27,16 @@ pub fn spot_line(spot: &manta_spot::Spot) -> String {
     )
 }
 
+/// `run --json`'s line for one spot: `{"spot": …}` with the spot's own
+/// field order and f32 text, as in `decode --json`'s `spots` (MAN-139).
+pub fn spot_json(spot: &manta_spot::Spot) -> String {
+    #[derive(serde::Serialize)]
+    struct SpotLine<'a> {
+        spot: &'a manta_spot::Spot,
+    }
+    serde_json::to_string(&SpotLine { spot }).expect("a spot always serializes")
+}
+
 pub fn decode_summary(report: &manta_engine::DecodeReport) -> String {
     format!(
         "frequency: {}  speed: {}  spots: {}",
@@ -194,7 +204,7 @@ mod tests {
     use manta_spot::{Spot, SpotType};
 
     #[test]
-    fn spot_specimen_and_unchanged_enum_serialization() {
+    fn spot_specimen_and_enum_serialization() {
         let spot = Spot {
             callsign: "W1AW".into(),
             freq_hz: 14_000_759.2,
@@ -220,17 +230,47 @@ mod tests {
             spot_line(&annotated),
             "SPOT: W1AW (CQ) 14000.8 kHz 29 dB 20 WPM conf=0.79 rst=599 QRL?"
         );
+        // MAN-139: the JSON spot stream's names, in declaration order.
+        assert_eq!(
+            serde_json::to_string(&annotated).unwrap(),
+            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"trackId":1,"sampleTs":0,"rst":"599","qrlQuery":true}"#
+        );
+        // The live-state `spotType` and `/metrics` `type` labels.
         for (value, human, json) in [
-            (SpotType::Cq, "CQ", "Cq"),
-            (SpotType::De, "DE", "De"),
-            (SpotType::Beacon, "BEACON", "Beacon"),
-            (SpotType::Unknown, "unknown", "Unknown"),
+            (SpotType::Cq, "CQ", "cq"),
+            (SpotType::De, "DE", "de"),
+            (SpotType::Beacon, "BEACON", "beacon"),
+            (SpotType::Unknown, "unknown", "unknown"),
         ] {
             assert_eq!(value.to_string(), human);
             assert_eq!(serde_json::to_value(value).unwrap(), json);
         }
         assert_eq!(wpm_opt(None), "unknown");
         assert_eq!(wpm_opt(Some(17.647_058)), "18 WPM");
+    }
+
+    /// MAN-139: `run --json`'s spot line is the spot as `decode --json`
+    /// prints it, wrapped, not a key-sorted `json!` value.
+    #[test]
+    fn spot_json_line_is_the_spot_in_declaration_order() {
+        let spot = Spot {
+            callsign: "W1AW".into(),
+            freq_hz: 14_012_341.017_764_632,
+            snr_db: 20.995_895,
+            wpm: 19.565_216,
+            confidence: 0.551_824_33,
+            spot_type: SpotType::Cq,
+            track_id: 1,
+            sample_ts: 2_006_272,
+            rst: None,
+            qrl_query: false,
+        };
+        let line = spot_json(&spot);
+        assert_eq!(
+            line,
+            format!("{{\"spot\":{}}}", serde_json::to_string(&spot).unwrap())
+        );
+        assert!(line.starts_with(r#"{"spot":{"dxCall":"#), "{line}");
     }
 
     #[test]

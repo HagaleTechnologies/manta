@@ -12,7 +12,13 @@
 //! [`SpotBus::subscribe_json`], which carries every spot plus, with
 //! `[rbn_compare]` enabled, each `spotGrade` record in publish order. With
 //! no grades published the JSON channel carries exactly the spots.
+//!
+//! A fourth channel carries relayed spots (MAN-320) to the RBN uplink only:
+//! [`SpotBus::publish_relay`] / [`SpotBus::subscribe_relay`]. Telnet, the
+//! JSON stream and the live-state stream never read it, so another local
+//! program's spots never appear on manta's own outputs.
 
+use crate::relay::RelaySpot;
 use manta_spot::Spot;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -247,6 +253,8 @@ pub struct SpotBus {
     json_tx: broadcast::Sender<JsonItem>,
     /// MAN-324: the live-state stream's own channel.
     live_tx: broadcast::Sender<JsonItem>,
+    /// MAN-320: relayed spots, read by the RBN uplink only.
+    relay_tx: broadcast::Sender<RelaySpot>,
     epoch: SystemTime,
     session_nonce: u128,
     sample_rate_hz: f64,
@@ -276,10 +284,12 @@ impl SpotBus {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
         let (json_tx, _json_rx) = broadcast::channel(CHANNEL_CAPACITY);
         let (live_tx, _live_rx) = broadcast::channel(LIVE_CHANNEL_CAPACITY);
+        let (relay_tx, _relay_rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             tx,
             json_tx,
             live_tx,
+            relay_tx,
             epoch,
             session_nonce,
             sample_rate_hz,
@@ -465,6 +475,20 @@ impl SpotBus {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusSpot> {
         self.tx.subscribe()
+    }
+
+    /// MAN-320: publishes one relayed spot to the RBN uplink's relay
+    /// receivers. No history, no occurrence count, no sequence number: a
+    /// relayed spot is another decoder's output and touches none of manta's
+    /// own spot state. Returns false (not an error) with no subscriber.
+    pub fn publish_relay(&self, spot: RelaySpot) -> bool {
+        self.relay_tx.send(spot).is_ok()
+    }
+
+    /// MAN-320: a receiver on the relay channel. Only the RBN uplink
+    /// subscribes.
+    pub fn subscribe_relay(&self) -> broadcast::Receiver<RelaySpot> {
+        self.relay_tx.subscribe()
     }
 
     /// Spots and grades in publish order: the JSON/WebSocket stream.
@@ -1203,5 +1227,54 @@ mod tests {
         let bus = bus.with_history_minutes(u32::MAX);
         bus.publish(sample_spot(u64::MAX));
         assert_eq!(bus.recent(1).len(), 1);
+    }
+
+    fn sample_relay() -> crate::relay::RelaySpot {
+        crate::relay::RelaySpot {
+            spotter: Arc::from("W3XYZ-2"),
+            callsign: "K5ARH".to_string(),
+            freq_hz: 14_027_100.0,
+            mode: crate::relay::RelayMode::Cw { wpm: 28 },
+            snr_db: 30,
+            spot_type: manta_spot::SpotType::Cq,
+            unix_ts: 1_700_000_000,
+        }
+    }
+
+    /// MAN-320 D4: a relayed spot reaches only `subscribe_relay()`.
+    #[tokio::test]
+    async fn a_relayed_spot_reaches_relay_subscribers_only() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut own = bus.subscribe();
+        let mut json = bus.subscribe_json();
+        let mut live = bus.subscribe_live();
+        let mut relay = bus.subscribe_relay();
+        assert!(bus.publish_relay(sample_relay()));
+        assert_eq!(relay.try_recv().unwrap(), sample_relay());
+        assert!(own.try_recv().is_err());
+        assert!(json.try_recv().is_err());
+        assert!(live.try_recv().is_err());
+    }
+
+    #[test]
+    fn publish_relay_without_subscribers_is_not_an_error() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        assert!(!bus.publish_relay(sample_relay()));
+    }
+
+    /// A relayed spot leaves `recent()` and the occurrence counts alone: the
+    /// next own spot of the same call still counts as its first.
+    #[tokio::test]
+    async fn a_relayed_spot_does_not_touch_occurrence_counts_or_history() {
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let _relay = bus.subscribe_relay();
+        let mut own = bus.subscribe();
+        bus.publish_relay(sample_relay());
+        bus.publish_relay(sample_relay());
+        assert!(bus.recent(10).is_empty());
+        let mut spot = sample_spot(0);
+        spot.callsign = "K5ARH".to_string();
+        bus.publish(spot);
+        assert_eq!(own.recv().await.unwrap().occurrence_count, 1);
     }
 }

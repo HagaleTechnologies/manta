@@ -56,10 +56,10 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all seven | yes |
+| `run` (alias `listen`) | all nine | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all seven, resolved exactly as `run` resolves them | yes |
+| `config check` | all nine, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
@@ -200,6 +200,95 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 | `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
 | `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
 | `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+
+## [[skimmer_relay]]
+
+Forwards the spots of another CW skimmer on your network (CW Skimmer, SkimSrv
+or a second manta) through `[[rbn_uplink]]`, under that skimmer's own call
+(MAN-320). One block per skimmer. manta connects to `host:port` by telnet,
+sends `callsign` plus CRLF when the skimmer's prompt arrives (with or without
+a trailing newline), and then only reads, writing a blank line every 300 s to
+notice a vanished peer. It reads `DX de` lines in the RBN layout (with the
+mode column) and in CW Skimmer's and manta's `skimmer` layout (without it),
+and forwards a line only when it is a CW spot whose `DX de` spotter, with
+`-#` stripped, equals `callsign`. It sends no `SKIMMER/SETT` and no password.
+Failed or dropped connections are retried with 1 s→60 s backoff.
+
+An enabled block needs an enabled `[[rbn_uplink]]` (which needs `[server]`),
+and the environment cannot set these keys. Every key needs a restart; a
+SIGHUP never applies them. The uplink's `dry_run`, `spot_types` and
+`max_spots_per_minute` apply to relayed spots as to manta's own, and
+relayed spots never appear on manta's telnet, JSON or stdout output. The
+SNR is forwarded as the skimmer quoted it (500 Hz). `doctor` does not
+check this table. See `manta_relay_*` in [METRICS.md](METRICS.md).
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `true` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `false` keeps the block but does not connect. |
+| `host` | none; example `"<skimmer-host>"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | The skimmer's host name or address. `config check` rejects the `<...>` placeholder. |
+| `port` | none; example `7300`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | The skimmer's telnet port: CW Skimmer 7300 and SkimSrv 7310 by default; for a second manta, its `telnet_port`. |
+| `callsign` | none; example `"N0CALL-2"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `CALL` or `CALL-N` (`-1` through `-99`), uppercased. Sent as the login and used as the spotter on every forwarded line; only lines the skimmer spotted under this call are forwarded. It may not be `[server].station_callsign` or any `[[rbn_uplink]].login_callsign`, since manta already forwards its own spots. `N0CALL` is rejected. |
+
+Load errors (`check`, `run`, `doctor`, `config check` and a SIGHUP reload all
+raise them, exit 1):
+
+```
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 forwards spots only through [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = false on this relay
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 has callsign = "W1ABC", this station's own call -- a skimmer relay forwards another skimmer's spots under that skimmer's own call (e.g. "W1ABC-2"); manta already forwards its own
+manta.toml: [[skimmer_relay]] 192.168.1.20:7300 is listed twice
+manta.toml: skimmer_relay must be written [[skimmer_relay]] (an array of tables)
+manta.toml: [[skimmer_relay]]: callsign "W1ABC-100" is not a plausible callsign (an SSID must be -1 through -99)
+manta.toml: [[skimmer_relay]]: host "<skimmer-host>" is the scaffold placeholder -- set the skimmer's host name or address
+```
+
+## [[wsjtx_relay]]
+
+Listens for WSJT-X or JTDX decodes by UDP and forwards new FT8/FT4 `CQ`
+decodes through `[[rbn_uplink]]` as digital spots (MAN-320). In WSJT-X, set
+Settings > Reporting > UDP Server to the `listen` address. manta never sends a
+datagram back. It learns each WSJT-X instance's dial frequency and mode from
+its `Status` messages (several instances can share one listener), adds the
+decode's audio offset to the dial frequency, and drops replays, `.wav`
+playback, low-confidence decodes, decodes from an instance it has no dial
+frequency for yet, modes other than FT8 and FT4, messages that are not a
+`CQ`, hashed `<...>` calls, and the same call, mode and band within 600 s.
+The SNR is WSJT-X's own figure (2500 Hz), not converted to 500 Hz. The spot
+is timed by its arrival.
+
+An enabled block needs an enabled `[[rbn_uplink]]` (which needs `[server]`),
+and the environment cannot set these keys. Every key needs a restart; a
+SIGHUP never applies them. The uplink's `dry_run`, `spot_types` and
+`max_spots_per_minute` apply. `doctor` does not check this table.
+
+**The listener is unauthenticated.** Anything that can send a UDP datagram to
+`listen` can put spots on the uplink under `callsign`. Keep it on
+`127.0.0.1` unless WSJT-X runs on another machine; see
+[RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md).
+
+**Multicast.** Only one program can own a unicast UDP port. If another program
+(GridTracker, JTAlert, a logger) already listens on WSJT-X's port, set WSJT-X's
+UDP Server to an IPv4 multicast group (e.g. `224.0.0.1`) and point every
+listener, manta included, at it: `listen = "224.0.0.1:2237"` binds
+`0.0.0.0:2237` with address reuse and joins the group. IPv6 multicast is
+rejected. A taken unicast port stops `manta run` at startup:
+
+```
+error: [[wsjtx_relay]] cannot listen on 127.0.0.1:2237: Address already in use (os error 98) -- another program may own the port; set WSJT-X's UDP Server to a multicast group (e.g. 224.0.0.1) and listen there
+```
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `true` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `false` keeps the block but does not listen. |
+| `listen` | `"127.0.0.1:2237"` | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `IP:port`; `127.0.0.1:2237` is WSJT-X's default UDP server. An IPv4 multicast group binds `0.0.0.0:port` with address reuse and joins the group; IPv6 multicast is rejected. Port `0` picks a free port, which the startup log names. |
+| `callsign` | none; example `"N0CALL"`; required | live: `run` with `[server]` and an enabled `[[rbn_uplink]]` | `CALL` or `CALL-N` (`-1` through `-99`), uppercased. The spotter on every forwarded FT8/FT4 line. The station's own call is allowed here, since FT8 spots are a different mode from manta's CW. `N0CALL` is rejected. |
+
+Load errors (exit 1, from the same entry points as `[[skimmer_relay]]`'s):
+
+```
+manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = false on this relay
+manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 is listed twice
+manta.toml: [[wsjtx_relay]]: listen "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
+```
 
 ## [input]
 

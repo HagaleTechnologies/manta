@@ -211,7 +211,10 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
     let src = manta_input::WavIqSource::open(&wav).unwrap();
     let report =
         manta_engine::doctor(Box::new(src), &cfg, std::time::Duration::from_secs(10)).unwrap();
-    let mut expected = serde_json::to_value(&report).unwrap();
+    // Parsed back from the report's own JSON text, the path the binary's
+    // output takes, so f32 values compare as the same short text.
+    let mut expected: serde_json::Value =
+        serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
     expected["verdict"] = serde_json::to_value(report.verdict()).unwrap();
     let out = manta()
         .args(["doctor", "--source-iq", "--source"])
@@ -221,21 +224,25 @@ fn command_reports_own_their_streams_and_json_preserves_measurements() {
         .unwrap();
     assert!(out.status.success());
     assert!(out.stderr.is_empty());
-    // Every pre-existing key keeps its exact value; MAN-126's `checks` and
-    // `checks_status` are the only additions.
-    let actual = serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap();
-    let expected = serde_json::from_str::<serde_json::Value>(&expected.to_string()).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    // MAN-139: a struct, not a key-sorted `Map`, so the report's keys come
+    // first in declaration order.
+    assert!(stdout.starts_with(r#"{"sampleRateHz":"#), "{stdout}");
+    // Every report key keeps its exact value; MAN-126's `checks` and
+    // `checksStatus` are the only additions.
+    let actual = serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
     let actual = actual.as_object().unwrap();
-    for (key, value) in expected.as_object().unwrap() {
+    let expected = expected.as_object().unwrap();
+    for (key, value) in expected {
         assert_eq!(actual.get(key), Some(value), "{key}");
     }
     let mut extra: Vec<&str> = actual
         .keys()
         .map(String::as_str)
-        .filter(|k| !expected.as_object().unwrap().contains_key(*k))
+        .filter(|k| !expected.contains_key(*k))
         .collect();
     extra.sort_unstable();
-    assert_eq!(extra, ["checks", "checks_status"]);
+    assert_eq!(extra, ["checks", "checksStatus"]);
     let out = manta()
         .args(["doctor", "--source-iq", "--source"])
         .arg(&wav)
@@ -337,22 +344,37 @@ fn run_spots_are_stdout_only_repeatable_and_json_stays_raw() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    let records: Vec<serde_json::Value> = String::from_utf8(out.stdout)
-        .unwrap()
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let records: Vec<(&str, serde_json::Value)> = stdout
         .lines()
-        .map(|s| serde_json::from_str(s).unwrap())
+        .map(|s| (s, serde_json::from_str(s).unwrap()))
         .collect();
-    let spots: Vec<_> = records.iter().filter_map(|v| v.get("spot")).collect();
+    let spots: Vec<(&str, &serde_json::Value)> = records
+        .iter()
+        .filter_map(|(raw, v)| Some((*raw, v.get("spot")?)))
+        .collect();
     assert!(!spots.is_empty());
     assert!(records.len() > spots.len());
-    let spot = spots.iter().find(|s| s["callsign"] == "W1AW").unwrap();
-    assert_eq!(spot["spot_type"], "Cq");
-    for key in ["freq_hz", "wpm", "snr_db", "confidence"] {
+    let (raw, spot) = *spots.iter().find(|(_, s)| s["dxCall"] == "W1AW").unwrap();
+    // MAN-139: the spot's declaration order, and its f32 text as short as
+    // `decode --json` prints it, not widened to 17 digits.
+    assert!(
+        raw.starts_with(r#"{"spot":{"dxCall":"W1AW","frequency":"#),
+        "{raw}"
+    );
+    let confidence =
+        serde_json::to_string(&(spot["decodeConfidence"].as_f64().unwrap() as f32)).unwrap();
+    assert!(
+        raw.contains(&format!(r#""decodeConfidence":{confidence},"#)),
+        "{raw}"
+    );
+    assert_eq!(spot["spotType"], "cq");
+    for key in ["frequency", "wpm", "snr", "decodeConfidence"] {
         assert_ne!(spot[key].as_f64().unwrap().fract(), 0.0, "{key}: {spot}");
     }
     assert_ne!(
-        spot["confidence"].as_f64().unwrap() * 100.0,
-        (spot["confidence"].as_f64().unwrap() * 100.0).round()
+        spot["decodeConfidence"].as_f64().unwrap() * 100.0,
+        (spot["decodeConfidence"].as_f64().unwrap() * 100.0).round()
     );
 }
 

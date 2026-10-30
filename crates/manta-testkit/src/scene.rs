@@ -60,10 +60,10 @@ pub struct QsbSine {
 }
 
 /// Watterson HF fading applied to this signal only, via coppa's real,
-/// currently-shipped `watterson_preset()` (one-shot, real-domain) -- design
-/// doc §6: the streaming `WattersonChannel` SPEC-decode-core.md assumes was
-/// never implemented in coppa; vector generation is offline/batch, so the
-/// streaming requirement doesn't apply.
+/// currently-shipped `watterson_preset()` (one-shot, real-domain) -- the
+/// streaming `WattersonChannel` the SPEC-watterson §6 design doc proposed
+/// was never implemented in coppa; vector generation is offline/batch, so
+/// the streaming requirement doesn't apply.
 #[derive(Debug, Clone, Copy)]
 pub struct WattersonFade {
     pub preset: coppa_channel::watterson::WattersonPreset,

@@ -41,6 +41,7 @@ mod live_state;
 mod logging;
 mod multi_run;
 mod reconnect;
+mod relay_socket;
 mod reload;
 mod silent;
 mod source_check;
@@ -971,8 +972,8 @@ enum Command {
         #[arg(long)]
         source_iq: bool,
         /// Radio dial frequency, in Hz. See `run --dial-freq-hz`; without it
-        /// an audio source's reported frequencies, and the report's
-        /// `center_freq_hz`, are baseband offsets.
+        /// an audio source's reported frequencies, and the report's center
+        /// frequency, are baseband offsets.
         #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Audio input")]
         dial_freq_hz: Option<f64>,
         /// TOML config file whose `[input]`, `[spot]`, `[detector]` and
@@ -4323,6 +4324,14 @@ fn start_list_refresh(
     Ok(Some(lists))
 }
 
+/// MAN-320: the `[[skimmer_relay]]`/`[[wsjtx_relay]]` blocks
+/// `start_spot_server` runs (`Default` = none).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RelayConfigs {
+    pub skimmer: Vec<manta_server::config::SkimmerRelayConfig>,
+    pub wsjtx: Vec<manta_server::config::WsjtxRelayConfig>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_spot_server(
     cfg: manta_server::config::ServerConfig,
@@ -4333,8 +4342,21 @@ fn start_spot_server(
     session_nonce: u128,
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
     pipeline: &PipelineConfig,
+    relays: RelayConfigs,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let validation_level = pipeline.validation_level;
+    // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
+    // anything is spawned, so a taken UDP port fails startup with the
+    // relay's own message instead of leaving a half-started daemon.
+    let wsjtx_sockets = relays
+        .wsjtx
+        .iter()
+        .map(|r| {
+            r.enabled
+                .then(|| relay_socket::bind_wsjtx_socket(r.listen))
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
     // MAN-59 connection/rejection events below are logged at `info`/
     // `warn`. `start_spot_server` no longer installs the subscriber:
     // `logging::init` does, at the top of `run` (MAN-124), and its module
@@ -4648,6 +4670,28 @@ fn start_spot_server(
             if rbn_compare_cfg.is_some() {
                 metrics.enable_rbn_compare();
             }
+            // MAN-320: one relay series per configured block (disabled ones
+            // included, reading 0), registered before the metrics endpoint
+            // spawns for MAN-44's reason. Workers spawn after the uplinks.
+            let skimmer_relays: Vec<_> = relays
+                .skimmer
+                .into_iter()
+                .map(|r| {
+                    let stats = metrics
+                        .register_relay(r.label(), manta_server::metrics::RelayKind::Skimmer);
+                    (r, stats)
+                })
+                .collect();
+            let wsjtx_relays: Vec<_> = relays
+                .wsjtx
+                .into_iter()
+                .zip(wsjtx_sockets)
+                .map(|(r, socket)| {
+                    let stats =
+                        metrics.register_relay(r.label(), manta_server::metrics::RelayKind::Wsjtx);
+                    (r, socket, stats)
+                })
+                .collect();
             let metrics_ip_request_limiter =
                 manta_server::rate_limit::IpRateLimiter::new_with_override(
                     manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
@@ -4690,6 +4734,46 @@ fn start_spot_server(
                     bus.clone(),
                     target,
                     dry_run.flag,
+                    shutdown_rx.clone(),
+                ));
+            }
+            // MAN-320: relay workers for the enabled blocks only. They
+            // publish onto the bus's relay channel, which only the uplinks
+            // read (D4).
+            for (r, stats) in skimmer_relays {
+                if !r.enabled {
+                    continue;
+                }
+                tokio::spawn(manta_server::relay::skimmer::run(
+                    manta_server::relay::skimmer::SkimmerRelay {
+                        host: r.host,
+                        port: r.port,
+                        callsign: r.callsign,
+                    },
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    stats,
+                    shutdown_rx.clone(),
+                ));
+            }
+            for (r, socket, stats) in wsjtx_relays {
+                let Some(socket) = socket else {
+                    continue;
+                };
+                // The label names the address actually bound, so
+                // `listen = "127.0.0.1:0"` logs its real port (devex 4).
+                let label = socket
+                    .local_addr()
+                    .map_or_else(|_| r.label(), |a| a.to_string());
+                tokio::spawn(manta_server::relay::wsjtx::run(
+                    manta_server::relay::wsjtx::WsjtxRelay {
+                        label,
+                        callsign: r.callsign,
+                    },
+                    socket,
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    stats,
                     shutdown_rx.clone(),
                 ));
             }
@@ -6729,6 +6813,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                     Some(server_cfg) => Some(multi_run::ServerSetup {
                         cfg: server_cfg,
                         rbn_uplink: loaded.rbn_uplink.clone(),
+                        relays: RelayConfigs {
+                            skimmer: loaded.skimmer_relay.clone(),
+                            wsjtx: loaded.wsjtx_relay.clone(),
+                        },
                         rbn_compare: resolved.rbn_compare.clone(),
                         replay_epoch: resolved.replay_epoch,
                     }),
@@ -6992,6 +7080,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                         session_nonce,
                         lists.clone(),
                         &cfg,
+                        RelayConfigs {
+                            skimmer: loaded.skimmer_relay.clone(),
+                            wsjtx: loaded.wsjtx_relay.clone(),
+                        },
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -7396,7 +7488,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }
                     }
                     if json {
-                        stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
+                        stdout_lines.line(format_args!("{}", fmt::spot_json(spot)));
                         return;
                     }
                     stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
@@ -7989,23 +8081,25 @@ fn run_command() -> Result<std::process::ExitCode> {
                 // `serde_json::to_string(&report)` omits the command's
                 // primary health classification entirely -- merge it in as
                 // an extra key rather than making JSON consumers duplicate
-                // the classification policy themselves.
-                let mut map = serde_json::Map::new();
-                if let Some(report) = &report {
-                    if let serde_json::Value::Object(fields) = serde_json::to_value(report)? {
-                        map = fields;
-                    }
-                    map.insert(
-                        "verdict".to_string(),
-                        serde_json::to_value(report.verdict())?,
-                    );
+                // the classification policy themselves. A struct, not a
+                // `Map`, so the keys keep declaration order (MAN-139).
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct DoctorJson<'a> {
+                    #[serde(flatten)]
+                    report: Option<&'a manta_engine::DoctorReport>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    verdict: Option<manta_engine::Verdict>,
+                    checks: &'a [doctor_checks::Check],
+                    checks_status: doctor_checks::Status,
                 }
-                map.insert("checks".to_string(), serde_json::to_value(&checks)?);
-                map.insert(
-                    "checks_status".to_string(),
-                    serde_json::to_value(doctor_checks::worst(&checks))?,
-                );
-                outln!("{}", serde_json::to_string(&map)?)?;
+                let doctor_json = DoctorJson {
+                    report: report.as_ref(),
+                    verdict: report.as_ref().map(|r| r.verdict()),
+                    checks: &checks,
+                    checks_status: doctor_checks::worst(&checks),
+                };
+                outln!("{}", serde_json::to_string(&doctor_json)?)?;
             } else {
                 outln!()?;
                 outln!("{}", doctor_checks::summary(&checks))?;
@@ -8875,6 +8969,7 @@ mod tests {
                 cty: Some(table.clone()),
                 ..Default::default()
             },
+            RelayConfigs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -8920,6 +9015,7 @@ mod tests {
             0,
             lists.clone(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -8967,6 +9063,17 @@ mod tests {
 
     /// MAN-235: `doctor --help` names every verdict with its `--strict`
     /// code, and the code it names is the one `strict_exit_code` returns.
+    #[test]
+    fn doctor_help_names_no_json_key() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let doctor = cli.find_subcommand_mut("doctor").unwrap();
+        let help = doctor.render_long_help().to_string();
+        // MAN-139: the report's JSON keys are camelCase now; the help names
+        // the concept, not a key.
+        assert!(!help.contains("center_freq_hz"), "{help}");
+    }
+
     #[test]
     fn doctor_help_lists_the_strict_code_for_every_verdict() {
         use clap::CommandFactory;
@@ -9342,6 +9449,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -9404,6 +9512,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -10391,6 +10500,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -10454,6 +10564,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -10515,6 +10626,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         );
         assert!(
             result.is_ok(),
@@ -10552,6 +10664,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -10664,12 +10777,89 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
         let err = format!("{err:#}");
         assert!(err.contains("operator_lon"), "{err}");
         assert!(err.starts_with("[server]: "), "{err}");
+    }
+
+    /// MAN-320: the loaded relay blocks, as `run` hands them over.
+    fn relay_test_start(body: &str) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+        let cfg_file = write_temp_file(body.as_bytes());
+        let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
+        start_spot_server(
+            loaded.server.unwrap(),
+            loaded.rbn_uplink,
+            None,
+            SourceInfo {
+                name: "file",
+                sample_rate_hz: 96_000.0,
+                dial_freq_hz: 14_000_000.0,
+                rf_passband_hz: (-48_000.0, 48_000.0),
+                freq_calibration: 1.0,
+                coverage: &[],
+                inputs: None,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            0,
+            bundled_reference_lists(),
+            &PipelineConfig::default(),
+            RelayConfigs {
+                skimmer: loaded.skimmer_relay,
+                wsjtx: loaded.wsjtx_relay,
+            },
+        )
+    }
+
+    const RELAY_SERVER: &str =
+        "[server]\nstation_callsign = \"W3XYZ\"\nbind_addr = \"127.0.0.1\"\n\
+         telnet_port = 0\njson_port = 0\nmetrics_port = 0\n\
+         [[rbn_uplink]]\nenabled = true\ntarget_host = \"127.0.0.1\"\ntarget_port = 9\n";
+
+    #[test]
+    fn a_taken_unicast_port_is_a_startup_error_naming_the_relay() {
+        let taken = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let Err(err) = relay_test_start(&format!(
+            "{RELAY_SERVER}[[wsjtx_relay]]\nlisten = \"{addr}\"\ncallsign = \"W3XYZ\"\n"
+        )) else {
+            panic!("a taken UDP port must fail startup");
+        };
+        let err = format!("{err:#}");
+        assert!(
+            err.starts_with(&format!("[[wsjtx_relay]] cannot listen on {addr}: ")),
+            "{err}"
+        );
+        assert!(err.contains("another program may own the port"), "{err}");
+    }
+
+    #[test]
+    fn start_spot_server_registers_one_relay_series_per_block() {
+        let (_rt, server) = relay_test_start(&format!(
+            "{RELAY_SERVER}[[skimmer_relay]]\nhost = \"127.0.0.1\"\nport = 9\n\
+             callsign = \"W3XYZ-2\"\n\
+             [[skimmer_relay]]\nhost = \"192.0.2.1\"\nport = 7300\ncallsign = \"W3XYZ-3\"\n\
+             enabled = false\n\
+             [[wsjtx_relay]]\nlisten = \"127.0.0.1:0\"\ncallsign = \"W3XYZ\"\n\
+             [[wsjtx_relay]]\nlisten = \"127.0.0.1:2237\"\ncallsign = \"W3XYZ\"\n\
+             enabled = false\n"
+        ))
+        .unwrap();
+        let text = server.metrics.render_prometheus_text();
+        for series in [
+            "relay=\"127.0.0.1:9\",kind=\"skimmer\"",
+            "relay=\"192.0.2.1:7300\",kind=\"skimmer\"",
+            "relay=\"127.0.0.1:0\",kind=\"wsjtx\"",
+            "relay=\"127.0.0.1:2237\",kind=\"wsjtx\"",
+        ] {
+            assert!(
+                text.contains(&format!("manta_relay_spots_total{{{series}}} 0")),
+                "{series} missing:\n{text}"
+            );
+        }
     }
 
     #[test]
@@ -10724,6 +10914,7 @@ mod tests {
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -13186,6 +13377,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 
@@ -13237,6 +13429,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             0,
             bundled_reference_lists(),
             &PipelineConfig::default(),
+            RelayConfigs::default(),
         )
         .unwrap();
 

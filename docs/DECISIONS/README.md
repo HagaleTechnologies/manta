@@ -26,6 +26,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-10-27 | MAN-440 | [MAN-440: the decision-record index is generated; record PRs add only their file](2026-10-27-man440-generated-decisions-index.md) |
 | 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
 | 2026-10-27 | MAN-343 | [MAN-343: `manta grade` reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
+| 2026-10-27 | MAN-320 | [MAN-320: manta relays a local skimmer's own spots and WSJT-X's FT8/FT4 CQs through the uplink](2026-10-27-man320-relay-local-skimmers-and-wsjtx.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
 | 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |
 | 2026-10-26 | MAN-393 | [MAN-393: a one-entry `[[input]]` already loads and takes `MANTA_INPUT_*` like `[input]`](2026-10-26-man393-one-entry-input-array.md) |
@@ -34,6 +35,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-10-26 | MAN-290 | [MAN-290: shadow-compare requires the RBN archive's `tx_mode` column](2026-10-26-man290-shadow-compare-requires-tx-mode.md) |
 | 2026-10-26 | MAN-289 | [MAN-289: a node spot without a `deCall` is malformed](2026-10-26-man289-node-spot-needs-decall.md) |
 | 2026-10-26 | MAN-249 | [MAN-249: public docs name roles, not machines, people or receiver hosts](2026-10-26-man249-public-disclosure.md) |
+| 2026-10-26 | MAN-139 | [MAN-139: decode, run and doctor `--json` use the JSON stream's camelCase names](2026-10-26-man139-cli-json-dialect.md) |
 | 2026-10-25 | MAN-423 | [MAN-423: hops buffered before a spliced loss keep their timestamps; a parked protocol-2 backlog keeps its anchor](2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) |
 | 2026-10-25 | MAN-402 | [MAN-402: a unimodal speed bootstrap reads its marks as dahs when the gaps between them say so](2026-10-25-man402-dah-heavy-bootstrap.md) |
 | 2026-10-25 | MAN-392 | [MAN-392: calibrate reports a standalone receiver's measurement beside several inputs](2026-10-25-man392-calibrate-source-beside-several-inputs.md) |

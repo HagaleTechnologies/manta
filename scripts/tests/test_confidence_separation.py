@@ -20,10 +20,10 @@ SAMPLE_RATE_HZ = 192000
 
 # Two spots that will match RBN truth (true positives), two that won't (bogus).
 SPOTS = [
-    {"callsign": "N4RV", "freq_hz": 7021000.0, "sample_ts": 0, "snr_db": 20.0, "confidence": 0.95, "spot_type": "cq"},
-    {"callsign": "N3RS", "freq_hz": 7049400.0, "sample_ts": 30 * SAMPLE_RATE_HZ, "snr_db": 15.0, "confidence": 0.85, "spot_type": "cq"},
-    {"callsign": "W1ABC", "freq_hz": 7030000.0, "sample_ts": 10 * SAMPLE_RATE_HZ, "snr_db": 8.0, "confidence": 0.40, "spot_type": "cq"},
-    {"callsign": "K2XYZ", "freq_hz": 7035000.0, "sample_ts": 20 * SAMPLE_RATE_HZ, "snr_db": 6.0, "confidence": 0.30, "spot_type": "cq"},
+    {"dxCall": "N4RV", "frequency": 7021000.0, "sampleTs": 0, "snr": 20.0, "decodeConfidence": 0.95, "spotType": "cq"},
+    {"dxCall": "N3RS", "frequency": 7049400.0, "sampleTs": 30 * SAMPLE_RATE_HZ, "snr": 15.0, "decodeConfidence": 0.85, "spotType": "cq"},
+    {"dxCall": "W1ABC", "frequency": 7030000.0, "sampleTs": 10 * SAMPLE_RATE_HZ, "snr": 8.0, "decodeConfidence": 0.40, "spotType": "cq"},
+    {"dxCall": "K2XYZ", "frequency": 7035000.0, "sampleTs": 20 * SAMPLE_RATE_HZ, "snr": 6.0, "decodeConfidence": 0.30, "spotType": "cq"},
 ]
 TRUTH_ROWS = [
     # spotter, freq kHz, dx, date -- matches N4RV at t=0 and N3RS at t=+30s; no truth row for

@@ -98,6 +98,8 @@ pub(crate) struct ServerSetup {
     pub cfg: manta_server::config::ServerConfig,
     pub rbn_uplink: Vec<manta_server::config::RbnUplinkConfig>,
     pub rbn_compare: Option<manta_server::config::RbnCompareConfig>,
+    /// MAN-320: the relay blocks, run like the single-input path's.
+    pub relays: crate::RelayConfigs,
     pub replay_epoch: Option<i64>,
 }
 
@@ -700,6 +702,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 nonce,
                 lists.clone(),
                 m.cfg,
+                setup.relays,
             )?;
             // MAN-324: one `bandState` per input per stream second, each
             // naming its input; track and decision records as with one.
@@ -896,7 +899,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 }
             }
             if json {
-                stdout_lines.line(format_args!("{}", serde_json::json!({ "spot": spot })));
+                stdout_lines.line(format_args!("{}", fmt::spot_json(spot)));
             } else {
                 stdout_lines.line(format_args!("{}", fmt::spot_line(spot)));
             }

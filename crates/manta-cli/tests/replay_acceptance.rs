@@ -180,7 +180,7 @@ fn first_spot_seconds(wav: &Path, fs: f64) -> f64 {
     let sample_ts = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find_map(|v| v.get("spot")?.get("sample_ts")?.as_u64())
+        .find_map(|v| v.get("spot")?.get("sampleTs")?.as_u64())
         .expect("the fixture's unpaced replay emits no spot");
     sample_ts as f64 / fs
 }

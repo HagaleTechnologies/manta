@@ -609,6 +609,168 @@ const RESUME_OUTCOMES: [ResumeMetricOutcome; 5] = [
     ResumeMetricOutcome::Invalid,
 ];
 
+/// MAN-320: which kind of relay a [`RelayStats`] series belongs to; its
+/// `kind` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayKind {
+    /// `[[skimmer_relay]]`: another CW skimmer's telnet spots.
+    Skimmer,
+    /// `[[wsjtx_relay]]`: WSJT-X's UDP decodes.
+    Wsjtx,
+}
+
+impl RelayKind {
+    /// The `kind` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            RelayKind::Skimmer => "skimmer",
+            RelayKind::Wsjtx => "wsjtx",
+        }
+    }
+}
+
+/// MAN-320: why a relay received a spot line or decode and did not forward
+/// it; the `reason` label of `manta_relay_dropped_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropReason {
+    /// Skimmer: the line's `DX de` call is not the relay's `callsign`.
+    OtherSpotter,
+    /// Skimmer: a well-formed spot line in another mode (RTTY ...).
+    NotCw,
+    /// Skimmer: the spotted call fails the relay's call check.
+    BadCall,
+    /// WSJT-X: the datagram does not decode.
+    BadDatagram,
+    /// WSJT-X: a replayed decode (`New` = false).
+    Replay,
+    /// WSJT-X: a decode of `.wav` playback.
+    OffAir,
+    /// WSJT-X: a low-confidence decode.
+    LowConfidence,
+    /// WSJT-X: no `Status` (or dial 0) from that instance yet.
+    NoDial,
+    /// WSJT-X: the instance is not in FT8 or FT4.
+    Mode,
+    /// WSJT-X: not a `CQ` message.
+    NotCq,
+    /// WSJT-X: no caller, or a hashed `<...>` call.
+    NoCall,
+    /// WSJT-X: the same call, mode and band within 600 s.
+    Duplicate,
+}
+
+impl DropReason {
+    /// Every reason, in render order (the `dropped` array's index order).
+    pub const ALL: [DropReason; 12] = [
+        DropReason::OtherSpotter,
+        DropReason::NotCw,
+        DropReason::BadCall,
+        DropReason::BadDatagram,
+        DropReason::Replay,
+        DropReason::OffAir,
+        DropReason::LowConfidence,
+        DropReason::NoDial,
+        DropReason::Mode,
+        DropReason::NotCq,
+        DropReason::NoCall,
+        DropReason::Duplicate,
+    ];
+
+    /// The `reason` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            DropReason::OtherSpotter => "other_spotter",
+            DropReason::NotCw => "not_cw",
+            DropReason::BadCall => "bad_call",
+            DropReason::BadDatagram => "bad_datagram",
+            DropReason::Replay => "replay",
+            DropReason::OffAir => "off_air",
+            DropReason::LowConfidence => "low_confidence",
+            DropReason::NoDial => "no_dial",
+            DropReason::Mode => "mode",
+            DropReason::NotCq => "not_cq",
+            DropReason::NoCall => "no_call",
+            DropReason::Duplicate => "duplicate",
+        }
+    }
+
+    /// Whether a relay of `kind` can record this reason; only those are
+    /// rendered for it.
+    pub fn applies_to(self, kind: RelayKind) -> bool {
+        let skimmer = matches!(
+            self,
+            DropReason::OtherSpotter | DropReason::NotCw | DropReason::BadCall
+        );
+        match kind {
+            RelayKind::Skimmer => skimmer,
+            RelayKind::Wsjtx => !skimmer,
+        }
+    }
+
+    fn index(self) -> usize {
+        DropReason::ALL.iter().position(|r| *r == self).unwrap_or(0)
+    }
+}
+
+/// MAN-320: one relay block's counters, registered by
+/// [`Metrics::register_relay`] and recorded by its worker.
+#[derive(Debug)]
+pub struct RelayStats {
+    label: String,
+    kind: RelayKind,
+    up: AtomicBool,
+    spots: AtomicU64,
+    dropped: [AtomicU64; 12],
+}
+
+impl RelayStats {
+    fn new(label: String, kind: RelayKind) -> Self {
+        Self {
+            label,
+            kind,
+            up: AtomicBool::new(false),
+            spots: AtomicU64::new(0),
+            dropped: Default::default(),
+        }
+    }
+
+    /// The `relay` label: `host:port` or the `listen` address.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub fn kind(&self) -> RelayKind {
+        self.kind
+    }
+
+    /// `manta_relay_up`: logged in (skimmer) or heard from (WSJT-X).
+    pub fn set_up(&self, up: bool) {
+        self.up.store(up, Ordering::Relaxed);
+    }
+
+    pub fn up(&self) -> bool {
+        self.up.load(Ordering::Relaxed)
+    }
+
+    /// One spot handed to the uplink.
+    pub fn record_spot(&self) {
+        self.spots.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn spots_total(&self) -> u64 {
+        self.spots.load(Ordering::Relaxed)
+    }
+
+    /// One spot line or decode received and not forwarded.
+    pub fn record_dropped(&self, reason: DropReason) {
+        self.dropped[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn dropped_total(&self, reason: DropReason) -> u64 {
+        self.dropped[reason.index()].load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -718,6 +880,9 @@ pub struct Metrics {
     /// pre-MAN-128 aggregate series are now DERIVED by summing over this
     /// registry rather than tracked as separate shared atomics.
     uplink_targets: RwLock<Vec<Arc<UplinkTarget>>>,
+    /// MAN-320: one handle per configured `[[skimmer_relay]]` /
+    /// `[[wsjtx_relay]]` block, disabled ones included.
+    relays: RwLock<Vec<Arc<RelayStats>>>,
     /// MAN-128: captured once at construction -- see `StartedAt`'s doc
     /// comment for why this is not `#[derive(Default)]`-trivial and not
     /// seeded from `resolve_epoch`.
@@ -1619,6 +1784,19 @@ impl Metrics {
         target
     }
 
+    /// MAN-320: registers one relay block and returns its handle. Call it
+    /// for every configured block, disabled ones included, before the
+    /// metrics listener starts: registration is what makes the relay's
+    /// series appear on `/metrics`.
+    pub fn register_relay(&self, label: String, kind: RelayKind) -> Arc<RelayStats> {
+        let stats = Arc::new(RelayStats::new(label, kind));
+        self.relays
+            .write()
+            .expect("relays lock poisoned")
+            .push(stats.clone());
+        stats
+    }
+
     fn uplink_targets_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<UplinkTarget>>> {
         self.uplink_targets
             .read()
@@ -2415,6 +2593,8 @@ impl Metrics {
         }
         drop(targets);
 
+        self.render_relays(&mut out);
+
         // MAN-128: process uptime/build-info.
         out.push_str(
             "# HELP manta_start_time_seconds Unix time at which this daemon's spot server and metrics endpoint started.\n",
@@ -2551,6 +2731,46 @@ impl Metrics {
         self.render_live(&mut out);
 
         out
+    }
+}
+
+impl Metrics {
+    /// MAN-320: the three relay families, one series per registered relay.
+    fn render_relays(&self, out: &mut String) {
+        let relays = self.relays.read().expect("relays lock poisoned");
+        out.push_str("# HELP manta_relay_up 1 while a skimmer relay is logged in, or while a WSJT-X relay has heard a WSJT-X datagram within the last 60 s; else 0.\n");
+        out.push_str("# TYPE manta_relay_up gauge\n");
+        for r in relays.iter() {
+            out.push_str(&format!(
+                "manta_relay_up{{relay=\"{}\",kind=\"{}\"}} {}\n",
+                escape_label_value(r.label()),
+                r.kind().label(),
+                u8::from(r.up())
+            ));
+        }
+        out.push_str("# HELP manta_relay_spots_total Spots this relay handed to the RBN uplink.\n");
+        out.push_str("# TYPE manta_relay_spots_total counter\n");
+        for r in relays.iter() {
+            out.push_str(&format!(
+                "manta_relay_spots_total{{relay=\"{}\",kind=\"{}\"}} {}\n",
+                escape_label_value(r.label()),
+                r.kind().label(),
+                r.spots_total()
+            ));
+        }
+        out.push_str("# HELP manta_relay_dropped_total Spot lines or decodes this relay received and did not forward, by reason.\n");
+        out.push_str("# TYPE manta_relay_dropped_total counter\n");
+        for r in relays.iter() {
+            for reason in DropReason::ALL.iter().filter(|x| x.applies_to(r.kind())) {
+                out.push_str(&format!(
+                    "manta_relay_dropped_total{{relay=\"{}\",kind=\"{}\",reason=\"{}\"}} {}\n",
+                    escape_label_value(r.label()),
+                    r.kind().label(),
+                    reason.label(),
+                    r.dropped_total(*reason)
+                ));
+            }
+        }
     }
 }
 
@@ -4512,5 +4732,58 @@ mod tests {
         assert!(m
             .render_prometheus_text()
             .contains(r#"manta_list_last_success_timestamp_seconds{list="cty"} 1791795600"#));
+    }
+
+    /// MAN-320: every relay renders all three families from the moment it
+    /// registers, with only the reasons that apply to its kind.
+    #[test]
+    fn relay_families_render_eagerly_per_kind() {
+        let m = Metrics::new();
+        m.register_relay("192.168.1.20:7300".to_string(), RelayKind::Skimmer);
+        m.register_relay("127.0.0.1:2237".to_string(), RelayKind::Wsjtx);
+        let text = m.render_prometheus_text();
+        let count = |needle: &str| text.lines().filter(|l| l.starts_with(needle)).count();
+        assert_eq!(
+            count("manta_relay_up{relay=\"192.168.1.20:7300\",kind=\"skimmer\"} 0"),
+            1
+        );
+        assert_eq!(count("manta_relay_spots_total{relay=\"127.0.0.1:2237\""), 1);
+        assert_eq!(
+            count("manta_relay_dropped_total{relay=\"192.168.1.20:7300\",kind=\"skimmer\""),
+            3
+        );
+        assert_eq!(
+            count("manta_relay_dropped_total{relay=\"127.0.0.1:2237\",kind=\"wsjtx\""),
+            9
+        );
+    }
+
+    #[test]
+    fn relay_labels_are_escaped() {
+        let m = Metrics::new();
+        m.register_relay("a\"b\\c".to_string(), RelayKind::Skimmer);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("manta_relay_up{relay=\"a\\\"b\\\\c\",kind=\"skimmer\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn relay_counters_never_go_backwards() {
+        let m = Metrics::new();
+        let r = m.register_relay("h:1".to_string(), RelayKind::Skimmer);
+        let mut last = (0, 0);
+        for i in 0..5 {
+            r.record_spot();
+            if i % 2 == 0 {
+                r.record_dropped(DropReason::OtherSpotter);
+            }
+            r.set_up(i % 2 == 0);
+            let now = (r.spots_total(), r.dropped_total(DropReason::OtherSpotter));
+            assert!(now.0 >= last.0 && now.1 >= last.1, "{now:?} < {last:?}");
+            last = now;
+        }
+        assert_eq!(last, (5, 3));
     }
 }

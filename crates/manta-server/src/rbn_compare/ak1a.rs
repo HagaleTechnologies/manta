@@ -58,17 +58,17 @@ pub fn parse_dx_line(line: &str) -> Option<DxLine> {
 
 /// RBN appends `-#` to every skimmer's call; the grading engine compares
 /// spotters without it, uppercase (the rule `shadow-compare.py` applies).
-fn normalize_spotter(raw: &str) -> String {
+pub(crate) fn normalize_spotter(raw: &str) -> String {
     let upper = raw.trim().to_ascii_uppercase();
     upper.strip_suffix("-#").unwrap_or(&upper).to_string()
 }
 
 /// The AK1A callsign column's width (RBN columns 27-41; `rbn.rs`).
-const CALL_COLUMN_WIDTH: usize = 15;
+pub(crate) const CALL_COLUMN_WIDTH: usize = 15;
 
 /// `HHMMZ`: four digits and a `Z`. The date-less time is not used (a live
 /// report's time is its arrival time); requiring it rejects a truncated line.
-fn is_hhmmz(token: &str) -> bool {
+pub(crate) fn is_hhmmz(token: &str) -> bool {
     let b = token.as_bytes();
     b.len() == 5 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'Z'
 }
