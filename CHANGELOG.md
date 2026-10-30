@@ -285,6 +285,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-413: configs now reject duplicate `[[input]]` entry names even when
+  an earlier entry's `bands` expand into labelled streams such as
+  `x-60m-1` and `x-60m-2`. The error names the duplicate base name, avoiding
+  ambiguous `--input` selection and calibration saves to the wrong receiver.
 - MAN-343: `manta grade` reads each `--spots`/`--rbn` file once, however it
   is named (directly and through its directory, with `./` or `..`, or
   through a symlink). Before, a file named twice was graded twice, and a
