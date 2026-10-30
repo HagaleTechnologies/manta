@@ -647,7 +647,8 @@ pub fn probe_receiver_capacity(host: &str, port: u16) -> Result<Option<usize>> {
         .context("resolve HPSDR capacity endpoint")?
         .find(|a| a.is_ipv4())
         .ok_or_else(|| anyhow::anyhow!("HPSDR needs an IPv4 endpoint"))?;
-    let socket = UdpSocket::bind("0.0.0.0:0").context("bind HPSDR capacity socket")?;
+    let socket =
+        crate::local_bind::bind_udp_for(peer.ip()).context("bind HPSDR capacity socket")?;
     let mut request = [0; 60];
     request[..3].copy_from_slice(&[0xef, 0xfe, 2]);
     socket
@@ -944,12 +945,18 @@ impl HpsdrDevice {
         let entered = Instant::now();
         cfg.validate()?;
 
-        let socket = UdpSocket::bind("0.0.0.0:0").context("bind HPSDR UDP socket")?;
+        use std::net::ToSocketAddrs;
+        let peer = (cfg.host.as_str(), cfg.port)
+            .to_socket_addrs()
+            .with_context(|| format!("resolve HPSDR endpoint {}:{}", cfg.host, cfg.port))?
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| anyhow::anyhow!("HPSDR needs an IPv4 endpoint"))?;
+        let socket = crate::local_bind::bind_udp_for(peer.ip()).context("bind HPSDR UDP socket")?;
         socket
             .set_read_timeout(Some(READ_TIMEOUT))
             .context("set HPSDR UDP read timeout")?;
         socket
-            .connect((cfg.host.as_str(), cfg.port))
+            .connect(peer)
             .with_context(|| format!("connect HPSDR UDP socket to {}:{}", cfg.host, cfg.port))?;
 
         // MAN-55 Finding 1: build every C&C setting this device needs
@@ -2910,6 +2917,6 @@ mod open_receiver_tests {
             .unwrap()
             .2
             .port();
-        assert!(UdpSocket::bind(("0.0.0.0", probe_port)).is_ok());
+        assert!(UdpSocket::bind(("127.0.0.1", probe_port)).is_ok());
     }
 }

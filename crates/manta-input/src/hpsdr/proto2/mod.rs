@@ -246,7 +246,12 @@ impl Protocol2IqSource {
         let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
             .context("create HPSDR protocol 2 UDP socket")?;
         let _ = s.set_recv_buffer_size(RCVBUF_BYTES);
-        s.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)))
+        let local = if radio_ip.is_loopback() {
+            radio_ip
+        } else {
+            Ipv4Addr::UNSPECIFIED
+        };
+        s.bind(&SockAddr::from(SocketAddrV4::new(local, 0)))
             .context("bind HPSDR protocol 2 UDP socket")?;
         s.set_read_timeout(Some(READ_TIMEOUT))
             .context("set HPSDR protocol 2 UDP read timeout")?;
