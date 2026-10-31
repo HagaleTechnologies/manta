@@ -40,6 +40,7 @@ pub struct TrackLifecycleObserver {
     rtty: AtomicU64,
     not_cw: AtomicU64,
     unkeyed: AtomicU64,
+    false_lease_hops: AtomicU64,
     gate_records_total: AtomicU64,
 }
 
@@ -59,6 +60,7 @@ impl TrackLifecycleObserver {
                 rtty: self.rtty.load(Ordering::Relaxed),
                 not_cw: self.not_cw.load(Ordering::Relaxed),
                 unkeyed: self.unkeyed.load(Ordering::Relaxed),
+                false_lease_hops: self.false_lease_hops.load(Ordering::Relaxed),
             },
             gate_records_total: self.gate_records_total.load(Ordering::Relaxed),
         }
@@ -75,6 +77,8 @@ impl TrackLifecycleObserver {
         self.rtty.store(closes.rtty, Ordering::Relaxed);
         self.not_cw.store(closes.not_cw, Ordering::Relaxed);
         self.unkeyed.store(closes.unkeyed, Ordering::Relaxed);
+        self.false_lease_hops
+            .store(closes.false_lease_hops, Ordering::Relaxed);
         self.gate_records_total
             .store(gate_records_total, Ordering::Relaxed);
     }
@@ -114,8 +118,13 @@ mod tests {
             rtty: 6,
             not_cw: 7,
             unkeyed: 8,
+            false_lease_hops: 750,
         };
         obs.publish_counts(closes, 19);
+        assert_eq!(
+            obs.snapshot().close_counts.false_lease_hops as f64 / 375.0,
+            2.0
+        );
         obs.publish_chunk(3);
         obs.publish_chunk(2);
         assert_eq!(obs.snapshot().peak_active_tracks, 3);

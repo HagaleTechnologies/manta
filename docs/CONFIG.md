@@ -631,9 +631,10 @@ milliseconds, 0 to 3600000.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
-| `on_snr_db` | `12.0` | live | SNR, dB, that starts a track; 0 to 100. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `on_snr_db` | `11.5` | live | Threshold, dB over the detection floor, that both disjoint power windows must average before rise; 0 to 100. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `integrator_hops` | `[38, 38]` | live | Two integration lengths, each 1 to 375 hops. Each length requires two full disjoint windows above `on_snr_db`; either length can produce rise. |
 | `off_snr_db` | `3.0` | live | SNR, dB, below which a track counts as silent; 0 to `on_snr_db`. |
-| `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; at most 3600000 (1 h), and must round to at least one hop. |
+| `confirm_ms` | `8.0` | live | How long rise must stay true after the integration windows fill before a candidate becomes active; at most 3600000 (1 h), and must round to at least one hop. |
 | `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; at most 3600000 (1 h), and must round to at least one hop. |
 | `reacquire_ms` | `10000.0` | live | After `hang_ms`, how long a track that has decoded characters keeps its identity and frequency while its signal is gone. No decoder runs in that time. If the signal comes back, the track resumes under the same track ID with a fresh decoder. 0 to 3600000 (1 h); `0` restores the previous behaviour (close at `hang_ms`). See [SPEC §2.4](SPEC-decode-core.md#24-track-lifecycle-state-machine) and [MAN-108](DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md). |
 | `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; at most 3600000 (1 h), and must round to at least one hop. |
