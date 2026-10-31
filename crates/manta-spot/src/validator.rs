@@ -48,6 +48,16 @@ const MAX_PLAUSIBLE_WPM: f32 = 45.0;
 /// exists to cap pathological growth, not to hold a meaningful backlog.
 const MAX_PENDING_BEACONS: usize = 8;
 
+/// Whether a published spot met its pattern tier's repetition requirement.
+/// Exempt single-decode spots can publish as tentative. Zero-evidence
+/// candidates are withheld as `Reason::NoEvidence` (MAN-106).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmissionState {
+    Confirmed,
+    Tentative,
+}
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
@@ -69,6 +79,9 @@ pub struct Spot {
     pub spot_type: SpotType,
     #[serde(rename = "decodeConfidence")]
     pub confidence: f32,
+    /// `confirmed` when the pattern tier's repetition requirement is met,
+    /// otherwise `tentative`. CLI JSON only (MAN-106).
+    pub emission_state: EmissionState,
     pub track_id: u32,
     pub sample_ts: u64,
     /// The most recent RST signal report this spot's track decoded before
@@ -1551,19 +1564,38 @@ impl Validator {
                 word.last_reps = reps;
             }
         }
+        // MAN-106 zero-evidence abstention gate: a candidate whose every
+        // character carried zero decoder confidence (the `?`-placeholder
+        // contract) has no acoustic evidence, so no public emission --
+        // regardless of database membership. Investigation 11: "Do not
+        // let a callsign database overwhelm contradictory sound" -- here,
+        // absent sound. Deliberately an evidence gate, NOT a confidence
+        // threshold: there is no numeric cutoff to argue with, and
+        // calibration never gets a chance to rescue pure silence.
+        // Applied before `c_call`'s non-empty assertion and before the
+        // repetition gate; allowlist, SCP and Beacon exemptions do not
+        // bypass it.
+        if !confidence::has_acoustic_evidence(&char_confidences) {
+            self.decide(|| withheld(Reason::NoEvidence).with_reps(reps));
+            return None;
+        }
+        let tier = self.patterns.tier(&candidate);
         let mut confidence = confidence::c_call(&char_confidences, reps);
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
         }
+        let emission_state = if reps >= self.level.required_reps(tier) {
+            EmissionState::Confirmed
+        } else {
+            EmissionState::Tentative
+        };
         // ARCHITECTURE §6.4 exempts BEACON-tagged messages from the
         // repetition requirement: NCDXF-style beacons ID once per cycle,
         // so a single decode must still spot (MAN-28). Only reachable
         // here for an ALLOWLISTED Beacon candidate -- non-allowlisted
         // ones never reach this function body at all (see the early
         // dispatch above).
-        if !is_allowlisted
-            && spot_type != SpotType::Beacon
-            && reps < self.level.required_reps(self.patterns.tier(&candidate))
+        if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
         {
             self.decide(|| withheld(Reason::Repetition).with_reps(reps));
             return None;
@@ -1630,6 +1662,7 @@ impl Validator {
             wpm,
             spot_type,
             confidence,
+            emission_state,
             track_id,
             sample_ts,
             rst,
@@ -1902,11 +1935,26 @@ impl Validator {
                     pb.word_seq,
                     |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
                 ) as u32;
+                // MAN-106: the zero-evidence abstention gate applies to
+                // beacons exactly as to every other candidate -- absent
+                // sound is absent sound (see `try_spot`'s gate).
+                if !confidence::has_acoustic_evidence(&pb.char_confidences) {
+                    self.decide(|| {
+                        beacon_decision(track_id, &pb, Reason::NoEvidence).with_reps(reps)
+                    });
+                    return None;
+                }
+                let tier = self.patterns.tier(&pb.candidate);
                 let mut confidence = confidence::c_call(&pb.char_confidences, reps);
                 if let Some(scp) = &self.scp {
                     confidence =
                         confidence::apply_scp_boost(confidence, scp.contains(&pb.candidate));
                 }
+                let emission_state = if reps >= self.level.required_reps(tier) {
+                    EmissionState::Confirmed
+                } else {
+                    EmissionState::Tentative
+                };
                 // ARCHITECTURE §6.4 exempts BEACON-tagged messages from
                 // the repetition requirement -- no `reps < 2` gate here,
                 // by design.
@@ -1959,6 +2007,7 @@ impl Validator {
                     wpm,
                     spot_type: SpotType::Beacon,
                     confidence,
+                    emission_state,
                     track_id,
                     sample_ts: pb.sample_ts,
                     rst: rst.clone(),

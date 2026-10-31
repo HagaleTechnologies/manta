@@ -24,6 +24,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-106 first slice: candidates with no finite positive character
+  confidence are withheld as `noEvidence`. CLI JSON spots gain
+  `emissionState`, based on whether the pattern tier's repetition
+  requirement is met. The character confidence multiplier `q` now uses
+  the engine-supplied floor-based SNR, with the rail estimate as standalone
+  fallback. Confidence remains an uncalibrated score; bench reporting and
+  fitted calibration are deferred to the next slice. See
+  docs/DECISIONS/2026-10-30-man106-q-snr-input.md.
 - MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
   `T0M`) now decodes as its own words. The speed tracker read five equal
   dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`

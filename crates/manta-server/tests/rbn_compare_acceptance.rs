@@ -154,6 +154,7 @@ fn fixture_spots() -> Vec<(i64, Spot)> {
                 wpm: v["wpm"].as_f64().unwrap() as f32,
                 spot_type: SpotType::Cq,
                 confidence: 0.8,
+                emission_state: manta_spot::EmissionState::Confirmed,
                 track_id: parts[2].parse().unwrap(),
                 sample_ts: parts[3].parse().unwrap(),
                 rst: None,

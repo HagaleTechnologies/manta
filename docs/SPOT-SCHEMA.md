@@ -107,6 +107,12 @@ the vendored ADIF entity table `dxcc.tsv`, except the reporting station's
 position: `deGrid`/`deLat`/`deLon` come only from the `[server]` location
 keys (MAN-138), never `cty.dat`.
 
+CLI `--json` additionally carries `emissionState`, either `confirmed` or
+`tentative`, according to whether the pattern tier's repetition requirement
+was met. Both states publish. This field is absent from the :7301 stream.
+Candidates with no finite positive character confidence never emit a spot;
+their live-state decision has reason `noEvidence` (MAN-106).
+
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
 | `id` | string | never | Unique key for this spot. Built today as `station_callsign:session_nonce:track_id:sample_ts:dxCall`, with `station_callsign` uppercased, including any RBN `-N` SSID. `session_nonce` is a hash of the file's contents when replaying a recording, so replaying the same recording again gives the same ids; for live input it is the session start time in nanoseconds. Treat `id` as an opaque key: do not parse it, because the composition may change. |

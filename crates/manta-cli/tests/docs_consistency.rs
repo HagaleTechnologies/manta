@@ -3507,6 +3507,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
             wpm: 20.0,
             spot_type: SpotType::Cq,
             confidence: 0.55,
+            emission_state: manta_spot::EmissionState::Confirmed,
             track_id: 1,
             sample_ts: 2_006_272,
             rst: Some("599".into()),

@@ -74,7 +74,7 @@ With several `[[input]]` entries the records are the same.
 
 ```json
 {"event":"TrackClosed","trackId":1,"closure":"signalEnded","survivorTrackId":null}
-{"spot":{"dxCall":"W1AW","frequency":14012341.017764632,"snr":20.995895,"wpm":19.565216,"spotType":"cq","decodeConfidence":0.55182433,"trackId":1,"sampleTs":2006272,"rst":null,"qrlQuery":false}}
+{"spot":{"dxCall":"W1AW","frequency":14012341.017764632,"snr":20.995895,"wpm":19.565216,"spotType":"cq","decodeConfidence":0.55182433,"emissionState":"confirmed","trackId":1,"sampleTs":2006272,"rst":null,"qrlQuery":false}}
 ```
 
 ## Events
@@ -168,6 +168,7 @@ object of a `run --json` spot line.
 | `wpm` | number | never | Keying speed in words per minute. |
 | `spotType` | string | never | `cq`, `de`, `beacon` or `unknown`: the context the call was decoded in, with the same labels as LIVE-STATE's `candidateDecision`. |
 | `decodeConfidence` | number | never | Callsign confidence from 0 to 1 (SPEC §4.6), as the stream's `decodeConfidence`. |
+| `emissionState` | string | never | `confirmed` or `tentative` (MAN-106): whether the pattern tier's repetition requirement was met. A spot that would be `abstained` (no acoustic evidence) is never emitted. CLI JSON only; the `:7301` stream does not send it. |
 | `trackId` | integer | never | The track that decoded the call. |
 | `sampleTs` | integer | never | Input sample counter at the decode that produced the spot. |
 | `rst` | string or null | when none decoded | The track's latest RST report as three digits (`5NN` reads as `"599"`). `null` when the track decoded none. |

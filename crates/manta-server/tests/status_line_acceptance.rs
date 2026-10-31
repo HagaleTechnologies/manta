@@ -77,6 +77,7 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
         wpm: 20.0,
         spot_type: manta_spot::SpotType::Cq,
         confidence: 0.9,
+        emission_state: manta_spot::EmissionState::Confirmed,
         track_id: 1,
         sample_ts: 0,
         rst: None,
