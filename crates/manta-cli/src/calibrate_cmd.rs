@@ -986,6 +986,7 @@ mod tests {
                 &Default::default(),
             ),
             rbn_compare: None,
+            callsign_lookup: None,
             notes: Vec::new(),
             replaced_file_source: None,
             replay: crate::ReplayMode::default(),
@@ -1029,6 +1030,7 @@ mod tests {
                 protocol: manta_input::hpsdr::HpsdrProtocol::Auto,
                 freq: Some(7_030_000.0),
                 rate: Some(192_000.0),
+                auto_attenuation: None,
             }));
             apply_tune_hz(&mut r, 9_998_500.0).unwrap();
             match &r.spec {

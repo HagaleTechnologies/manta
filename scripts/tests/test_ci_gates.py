@@ -101,8 +101,9 @@ class VerifierTestsGateTests(unittest.TestCase):
 
 
 COPPA_GIT = "https://github.com/HagaleTechnologies/coppa.git"
+# MAN-318: CDLA-Permissive-2.0 is webpki-roots' (Mozilla's CA list, as data).
 PERMISSIVE = {"0BSD", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
-              "BSL-1.0", "ISC", "MIT", "Unicode-3.0", "Unlicense", "Zlib"}
+              "BSL-1.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0", "Unlicense", "Zlib"}
 SHA_PIN = re.compile(r"^taiki-e/install-action@[0-9a-f]{40}$")
 
 

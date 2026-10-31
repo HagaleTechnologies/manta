@@ -195,6 +195,8 @@ pub struct SharedObservers {
     /// MAN-14: the shared validator's per-input cross-input dedupe
     /// withholds, updated after each batch. `None` skips the copy.
     pub suppressions: Option<Arc<crate::SuppressionObserver>>,
+    /// MAN-318: the shared validator's callsign lookup; `None` skips it.
+    pub callsign_lookup: Option<Arc<dyn manta_spot::CallsignLookup>>,
 }
 
 enum Msg {
@@ -563,6 +565,8 @@ pub fn listen_inputs(
             }
         }
     }
+    // MAN-318: every input has ended; settle the spots held for lookups.
+    back.finish_lookups(&mut on_spot);
     for h in handles {
         let _ = h.join();
     }
