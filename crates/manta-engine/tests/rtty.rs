@@ -34,6 +34,7 @@ fn cw(offset_hz: f64, snr: f32) -> SignalSpec {
 
 fn rtty(mark_offset_hz: f64, shift_hz: f64, snr: f32) -> FskSpec {
     FskSpec {
+        mark_below_space: false,
         mark_offset_hz,
         shift_hz,
         baud: if shift_hz < 300.0 { 45.45 } else { 50.0 },

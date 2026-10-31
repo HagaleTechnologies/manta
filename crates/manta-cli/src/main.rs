@@ -8587,6 +8587,7 @@ mod tests {
             space_hz: 14_079_832.6,
             shift_hz: 170.0,
             measured_shift_hz: 169.8,
+            decoded_text: String::new(),
             marked_sample_ts: 2_016_000,
             cleared_sample_ts: None,
             id: 1,

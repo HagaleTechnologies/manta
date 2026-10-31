@@ -4241,6 +4241,7 @@ mod tests {
             &mut iq,
             fs,
             &manta_testkit::fsk::FskSpec {
+                mark_below_space: false,
                 mark_offset_hz: 15_000.0,
                 shift_hz: 170.0,
                 baud: 45.45,
