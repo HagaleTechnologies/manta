@@ -322,6 +322,9 @@ jobs:
       # Decisions Index workflow's shape and behaviour. Linux only: pure Python over temp files.
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_decisions_index -v
+      # MAN-445: run the field-node script tests in the required Unix test checks.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_field_node -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
