@@ -203,6 +203,7 @@ One RTTY signal the detector marked in `decode --json`'s `rtty`.
 
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
+| `decodedText` | string | never | Latest diagnostic ITA2 text after recognition, limited to 256 ASCII characters. Only the first 100 recognised signals per input decode. No preroll or RTTY spots yet. |
 | `markHz` | number | never | Upper tone frequency in Hz, on the same scale as `frequency`. |
 | `spaceHz` | number | never | Lower tone frequency in Hz. |
 | `shiftHz` | number | never | The nearest standard shift: 170, 200, 425, 450 or 850 Hz. |

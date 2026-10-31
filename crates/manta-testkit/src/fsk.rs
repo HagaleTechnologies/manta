@@ -10,6 +10,8 @@ use num_complex::Complex32;
 /// One RTTY signal added to an existing analytic IQ buffer.
 #[derive(Debug, Clone)]
 pub struct FskSpec {
+    /// Swap physical mark and space tones. Defaults at construction sites remain false.
+    pub mark_below_space: bool,
     /// Mark (upper RF tone, amateur convention) offset from the IQ centre.
     pub mark_offset_hz: f64,
     /// Space = mark - shift.
@@ -139,8 +141,13 @@ pub fn baudot_half_bits(text: &str) -> Vec<bool> {
 pub fn add_fsk(iq: &mut [Complex32], fs: f64, spec: &FskSpec) {
     let halves = baudot_half_bits(&spec.text);
     let amp = amplitude_for_snr_2500(spec.snr_2500_db, fs) * MASTER_SCALE;
-    let mark = spec.mark_offset_hz;
-    let space = spec.mark_offset_hz - spec.shift_hz;
+    let upper = spec.mark_offset_hz;
+    let lower = upper - spec.shift_hz;
+    let (mark, space) = if spec.mark_below_space {
+        (lower, upper)
+    } else {
+        (upper, lower)
+    };
     // Deterministic initial phase from the seed (no RNG state needed).
     let mut phi = (spec.seed % 1000) as f64 / 1000.0 * std::f64::consts::TAU;
     let freq_at = |i: usize| -> Option<f64> {
@@ -213,6 +220,7 @@ mod tests {
 
     fn spec(text: &str) -> FskSpec {
         FskSpec {
+            mark_below_space: false,
             mark_offset_hz: 1_000.0,
             shift_hz: 170.0,
             baud: 45.45,
@@ -246,6 +254,24 @@ mod tests {
                 * num_complex::Complex64::from_polar(1.0, ph);
         }
         acc.norm_sqr() / (iq.len() as f64).powi(2)
+    }
+
+    #[test]
+    fn reversed_spec_keys_mark_on_the_lower_tone() {
+        let fs = 8000.0;
+        for reversed in [false, true] {
+            let mut s = spec("");
+            s.mark_below_space = reversed;
+            let mut iq = vec![Complex32::default(); 8000];
+            add_fsk(&mut iq, fs, &s);
+            let upper = tone_power(&iq, fs, 1000.0);
+            let lower = tone_power(&iq, fs, 830.0);
+            assert!(if reversed {
+                lower > upper * 100.0
+            } else {
+                upper > lower * 100.0
+            });
+        }
     }
 
     #[test]

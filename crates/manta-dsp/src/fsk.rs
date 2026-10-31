@@ -18,6 +18,7 @@
 
 use crate::channelizer::{odd_channel_sign_correction, HopOutput};
 use crate::floor::FloorBank;
+use crate::rtty::RttyDemod;
 use num_complex::{Complex32, Complex64};
 use std::collections::BTreeMap;
 
@@ -61,6 +62,8 @@ const CHANNELS_PER_CYCLE: f64 = crate::channelizer::CHANNELS_PER_PHASE_CYCLE;
 pub struct FskSignal {
     /// Stable across blocks while the signal stays marked.
     pub id: u32,
+    /// Latest diagnostic ITA2 text, bounded to 256 characters. No preroll.
+    pub decoded_text: String,
     /// Space (lower tone) position, fractional channel.
     pub low_j: f64,
     /// Mark (upper tone) position, fractional channel.
@@ -112,6 +115,8 @@ pub struct FskDetector {
     /// Hard-span membership, per FFT-order channel `k`.
     hard: Vec<bool>,
     next_id: u32,
+    demods: BTreeMap<u32, RttyDemod>,
+    text_dirty: bool,
 }
 
 impl FskDetector {
@@ -132,6 +137,8 @@ impl FskDetector {
             signals: Vec::new(),
             hard: vec![false; n_channels],
             next_id: 1,
+            demods: BTreeMap::new(),
+            text_dirty: false,
         }
     }
 
@@ -163,12 +170,30 @@ impl FskDetector {
             }
             self.prev[j] = xc;
         }
+        // This first slice decodes only already recognised signals, at most
+        // 100 per input. The engine adapter will add admission and preroll.
+        for signal in &mut self.signals {
+            let Some(demod) = self.demods.get_mut(&signal.id) else {
+                continue;
+            };
+            let k = |j: f64| (j.round() as usize + n / 2) % n;
+            let low = x.get(k(signal.low_j)).copied().unwrap_or_default();
+            let high = x.get(k(signal.high_j)).copied().unwrap_or_default();
+            let text = demod.push(low, high);
+            self.text_dirty |= !text.is_empty();
+            signal.decoded_text.push_str(&text);
+            if signal.decoded_text.len() > 256 {
+                let excess = signal.decoded_text.len() - 256;
+                signal.decoded_text.drain(..excess);
+            }
+        }
         self.pos += 1;
         if self.pos < BLOCK_HOPS {
             return false;
         }
         self.pos = 0;
-        let changed = self.end_block(m);
+        let changed = self.end_block(m) || self.text_dirty;
+        self.text_dirty = false;
         self.z
             .iter_mut()
             .for_each(|z| *z = Complex64::new(0.0, 0.0));
@@ -408,6 +433,9 @@ impl FskDetector {
             };
             self.signals.push(FskSignal {
                 id,
+                decoded_text: prev
+                    .map(|(_, s)| s.decoded_text.clone())
+                    .unwrap_or_default(),
                 low_j,
                 high_j,
                 measured_shift_hz,
@@ -416,6 +444,14 @@ impl FskDetector {
                 span_j: (lo, hi),
                 marked_hop,
             });
+        }
+        self.demods
+            .retain(|id, _| self.signals.iter().any(|s| s.id == *id));
+        for signal in &self.signals {
+            if self.demods.len() >= 100 {
+                break;
+            }
+            self.demods.entry(signal.id).or_default();
         }
         self.hard.iter_mut().for_each(|h| *h = false);
         for s in &self.signals {
