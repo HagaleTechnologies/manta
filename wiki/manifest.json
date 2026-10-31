@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-26T12:19:52Z",
-  "head_commit": "420a580",
+  "generated_at": "2026-10-30T15:36:30Z",
+  "head_commit": "f182847",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:38b9d762bee6eacbf2208ba206954b674e3a3725cdee6c0666d7fba84b97b6da",
+      "hash": "sha256:ead44ce71e0b86635736ed2923ef14b39ee01fdba3ef51c4303490adbeb1cbd9",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -82,8 +82,8 @@
       ],
       "status": "current",
       "title": "How does the detector and track manager decide what to decode?",
-      "verified_commit": "d0fd24d",
-      "verified_date": "2026-10-16",
+      "verified_commit": "f182847",
+      "verified_date": "2026-10-30",
       "visibility": "public"
     },
     {

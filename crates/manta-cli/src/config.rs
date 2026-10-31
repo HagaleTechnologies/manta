@@ -30,6 +30,7 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "rbn_compare",
     "skimmer_relay",
     "wsjtx_relay",
+    "callsign_lookup",
     "input",
     "spot",
     "detector",
@@ -63,6 +64,7 @@ pub(crate) const ENV_CONFIG: &str = "MANTA_CONFIG";
 const ENV_TABLES: &[(&str, &str)] = &[
     ("SERVER_", "server"),
     ("RBN_COMPARE_", "rbn_compare"),
+    ("CALLSIGN_LOOKUP_", "callsign_lookup"),
     ("INPUT_", "input"),
     ("SPOT_", "spot"),
     ("DETECTOR_", "detector"),
@@ -84,6 +86,10 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("server", "operator_grid"),
     ("rbn_compare", "feed_host"),
     ("rbn_compare", "login_callsign"),
+    // MAN-318: a numeric user name or password stays a string.
+    ("callsign_lookup", "qrz_username"),
+    ("callsign_lookup", "qrz_password"),
+    ("callsign_lookup", "qrz_url"),
     ("input", "type"),
     ("input", "device"),
     ("input", "path"),
@@ -157,6 +163,9 @@ pub(crate) struct Loaded {
     /// MAN-320: `[[wsjtx_relay]]` blocks as written, validated (disabled
     /// ones included). Restart-only.
     pub wsjtx_relay: Vec<WsjtxRelayConfig>,
+    /// MAN-318: `[callsign_lookup]` as written, validated (`None` when the
+    /// table is absent; present even when `enabled = false`).
+    pub callsign_lookup: Option<CallsignLookupConfig>,
     pub decode: DecodeConfig,
     pub detector: DetectorConfig,
     pub spot: SpotFile,
@@ -176,6 +185,108 @@ pub(crate) struct Loaded {
     /// Stderr notes about the file itself (an inert table), printed by the
     /// caller with `resolve`'s merge notes.
     pub notes: Vec<String>,
+}
+
+/// MAN-318: `[callsign_lookup]`: withhold a spot whose callsign QRZ.com does
+/// not list. Restart-only; live sources only. See
+/// docs/DECISIONS/2026-10-27-man318-callsign-lookup.md.
+#[derive(Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub(crate) struct CallsignLookupConfig {
+    pub enabled: bool,
+    pub qrz_username: String,
+    pub qrz_password: String,
+    pub qrz_url: String,
+}
+
+impl Default for CallsignLookupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            qrz_username: String::new(),
+            qrz_password: String::new(),
+            qrz_url: crate::qrz::DEFAULT_URL.to_string(),
+        }
+    }
+}
+
+/// Never prints the password.
+impl std::fmt::Debug for CallsignLookupConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallsignLookupConfig")
+            .field("enabled", &self.enabled)
+            .field("qrz_username", &self.qrz_username)
+            .field(
+                "qrz_password",
+                &if self.qrz_password.is_empty() {
+                    "none"
+                } else {
+                    "set"
+                },
+            )
+            .field("qrz_url", &self.qrz_url)
+            .finish()
+    }
+}
+
+impl CallsignLookupConfig {
+    /// D11: enabled needs both credentials; `qrz_url` is `https://`, or
+    /// `http://` to a loopback host only (the password must not cross a
+    /// network in cleartext).
+    pub(crate) fn validate(&self) -> std::result::Result<(), String> {
+        if self.enabled {
+            for (key, value) in [
+                ("qrz_username", &self.qrz_username),
+                ("qrz_password", &self.qrz_password),
+            ] {
+                if value.trim().is_empty() {
+                    return Err(format!(
+                        "[callsign_lookup] is enabled but {key} is empty -- set your QRZ.com \
+                         user name and password (or MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME / \
+                         MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD)"
+                    ));
+                }
+            }
+        }
+        if !qrz_url_allowed(&self.qrz_url) {
+            return Err(format!(
+                "[callsign_lookup].qrz_url must be an https:// URL (http:// only to a loopback \
+                 address such as 127.0.0.1), got \"{}\"",
+                self.qrz_url
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// `https://<host>...`, or `http://` to `localhost`, `127.0.0.0/8` or `::1`.
+fn qrz_url_allowed(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("https://") {
+        return !rest.is_empty() && !rest.starts_with('/');
+    }
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        match v6.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 /// `[spot]`, with relative file paths already resolved (file values against
@@ -343,6 +454,7 @@ impl InputKind {
                 "receivers",
                 "bands",
                 "tuning_range_hz",
+                "auto_attenuation",
             ],
             InputKind::Ka9q => &["group", "port", "ssrc", "interface"],
         }
@@ -385,6 +497,8 @@ struct InputToml {
     ssrc: Option<i64>,
     receivers: Option<toml::Value>,
     interface: Option<String>,
+    /// MAN-308: hpsdr protocol 2's automatic step attenuation.
+    auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
     freq_correction_ppm: Option<f64>,
     center_freq_hz: Option<f64>,
@@ -497,6 +611,9 @@ pub(crate) enum SourceFromFile {
         protocol: manta_input::hpsdr::HpsdrProtocol,
         freq_hz: f64,
         rate_hz: f64,
+        /// MAN-308: `input.auto_attenuation`, `false` when absent; never
+        /// `true` with `protocol = "1"`.
+        auto_attenuation: bool,
     },
     /// MAN-140: one ka9q-radio (radiod) IQ channel. `group` passed
     /// `check_group` at load; a host name is resolved at open.
@@ -623,6 +740,12 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
                 .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("rbn_compare")))?,
         }
     }
+    let callsign_lookup =
+        take_typed::<CallsignLookupConfig>(&doc, "callsign_lookup", &origin, &overlay)?;
+    if let Some(cl) = &callsign_lookup {
+        cl.validate()
+            .map_err(|e| anyhow!("{origin}: {e}{}", overlay.suffix("callsign_lookup")))?;
+    }
     let decode_toml =
         take_typed::<DecodeConfigToml>(&doc, "decode", &origin, &overlay)?.unwrap_or_default();
     let decode = crate::validate_decode_config(decode_toml.into_decode_config(), &origin)?;
@@ -716,6 +839,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         rbn_compare,
         skimmer_relay,
         wsjtx_relay,
+        callsign_lookup,
         decode,
         detector,
         spot,
@@ -1129,6 +1253,7 @@ pub(crate) fn hpsdr_allocations(inputs: &[NamedInput]) -> Vec<HpsdrAllocation> {
             rate_hz,
             freq_hz,
             receivers,
+            ..
         }) = &input.input.source
         {
             // MAN-306 x MAN-307: entries naming one radio the same way share
@@ -1171,6 +1296,22 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         {
             bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
         }
+        // MAN-308 D1: several receivers on one radio run protocol 1, which
+        // has no attenuator manta drives.
+        if group.members.len() > 1 {
+            if let Some(&index) = group.members.iter().find(|&&i| {
+                matches!(
+                    inputs[i].input.source,
+                    Some(SourceFromFile::Hpsdr {
+                        auto_attenuation: true,
+                        ..
+                    })
+                )
+            }) {
+                let name = &inputs[index].name;
+                bail!("{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta");
+            }
+        }
         for &index in group.members.iter().skip(1) {
             let name = &inputs[index].name;
             if let Some(SourceFromFile::Hpsdr {
@@ -1203,6 +1344,7 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             ddc_count: group.members.len(),
             sample_rate_hz: group.rate,
             center_freq_hz: group.frequencies.clone(),
+            auto_attenuation: None,
         }
         .validate()
         .map_err(|e| anyhow!("{origin}: [[input]] \"{first}\": {e}"))?;
@@ -1611,6 +1753,21 @@ fn validate_input(
                 .unwrap_or_default(),
             freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
             rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+            // MAN-308 D1: `protocol` parsed above, so this re-read cannot fail.
+            auto_attenuation: match t.auto_attenuation {
+                Some(true)
+                    if matches!(
+                        t.protocol
+                            .as_ref()
+                            .map(ProtocolValue::protocol)
+                            .transpose()?,
+                        Some(manta_input::hpsdr::HpsdrProtocol::One)
+                    ) =>
+                {
+                    return Err("input.auto_attenuation needs openHPSDR protocol 2 (protocol = \"2\" or \"auto\"); manta drives no attenuator over protocol 1".into());
+                }
+                on => on.unwrap_or(false),
+            },
         },
         InputKind::Ka9q => SourceFromFile::Ka9q {
             port: port(manta_input::ka9q::wire::DATA_PORT)?,
@@ -1632,7 +1789,7 @@ fn validate_input(
 /// D5: every source key set belongs to `input.type`, and a source key
 /// needs a type.
 fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
-    let set: [(&str, bool); 22] = [
+    let set: [(&str, bool); 23] = [
         ("receivers", t.receivers.is_some()),
         ("device", t.device.is_some()),
         ("path", t.path.is_some()),
@@ -1655,6 +1812,7 @@ fn check_input_keys(t: &InputToml) -> std::result::Result<(), String> {
         ("interface", t.interface.is_some()),
         ("bands", t.bands.is_some()),
         ("tuning_range_hz", t.tuning_range_hz.is_some()),
+        ("auto_attenuation", t.auto_attenuation.is_some()),
     ];
     let Some(kind) = t.kind else {
         if let Some((key, _)) = set.iter().find(|(_, is_set)| *is_set) {
@@ -1733,7 +1891,7 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
         }) else {
             bail!(
                 "unrecognized environment variable {name} (manta reads {ENV_CONFIG} and \
-                 MANTA_<SERVER|RBN_COMPARE|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
+                 MANTA_<SERVER|RBN_COMPARE|CALLSIGN_LOOKUP|INPUT|SPOT|DETECTOR|DECODE>_<KEY>)"
             );
         };
         let Some(value) = value.to_str() else {
@@ -1771,6 +1929,23 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
                  that entry instead",
                 inputs.len()
             );
+        }
+    }
+    // Remove inherited tuning selectors before inserting any environment values,
+    // so two explicit environment selectors still reach the conflict check.
+    if let Some(toml::Value::Table(input)) = doc.get_mut("input") {
+        if entries
+            .iter()
+            .any(|(_, table, key, _)| *table == "input" && key == "bands")
+        {
+            input.remove("freq_hz");
+        }
+        if entries
+            .iter()
+            .any(|(_, table, key, _)| *table == "input" && key == "freq_hz")
+            && input.remove("bands").is_some()
+        {
+            input.remove("tuning_range_hz");
         }
     }
     let mut overlay = EnvOverlay::default();
@@ -2586,7 +2761,9 @@ mod tests {
     fn unrecognized_table_message_lists_the_relay_tables() {
         let err = err_of("[relay_source]\nx = 1\n");
         assert!(
-            err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+            err.contains(
+                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+            ),
             "{err}"
         );
     }
@@ -3255,6 +3432,7 @@ mod tests {
                 freq_hz: 7_030_000.0,
                 rate_hz: 192_000.0,
                 receivers: None,
+                auto_attenuation: false,
             })
         );
     }
@@ -3289,6 +3467,115 @@ mod tests {
             hpsdr_protocol_of(&loaded.input.source),
             manta_input::hpsdr::HpsdrProtocol::Two
         );
+    }
+
+    fn hpsdr_auto_attenuation_of(source: &Option<SourceFromFile>) -> bool {
+        match source {
+            Some(SourceFromFile::Hpsdr {
+                auto_attenuation, ..
+            }) => *auto_attenuation,
+            other => panic!("expected an hpsdr input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hpsdr_auto_attenuation_defaults_off_and_reads_true() {
+        let loaded = load_file(HPSDR_BODY).unwrap();
+        assert!(!hpsdr_auto_attenuation_of(&loaded.input.source));
+        let loaded = load_file(&format!("{HPSDR_BODY}auto_attenuation = true\n")).unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
+    }
+
+    #[test]
+    fn auto_attenuation_does_not_apply_to_kiwi() {
+        let err = err_of(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7e6\nauto_attenuation = true\n",
+        );
+        assert!(
+            err.ends_with(
+                "input.auto_attenuation does not apply to input.type = \"kiwi\" (kiwi takes \
+                 host, port, freq_hz, password, bands, tuning_range_hz)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn auto_attenuation_needs_protocol_2() {
+        for value in ["\"1\"", "1"] {
+            let err = err_of(&format!(
+                "{HPSDR_BODY}protocol = {value}\nauto_attenuation = true\n"
+            ));
+            assert!(
+                err.ends_with(
+                    "input.auto_attenuation needs openHPSDR protocol 2 (protocol = \"2\" or \
+                     \"auto\"); manta drives no attenuator over protocol 1"
+                ),
+                "{value}: {err}"
+            );
+        }
+        for value in ["\"2\"", "\"auto\""] {
+            let loaded = load_file(&format!(
+                "{HPSDR_BODY}protocol = {value}\nauto_attenuation = true\n"
+            ))
+            .unwrap_or_else(|e| panic!("{value}: {e:#}"));
+            assert!(hpsdr_auto_attenuation_of(&loaded.input.source), "{value}");
+        }
+        // Off, protocol 1 still loads.
+        assert!(load_file(&format!(
+            "{HPSDR_BODY}protocol = \"1\"\nauto_attenuation = false\n"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn auto_attenuation_is_refused_on_a_shared_radio() {
+        let on = "protocol = \"auto\"\nauto_attenuation = true\n";
+        let off = "protocol = \"auto\"\n";
+        let err = err_of(&(hpsdr_entry("a", "radio", on) + &hpsdr_entry("b", "radio", off)));
+        assert!(
+            err.ends_with(
+                "[[input]] \"a\": auto_attenuation needs a radio with one receiver; several \
+                 receivers on one radio speak protocol 1 in manta"
+            ),
+            "{err}"
+        );
+        let err = err_of(&(hpsdr_entry("a", "radio", off) + &hpsdr_entry("b", "radio", on)));
+        assert!(
+            err.ends_with(
+                "[[input]] \"b\": auto_attenuation needs a radio with one receiver; several \
+                 receivers on one radio speak protocol 1 in manta"
+            ),
+            "{err}"
+        );
+        let loaded =
+            load_file(&(hpsdr_entry("a", "radio1", on) + &hpsdr_entry("b", "radio2", on))).unwrap();
+        assert!(loaded
+            .inputs
+            .iter()
+            .all(|i| hpsdr_auto_attenuation_of(&i.input.source)));
+    }
+
+    #[test]
+    fn env_sets_hpsdr_auto_attenuation() {
+        let loaded = load_env(
+            Some(HPSDR_BODY),
+            &[("MANTA_INPUT_AUTO_ATTENUATION", "true")],
+        )
+        .unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_TYPE", "hpsdr"),
+                ("MANTA_INPUT_HOST", "192.0.2.10"),
+                ("MANTA_INPUT_FREQ_HZ", "7030000"),
+                ("MANTA_INPUT_RATE_HZ", "192000"),
+                ("MANTA_INPUT_AUTO_ATTENUATION", "true"),
+            ],
+        )
+        .unwrap();
+        assert!(hpsdr_auto_attenuation_of(&loaded.input.source));
     }
 
     #[test]
@@ -3843,6 +4130,154 @@ mod tests {
     }
 
     #[test]
+    fn env_bands_replace_file_frequency_for_both_single_input_forms() {
+        for section in ["[input]", "[[input]]"] {
+            let file = format!(
+                "{section}\nname = \"receiver\"\ntype = \"kiwi\"\nhost = \"example\"\n\
+                 freq_hz = 7040000\nfreq_correction_ppm = 2.5\n"
+            );
+            let loaded = load_env(Some(&file), &[("MANTA_INPUT_BANDS", "7030")]).unwrap();
+            assert_eq!(
+                loaded.input.source.as_ref().unwrap().freq_hz(),
+                Some(7030000.0)
+            );
+            assert_eq!(loaded.inputs.len(), 1);
+            assert_eq!(loaded.inputs[0].name, "receiver");
+            assert_eq!(loaded.input.shared.freq_correction_ppm, Some(2.5));
+            let raw = loaded.raw["input"].as_table().unwrap();
+            assert_eq!(raw["host"].as_str(), Some("example"));
+            assert_eq!(raw["bands"], toml::Value::Integer(7030));
+            assert!(!raw.contains_key("freq_hz"));
+            assert_eq!(loaded.env_vars, ["MANTA_INPUT_BANDS"]);
+        }
+    }
+
+    #[test]
+    fn env_frequency_replaces_file_bands_and_their_range_for_both_single_input_forms() {
+        for section in ["[input]", "[[input]]"] {
+            for range in ["", "tuning_range_hz = [3000000, 30000000]\n"] {
+                let file = format!(
+                    "{section}\nname = \"receiver\"\ntype = \"kiwi\"\nhost = \"example\"\n\
+                     bands = \"7030\"\nfreq_correction_ppm = 2.5\n{range}"
+                );
+                let loaded = load_env(Some(&file), &[("MANTA_INPUT_FREQ_HZ", "7040000")]).unwrap();
+                assert_eq!(
+                    loaded.input.source.as_ref().unwrap().freq_hz(),
+                    Some(7040000.0)
+                );
+                assert_eq!(loaded.inputs.len(), 1);
+                assert_eq!(loaded.inputs[0].name, "receiver");
+                assert_eq!(loaded.input.shared.freq_correction_ppm, Some(2.5));
+                let raw = loaded.raw["input"].as_table().unwrap();
+                assert_eq!(raw["host"].as_str(), Some("example"));
+                assert_eq!(raw["freq_hz"], toml::Value::Integer(7040000));
+                assert!(!raw.contains_key("bands"));
+                assert!(!raw.contains_key("tuning_range_hz"));
+                assert_eq!(loaded.env_vars, ["MANTA_INPUT_FREQ_HZ"]);
+            }
+        }
+    }
+
+    #[test]
+    fn env_tuning_selectors_still_conflict_with_each_other() {
+        for file_selector in ["freq_hz = 7020000", "bands = \"7020\""] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}\n");
+            let mut env = [
+                ("MANTA_INPUT_BANDS", "7030"),
+                ("MANTA_INPUT_FREQ_HZ", "7040000"),
+            ];
+            for _ in 0..2 {
+                let err = load_env(Some(&file), &env).unwrap_err().to_string();
+                assert!(
+                    err.contains("input.bands and input.freq_hz both set"),
+                    "{err}"
+                );
+                assert!(
+                    err.contains("environment: MANTA_INPUT_BANDS, MANTA_INPUT_FREQ_HZ"),
+                    "{err}"
+                );
+                env.reverse();
+            }
+        }
+    }
+
+    #[test]
+    fn empty_env_tuning_selectors_leave_file_settings_intact() {
+        for file_selector in [
+            "freq_hz = 7040000\n",
+            "bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n",
+        ] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}");
+            let loaded = load_env(
+                Some(&file),
+                &[("MANTA_INPUT_BANDS", ""), ("MANTA_INPUT_FREQ_HZ", "")],
+            )
+            .unwrap();
+            assert_eq!(loaded.raw, load_file(&file).unwrap().raw);
+            assert!(loaded.env_vars.is_empty());
+        }
+    }
+
+    #[test]
+    fn invalid_env_tuning_selectors_are_rejected_with_attribution() {
+        for (file_selector, name, value, diagnostic) in [
+            (
+                "freq_hz = 7040000",
+                "MANTA_INPUT_BANDS",
+                "not-a-band",
+                "input.bands",
+            ),
+            (
+                "bands = \"7030\"",
+                "MANTA_INPUT_FREQ_HZ",
+                "-1",
+                "input.freq_hz",
+            ),
+        ] {
+            let file = format!("[input]\ntype = \"kiwi\"\nhost = \"example\"\n{file_selector}\n");
+            let err = load_env(Some(&file), &[(name, value)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(diagnostic), "{err}");
+            assert!(err.contains(&format!("environment: {name}")), "{err}");
+            assert!(!err.contains("both set"), "{err}");
+        }
+    }
+
+    #[test]
+    fn env_frequency_does_not_hide_an_explicit_or_orphan_tuning_range() {
+        let file = "[input]\ntype = \"kiwi\"\nhost = \"example\"\n\
+                    bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n";
+        let err = load_env(
+            Some(file),
+            &[
+                ("MANTA_INPUT_FREQ_HZ", "7040000"),
+                ("MANTA_INPUT_TUNING_RANGE_HZ", "[3000000, 30000000]"),
+            ],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("input.tuning_range_hz applies only with input.bands"),
+            "{err}"
+        );
+        assert!(
+            err.contains("environment: MANTA_INPUT_FREQ_HZ, MANTA_INPUT_TUNING_RANGE_HZ"),
+            "{err}"
+        );
+
+        let file = file.replace("bands = \"7030\"", "freq_hz = 7020000");
+        let err = load_env(Some(&file), &[("MANTA_INPUT_FREQ_HZ", "7040000")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("input.tuning_range_hz applies only with input.bands"),
+            "{err}"
+        );
+        assert!(err.contains("environment: MANTA_INPUT_FREQ_HZ"), "{err}");
+    }
+
+    #[test]
     fn unknown_manta_variable_is_rejected_naming_it() {
         let err = format!(
             "{:#}",
@@ -4128,12 +4563,122 @@ mod tests {
         assert!(
             err.ends_with(
                 "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [[skimmer_relay]], \
-                 [[wsjtx_relay]], [input], [spot], [detector], [decode]"
+                 [[wsjtx_relay]], [callsign_lookup], [input], [spot], [detector], [decode]"
             ),
             "{err}"
         );
         let err = err_of("[rbn_compar]\nenabled = true\n");
         assert!(err.contains("did you mean [rbn_compare]?"), "{err}");
+    }
+
+    // ---- MAN-318: [callsign_lookup] ----
+
+    const LOOKUP_ON: &str = "[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n\
+                             qrz_password = \"p&ss;w=rd\"\n";
+
+    #[test]
+    fn callsign_lookup_absent_is_none() {
+        assert!(load_env(Some(SERVER), &[])
+            .unwrap()
+            .callsign_lookup
+            .is_none());
+    }
+
+    #[test]
+    fn callsign_lookup_present_but_disabled_is_some() {
+        let loaded = load_env(Some("[callsign_lookup]\n"), &[]).unwrap();
+        assert_eq!(
+            loaded.callsign_lookup,
+            Some(CallsignLookupConfig::default())
+        );
+        assert_eq!(
+            loaded.callsign_lookup.unwrap().qrz_url,
+            "https://xmldata.qrz.com/xml/current/"
+        );
+        let on = load_env(Some(LOOKUP_ON), &[])
+            .unwrap()
+            .callsign_lookup
+            .unwrap();
+        assert!(on.enabled);
+        assert_eq!(on.qrz_username, "N1TEST");
+        assert_eq!(on.qrz_password, "p&ss;w=rd");
+        assert!(
+            !format!("{on:?}").contains("p&ss"),
+            "Debug hides the password"
+        );
+    }
+
+    #[test]
+    fn enabled_lookup_needs_a_username_and_password() {
+        let err = err_of("[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n");
+        assert!(
+            err.contains(
+                "[callsign_lookup] is enabled but qrz_password is empty -- set your QRZ.com \
+                 user name and password (or MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME / \
+                 MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD)"
+            ),
+            "{err}"
+        );
+        let err = err_of("[callsign_lookup]\nenabled = true\nqrz_password = \"x\"\n");
+        assert!(err.contains("but qrz_username is empty"), "{err}");
+        // Disabled, empty credentials are fine.
+        assert!(load_env(Some("[callsign_lookup]\nenabled = false\n"), &[]).is_ok());
+    }
+
+    #[test]
+    fn qrz_url_must_be_https_or_loopback_http() {
+        for ok in [
+            "https://xmldata.qrz.com/xml/current/",
+            "http://127.0.0.1:9/x/",
+            "http://[::1]:9/",
+            "http://localhost:9/",
+        ] {
+            let body = format!("{LOOKUP_ON}qrz_url = \"{ok}\"\n");
+            assert!(load_env(Some(&body), &[]).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://xmldata.qrz.com/xml/current/",
+            "ftp://xmldata.qrz.com/",
+            "http://127.0.0.1@evil.example/",
+            "http://localhost.evil.example/",
+        ] {
+            let body = format!("{LOOKUP_ON}qrz_url = \"{bad}\"\n");
+            let err = err_of(&body);
+            assert!(
+                err.contains(&format!(
+                    "[callsign_lookup].qrz_url must be an https:// URL (http:// only to a \
+                     loopback address such as 127.0.0.1), got \"{bad}\""
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_sets_the_qrz_password_verbatim() {
+        let loaded = load_env(
+            Some("[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n"),
+            &[("MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD", "12345678")],
+        )
+        .unwrap();
+        assert_eq!(loaded.callsign_lookup.unwrap().qrz_password, "12345678");
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unknown_callsign_lookup_key_is_refused() {
+        let err = err_of("[callsign_lookup]\nservice = \"hamqth\"\n");
+        assert!(err.contains("[callsign_lookup]"), "{err}");
+        assert!(err.contains("unknown field `service`"), "{err}");
+    }
+
+    #[test]
+    fn unknown_table_message_lists_callsign_lookup() {
+        let err = err_of("[callsign_lookups]\nenabled = true\n");
+        assert!(err.contains("did you mean [callsign_lookup]?"), "{err}");
     }
 
     #[test]

@@ -98,6 +98,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
+  protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
+  overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
+  Each change is logged, and `/metrics` gains `manta_input_attenuation_db`
+  and `manta_input_attenuation_changes_total`.
 - MAN-309: `manta run --record-iq PATH` (or `record_iq` in each `[input]`/
   `[[input]]`) records the IQ it decodes, from any input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
   centre, start time, source passband and guards, input gaps). `decode`

@@ -480,6 +480,7 @@ fn check_prints_one_summary_line_per_table() {
             "rbn_compare",
             "skimmer_relay",
             "wsjtx_relay",
+            "callsign_lookup",
             "input",
             "spot",
             "detector",
@@ -1400,6 +1401,47 @@ fn bands_from_the_environment() {
     );
 }
 
+#[test]
+fn environment_bands_replace_the_file_frequency() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), "m.toml", &format!("{KIWI}freq_hz = 7040000\n"));
+    let checked = manta()
+        .current_dir(dir.path())
+        .env("MANTA_INPUT_BANDS", "7030")
+        .args(["config", "check", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let out = succeeds(&checked);
+    assert!(out.contains("freq_hz=7030000"), "{out}");
+    assert!(out.contains("environment: MANTA_INPUT_BANDS\n"), "{out}");
+    assert_eq!(
+        stderr(&checked),
+        "note: [input]: bands = [\"7030\"] plans 1 stream: 7030 kHz\n"
+    );
+}
+
+#[test]
+fn environment_frequency_replaces_the_file_bands_and_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "m.toml",
+        &format!("{KIWI}bands = \"7030\"\ntuning_range_hz = [3000000, 30000000]\n"),
+    );
+    let checked = manta()
+        .current_dir(dir.path())
+        .env("MANTA_INPUT_FREQ_HZ", "7040000")
+        .args(["config", "check", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    let out = succeeds(&checked);
+    assert!(out.contains("freq_hz=7040000"), "{out}");
+    assert!(out.contains("environment: MANTA_INPUT_FREQ_HZ\n"), "{out}");
+    assert!(stderr(&checked).is_empty(), "{}", stderr(&checked));
+}
+
 /// MAN-306: config check prints the canonical MAC without opening a radio.
 #[test]
 fn hpsdr_discovery_config_check_normalizes_mac_without_opening_a_radio() {
@@ -1446,7 +1488,8 @@ fn check_prints_the_relay_summary_lines() {
     let skimmer = at("skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true");
     let wsjtx = at("wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true");
     assert_eq!((skimmer, wsjtx), (compare + 1, compare + 2), "{out}");
-    assert!(lines[wsjtx + 1].starts_with("input: "), "{out}");
+    assert_eq!(lines[wsjtx + 1], "callsign_lookup: none", "{out}");
+    assert!(lines[wsjtx + 2].starts_with("input: "), "{out}");
 
     let path = write_cfg(dir.path(), "plain.toml", RELAY_BASE);
     let out = succeeds(&check_file(&path));
@@ -1527,7 +1570,9 @@ fn check_rejects_each_relay_error_with_its_message() {
     let path = write_cfg(dir.path(), "unknown.toml", "[relay_source]\nx = 1\n");
     let err = fails(&check_file(&path));
     assert!(
-        err.contains("[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [input], "),
+        err.contains(
+            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+        ),
         "{err}"
     );
 }

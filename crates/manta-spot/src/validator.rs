@@ -9,6 +9,7 @@ use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::{Dedupe, DedupeOutcome};
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
+use crate::lookup::{CallsignLookup, Existence, LookupStatus};
 use crate::message;
 use crate::notch::NotchList;
 use crate::scp;
@@ -431,6 +432,18 @@ pub struct Validator {
     /// MAN-13: inputs interleaving their track ids into this validator
     /// (`with_input_count`).
     input_count: u32,
+    /// MAN-318: validation's last step (`set_callsign_lookup`). `None`, the
+    /// default, never asks.
+    lookup: Option<Arc<dyn CallsignLookup>>,
+    /// MAN-318: spots held until their base call's lookup settles, keyed by
+    /// that base call, in hold order.
+    held: BTreeMap<String, Vec<HeldSpot>>,
+}
+
+/// MAN-318: a spot waiting for its callsign lookup.
+struct HeldSpot {
+    spot: Spot,
+    reps: u32,
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -477,7 +490,118 @@ impl Validator {
             merged_into: BTreeMap::new(),
             decisions: None,
             input_count: 1,
+            lookup: None,
+            held: BTreeMap::new(),
         }
+    }
+
+    /// MAN-318: asks `lookup` whether each would-be spot's call exists, as
+    /// validation's last step. See `admit`.
+    pub fn set_callsign_lookup(&mut self, lookup: Arc<dyn CallsignLookup>) {
+        self.lookup = Some(lookup);
+    }
+
+    /// MAN-318: validation's last step. With a lookup set and the call not
+    /// allowlisted, a call the lookup does not list is withheld, and one it
+    /// has not answered yet is held until `poll_lookups`/`finish_lookups`.
+    /// Dedupe has already stored the spot either way.
+    fn admit(&mut self, spot: Spot, reps: u32, allowlisted: bool) -> Option<Spot> {
+        let lookup = match &self.lookup {
+            Some(l) if !allowlisted => l.clone(),
+            _ => {
+                self.decide(|| Decision::spotted(&spot, reps));
+                return Some(spot);
+            }
+        };
+        let key = lookup_key(&spot.callsign).to_string();
+        match lookup.check(&key) {
+            LookupStatus::Known(Existence::NotFound) => {
+                self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
+                None
+            }
+            LookupStatus::Known(Existence::Exists | Existence::Unknown) => {
+                self.decide(|| Decision::spotted(&spot, reps));
+                Some(spot)
+            }
+            LookupStatus::Pending => {
+                self.decide(|| lookup_decision(&spot, Reason::LookupPending, reps));
+                self.held
+                    .entry(key)
+                    .or_default()
+                    .push(HeldSpot { spot, reps });
+                None
+            }
+        }
+    }
+
+    /// MAN-318: held spots whose lookups settled since the last call, in
+    /// settle order (one call's spots in hold order). Empty, without
+    /// allocating, when no lookup is set. Call once per batch.
+    pub fn poll_lookups(&mut self) -> Vec<Spot> {
+        match self.lookup.clone() {
+            Some(lookup) => self.release(lookup.settled()),
+            None => Vec::new(),
+        }
+    }
+
+    /// MAN-318: settles every held spot, waiting at most each call's own
+    /// deadline. Anything the lookup failed to report is spotted (as
+    /// `Unknown`), so no held spot is ever lost.
+    pub fn finish_lookups(&mut self) -> Vec<Spot> {
+        let Some(lookup) = self.lookup.clone() else {
+            return Vec::new();
+        };
+        let mut spots = self.release(lookup.settle_all());
+        let rest: Vec<(String, Existence)> = self
+            .held
+            .keys()
+            .map(|k| (k.clone(), Existence::Unknown))
+            .collect();
+        spots.extend(self.release(rest));
+        spots
+    }
+
+    /// MAN-318: decides the held spots of each settled call. The operator's
+    /// lists can be replaced (MAN-78, SIGHUP) while a spot is held, so each
+    /// one is checked against the current lists first: a newly blocklisted
+    /// call or notched frequency is withheld and counted as such, and a
+    /// newly allowlisted call spots whatever the lookup said, as it would
+    /// have had it been allowlisted at capture.
+    fn release(&mut self, settled: Vec<(String, Existence)>) -> Vec<Spot> {
+        let mut spots = Vec::new();
+        for (key, existence) in settled {
+            let Some(held) = self.held.remove(&key) else {
+                continue;
+            };
+            for HeldSpot { spot, reps } in held {
+                if let Some(reason) = self.held_operator_suppressed(&spot) {
+                    self.decide(|| lookup_decision(&spot, reason, reps));
+                } else if existence == Existence::NotFound
+                    && !self.allowlist.contains(&spot.callsign)
+                {
+                    self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
+                } else {
+                    self.decide(|| Decision::spotted(&spot, reps));
+                    spots.push(spot);
+                }
+            }
+        }
+        spots
+    }
+
+    /// MAN-318: like `operator_suppressed`, for a spot held on its lookup:
+    /// counts and reports one the current lists suppress. A no-op when the
+    /// lists were not replaced, since capture already passed the same checks.
+    fn held_operator_suppressed(&mut self, spot: &Spot) -> Option<Reason> {
+        if self.blocklist.contains(&spot.callsign) {
+            self.suppression_counts.blocklist += 1;
+            return Some(Reason::Blocklist);
+        }
+        if self.notch.contains(spot.freq_hz) {
+            self.suppression_counts.notch += 1;
+            return Some(Reason::Notch);
+        }
+        None
     }
 
     /// MAN-13: the number of inputs whose interleaved track ids feed this
@@ -1511,8 +1635,7 @@ impl Validator {
             rst,
             qrl_query,
         };
-        self.decide(|| Decision::spotted(&spot, reps));
-        Some(spot)
+        self.admit(spot, reps, is_allowlisted)
     }
 
     /// Captures a non-allowlisted Beacon candidate once every permanent,
@@ -1841,8 +1964,7 @@ impl Validator {
                     rst: rst.clone(),
                     qrl_query,
                 };
-                self.decide(|| Decision::spotted(&spot, reps));
-                Some(spot)
+                self.admit(spot, reps, false)
             })
             .collect()
     }
@@ -1857,6 +1979,29 @@ fn insert_by_age(pending: &mut Vec<PendingBeacon>, pb: PendingBeacon) -> Option<
     let at = pending.partition_point(|p| p.sample_ts <= pb.sample_ts);
     pending.insert(at, pb);
     (pending.len() > MAX_PENDING_BEACONS).then(|| pending.remove(0))
+}
+
+/// MAN-318: the call a lookup is asked about: `call` without a valid
+/// portable designator (`W1AW/P` -> `W1AW`), the rule
+/// `cty::exact_match_base_len` uses.
+fn lookup_key(call: &str) -> &str {
+    match call.split_once('/') {
+        Some((base, portable)) if grammar::is_valid_portable(portable) => base,
+        _ => call,
+    }
+}
+
+/// MAN-318: a lookup decision (`LookupPending`/`LookupNotFound`) about `spot`.
+fn lookup_decision(spot: &Spot, reason: Reason, reps: u32) -> Decision {
+    Decision::withheld(
+        spot.track_id,
+        spot.sample_ts,
+        &spot.callsign,
+        spot.freq_hz,
+        spot.spot_type,
+        reason,
+    )
+    .with_reps(reps)
 }
 
 /// A decision about a deferred beacon candidate, decided under
@@ -1979,6 +2124,299 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
     fn decisions_for<'a>(log: &'a [Decision], call: &str) -> Vec<&'a Decision> {
         log.iter().filter(|d| d.call == call).collect()
+    }
+
+    // ---- MAN-318: the callsign lookup step ----
+
+    use std::sync::Mutex;
+
+    /// MAN-318: answers `check` from a script and records every question.
+    #[derive(Default)]
+    struct ScriptedLookup {
+        known: Mutex<BTreeMap<String, LookupStatus>>,
+        asked: Mutex<Vec<String>>,
+        settle_next: Mutex<Vec<(String, Existence)>>,
+    }
+
+    impl ScriptedLookup {
+        fn answering(call: &str, status: LookupStatus) -> Arc<Self> {
+            let l = Self::default();
+            l.known.lock().unwrap().insert(call.to_string(), status);
+            Arc::new(l)
+        }
+        fn settle(&self, call: &str, existence: Existence) {
+            self.settle_next
+                .lock()
+                .unwrap()
+                .push((call.to_string(), existence));
+        }
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl CallsignLookup for ScriptedLookup {
+        fn check(&self, call: &str) -> LookupStatus {
+            self.asked.lock().unwrap().push(call.to_string());
+            self.known
+                .lock()
+                .unwrap()
+                .get(call)
+                .copied()
+                .unwrap_or(LookupStatus::Pending)
+        }
+        fn settled(&self) -> Vec<(String, Existence)> {
+            std::mem::take(&mut *self.settle_next.lock().unwrap())
+        }
+        fn settle_all(&self) -> Vec<(String, Existence)> {
+            let mut out = self.settled();
+            let asked = self.asked();
+            let known = self.known.lock().unwrap();
+            for call in asked {
+                let pending = !matches!(known.get(&call), Some(LookupStatus::Known(_)));
+                if pending && !out.iter().any(|(c, _)| *c == call) {
+                    out.push((call, Existence::Unknown));
+                }
+            }
+            out
+        }
+    }
+
+    /// The K5ARH spot two `DE K5ARH K` transmissions yield, with `lookup` set.
+    fn k5arh_with(lookup: Option<Arc<ScriptedLookup>>) -> (Validator, Vec<Spot>) {
+        let mut v = recording(CTY_FIXTURE);
+        if let Some(l) = lookup {
+            v.set_callsign_lookup(l);
+        }
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        (v, spots)
+    }
+
+    fn last_k5arh_decision(v: &mut Validator) -> Decision {
+        let log = v.take_decisions();
+        decisions_for(&log, "K5ARH")
+            .last()
+            .copied()
+            .cloned()
+            .expect("a K5ARH decision")
+    }
+
+    #[test]
+    fn a_call_the_lookup_reports_not_found_is_not_spotted() {
+        let lookup = ScriptedLookup::answering("K5ARH", LookupStatus::Known(Existence::NotFound));
+        let (mut v, spots) = k5arh_with(Some(lookup.clone()));
+        assert!(spots.is_empty(), "{spots:?}");
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Withheld);
+        assert_eq!(d.reason, Some(Reason::LookupNotFound));
+        assert!(d.reps.is_some());
+        assert!(d.spot.is_none());
+        assert_eq!(lookup.asked(), ["K5ARH"]);
+    }
+
+    #[test]
+    fn a_pending_call_is_held_and_spotted_once_it_exists() {
+        let (_, plain) = k5arh_with(None);
+        assert_eq!(plain.len(), 1);
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, spots) = k5arh_with(Some(lookup.clone()));
+        assert!(spots.is_empty());
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Deferred);
+        assert_eq!(d.reason, Some(Reason::LookupPending));
+        assert!(v.poll_lookups().is_empty(), "nothing settled yet");
+        lookup.settle("K5ARH", Existence::Exists);
+        let released = v.poll_lookups();
+        assert_eq!(released, plain);
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Spotted);
+        assert_eq!(d.spot.as_ref(), Some(&released[0]));
+        assert!(v.poll_lookups().is_empty(), "released once");
+    }
+
+    #[test]
+    fn a_pending_call_settled_not_found_is_withheld() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.take_decisions();
+        lookup.settle("K5ARH", Existence::NotFound);
+        assert!(v.poll_lookups().is_empty());
+        let d = last_k5arh_decision(&mut v);
+        assert_eq!(d.verdict, Verdict::Withheld);
+        assert_eq!(d.reason, Some(Reason::LookupNotFound));
+        assert!(d.spot.is_none());
+    }
+
+    #[test]
+    fn a_pending_call_settled_unknown_is_spotted() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        lookup.settle("K5ARH", Existence::Unknown);
+        let released = v.poll_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn allowlisted_calls_are_never_looked_up() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let mut v = recording(CTY_FIXTURE);
+        v.set_callsign_lookup(lookup.clone());
+        v.allowlist("W4KTNL");
+        let spots = run(&transmission_events(1, &["W4KTNL"], 0), &mut v);
+        assert_eq!(spots.len(), 1);
+        assert!(lookup.asked().is_empty());
+    }
+
+    #[test]
+    fn a_portable_call_is_looked_up_by_its_base_call() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let mut v2 = recording(CTY_FIXTURE);
+        v2.set_callsign_lookup(lookup.clone());
+        let words = ["DE", "W1AW/P", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v2);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v2));
+        assert!(spots.is_empty());
+        assert_eq!(lookup.asked(), ["W1AW"]);
+        lookup.settle("W1AW", Existence::Exists);
+        let released = v2.poll_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "W1AW/P");
+    }
+
+    #[test]
+    fn spots_held_for_one_call_are_released_together_in_order() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let mut v = recording(CTY_FIXTURE);
+        v.set_callsign_lookup(lookup.clone());
+        seed_meta(&mut v, 2);
+        v.ingest(&DecoderEvent::TrackMeta {
+            track_id: 2,
+            sample_ts: 0,
+            snr_2500_db: 20.0,
+            freq_hz: 14_010_000.0,
+        });
+        let words = ["DE", "K5ARH", "K"];
+        let mut spots = Vec::new();
+        for track in [1, 2] {
+            spots.extend(run(&transmission_events(track, &words, 0), &mut v));
+            spots.extend(run(&transmission_events(track, &words, 100_000), &mut v));
+        }
+        assert!(spots.is_empty());
+        lookup.settle("K5ARH", Existence::Exists);
+        let released = v.poll_lookups();
+        assert_eq!(released.len(), 2, "{released:?}");
+        assert_eq!(released[0].track_id, 1);
+        assert_eq!(released[1].track_id, 2);
+    }
+
+    #[test]
+    fn a_deferred_beacon_is_looked_up_when_its_track_ends() {
+        let lookup = ScriptedLookup::answering("K5ARH", LookupStatus::Known(Existence::NotFound));
+        let mut v = recording(CTY_FIXTURE);
+        v.set_callsign_lookup(lookup.clone());
+        run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], 0),
+            &mut v,
+        );
+        v.take_decisions();
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "{spots:?}");
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].verdict, Verdict::Withheld);
+        assert_eq!(log[0].reason, Some(Reason::LookupNotFound));
+        assert_eq!(lookup.asked(), ["K5ARH"]);
+    }
+
+    /// Codex review, PR #442: a reload while a spot is held must not let it
+    /// leak past a blocklist or notch it now falls under.
+    #[test]
+    fn a_held_spot_newly_blocklisted_or_notched_is_withheld_on_release() {
+        for (blocklist, notch, reason) in [
+            (
+                Blocklist::parse("K5ARH\n"),
+                NotchList::default(),
+                Reason::Blocklist,
+            ),
+            (
+                Blocklist::default(),
+                NotchList::parse("13999900-14000100\n"),
+                Reason::Notch,
+            ),
+        ] {
+            for existence in [Existence::Exists, Existence::Unknown] {
+                let lookup = Arc::new(ScriptedLookup::default());
+                let (mut v, spots) = k5arh_with(Some(lookup.clone()));
+                assert!(spots.is_empty());
+                v.take_decisions();
+                v.replace_operator_lists(&[], blocklist.clone(), notch.clone());
+                lookup.settle("K5ARH", existence);
+                assert!(v.poll_lookups().is_empty(), "{reason:?} {existence:?}");
+                let d = last_k5arh_decision(&mut v);
+                assert_eq!(d.verdict, Verdict::Withheld);
+                assert_eq!(d.reason, Some(reason));
+                let counts = v.suppression_counts();
+                assert_eq!(
+                    (counts.blocklist, counts.notch),
+                    if reason == Reason::Blocklist {
+                        (1, 0)
+                    } else {
+                        (0, 1)
+                    }
+                );
+            }
+        }
+        // finish_lookups (shutdown) applies the same check.
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
+        assert!(v.finish_lookups().is_empty());
+        assert_eq!(v.suppression_counts().blocklist, 1);
+    }
+
+    #[test]
+    fn a_held_spot_newly_allowlisted_spots_even_if_not_found() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        v.replace_operator_lists(
+            &["k5arh".to_string()],
+            Blocklist::default(),
+            NotchList::default(),
+        );
+        lookup.settle("K5ARH", Existence::NotFound);
+        let released = v.poll_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "K5ARH");
+    }
+
+    #[test]
+    fn finish_lookups_settles_every_held_spot() {
+        let lookup = Arc::new(ScriptedLookup::default());
+        let (mut v, _) = k5arh_with(Some(lookup.clone()));
+        assert!(v.poll_lookups().is_empty());
+        let released = v.finish_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "K5ARH");
+        assert!(v.held.is_empty());
+        assert!(v.finish_lookups().is_empty());
+    }
+
+    #[test]
+    fn without_a_lookup_poll_and_finish_return_nothing() {
+        let (mut v, spots) = k5arh_with(None);
+        assert_eq!(spots.len(), 1);
+        assert!(v.poll_lookups().is_empty());
+        assert!(v.finish_lookups().is_empty());
     }
 
     #[test]
