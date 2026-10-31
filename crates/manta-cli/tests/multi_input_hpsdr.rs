@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -315,6 +315,116 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, why: impl 
         thread::sleep(Duration::from_millis(30));
     }
 }
+/// Waits for the condition while resetting the stall clock on each new progress
+/// value. The hard ceiling bounds even a wait that keeps making progress.
+fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
+    idle: Duration,
+    ceiling: Duration,
+    mut progress: impl FnMut() -> P,
+    mut condition: impl FnMut() -> bool,
+    why: impl Fn() -> String,
+) {
+    let start = Instant::now();
+    let hard_deadline = start + ceiling;
+    let mut last = progress();
+    let mut last_progress_at = start;
+    while !condition() {
+        let now = Instant::now();
+        let current = progress();
+        if current != last {
+            last = current;
+            last_progress_at = now;
+        }
+        assert!(
+            now - last_progress_at < idle,
+            "no progress for {:?} (last: {:?}, elapsed {:?}): {}",
+            idle,
+            last,
+            now - start,
+            why()
+        );
+        assert!(
+            now < hard_deadline,
+            "progressed but goal unmet within {:?} ceiling (last: {:?}): {}",
+            ceiling,
+            last,
+            why()
+        );
+        thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn wait_until_progress_returns_when_condition_holds() {
+    let progress = Arc::new(AtomicUsize::new(0));
+    wait_until_progress(
+        Duration::from_millis(120),
+        Duration::from_millis(900),
+        || progress.fetch_add(1, Ordering::Relaxed),
+        || true,
+        || panic!("a satisfied condition needs no failure diagnostic"),
+    );
+    assert_eq!(progress.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn wait_until_progress_fails_after_idle_with_no_progress() {
+    let idle = Duration::from_millis(120);
+    let start = Instant::now();
+    let failure = std::panic::catch_unwind(|| {
+        wait_until_progress(
+            idle,
+            Duration::from_millis(900),
+            || 0,
+            || false,
+            || "stalled fixture".into(),
+        );
+    })
+    .expect_err("a stalled wait must fail");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("no progress"), "{message}");
+    assert!(message.contains("stalled fixture"), "{message}");
+    assert!(start.elapsed() >= idle);
+    assert!(start.elapsed() < idle * 3);
+}
+
+#[test]
+fn wait_until_progress_outlives_idle_while_progressing() {
+    let progress = Arc::new(AtomicUsize::new(0));
+    let idle = Duration::from_millis(120);
+    let start = Instant::now();
+    wait_until_progress(
+        idle,
+        Duration::from_millis(900),
+        || progress.fetch_add(1, Ordering::Relaxed),
+        || progress.load(Ordering::Relaxed) >= 7,
+        || "progressing fixture".into(),
+    );
+    assert!(start.elapsed() > idle);
+}
+
+#[test]
+fn wait_until_progress_fails_at_ceiling_despite_progress() {
+    let progress = Arc::new(AtomicUsize::new(0));
+    let ceiling = Duration::from_millis(180);
+    let start = Instant::now();
+    let failure = std::panic::catch_unwind(|| {
+        wait_until_progress(
+            Duration::from_millis(120),
+            ceiling,
+            || progress.fetch_add(1, Ordering::Relaxed),
+            || false,
+            || "unmet fixture goal".into(),
+        );
+    })
+    .expect_err("even a progressing wait must be bounded");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("ceiling"), "{message}");
+    assert!(message.contains("unmet fixture goal"), "{message}");
+    assert!(start.elapsed() >= ceiling);
+    assert!(start.elapsed() < ceiling * 3);
+}
+
 fn request(port: u16, path: &str) -> String {
     let Ok(mut stream) = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
@@ -465,8 +575,10 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
     }
     let _reader = ReaderGuard(json_stop, Some(json));
     radio.mode.store(1, Ordering::Relaxed);
-    wait_until(
-        Duration::from_secs(80),
+    wait_until_progress(
+        Duration::from_secs(80),  // Keep the existing budget for a complete stall.
+        Duration::from_secs(300), // Bound total time even when spots keep arriving.
+        || daemon.output.lock().unwrap().len(),
         || {
             let spots = daemon.output.lock().unwrap();
             CALLS
