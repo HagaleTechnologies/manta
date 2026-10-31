@@ -51,16 +51,13 @@ pub enum Reason {
     /// A deferred beacon dropped when its track closed for bookkeeping
     /// with no survivor.
     BeaconDiscarded,
-<<<<<<< HEAD
     /// No finite positive character confidence supports the candidate (MAN-106).
     NoEvidence,
-=======
     /// A candidate held until the callsign lookup answers (MAN-318); a
     /// later decision settles it.
     LookupPending,
     /// The callsign lookup service does not list the call (MAN-318).
     LookupNotFound,
->>>>>>> beadb032319f40965cf02d24cde8e72538b0981e
 }
 
 /// The variant that beat a candidate withheld for `Reason::Variant`.

@@ -19,12 +19,17 @@ the *reported* `TrackMeta.snr_2500_db`.
 The research phase for this ticket (commit 65ad1bb, before this change)
 measured the consequence end to end:
 
-| scene | characters at the 0.3 `q` floor | spot confidences |
-|---|---|---|
-| AWGN 3 dB | 100% | median pinned at 0.225 = 0.3 × 0.75 |
-| AWGN 6 dB | 100% | pinned |
-| AWGN 9 dB | 49% | 83 of 100 spots carry exactly 0.225 |
-| V8w (fading) | 69% of 9,344 | near-constant |
+| scene | characters at the 0.3 `q` floor |
+|---|---|
+| AWGN 3 dB | 100% |
+| AWGN 6 dB | 100% |
+| AWGN 9 dB | 49% |
+| V8w (fading) | 69% of 9,344 |
+
+Separately, the research pooled 100 spots across AWGN cells at
+0/3/6/9 dB and multiple trials. Of those, 83 carry exactly
+0.225 = 0.3 × 0.75. This is a pooled spot-level baseline, not a
+measurement of the 9 dB cell alone.
 
 The rail estimate understates SNR by ~8 dB, so it sits below `q`'s own
 6 dB clamp knee across the operating range: `q` is a near-constant and
@@ -57,8 +62,9 @@ reporting semantics do not move.
 - Integration: `manta-cli`'s `confidence_desaturation` test — the
   median correct-spot confidence on the deterministic AWGN 25 WPM
   10-station scene is now strictly increasing across 3 → 9 → 15 dB, and
-  at 9 dB fewer than 10% of spots carry exactly 0.225 (before: median
-  pinned equal, 83 of 100 at 0.225).
+  at 9 dB fewer than 10% of spots carry exactly 0.225. The research
+  baseline of 83 of 100 pinned spots pools multiple AWGN cells and
+  trials, so it is not a matched per-cell before/after comparison.
 - Golden decode gates unchanged: `q` multiplies every beam hypothesis's
   confidence by the same factor, so glyph selection, decode text and
   spot sets do not move (`golden_v8_v8w` green at this commit).
@@ -66,8 +72,9 @@ reporting semantics do not move.
 ## Alternatives rejected
 
 - Keep the rail pin and calibrate around it: the saturation destroys
-  information before any calibration can recover it — 83 of 100 spots
-  carry the *identical* raw score with wildly different accuracy.
+  information before any calibration can recover it: 83 of 100 spots
+  in the pooled AWGN baseline carry the *identical* raw score. That
+  sample does not establish a true/bogus accuracy comparison.
 - Replace the rail stand-in with a true physical SNR measurement
   (gain-corrected key-down power, ENBW-corrected noise density):
   investigation 11's M2/§2.3 front-end work, explicitly out of scope
@@ -100,7 +107,9 @@ therefore does not rewrite its generated row.
 --nocapture` passed on the 30 s, seed 1, 25 WPM, ten-station AWGN
 recipe. Correct-spot medians at 3/9/15 dB were respectively
 0.22495812 / 0.22498953 / 0.34301296. At 9 dB, 0 of 5 correct spots
-were within 1e-6 of 0.225. The low-SNR medians remain near the floor;
+were within 1e-6 of 0.225. This five-spot 9 dB result is a different
+population from the pooled 100-spot research baseline. The low-SNR
+medians remain near the floor;
 this input correction alone does not establish empirical calibration
 or the true/bogus separation bar.
 

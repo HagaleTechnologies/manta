@@ -327,12 +327,9 @@ pub fn reason_label(r: Reason) -> &'static str {
         Reason::BeaconSpeed => "beaconSpeed",
         Reason::BeaconOverflow => "beaconOverflow",
         Reason::BeaconDiscarded => "beaconDiscarded",
-<<<<<<< HEAD
         Reason::NoEvidence => "noEvidence",
-=======
         Reason::LookupPending => "lookupPending",
         Reason::LookupNotFound => "lookupNotFound",
->>>>>>> beadb032319f40965cf02d24cde8e72538b0981e
     }
 }
 

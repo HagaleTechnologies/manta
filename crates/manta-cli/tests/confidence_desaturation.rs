@@ -1,8 +1,9 @@
 //! MAN-106 Phase 2: after `q` reads the engine-supplied floor-based SNR,
 //! spot confidence regains dynamic range across the SNR band. Baselines
 //! from the research phase (measured at 65ad1bb, before the fix): the
-//! median correct-spot confidence was pinned equal across 3/9/15 dB AWGN
-//! and 83 of 100 spots at 9 dB carried exactly 0.225 = 0.3 × 0.75.
+//! pooled AWGN sample across 0/3/6/9 dB and multiple trials had 83 of
+//! 100 spots at exactly 0.225 = 0.3 × 0.75. This is not a per-cell baseline
+//! for the deterministic scenes below.
 
 use manta_engine::{decode_samples, PipelineConfig};
 use manta_server::rbn::RBN_REF_BW_CORRECTION_DB;
@@ -70,15 +71,16 @@ fn median_confidence_rises_with_snr_and_leaves_the_pinned_floor() {
     let at_3 = correct_spot_confidences(3.0);
     let at_9 = correct_spot_confidences(9.0);
     let at_15 = correct_spot_confidences(15.0);
-    // The research baseline had every one of these pinned at 0.225.
+    // Each cell needs correct spots for its median to be meaningful.
     assert!(!at_3.is_empty() && !at_9.is_empty() && !at_15.is_empty());
     let (m3, m9, m15) = (median(at_3.clone()), median(at_9.clone()), median(at_15));
     assert!(
         m3 < m9 && m9 < m15,
         "median correct-spot confidence must rise across the band: 3 dB {m3}, 9 dB {m9}, 15 dB {m15}"
     );
-    // Before the fix, 83 of 100 spots at 9 dB sat exactly on the
-    // 0.225 = 0.3 (q floor) × 0.75 (r=2) pin.
+    // The pooled research baseline had 83 of 100 AWGN spots on the
+    // 0.225 = 0.3 (q floor) × 0.75 (r=2) pin. This checks the new
+    // 9 dB cell independently, not against a matched per-cell baseline.
     let pinned = at_9.iter().filter(|c| (**c - 0.225).abs() < 1e-6).count();
     eprintln!(
         "medians 3/9/15 dB: {m3}/{m9}/{m15}; pinned at 9 dB: {pinned}/{}",
