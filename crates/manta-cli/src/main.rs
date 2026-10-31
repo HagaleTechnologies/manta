@@ -13397,6 +13397,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[spot]\npattern_path = 'patterns.lst'\n",
             ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+            ("decode.prior", "[decode]\nprior = \"on\"\n"),
             (
                 "rbn_compare.enabled",
                 "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n",

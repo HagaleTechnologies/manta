@@ -302,6 +302,9 @@ station_callsign = "N0CALL"
 # directory. Unset: the built-in copy. --scp overrides it.
 #scp_path = "MASTER.SCP"
 
+# Optional local hearing counts, one CALL [COUNT] per line; missing file is empty.
+#calls_heard_path = "calls-heard.txt"
+
 # Download current copies of cty.dat and MASTER.SCP while `manta run`
 # runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day.
 # A download is used only if it parses and looks complete; a failed one is
@@ -385,6 +388,12 @@ station_callsign = "N0CALL"
 # did not pass the accuracy and speed checks needed to become the default.
 # --engine overrides this.
 #engine = "legacy"
+
+# Bounded word readings, legacy and edge-legacy only; --prior overrides the switch.
+#prior = "off"
+#prior_weight = 2.0                  # maximum language bonus per reading, nats
+#reading_margin = 3.0                # acoustic retention margin, nats
+#held_readings = 4                   # maximum readings retained, 1 through 16
 
 # Keying and character decoding, legacy and edge-legacy engines
 # (hyst_frac, tau_lo_ms and tau_hi_bounds_ms: legacy only):
