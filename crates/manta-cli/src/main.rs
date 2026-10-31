@@ -152,6 +152,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         #[command(flatten)]
         filters: FilterOpts,
     },
@@ -205,6 +208,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         /// Write one JSON object per reference spot to this file. The
         /// summary always goes to stdout as well.
         #[arg(long)]
@@ -522,6 +528,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         #[command(flatten)]
         filters: FilterOpts,
         #[command(flatten)]
@@ -3126,6 +3135,34 @@ fn build_pipeline_config(
     Ok((cfg, [cty_in_use, scp_in_use]))
 }
 
+/// Shares live country/SCP cells with the running validator. No list generates text.
+fn attach_language_prior(
+    cfg: &mut PipelineConfig,
+    spot: &SpotResolved,
+    lists: Option<std::sync::Arc<manta_engine::ReferenceLists>>,
+) -> Result<()> {
+    if !cfg.decode.prior_enabled {
+        return Ok(());
+    }
+    let heard = match &spot.calls_heard_path {
+        Some(path) => manta_spot::prior::CallsHeard::load(path)
+            .with_context(|| format!("reading calls-heard file {}", path.display()))?,
+        None => manta_spot::prior::CallsHeard::default(),
+    };
+    let lists = lists.unwrap_or_else(|| {
+        std::sync::Arc::new(manta_engine::ReferenceLists::new(
+            cfg.cty_table(),
+            cfg.scp_set(),
+        ))
+    });
+    cfg.decode.prior = Some(std::sync::Arc::new(manta_spot::prior::LanguagePrior::new(
+        lists,
+        heard,
+        cfg.decode.prior_weight,
+    )));
+    Ok(())
+}
+
 /// MAN-316 D3 steps 1 and 2 for one list: the text an explicit path or a
 /// hash pin chooses, or `None` for the built-in copy (no path and no pin).
 /// A pin matching the built-in copy returns the built-in text, reported as
@@ -3225,6 +3262,15 @@ fn validate_decode_config(
     cfg: manta_decode::decoder::DecodeConfig,
     origin: &str,
 ) -> Result<manta_decode::decoder::DecodeConfig> {
+    if !cfg.prior_weight.is_finite() || cfg.prior_weight < 0.0 {
+        bail!("[decode] prior_weight must be finite and >= 0 in {origin}");
+    }
+    if !cfg.reading_margin.is_finite() || cfg.reading_margin < 0.1 {
+        bail!("[decode] reading_margin must be finite and >= 0.1 in {origin}");
+    }
+    if !(1..=16).contains(&cfg.held_readings) {
+        bail!("[decode] held_readings must be in 1..=16 in {origin}");
+    }
     // Codex review, PR #161: `fallback_hops = 0` deserializes successfully (it's a
     // plain u32 with no serde-level range check) but Evidence::push's anchor
     // computation divides by it (`self.hop_out % self.cfg.fallback_hops as u64`),
@@ -3640,6 +3686,28 @@ fn validate_decode_config(
 #[cfg(test)]
 fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
     Ok(config::load(config, config::Env::Ignore)?.decode)
+}
+
+fn parse_prior(value: &str) -> std::result::Result<manta_decode::config_file::PriorSwitch, String> {
+    match value {
+        "on" => Ok(manta_decode::config_file::PriorSwitch::On),
+        "off" => Ok(manta_decode::config_file::PriorSwitch::Off),
+        _ => Err("prior must be on or off".into()),
+    }
+}
+
+fn merge_cli_prior(
+    prior: Option<manta_decode::config_file::PriorSwitch>,
+    mut cfg: manta_decode::decoder::DecodeConfig,
+    origin: &str,
+) -> Result<manta_decode::decoder::DecodeConfig> {
+    if let Some(prior) = prior {
+        cfg.prior_enabled = prior == manta_decode::config_file::PriorSwitch::On;
+    }
+    if cfg.prior_enabled && cfg.engine == Engine::Hsmm {
+        bail!("[decode] prior requires legacy or edge-legacy in {origin}");
+    }
+    Ok(cfg)
 }
 
 /// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
@@ -4976,6 +5044,7 @@ fn start_spot_server(
 /// `Clone` so a SIGHUP reload (MAN-78) re-resolves with the same flags.
 #[derive(Clone)]
 struct CliOverrides {
+    prior: Option<manta_decode::config_file::PriorSwitch>,
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
@@ -5009,6 +5078,7 @@ impl CliOverrides {
     /// so it validates exactly what the file and environment give `run`.
     fn none() -> Self {
         CliOverrides {
+            prior: None,
             device: None,
             source: None,
             source_iq: false,
@@ -5115,6 +5185,7 @@ struct SpotResolved {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    calls_heard_path: Option<PathBuf>,
     /// MAN-316: hash pins, CLI > `MANTA_SPOT_*_SHA256` > file.
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
@@ -5181,6 +5252,7 @@ fn resolve_spot_pinned(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        calls_heard_path: spot.calls_heard_path.clone(),
         cty_sha256: pins.cty_sha256.or_else(|| spot.cty_sha256.clone()),
         scp_sha256: pins.scp_sha256.or_else(|| spot.scp_sha256.clone()),
         refresh_lists: spot.refresh_lists,
@@ -5870,10 +5942,15 @@ fn prepare_config_for(
     if let Some(one) = one.filter(|one| needs_input_selection(&cli, *one)) {
         select_input(&mut loaded, one.name, one.command)?;
     }
+    let cli_prior = cli.prior;
     let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
-    let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
+    let decode = merge_cli_prior(
+        cli_prior,
+        merge_cli_engine(cli_engine, loaded.decode.clone()),
+        &loaded.origin,
+    )?;
     let (mut pipeline, lists_in_use) = build_pipeline_config(
         resolved.freq_correction_ppm,
         &resolved.spot,
@@ -5881,6 +5958,7 @@ fn prepare_config_for(
         decode.engine,
     )?;
     pipeline.decode = decode;
+    attach_language_prior(&mut pipeline, &resolved.spot, None)?;
     Ok(Prepared {
         config_path,
         loaded,
@@ -6544,6 +6622,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             filters,
             config,
             engine,
+            prior,
         } => {
             let FilterOpts {
                 freq_correction_ppm,
@@ -6614,7 +6693,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                 patterns,
                 &loaded.spot,
             );
-            let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
+            let decode_cfg = merge_cli_prior(
+                prior,
+                merge_cli_engine(engine, loaded.decode.clone()),
+                &loaded.origin,
+            )?;
             let (mut cfg, lists_in_use) = build_pipeline_config(
                 freq_correction_ppm
                     .or(loaded.input.shared.freq_correction_ppm)
@@ -6625,6 +6708,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             )?;
             note_pinned_lists(&spot, &lists_in_use);
             cfg.decode = decode_cfg;
+            attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-131: say so before decoding when the reported frequencies
             // will be baseband offsets. Only for an existing file, so a
             // missing WAV still fails with just its `open WAV` error.
@@ -6679,6 +6763,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if !report.rtty.is_empty() {
                     errln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
                 }
+                for event in &report.events {
+                    if let manta_decode::events::DecoderEvent::ReadingsHeld { readings, .. } = event
+                    {
+                        errln!("{}", text_lines::readings_line(readings));
+                    }
+                }
                 // MAN-315: the primary track's learned sender timing, on
                 // request only, so the default stderr stays the summary.
                 if timing {
@@ -6704,10 +6794,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             window_s,
             config,
             engine,
+            prior,
             jsonl,
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
-            note_ignored_tables(&loaded, "oracle", &["decode"]);
+            note_ignored_tables(&loaded, "oracle", &["decode", "spot"]);
             // MAN-309: a manta IQ recording opens through the same reader as
             // `decode`; the oracle reads one continuous capture, so a
             // recording with gaps is refused rather than spliced.
@@ -6723,7 +6814,26 @@ fn run_command() -> Result<std::process::ExitCode> {
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(src.as_mut())?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
-            let cfg = merge_cli_engine(engine, loaded.decode);
+            let decode = merge_cli_prior(
+                prior,
+                merge_cli_engine(engine, loaded.decode.clone()),
+                &loaded.origin,
+            )?;
+            let spot = resolve_spot_pinned(
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                CliPins::default(),
+                None,
+                &loaded.spot,
+            );
+            let (mut pipeline, _) =
+                build_pipeline_config(0.0, &spot, loaded.detector, decode.engine)?;
+            pipeline.decode = decode;
+            attach_language_prior(&mut pipeline, &spot, None)?;
+            let cfg = pipeline.decode;
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -6812,6 +6922,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             dial_freq_hz,
             replay_epoch,
             engine,
+            prior,
             rbn,
             logging: log_opts,
         } => {
@@ -6830,6 +6941,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 patterns,
             } = filters;
             let cli = CliOverrides {
+                prior,
                 device,
                 source,
                 source_iq,
@@ -6944,6 +7056,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 let live = resolved.inputs.iter().any(|i| i.spec.is_reconnectable());
                 let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
                 let mut cfg = cfg;
+                attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
                 if run_lists.refresh.is_some() {
                     cfg.cty = Some(run_lists.lists.cty.load());
                     cfg.scp = Some(run_lists.lists.scp.load());
@@ -7124,6 +7237,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             let run_lists =
                 prepare_run_lists(spec.is_reconnectable(), &resolved.spot, lists_in_use, &cfg)?;
             let mut cfg = cfg;
+            attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
             if run_lists.refresh.is_some() {
                 cfg.cty = Some(run_lists.lists.cty.load());
                 cfg.scp = Some(run_lists.lists.scp.load());
@@ -7906,6 +8020,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 ..
             } = prepare_live(
                 CliOverrides {
+                    prior: None,
                     device,
                     source,
                     source_iq,
@@ -8111,6 +8226,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 lists_in_use,
             } = prepare_live(
                 CliOverrides {
+                    prior: None,
                     device,
                     source,
                     source_iq,
@@ -8327,6 +8443,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             json,
             config,
             cli: CliOverrides {
+                prior: None,
                 device,
                 source,
                 source_iq,
@@ -9839,6 +9956,86 @@ mod tests {
         // candidate.
         let f = write_temp_file(b"[decode]\ntiming_sigma = 1e-30\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn prior_cli_override_wins_and_rejects_hsmm() {
+        use manta_decode::config_file::PriorSwitch;
+        let cfg = manta_decode::decoder::DecodeConfig {
+            prior_enabled: true,
+            ..Default::default()
+        };
+        let cfg = merge_cli_prior(Some(PriorSwitch::Off), cfg, "test").unwrap();
+        assert!(!cfg.prior_enabled);
+        let cfg = merge_cli_prior(Some(PriorSwitch::On), cfg, "test").unwrap();
+        assert!(cfg.prior_enabled);
+        let mut cfg = cfg;
+        cfg.engine = Engine::Hsmm;
+        assert!(merge_cli_prior(None, cfg, "test").is_err());
+        assert!(Cli::try_parse_from(["manta", "decode", "test.wav", "--prior", "on"]).is_ok());
+        assert!(Cli::try_parse_from(["manta", "run", "--prior", "off"]).is_ok());
+        assert!(Cli::try_parse_from(["manta", "decode", "test.wav", "--prior", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn config_defaults_and_validation() {
+        let defaults = load_decode_config_file(None).unwrap();
+        assert!(!defaults.prior_enabled);
+        assert_eq!(defaults.prior_weight, 2.0);
+        assert_eq!(defaults.reading_margin, 3.0);
+        assert_eq!(defaults.held_readings, 4);
+        let file = write_temp_file(b"[decode]\nprior = 'on'\nprior_weight = 1.5\nreading_margin = 2.0\nheld_readings = 8\n");
+        let cfg = load_decode_config_file(Some(file.path())).unwrap();
+        assert!(cfg.prior_enabled);
+        assert_eq!(
+            (cfg.prior_weight, cfg.reading_margin, cfg.held_readings),
+            (1.5, 2.0, 8)
+        );
+        for invalid in [
+            "prior = 'maybe'",
+            "prior_weight = -0.1",
+            "prior_weight = nan",
+            "reading_margin = 0.01",
+            "reading_margin = inf",
+            "held_readings = 0",
+            "held_readings = 17",
+        ] {
+            let file = write_temp_file(format!("[decode]\n{invalid}\n").as_bytes());
+            assert!(
+                load_decode_config_file(Some(file.path())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn prior_pipeline_loads_local_calls_heard_file() {
+        let file = write_temp_file(b"W1AW 12\nK1ABC 3\nAB2KLK\n");
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile {
+                calls_heard_path: Some(file.path().into()),
+                ..Default::default()
+            },
+        );
+        let (mut pipeline, _) =
+            build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy).unwrap();
+        pipeline.decode.prior_enabled = true;
+        attach_language_prior(&mut pipeline, &spot, None).unwrap();
+        assert!(
+            pipeline
+                .decode
+                .prior
+                .as_ref()
+                .unwrap()
+                .reading_bonus("W1AW")
+                > 0.0
+        );
     }
 
     #[test]
@@ -12116,6 +12313,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_cli_source_flag_replaces_the_input_list_with_a_note() {
         let loaded = loaded_from(THREE_KA9Q);
         let cli = CliOverrides {
+            prior: None,
             kiwi: KiwiOpts {
                 host: Some("kiwi.example.net".into()),
                 port: 8073,
@@ -12143,6 +12341,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         for (cli, flag, key) in [
             (
                 CliOverrides {
+                    prior: None,
                     freq_correction_ppm: Some(1.0),
                     ..cli_overrides()
                 },
@@ -12151,6 +12350,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ),
             (
                 CliOverrides {
+                    prior: None,
                     dial_freq_hz: Some(7_000_000.0),
                     ..cli_overrides()
                 },
@@ -12159,6 +12359,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ),
             (
                 CliOverrides {
+                    prior: None,
                     capture_rate_hz: Some(48_000.0),
                     ..cli_overrides()
                 },
@@ -12185,6 +12386,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
              [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"/x/b.wav\"\n",
         );
         let cli = CliOverrides {
+            prior: None,
             realtime: true,
             replay_epoch: Some(1_700_000_000),
             ..cli_overrides()
@@ -12296,6 +12498,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(err.contains("is not one of"), "{err}");
         let mut loaded = loaded_from(body);
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12327,6 +12530,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
         let loaded = loaded_from(KIWI_INPUT);
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12344,6 +12548,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn untyped_input_shared_keys_survive_a_cli_source() {
         let loaded = loaded_from("[input]\nfreq_correction_ppm = 2.5\n");
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12367,6 +12572,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn cli_ppm_beats_file_ppm() {
         let cli = CliOverrides {
+            prior: None,
             freq_correction_ppm: Some(4.0),
             ..cli_overrides()
         };
@@ -12377,6 +12583,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn explicit_cli_ppm_zero_beats_file_ppm() {
         let cli = CliOverrides {
+            prior: None,
             freq_correction_ppm: Some(0.0),
             ..cli_overrides()
         };
@@ -12387,6 +12594,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn source_iq_flag_sets_iq_on_a_config_file_source() {
         let cli = CliOverrides {
+            prior: None,
             source_iq: true,
             ..cli_overrides()
         };
@@ -12418,6 +12626,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn realtime_flag_paces_a_cli_file_source() {
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("x.wav")),
             realtime: true,
             ..cli_overrides()
@@ -12435,6 +12644,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn loop_flag_implies_pacing() {
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("x.wav")),
             loop_replay: true,
             ..cli_overrides()
@@ -12478,6 +12688,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn cli_realtime_adds_to_a_config_file_source() {
         let cli = CliOverrides {
+            prior: None,
             realtime: true,
             ..cli_overrides()
         };
@@ -12490,6 +12701,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             }
         );
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12507,6 +12719,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_cli_source_selector_discards_the_files_realtime_and_loop() {
         let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("y.wav")),
             ..cli_overrides()
         };
@@ -12521,6 +12734,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn realtime_with_a_live_source_is_an_error() {
         let cli = CliOverrides {
+            prior: None,
             kiwi: KiwiOpts {
                 host: Some("192.0.2.1".into()),
                 port: 8073,
@@ -12542,6 +12756,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn loop_with_the_default_audio_device_is_an_error() {
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12553,6 +12768,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         // The same for a typed non-file [input] the CLI adds --loop to.
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12936,6 +13152,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
         let cli = CliOverrides {
+            prior: None,
             ka9q: Ka9qOpts {
                 interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
                 ..ka9q_opts(Some(14_100_000))
@@ -13217,6 +13434,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("scp_sha256", "spot.scp_sha256"),
         ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
+        ("prior", "decode.prior"),
         ("rbn_compare", "rbn_compare.enabled"),
         ("rbn_spotter", "rbn_compare.spotters"),
     ];
@@ -13424,6 +13642,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[spot]\npattern_path = 'patterns.lst'\n",
             ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+            ("decode.prior", "[decode]\nprior = \"on\"\n"),
             (
                 "rbn_compare.enabled",
                 "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n",
@@ -14188,6 +14407,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn prepare_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
         let f = write_temp_file(body.as_bytes());
         let cli = CliOverrides {
+            prior: None,
             source: source.map(PathBuf::from),
             rbn,
             ..CliOverrides::none()

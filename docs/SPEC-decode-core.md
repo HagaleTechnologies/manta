@@ -1556,6 +1556,41 @@ currently live rather than growing with track history. See
 comparison, and the MAN-100 decision record for the measured rationale
 behind the prefix-only asymmetry.
 
+### 4.7 Optional word readings and language prior (MAN-317)
+
+`[decode] prior = "off"` is the default and preserves the character-local
+path above. With `prior = "on"`, the legacy and edge-legacy engines retain
+complete word readings across character boundaries. The mark sequence and
+gap classifier still determine which characters can exist. A language list
+cannot insert, complete or substitute a reading.
+
+Each candidate character has the sum of its mark log-likelihoods. Learned
+sender dot/dash variance determines each class's log-space spread once the
+class has enough observations; sparse classes use `timing_sigma`. Scores
+compare paths over the same marks, with no alternative segmentation.
+The word beam expands only with those acoustic candidates. It drops readings
+more than `reading_margin` nats behind the acoustic leader, then retains at
+most `held_readings` readings in deterministic score and lexical order.
+Readings are limited to 24 glyphs to bound retention.
+
+The prior adds a nonnegative bonus capped at `prior_weight` nats per word.
+Its evidence is exact SCP membership, logarithmic calls-heard counts,
+allocated country prefixes, and common CW words. Unknown valid calls stay
+eligible. The prior never rescues a reading dropped by acoustic pruning.
+At word settlement the largest acoustic-plus-prior score wins. Characters
+then emit with their original timestamps before the word boundary. Confidence
+continues to describe acoustic evidence, not dictionary membership.
+
+`ReadingsHeld` reports every retained reading and its nonnegative score gap
+to the leader when at least two remain, after each character and again on
+settlement. The leader gap is zero; the settlement leader is the committed
+word. The prior-off path emits no such diagnostics. Existing spot schemas,
+repetition gates and validation thresholds are unchanged.
+
+The default may change only in a separate release after prior-on V8, V8w
+and VC3 precision gates pass and a paired week of live RBN grades shows no
+rise in the `none` rate. The runbook specifies that operational measurement.
+
 ---
 
 ## 5. Decoder output
@@ -1565,6 +1600,8 @@ Per track, an ordered event stream:
 ```
 CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
 WordBoundary   { track_id, sample_ts: u64 }
+ReadingsHeld   { track_id, sample_ts: u64, readings: [(String, f32)], settled: bool }
+                 (MAN-317; prior-on only; reading and gap-to-leader in nats)
 SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
 TrackMeta      { track_id, sample_ts: u64, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
 TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;

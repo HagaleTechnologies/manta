@@ -224,6 +224,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         resolved, loaded, ..
     } = prepare_source(
         CliOverrides {
+            prior: None,
             device: args.device,
             source: args.path.or(args.source),
             source_iq: args.source_iq,

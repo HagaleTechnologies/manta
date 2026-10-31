@@ -107,6 +107,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "notch_path"),
     ("spot", "cty_path"),
     ("spot", "scp_path"),
+    ("spot", "calls_heard_path"),
     // MAN-316: paths and URLs verbatim, and an all-digit SHA-256 must stay
     // a string rather than TOML-probe as a number.
     ("spot", "list_cache_dir"),
@@ -117,6 +118,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "pattern_path"),
     ("spot", "validation_level"),
     ("decode", "engine"),
+    ("decode", "prior"),
     ("detector", "crash_filter"),
 ];
 
@@ -298,6 +300,7 @@ pub(crate) struct SpotFile {
     pub notch_path: Option<PathBuf>,
     pub cty_path: Option<PathBuf>,
     pub scp_path: Option<PathBuf>,
+    pub calls_heard_path: Option<PathBuf>,
     /// MAN-316: download current lists while `run` reads a live receiver.
     pub refresh_lists: bool,
     /// MAN-316: where downloaded lists persist; resolved like `cty_path`.
@@ -334,6 +337,7 @@ struct SpotToml {
     notch_path: Option<PathBuf>,
     cty_path: Option<PathBuf>,
     scp_path: Option<PathBuf>,
+    calls_heard_path: Option<PathBuf>,
     refresh_lists: Option<bool>,
     list_cache_dir: Option<PathBuf>,
     cty_url: Option<String>,
@@ -777,6 +781,9 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         scp_path: spot_toml
             .scp_path
             .map(|p| resolve_path("spot", "scp_path", p)),
+        calls_heard_path: spot_toml
+            .calls_heard_path
+            .map(|p| resolve_path("spot", "calls_heard_path", p)),
         refresh_lists: spot_toml.refresh_lists.unwrap_or(false),
         list_cache_dir: spot_toml
             .list_cache_dir
@@ -2038,6 +2045,17 @@ mod tests {
             loaded.spot.pattern_path,
             Some(dir.path().join("patterns.lst"))
         );
+    }
+
+    #[test]
+    fn calls_heard_path_resolves_against_config_directory() {
+        let file = write_cfg("[spot]\ncalls_heard_path = 'heard.txt'\n[decode]\nprior = 'on'\n");
+        let loaded = load(Some(file.path()), Env::Ignore).unwrap();
+        assert_eq!(
+            loaded.spot.calls_heard_path,
+            Some(file.path().parent().unwrap().join("heard.txt"))
+        );
+        assert!(loaded.decode.prior_enabled);
     }
 
     #[test]

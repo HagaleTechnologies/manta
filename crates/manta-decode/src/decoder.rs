@@ -1,16 +1,19 @@
 //! Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 
-use crate::beam::{decode_char, BeamConfig};
+use crate::beam::{class_sigma, decode_char, decode_char_readings, BeamConfig};
 use crate::edge_demod::EdgeDemod;
 use crate::envelope::{Demod, DemodConfig, Run};
 use crate::events::DecoderEvent;
 use crate::evidence::{Evidence, EvidenceConfig, HopEvidence};
 use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
 use crate::noise::{NoiseConfig, NoiseTracker};
+use crate::prior::WordPrior;
+use crate::readings::ReadingsBeam;
 use crate::timing::{GapClass, GapClassifier, SenderTiming, SpeedTracker, TimingClass};
 use crate::tree::{pattern_for, Glyph};
 use crate::HOP_MS;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Decode engine selection (SPEC v2 §0): which timing/beam chain and which
 /// keying-decision front end feeds it. `Hsmm` (`TrackDecoder::push_hop_hsmm`)
@@ -43,6 +46,12 @@ impl std::str::FromStr for Engine {
 /// Tunables for one track's decode chain: demod + beam + flush threshold. SPEC §9.
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
+    /// Enable bounded word readings. Default off until recorded and live gates pass.
+    pub prior_enabled: bool,
+    pub prior: Option<Arc<dyn WordPrior>>,
+    pub prior_weight: f32,
+    pub reading_margin: f32,
+    pub held_readings: usize,
     pub demod: DemodConfig,
     pub beam: BeamConfig,
     /// SPEC §9 decode.flush_gap_dits
@@ -67,6 +76,11 @@ pub struct DecodeConfig {
 impl Default for DecodeConfig {
     fn default() -> Self {
         DecodeConfig {
+            prior_enabled: false,
+            prior: None,
+            prior_weight: 2.0,
+            reading_margin: 3.0,
+            held_readings: 4,
             demod: DemodConfig::default(),
             beam: BeamConfig::default(),
             flush_gap_dits: 7.0,
@@ -98,6 +112,7 @@ const SNR_BW_CORR_DB: f32 = 14.3;
 
 /// Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 pub struct TrackDecoder {
+    readings: ReadingsBeam,
     track_id: u32,
     cfg: DecodeConfig,
     demod: Demod,
@@ -196,6 +211,7 @@ impl TrackDecoder {
         // CHAR_GAP_DITS doc comment).
         let gaps = GapClassifier::new();
         TrackDecoder {
+            readings: ReadingsBeam::default(),
             track_id,
             cfg,
             demod,
@@ -686,9 +702,11 @@ impl TrackDecoder {
             let ts = self.last_ts;
             self.emit_char(ts, &mut events);
             if !self.word_flushed {
+                self.settle_readings(ts, &mut events);
                 events.push(DecoderEvent::word_boundary(self.track_id, ts));
             }
         }
+        self.settle_readings(self.last_ts, &mut events);
         self.flush_final_speed(&mut events);
         self.emit_timing(&mut events);
         events
@@ -869,6 +887,7 @@ impl TrackDecoder {
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
+                    self.settle_readings(run.start_ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_decoded > 1 {
                         self.single_flush_gaps.clear();
@@ -1032,6 +1051,7 @@ impl TrackDecoder {
                     self.single_flush_gaps.clear();
                 }
                 if !self.word_flushed {
+                    self.settle_readings(ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
@@ -1081,6 +1101,7 @@ impl TrackDecoder {
                 }
                 self.emit_char(ts, events);
                 if !self.word_flushed {
+                    self.settle_readings(ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
@@ -1088,6 +1109,32 @@ impl TrackDecoder {
                 self.word_flushed = true;
                 self.flushed_gap_ms = Some(gap_ms);
             }
+        }
+    }
+
+    fn settle_readings(&mut self, sample_ts: u64, events: &mut Vec<DecoderEvent>) {
+        if !self.cfg.prior_enabled {
+            return;
+        }
+        let settlement = self
+            .readings
+            .settle(self.cfg.prior.as_deref(), self.cfg.prior_weight);
+        let readings = settlement.readings;
+        for (glyph, confidence, ts) in settlement.chars {
+            events.push(DecoderEvent::char_decoded(
+                self.track_id,
+                ts,
+                glyph,
+                confidence,
+            ));
+        }
+        if readings.len() >= 2 {
+            events.push(DecoderEvent::ReadingsHeld {
+                track_id: self.track_id,
+                sample_ts,
+                readings,
+                settled: true,
+            });
         }
     }
 
@@ -1106,6 +1153,70 @@ impl TrackDecoder {
         let q = snr.map(|snr| (snr / 20.0).clamp(0.3, 1.0)).unwrap_or(1.0);
         let marks = std::mem::take(&mut self.cur_marks);
         self.word_chars = self.word_chars.saturating_add(1);
+        if self.cfg.prior_enabled {
+            let timing = self.sender.estimates(self.tracker.dit_estimate_ms());
+            let sigma = |estimate: Option<crate::timing::ClassEstimate>| {
+                estimate.map(|e| class_sigma(&e, 8, self.cfg.beam.sigma))
+            };
+            let mean = |estimate: Option<crate::timing::ClassEstimate>, fallback: f32| {
+                estimate
+                    .filter(|e| e.n >= 8)
+                    .map_or(fallback, |e| e.mean_dits * timing.dit_ms)
+            };
+            match decode_char_readings(
+                &marks,
+                mean(timing.dot, self.tracker.mu_dit_ms()),
+                mean(timing.dash, self.tracker.mu_dah_ms()),
+                sigma(timing.dot),
+                sigma(timing.dash),
+                q,
+                &self.cfg.beam,
+            ) {
+                Some(mut candidates) => {
+                    // Keep confidence comparable with prior-off for unchanged
+                    // glyphs. The prior itself never increases confidence.
+                    if let Some(legacy) = decode_char(
+                        &marks,
+                        self.tracker.mu_dit_ms(),
+                        self.tracker.mu_dah_ms(),
+                        q,
+                        &self.cfg.beam,
+                    ) {
+                        for candidate in &mut candidates {
+                            if candidate.glyph == legacy.glyph {
+                                candidate.confidence = legacy.confidence;
+                            }
+                        }
+                    }
+                    self.word_decoded = self.word_decoded.saturating_add(1);
+                    // Train from acoustic evidence only, never from the prior's winner.
+                    self.observe_marks(candidates[0].glyph, &marks);
+                    self.readings.push(
+                        &candidates,
+                        sample_ts,
+                        self.cfg.reading_margin,
+                        self.cfg.held_readings,
+                    );
+                    let readings = self
+                        .readings
+                        .snapshot(self.cfg.prior.as_deref(), self.cfg.prior_weight);
+                    if readings.len() >= 2 {
+                        events.push(DecoderEvent::ReadingsHeld {
+                            track_id: self.track_id,
+                            sample_ts,
+                            readings,
+                            settled: false,
+                        });
+                    }
+                }
+                None => {
+                    self.garble_count += 1;
+                    // A garble must not join two unrelated fragments into a listed word.
+                    self.settle_readings(sample_ts, events);
+                }
+            }
+            return;
+        }
         match decode_char(
             &marks,
             self.tracker.mu_dit_ms(),
@@ -1195,6 +1306,88 @@ mod tests {
         }
         push(0.0, 8 * dit_hops); // tail so the last word flushes by timeout
         env
+    }
+
+    #[test]
+    fn prior_defaults_off() {
+        assert!(!DecodeConfig::default().prior_enabled);
+        assert!(DecodeConfig::default().prior.is_none());
+    }
+
+    fn prior_events(enabled: bool) -> Vec<DecoderEvent> {
+        let mut decoder = TrackDecoder::new(
+            7,
+            DecodeConfig {
+                prior_enabled: enabled,
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope("CQ W1AW", 23).into_iter().enumerate() {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        events
+    }
+
+    #[test]
+    fn prior_off_stream_is_byte_identical() {
+        // Explicit off and the public default must select the same path,
+        // including event cadence and timestamps. Golden V1/V2/V3 lock the
+        // historical output independently.
+        let mut decoder = TrackDecoder::new(7, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope("CQ W1AW", 23).into_iter().enumerate() {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        assert_eq!(
+            serde_json::to_vec(&events).unwrap(),
+            serde_json::to_vec(&prior_events(false)).unwrap()
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::ReadingsHeld { .. })));
+    }
+
+    #[test]
+    fn prior_on_commits_word_at_settlement_preserving_timestamps() {
+        let off = prior_events(false);
+        let on = prior_events(true);
+        let chars = |events: &[DecoderEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::CharDecoded {
+                        glyph, sample_ts, ..
+                    } => Some((*glyph, *sample_ts)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chars(&off), chars(&on));
+        assert_eq!(events_to_text(&on), "CQ W1AW");
+        // Per-word commits are adjacent even when meta/timing events occur
+        // during reception of the word.
+        let w = on
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    DecoderEvent::CharDecoded {
+                        glyph: Glyph::Char('W'),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(on[w..w + 4]
+            .iter()
+            .all(|e| matches!(e, DecoderEvent::CharDecoded { .. })));
+        assert_eq!(
+            serde_json::to_vec(&on).unwrap(),
+            serde_json::to_vec(&prior_events(true)).unwrap()
+        );
     }
 
     /// Rectangular envelope helper with `depth_db` keying depth (the existing

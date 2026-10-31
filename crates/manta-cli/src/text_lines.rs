@@ -35,6 +35,7 @@ impl TrackLines {
             DecoderEvent::TrackPromoted { .. } => None,
             // Sender-timing diagnostics (MAN-315) stay out of text mode.
             DecoderEvent::TimingUpdate { .. } => None,
+            DecoderEvent::ReadingsHeld { readings, .. } => Some(readings_line(readings)),
             DecoderEvent::TrackClosed { track_id, .. } => {
                 let line = self.tracks.remove(track_id)?;
                 render(*track_id, &line)
@@ -91,6 +92,18 @@ impl TrackLines {
     }
 }
 
+/// Held word readings and their gaps to the leading score, in nats.
+pub(crate) fn readings_line(readings: &[(String, f32)]) -> String {
+    format!(
+        "readings {}",
+        readings
+            .iter()
+            .map(|(word, gap)| format!("{word} +{gap:.2}"))
+            .collect::<Vec<_>>()
+            .join("  ")
+    )
+}
+
 /// Renders the track's line and empties its buffer; the label fields stay.
 fn take(track_id: u32, line: &mut PendingLine) -> Option<String> {
     let out = render(track_id, line);
@@ -124,6 +137,14 @@ mod tests {
     use manta_decode::decoder::events_to_text;
     use manta_decode::events::ClosureKind;
     use manta_decode::tree::{Glyph, Prosign};
+
+    #[test]
+    fn readings_diagnostic_names_each_gap() {
+        assert_eq!(
+            readings_line(&[("W1AW".into(), 0.0), ("R1AW".into(), 1.24)]),
+            "readings W1AW +0.00  R1AW +1.24"
+        );
+    }
 
     fn ch(id: u32, ts: u64, c: char) -> DecoderEvent {
         DecoderEvent::char_decoded(id, ts, Glyph::Char(c), 1.0)

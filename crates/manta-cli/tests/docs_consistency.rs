@@ -3450,6 +3450,12 @@ fn cli_json_doc_lists_every_field_both_ways() {
             confidence: 0.9,
             alternatives: vec![(Glyph::Char('D'), 0.41)],
         },
+        DecoderEvent::ReadingsHeld {
+            track_id: 1,
+            sample_ts: 59_392,
+            readings: vec![("W1AW".into(), 0.0), ("R1AW".into(), 1.24)],
+            settled: false,
+        },
         DecoderEvent::WordBoundary {
             track_id: 1,
             sample_ts: 151_552,
@@ -3490,6 +3496,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
             | DecoderEvent::WordBoundary { .. }
             | DecoderEvent::SpeedUpdate { .. }
             | DecoderEvent::TrackMeta { .. }
+            | DecoderEvent::ReadingsHeld { .. }
             | DecoderEvent::TimingUpdate { .. }
             | DecoderEvent::TrackPromoted { .. }
             | DecoderEvent::TrackClosed { .. } => {}

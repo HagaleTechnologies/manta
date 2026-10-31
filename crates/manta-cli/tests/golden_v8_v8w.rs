@@ -518,3 +518,63 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_with_hsmm_engine() {
         );
     }
 }
+
+/// MAN-317: the opt-in prior must preserve the existing precision and recall
+/// bars on the same pinned scenes, including the VC3 crash realization.
+#[test]
+fn v8_and_v8w_with_prior_on_stay_at_zero_bogus() {
+    for scene in ["V8", "V8w", "VC3"] {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = match scene {
+            "V8" => manta_testkit::vectors::v8(),
+            "V8w" => manta_testkit::vectors::v8w(),
+            _ => manta_testkit::crash::vc3().0,
+        };
+        let manifest = if scene == "VC3" {
+            let (_, crashes) = manta_testkit::crash::vc3();
+            manta_testkit::crash::write_crash_fixture_set(&spec, &crashes, dir.path()).unwrap()
+        } else {
+            manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap()
+        };
+        for weight in [0.0, 1.0, 2.0] {
+            let config = dir.path().join("prior.toml");
+            std::fs::write(
+                &config,
+                format!("[decode]\nprior = \"on\"\nprior_weight = {weight}\n"),
+            )
+            .unwrap();
+            let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+                .args(["decode", "--json", "--config"])
+                .arg(&config)
+                .arg(dir.path().join(format!("{}.wav", spec.name)))
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let report = serde_json::from_slice(&out.stdout).unwrap();
+            let (bogus, validated, _) = bogus_and_validated(&report, &manifest, scene);
+            eprintln!(
+                "MAN-317 {scene} weight={weight}: bogus={}, validated={validated}",
+                bogus.len()
+            );
+            assert!(bogus.is_empty(), "{scene} prior {weight}: {bogus:?}");
+            let floor = if scene == "V8" { 45 } else { MIN_V8W_VALIDATED };
+            assert!(
+                validated >= floor,
+                "{scene} prior {weight}: {validated} < {floor}"
+            );
+            if scene == "VC3" {
+                let promoted = report["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"] == "TrackPromoted")
+                    .count();
+                assert!(promoted <= MAX_VC3_PROMOTED);
+            }
+        }
+    }
+}

@@ -193,6 +193,15 @@ pub struct DecodeConfigToml {
     pub timing_sigma: f32,
     #[serde(default = "default_beam_width")]
     pub beam_width: usize,
+    #[serde(default)]
+    pub prior: PriorSwitch,
+    #[serde(default = "default_prior_weight")]
+    pub prior_weight: f32,
+    #[serde(default = "default_reading_margin")]
+    pub reading_margin: f32,
+    #[serde(default = "default_held_readings")]
+    pub held_readings: usize,
+
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: f64,
     #[serde(default = "default_hyst_frac")]
@@ -212,6 +221,24 @@ pub struct DecodeConfigToml {
     // `manta-decode`'s core timing/gap-classification logic, not a config-
     // plumbing fix -- tracked as a fast-follow rather than attempted here
     // (Codex review, PR #161).
+}
+
+/// Language evidence is opt-in until recorded and live regression gates pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PriorSwitch {
+    #[default]
+    Off,
+    On,
+}
+fn default_prior_weight() -> f32 {
+    2.0
+}
+fn default_reading_margin() -> f32 {
+    3.0
+}
+fn default_held_readings() -> usize {
+    4
 }
 
 impl Default for DecodeConfigToml {
@@ -236,6 +263,10 @@ impl Default for DecodeConfigToml {
             conf_kappa: default_conf_kappa(),
             timing_sigma: default_timing_sigma(),
             beam_width: default_beam_width(),
+            prior: PriorSwitch::Off,
+            prior_weight: default_prior_weight(),
+            reading_margin: default_reading_margin(),
+            held_readings: default_held_readings(),
             debounce_ms: default_debounce_ms(),
             hyst_frac: default_hyst_frac(),
             tau_lo_ms: default_tau_lo_ms(),
@@ -256,6 +287,11 @@ impl DecodeConfigToml {
     pub fn into_decode_config(self) -> DecodeConfig {
         DecodeConfig {
             engine: self.engine,
+            prior_enabled: self.prior == PriorSwitch::On,
+            prior: None,
+            prior_weight: self.prior_weight,
+            reading_margin: self.reading_margin,
+            held_readings: self.held_readings,
             demod: DemodConfig {
                 hyst_frac: self.hyst_frac,
                 debounce_ms: self.debounce_ms,
