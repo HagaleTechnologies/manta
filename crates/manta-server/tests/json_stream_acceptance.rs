@@ -688,6 +688,49 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
     let _ = ws.close(None).await;
 }
 
+/// MAN-323: an FT8 spot published with `publish_ftx` reaches a TCP client
+/// and a WebSocket client on the same port as a 29-key spot line labelled
+/// FT8. The telnet server and the uplink read `SpotBus::subscribe`, which
+/// receives nothing.
+#[tokio::test]
+async fn an_ft8_spot_reaches_the_json_stream_labelled_ft8() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let mut telnet_channel = bus.subscribe();
+    let (mut tcp, _) = connect_tcp(addr).await;
+    let (mut ws, _) = connect_ws(format!("ws://{addr}"))
+        .await
+        .expect("ws connect");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    bus.publish_ftx(manta_server::spot_message::FtxSpot {
+        mode: manta_server::spot_message::FtxMode::Ft8,
+        callsign: "W1AW".to_string(),
+        grid: Some("FN31".to_string()),
+        freq_hz: 14_075_234.4,
+        snr_db: -10,
+        slot_start_ms: 1_730_462_415_000,
+    });
+
+    for value in [next_tcp(&mut tcp).await, next_ws(&mut ws).await] {
+        assert_eq!(value["mode"], "FT8", "{value}");
+        assert_eq!(value["dxCall"], "W1AW");
+        assert_eq!(value["dxGrid"], "FN31");
+        assert_eq!(value["frequency"], 14_075_234);
+        assert_eq!(value["snr"], -10);
+        assert_eq!(value["snrRefHz"], 2500);
+        assert_eq!(value["timestamp"], 1_730_462_415);
+        assert_eq!(value["seq"], 1);
+        assert!(value["wpm"].is_null(), "{value}");
+        assert!(value["decodeConfidence"].is_null(), "{value}");
+        assert_eq!(value.as_object().unwrap().len(), 29, "{value}");
+    }
+    assert!(matches!(
+        telnet_channel.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+    let _ = ws.close(None).await;
+}
+
 #[tokio::test]
 async fn websocket_client_receives_spot_as_json_message() {
     let bus = Arc::new(SpotBus::new(SAMPLE_RATE_HZ, SystemTime::now(), 0));

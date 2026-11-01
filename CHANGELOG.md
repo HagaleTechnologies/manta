@@ -24,6 +24,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-109: add rise from two disjoint power windows alongside the 12 dB EMA rise; keep the 19-hop confirmation and the EMA for drop and SNR.
 - MAN-106 first slice: candidates with no finite positive character
   confidence are withheld as `noEvidence`. CLI JSON spots gain
   `emissionState`, based on whether the pattern tier's repetition

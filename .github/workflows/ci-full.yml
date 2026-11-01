@@ -274,6 +274,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
       - run: cargo test --workspace --locked
+      # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
+      # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
+      - if: runner.os != 'Windows'
+        run: cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
+      - if: runner.os != 'Windows'
+        run: cargo test -p manta-engine --features ftx --locked --lib ftx
+      - if: runner.os != 'Windows'
+        run: cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
       # MAN-65: the release pipeline's tag grammar and :latest recency
       # logic are testable without pushing a tag, and this rides the
       # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
@@ -322,6 +330,9 @@ jobs:
       # Decisions Index workflow's shape and behaviour. Linux only: pure Python over temp files.
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_decisions_index -v
+      # MAN-445: run the field-node script tests in the required Unix test checks.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_field_node -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
