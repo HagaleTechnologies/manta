@@ -1571,7 +1571,10 @@ compare paths over the same marks, with no alternative segmentation.
 The word beam expands only with those acoustic candidates. It drops readings
 more than `reading_margin` nats behind the acoustic leader, then retains at
 most `held_readings` readings in deterministic score and lexical order.
-Readings are limited to 24 glyphs to bound retention.
+Readings are limited to 24 glyphs to bound retention. An `<ERR>` (§4.4)
+keeps only the acoustic leader, whose characters and the `<ERR>` still emit
+at settlement, and the characters after it are ranked as a new word, the
+text the validator keeps.
 
 The prior adds a nonnegative bonus capped at `prior_weight` nats per word.
 Its evidence is exact SCP membership, logarithmic calls-heard counts,

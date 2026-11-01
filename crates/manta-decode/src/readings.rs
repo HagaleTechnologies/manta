@@ -2,7 +2,7 @@
 
 use crate::beam::CharReading;
 use crate::prior::WordPrior;
-use crate::tree::Glyph;
+use crate::tree::{Glyph, Prosign};
 
 const MAX_READING_CHARS: usize = 24;
 
@@ -11,7 +11,7 @@ pub(crate) struct Settlement {
     pub(crate) chars: Vec<(Glyph, f32, u64)>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct Reading {
     text: String,
     score: f32,
@@ -36,6 +36,27 @@ impl ReadingsBeam {
         {
             self.held.clear();
             self.overflow = true;
+            return;
+        }
+        // SPEC §4.4: the validator discards the word on <ERR>. Keep the
+        // acoustic leader's characters and the <ERR> for the event stream,
+        // and rank later characters as a fresh word.
+        if let [CharReading {
+            glyph: Glyph::Prosign(Prosign::Err),
+            confidence,
+            ..
+        }] = candidates
+        {
+            self.held.truncate(1);
+            if self.held.is_empty() {
+                self.held.push(Reading::default());
+            }
+            let leader = &mut self.held[0];
+            leader.text.clear();
+            leader.score = 0.0;
+            leader
+                .chars
+                .push((Glyph::Prosign(Prosign::Err), *confidence, ts));
             return;
         }
         let roots = if self.held.is_empty() {
@@ -202,6 +223,69 @@ mod tests {
             "W1AW"
         );
         assert_eq!(chars[0].2, 10);
+    }
+    #[test]
+    fn error_prosign_restarts_ranked_text_but_keeps_its_events() {
+        let one = |c| CharReading {
+            glyph: Glyph::Char(c),
+            score: 0.0,
+            confidence: 1.0,
+        };
+        let mut b = ReadingsBeam::default();
+        b.push(&candidates(), 5, 3.0, 4);
+        b.push(
+            &[CharReading {
+                glyph: Glyph::Prosign(Prosign::Err),
+                score: 0.0,
+                confidence: 0.8,
+            }],
+            8,
+            3.0,
+            4,
+        );
+        b.push(&candidates(), 10, 3.0, 4);
+        for (i, c) in "1AW".chars().enumerate() {
+            b.push(&[one(c)], 20 + i as u64, 3.0, 4);
+        }
+        assert_eq!(
+            b.snapshot(Some(&Prior), 2.0),
+            vec![("W1AW".into(), 0.0), ("R1AW".into(), 1.0)]
+        );
+        let glyphs: Vec<_> = b
+            .settle(Some(&Prior), 2.0)
+            .chars
+            .iter()
+            .map(|(g, _, ts)| (*g, *ts))
+            .collect();
+        assert_eq!(
+            glyphs,
+            vec![
+                (Glyph::Char('R'), 5),
+                (Glyph::Prosign(Prosign::Err), 8),
+                (Glyph::Char('W'), 10),
+                (Glyph::Char('1'), 20),
+                (Glyph::Char('A'), 21),
+                (Glyph::Char('W'), 22),
+            ]
+        );
+    }
+    #[test]
+    fn error_prosign_opening_a_word_still_emits_at_settlement() {
+        let mut b = ReadingsBeam::default();
+        b.push(
+            &[CharReading {
+                glyph: Glyph::Prosign(Prosign::Err),
+                score: 0.0,
+                confidence: 0.8,
+            }],
+            8,
+            3.0,
+            4,
+        );
+        assert_eq!(b.snapshot(Some(&Prior), 2.0), vec![(String::new(), 0.0)]);
+        let settled = b.settle(Some(&Prior), 2.0);
+        assert_eq!(settled.chars, vec![(Glyph::Prosign(Prosign::Err), 0.8, 8)]);
+        assert_eq!(settled.readings, vec![(String::new(), 0.0)]);
     }
     #[test]
     fn prior_never_rescues_or_substitutes_outside_margin() {
