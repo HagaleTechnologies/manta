@@ -3751,7 +3751,10 @@ fn push_pending(
         decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
         decoder.set_freq_hz(freq_hz);
         let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-        if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
+        if decoder
+            .hop_count()
+            .is_multiple_of(manta_decode::META_INTERVAL_HOPS)
+        {
             *peak = f32::NEG_INFINITY;
         }
         sample_rail_ratio_at_boundary(decoder, quality);
@@ -5704,6 +5707,269 @@ mod tests {
             saw_promotion,
             "step_hop must return a TrackPromoted event at the hop it promotes a track"
         );
+    }
+
+    use manta_dsp::channelizer::Channelizer;
+    use num_complex::Complex32;
+
+    /// MAN-202: a keyed "PARIS " stream at 20 WPM on channel 10 (dit = 22
+    /// hops), one bool per hop, `len` hops long.
+    fn paris_keying(len: usize) -> Vec<bool> {
+        let code = |c: char| match c {
+            'P' => ".--.",
+            'A' => ".-",
+            'R' => ".-.",
+            'I' => "..",
+            'S' => "...",
+            _ => "",
+        };
+        let dit = 22;
+        let mut out = Vec::new();
+        while out.len() < len {
+            for w in ["PARIS"] {
+                for ch in w.chars() {
+                    for e in code(ch).chars() {
+                        let on = if e == '.' { dit } else { 3 * dit };
+                        out.extend(std::iter::repeat_n(true, on));
+                        out.extend(std::iter::repeat_n(false, dit));
+                    }
+                    out.extend(std::iter::repeat_n(false, 2 * dit));
+                }
+                out.extend(std::iter::repeat_n(false, 4 * dit));
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// MAN-202: a warmed-up 64-channel manager and the keyed hops after
+    /// warm-up, starting at hop `250 * 15`.
+    fn keyed_manager(len: usize) -> (TrackManager, Vec<HopOutput>) {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let start = 250u64 * 15;
+        let hops = paris_keying(len)
+            .into_iter()
+            .enumerate()
+            .map(|(i, on)| {
+                let mut power = quiet_power(n);
+                if on {
+                    power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+                }
+                hop(start + i as u64, power)
+            })
+            .collect();
+        (tm, hops)
+    }
+
+    #[test]
+    fn first_hop_after_gap_is_the_first_hop_holding_a_post_gap_sample() {
+        let probe = Channelizer::new(96_000.0, 0.0).unwrap();
+        let (hop, filter_len) = (probe.hop() as u64, probe.filter_len());
+        for g in [0, 1, hop - 1, hop, 3 * hop + 5, 10_000] {
+            let mut ch = Channelizer::new(96_000.0, 0.0).unwrap();
+            let mut input = vec![Complex32::new(0.0, 0.0); filter_len + g as usize];
+            input.push(Complex32::new(1.0, 0.0));
+            input.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), filter_len));
+            let first = ch
+                .process(&input)
+                .into_iter()
+                .find(|h| h.power.iter().any(|&p| p > 0.0))
+                .map(|h| h.m);
+            assert_eq!(first, Some(first_hop_after_gap(g, hop)), "g = {g}");
+        }
+    }
+
+    #[test]
+    fn note_input_gap_applies_at_the_same_hop_whatever_the_batch_split() {
+        let len = 6_000;
+        let gap_at = 250u64 * 15 + 4_000;
+        let run = |split: Option<u64>| {
+            let (mut tm, hops) = keyed_manager(len);
+            tm.note_input_gap(gap_at);
+            let mut events = Vec::new();
+            let at = split.map_or(hops.len(), |s| hops.iter().position(|h| h.m == s).unwrap());
+            for batch in [&hops[..at], &hops[at..]] {
+                events.extend(tm.process_hops(batch, |m| m * 256));
+            }
+            let epoch = tm.continuity_epoch();
+            let decoders: Vec<u32> = tm
+                .tracks
+                .values()
+                .filter_map(|t| t.decoder.as_ref().map(|d| d.continuity_epoch()))
+                .collect();
+            (skeleton_of(&events), epoch, decoders)
+        };
+        let (whole, epoch, decoders) = run(None);
+        assert!(whole.iter().any(|e| e.starts_with('C')), "{whole:?}");
+        assert!(
+            !whole.iter().any(|e| e.starts_with('X')),
+            "the gap closed a track"
+        );
+        assert_eq!(epoch, 1);
+        assert_eq!(decoders, vec![1], "one track, its decoder invalidated once");
+        for split in [gap_at - 1, gap_at, gap_at + 1] {
+            assert_eq!(run(Some(split)).0, whole, "split at {split}");
+        }
+    }
+
+    /// `TrackPromoted`, `CharDecoded`, `WordBoundary` and `TrackClosed`, in
+    /// order, as `crates/manta-engine/tests/support/man202.rs` reads them.
+    fn skeleton_of(events: &[DecoderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackPromoted {
+                    track_id,
+                    sample_ts,
+                    ..
+                } => Some(format!("P{track_id}@{sample_ts}")),
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph,
+                    ..
+                } => Some(format!("C{track_id}@{sample_ts}:{glyph:?}")),
+                DecoderEvent::WordBoundary {
+                    track_id,
+                    sample_ts,
+                    ..
+                } => Some(format!("W{track_id}@{sample_ts}")),
+                DecoderEvent::TrackClosed { track_id, closure } => {
+                    Some(format!("X{track_id}:{closure:?}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_gap_pending_at_finish_is_applied_before_the_flush() {
+        // The stream ends inside a dah, with a gap noted for a hop never
+        // reached: the closing flush must not force that dah into a
+        // character, and the gap still counts.
+        let (mut tm, hops) = keyed_manager(6_000);
+        let mid_dah = hops
+            .windows(40)
+            .rposition(|w| w.iter().all(|h| h.power[10] > 1e-8))
+            .unwrap()
+            + 40;
+        let events = tm.process_hops(&hops[..mid_dah], |m| m * 256);
+        assert!(skeleton_of(&events).iter().any(|e| e.starts_with('C')));
+        let last_char_ts = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { sample_ts, .. } => Some(*sample_ts),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        tm.note_input_gap(u64::MAX / 512);
+        let flush = tm.finish();
+        assert_eq!(tm.continuity_epoch(), 1);
+        let dah_start_ts = hops[..mid_dah]
+            .iter()
+            .rev()
+            .take_while(|h| h.power[10] > 1e-8)
+            .last()
+            .unwrap()
+            .m
+            * 256;
+        for e in &flush {
+            if let DecoderEvent::CharDecoded { sample_ts, .. } = e {
+                assert!(
+                    *sample_ts < dah_start_ts && *sample_ts >= last_char_ts,
+                    "the flush forced a character from the dah open at the gap: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn input_gap_drains_the_refiners_backlog_before_resetting_it() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig {
+                refine_bw_hz: 30.0,
+                ..DecodeConfig::default()
+            },
+        );
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut m = 250 * 15;
+        loop {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
+                break;
+            }
+        }
+        let id = *tm.tracks.keys().next().unwrap();
+        for _ in 0..(GROUP_DELAY_HOPS as u64 + 5) {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+        }
+        let t = tm.tracks.get_mut(&id).unwrap();
+        let backlog = t.refiner_backlog.len();
+        assert!(backlog > 0, "the refiner must hold a backlog");
+        let pending_before = t.pending.len();
+        t.note_input_gap(m * 256);
+        assert_eq!(
+            t.pending.len(),
+            pending_before + backlog,
+            "backlog drained first"
+        );
+        assert!(t.refiner_backlog.is_empty());
+        assert_eq!(
+            t.refiner_hops_since_reset, 0,
+            "refiner reset after the drain"
+        );
+        assert!(t.clean_hist.is_empty() && t.phase_hist.is_empty());
+        assert_eq!(t.input_gaps.front(), Some(&(m * 256)));
+    }
+
+    #[test]
+    fn a_gap_marker_waits_in_an_unleased_tracks_queue() {
+        // A track whose decoder is not leased (MAN-313) keeps its gap
+        // markers; once leased, the gap applies before the first post-gap
+        // entry.
+        let (mut tm, hops) = keyed_manager(3_000);
+        tm.process_hops(&hops[..2_000], |m| m * 256);
+        let id = *tm.tracks.keys().next().unwrap();
+        let t = tm.tracks.get_mut(&id).unwrap();
+        let leased = t.decoder.take().expect("the keyed track decodes");
+        t.note_input_gap(hops[2_000].m * 256);
+        tm.process_hops(&hops[2_000..2_500], |m| m * 256);
+        let t = tm.tracks.get_mut(&id).unwrap();
+        assert_eq!(t.input_gaps.len(), 1, "the marker waits for the lease");
+        t.decoder = Some(leased);
+        tm.process_hops(&hops[2_500..], |m| m * 256);
+        let t = &tm.tracks[&id];
+        assert!(t.input_gaps.is_empty());
+        assert_eq!(t.decoder.as_ref().unwrap().continuity_epoch(), 1);
     }
 
     #[test]
