@@ -342,6 +342,21 @@ fn median(values: &mut [f64]) -> Option<f64> {
     })
 }
 
+/// Outside every band, "same band" falls back to the frequency tolerance.
+fn same_band(
+    band: &str,
+    freq_hz: f64,
+    other_band: &str,
+    other_freq_hz: f64,
+    cfg: &GradeConfig,
+) -> bool {
+    if band == "unknown" {
+        (other_freq_hz - freq_hz).abs() <= cfg.freq_tol_hz
+    } else {
+        other_band == band
+    }
+}
+
 fn window_of(spot: &GradeInput, cfg: &GradeConfig) -> (i64, i64) {
     (spot.time - cfg.window_secs, spot.time + cfg.window_secs)
 }
@@ -381,13 +396,7 @@ fn grade_with(
         }
         let report_band = crate::band::band_for_freq_hz(r.freq_hz);
         bands.insert(band_rank(report_band));
-        // Outside every band, "same band" falls back to the tolerance.
-        let same_band = if band == "unknown" {
-            (r.freq_hz - spot.freq_hz as f64).abs() <= cfg.freq_tol_hz
-        } else {
-            report_band == band
-        };
-        if same_band {
+        if same_band(band, spot.freq_hz as f64, report_band, r.freq_hz, cfg) {
             same.push(r);
         }
     }
@@ -530,6 +539,83 @@ pub fn grade_batch(
         .collect();
     sort_grades(&mut grades);
     grades
+}
+
+/// MAN-97: what manta's spots say about one reference report, the reverse
+/// of [`grade_batch`]'s question under the same (call, band, window) rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Recall {
+    /// manta spotted the call on the report's band within the window.
+    Found,
+    /// manta spotted the call within the window, on another band only.
+    Elsewhere,
+    /// manta did not spot the call within the window.
+    Missed,
+}
+
+/// One reference report's reverse grade ([`grade_references`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReferenceGrade {
+    pub recall: Recall,
+    /// The report's band (`unknown` outside every band).
+    pub band: &'static str,
+    /// Bands manta spotted the call on within the window, in band-table
+    /// order (the report's own band included when `Found`).
+    pub manta_bands: Vec<&'static str>,
+}
+
+/// Grades each report against `spots`; aligned with `reports`, `None` where
+/// the spotter filter rejects the report. manta is taken to be up
+/// throughout: there is no `unknown` (a manta outage is a miss).
+/// Disagreements are the forward pass's business: any same-call, same-band
+/// spot within the window is `Found`.
+pub fn grade_references(
+    reports: &[RbnReport],
+    spots: &[GradeInput],
+    cfg: &GradeConfig,
+) -> Vec<Option<ReferenceGrade>> {
+    let filter = SpotterFilter::new(cfg);
+    let mut by_call: BTreeMap<String, Vec<&GradeInput>> = BTreeMap::new();
+    for s in spots {
+        by_call
+            .entry(s.call.trim().to_ascii_uppercase())
+            .or_default()
+            .push(s);
+    }
+    reports
+        .iter()
+        .map(|r| {
+            if !filter.admits(&r.spotter) {
+                return None;
+            }
+            let (lo, hi) = (r.time - cfg.window_secs, r.time + cfg.window_secs);
+            let band = crate::band::band_for_freq_hz(r.freq_hz);
+            let mut bands: BTreeSet<usize> = BTreeSet::new();
+            let mut found = false;
+            let call = r.call.trim().to_ascii_uppercase();
+            for s in by_call.get(&call).into_iter().flatten() {
+                if s.time < lo || s.time > hi {
+                    continue;
+                }
+                let spot_band = crate::band::band_for_freq_hz(s.freq_hz as f64);
+                bands.insert(band_rank(spot_band));
+                if same_band(band, r.freq_hz, spot_band, s.freq_hz as f64, cfg) {
+                    found = true;
+                }
+            }
+            let recall = match (found, bands.is_empty()) {
+                (true, _) => Recall::Found,
+                (false, false) => Recall::Elsewhere,
+                (false, true) => Recall::Missed,
+            };
+            Some(ReferenceGrade {
+                recall,
+                band,
+                manta_bands: bands.into_iter().map(band_at_rank).collect(),
+            })
+        })
+        .collect()
 }
 
 /// Live, incremental grading: reports are observed as the feed delivers
@@ -1450,5 +1536,175 @@ mod tests {
         assert!(serde_json::to_string(&g)
             .unwrap()
             .starts_with(r#"{"kind":"spotGrade","seq":9,"spotId":"#));
+    }
+
+    fn recall_of(r: &RbnReport, spots: &[GradeInput], c: &GradeConfig) -> ReferenceGrade {
+        grade_references(std::slice::from_ref(r), spots, c)
+            .pop()
+            .flatten()
+            .expect("admitted")
+    }
+
+    #[test]
+    fn reference_report_with_a_same_band_spot_in_the_window_is_found() {
+        let r = rep("W3XYZ-#", "W1AW", 14_025.0, Some(25.0), T0);
+        let g = recall_of(
+            &r,
+            &[spot("a", "w1aw", 14_025_100, Some(25), T0 + 60)],
+            &cfg(),
+        );
+        assert_eq!(g.recall, Recall::Found);
+        assert_eq!(g.band, "20m");
+        assert_eq!(g.manta_bands, vec!["20m"]);
+    }
+
+    #[test]
+    fn reference_report_found_ignores_frequency_and_speed_gaps() {
+        let r = rep("W3XYZ", "W1AW", 14_025.0, Some(25.0), T0);
+        let s = spot("a", "W1AW", 14_026_400, Some(35), T0);
+        assert_eq!(recall_of(&r, &[s.clone()], &cfg()).recall, Recall::Found);
+        // The forward pass calls the same pair a disagreement, not a miss.
+        assert_eq!(graded((s, vec![r]), true, &cfg()).grade, Grade::Disagree);
+    }
+
+    #[test]
+    fn reference_report_with_the_call_only_on_another_band_is_elsewhere() {
+        let r = rep("W3XYZ", "DL1ABC", 14_030.0, None, T0);
+        let g = recall_of(
+            &r,
+            &[spot("a", "DL1ABC", 7_030_000, None, T0 + 120)],
+            &cfg(),
+        );
+        assert_eq!(g.recall, Recall::Elsewhere);
+        assert_eq!(g.manta_bands, vec!["40m"]);
+    }
+
+    #[test]
+    fn reference_report_with_no_spot_of_the_call_is_missed() {
+        let r = rep("W3XYZ", "N4RV", 14_021.0, None, T0);
+        let g = recall_of(&r, &[spot("a", "W1AW", 14_021_000, None, T0)], &cfg());
+        assert_eq!(g.recall, Recall::Missed);
+        assert!(g.manta_bands.is_empty());
+        assert_eq!(recall_of(&r, &[], &cfg()).recall, Recall::Missed);
+    }
+
+    #[test]
+    fn reference_window_edges_are_inclusive() {
+        let r = rep("W3XYZ", "W1AW", 14_025.0, None, T0);
+        for (dt, want) in [
+            (W, Recall::Found),
+            (-W, Recall::Found),
+            (W + 1, Recall::Missed),
+            (-W - 1, Recall::Missed),
+        ] {
+            let s = spot("a", "W1AW", 14_025_000, None, T0 + dt);
+            assert_eq!(recall_of(&r, &[s], &cfg()).recall, want, "dt {dt}");
+        }
+    }
+
+    #[test]
+    fn reference_grades_align_with_input_and_apply_the_spotter_filter() {
+        let reports = vec![
+            rep("K5TR-#", "W1AW", 14_025.0, None, T0),
+            rep("DL8LAS", "W1AW", 14_025.0, None, T0),
+            rep("W3XYZ-1", "W1AW", 14_025.0, None, T0),
+            rep("k5tr", "N4RV", 14_021.0, None, T0),
+        ];
+        let spots = [spot("a", "W1AW", 14_025_000, None, T0)];
+        let c = GradeConfig {
+            spotters: BTreeSet::from(["K5TR".to_string(), "W3XYZ-1".to_string()]),
+            exclude_spotters: BTreeSet::from(["W3XYZ-1".to_string()]),
+            ..cfg()
+        };
+        let got: Vec<Option<Recall>> = grade_references(&reports, &spots, &c)
+            .into_iter()
+            .map(|g| g.map(|g| g.recall))
+            .collect();
+        assert_eq!(
+            got,
+            vec![Some(Recall::Found), None, None, Some(Recall::Missed)]
+        );
+        assert_eq!(grade_references(&reports, &spots, &cfg()).len(), 4);
+    }
+
+    #[test]
+    fn out_of_band_reference_report_correlates_by_frequency_tolerance() {
+        // 15.5 MHz lies outside every amateur band.
+        let r = rep("W3XYZ", "W1AW", 15_500.0, None, T0);
+        assert_eq!(crate::band::band_for_freq_hz(r.freq_hz), "unknown");
+        let near = spot("a", "W1AW", 15_500_400, None, T0);
+        let far = spot("b", "W1AW", 15_502_000, None, T0);
+        assert_eq!(recall_of(&r, &[near], &cfg()).recall, Recall::Found);
+        assert_eq!(recall_of(&r, &[far], &cfg()).recall, Recall::Elsewhere);
+    }
+
+    #[test]
+    fn forward_and_reverse_passes_agree() {
+        const CALLS: [&str; 4] = ["W1AW", "K5XYZ", "DL1ABC", "N4RV"];
+        let mut rng = Lcg(0x004d_414e_2d39_3700);
+        let freq = |rng: &mut Lcg, call: usize| -> f64 {
+            let base = if rng.below(2) == 0 {
+                7_010_000.0
+            } else {
+                14_010_000.0
+            };
+            base + call as f64 * 5_000.0 + rng.below(2_000) as f64
+        };
+        let span = 3 * 3600;
+        let mut spots = Vec::new();
+        let mut reports = Vec::new();
+        for i in 0..120 {
+            let c = rng.below(CALLS.len() as u64) as usize;
+            let f = freq(&mut rng, c);
+            let t = T0 + rng.below(span) as i64;
+            spots.push(spot(&format!("s{i:03}"), CALLS[c], f as i64, None, t));
+            let c = rng.below(CALLS.len() as u64) as usize;
+            let f = freq(&mut rng, c);
+            let t = T0 + rng.below(span) as i64;
+            reports.push(rep("W3XYZ", CALLS[c], f / 1000.0, None, t));
+        }
+        // One archive whose span covers every window.
+        let mut archive = reports.clone();
+        archive.push(rep("W3XYZ", "ZZ9ZZ", 14_000.0, None, T0 - 2 * W));
+        archive.push(rep(
+            "W3XYZ",
+            "ZZ9ZZ",
+            14_000.0,
+            None,
+            T0 + span as i64 + 2 * W,
+        ));
+        let c = cfg();
+        let forward = grade_batch(&spots, vec![archive], &c);
+        let backward = grade_references(&reports, &spots, &c);
+        let confirmed = |g: &SpotGrade| matches!(g.grade, Grade::Match | Grade::Disagree);
+        let pair = |s: &GradeInput, r: &RbnReport| {
+            s.call == r.call
+                && (s.time - r.time).abs() <= W
+                && crate::band::band_for_freq_hz(s.freq_hz as f64)
+                    == crate::band::band_for_freq_hz(r.freq_hz)
+        };
+        let (mut found, mut confirmed_n) = (0, 0);
+        for (r, g) in reports.iter().zip(&backward) {
+            let g = g.as_ref().expect("no spotter filter");
+            if g.recall == Recall::Found {
+                found += 1;
+                assert!(forward.iter().any(|fg| {
+                    let s = spots.iter().find(|s| s.spot_id == fg.spot_id).unwrap();
+                    confirmed(fg) && pair(s, r)
+                }));
+            }
+        }
+        for fg in &forward {
+            assert_ne!(fg.grade, Grade::Unknown);
+            if confirmed(fg) {
+                confirmed_n += 1;
+                let s = spots.iter().find(|s| s.spot_id == fg.spot_id).unwrap();
+                assert!(reports
+                    .iter()
+                    .zip(&backward)
+                    .any(|(r, g)| pair(s, r) && g.as_ref().unwrap().recall == Recall::Found));
+            }
+        }
+        assert!(found > 0 && confirmed_n > 0, "the generator exercises both");
     }
 }

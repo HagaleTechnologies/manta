@@ -2,6 +2,9 @@
 //! archive, offline, through the same engine the live comparator uses
 //! (`manta_server::rbn_compare::grade`). Its output depends only on its
 //! inputs and flags: like `decode`/`oracle` it never reads `MANTA_*`.
+//! MAN-97 adds a skimmer's `DX de` transcript as the reference
+//! (`--reference`, [`crate::grade_transcript`]) and the two-way report
+//! (`--paired`, [`crate::grade_paired`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -17,8 +20,15 @@ use manta_server::rbn_compare::grade::{
 };
 
 use crate::config;
+use crate::grade_paired::{self, PairedInputs, PAIRED_WINDOW_SECS};
+use crate::grade_transcript::{day_from_file_name, parse_transcript, ReferenceReport};
 
 #[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("reference_source")
+        .required(true)
+        .args(["rbn", "reference"])
+))]
 pub(crate) struct Args {
     /// SpotMessage JSON Lines files, or directories of them (their
     /// `spots-*.jsonl` files, sorted): the `field-node.py record-spots`
@@ -29,10 +39,21 @@ pub(crate) struct Args {
     /// RBN daily-dump CSVs, or directories of them (their `*.csv` files,
     /// sorted). Unzip RBN's `.zip` first. Repeatable. A file named twice,
     /// directly, through its directory or through a symlink, is read once.
-    #[arg(long, value_name = "PATH", required = true, num_args = 1..)]
+    #[arg(long, value_name = "PATH", num_args = 1..)]
     rbn: Vec<PathBuf>,
+    /// A skimmer's `DX de` telnet output saved to files (for example CW
+    /// Skimmer Server's port 7310), or directories of them (their `*.txt`
+    /// and `*.log` files, sorted). Repeatable; instead of --rbn. A line may
+    /// start with its UTC arrival time (2026-10-31T00:05:00Z); a line
+    /// without one takes its day from the file name
+    /// (reference-2026-10-31.txt) and its minute from the line's HHMMZ. The
+    /// node's own calls are not excluded: the transcript holds only that
+    /// skimmer's spots.
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    reference: Vec<PathBuf>,
     /// Count only this RBN skimmer's reports, for example a co-located
-    /// skimmer. Repeatable. Replaces [rbn_compare].spotters from --config.
+    /// skimmer; with --reference, only this `DX de` spotter's lines.
+    /// Repeatable. Replaces [rbn_compare].spotters from --config.
     #[arg(long, value_name = "CALL", value_parser = parse_spotter)]
     spotter: Vec<String>,
     /// Never count this RBN skimmer's reports. Repeatable. Replaces
@@ -63,9 +84,40 @@ pub(crate) struct Args {
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
     /// Print the grade records, one JSON object per line, sorted by
-    /// windowClose then spotId, instead of the summary.
+    /// windowClose then spotId, instead of the summary; with --paired, the
+    /// report as one JSON object.
     #[arg(long)]
     json: bool,
+    /// Grade both ways and print one report: recall (reference reports
+    /// manta also spotted), the reports manta missed, and manta's spots the
+    /// reference did not report (candidate false spots). Needs
+    /// --passband-khz; with --rbn it also needs --spotter. The window
+    /// defaults to 600 s (manta's re-spot interval); --window-secs changes
+    /// it, and --config's window_secs is not used.
+    #[arg(long, requires = "passband_khz")]
+    paired: bool,
+    /// With --paired: count only spots and reports inside this range, in
+    /// kHz (for example 14000-14070). Repeatable. Spots and reports outside
+    /// still match.
+    #[arg(
+        long,
+        value_name = "LO-HI",
+        requires = "paired",
+        value_parser = grade_paired::parse_passband
+    )]
+    passband_khz: Vec<(f64, f64)>,
+    /// With --paired: count only spots and reports at or after this time
+    /// (2026-10-31T00:00:00Z). Spots and reports before it still match.
+    #[arg(long, value_name = "UTC", requires = "paired", value_parser = parse_utc)]
+    start: Option<i64>,
+    /// With --paired: count only spots and reports before this time.
+    #[arg(long, value_name = "UTC", requires = "paired", value_parser = parse_utc)]
+    end: Option<i64>,
+}
+
+/// `--start`/`--end`: a whole-second UTC time, `T` or space separated.
+fn parse_utc(s: &str) -> std::result::Result<i64, String> {
+    manta_testkit::oracle::parse_utc_timestamp(s).map_err(|e| format!("{e:#}"))
 }
 
 /// `--spotter`/`--exclude-spotter`: the same callsign rule as
@@ -91,11 +143,21 @@ struct SpotStats {
     de_calls: Vec<String>,
 }
 
-/// What `load_rbn_csv` read, for the summary header.
+/// What `load_rbn_csv` or `load_reference` read, for the summary header.
 #[derive(Debug, Default)]
 struct RbnStats {
     files: usize,
     non_cw: usize,
+    /// Transcript lines that are neither CW nor another mode's spot.
+    other: usize,
+}
+
+/// The SpotMessage fields the paired report lists beside a spot, which
+/// grading itself never reads.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct SpotExtra {
+    pub snr: Option<i64>,
+    pub decode_confidence: Option<f64>,
 }
 
 fn render(args: &Args, out: &mut String) -> Result<()> {
@@ -109,6 +171,9 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
             );
         }
     }
+    // A transcript holds only its own skimmer's spots, so the node's own
+    // calls are neither excluded nor refused as --spotter (MAN-97 D6).
+    let transcript = !args.reference.is_empty();
     let (mut cfg, excludes) = grade_config(args)?;
     // The exclusion wins, so a spotter on both lists would grade every spot
     // it alone covers `none`: refuse it, as `[rbn_compare]` does.
@@ -119,53 +184,181 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
              would never count"
         );
     }
+    if args.paired {
+        if !transcript && cfg.spotters.is_empty() {
+            bail!(
+                "--paired with --rbn needs --spotter (the co-located skimmer): against every \
+                 RBN skimmer, each call heard anywhere would count as a miss"
+            );
+        }
+        if let (Some(start), Some(end)) = (args.start, args.end) {
+            if end <= start {
+                bail!(
+                    "--end ({}) must be after --start ({})",
+                    date_time(end),
+                    date_time(start)
+                );
+            }
+        }
+    }
     let (spots, spot_stats) = load_node_spots(&args.spots)?;
     // Likewise a node's own call, which its spots always exclude.
-    for de in &spot_stats.de_calls {
-        if let Some(call) = own_calls(de).into_iter().find(|c| cfg.spotters.contains(c)) {
+    if !transcript {
+        for de in &spot_stats.de_calls {
+            if let Some(call) = own_calls(de).into_iter().find(|c| cfg.spotters.contains(c)) {
+                bail!(
+                    "spotter {call} is node {de}'s own call: its reports never count for that \
+                     node's spots, so every one would grade none"
+                );
+            }
+        }
+    }
+    if args.paired {
+        let mut nodes: Vec<&str> = Vec::new();
+        for (de, _, _) in &spots {
+            let de = if de.is_empty() { "no deCall" } else { de };
+            if !nodes.contains(&de) {
+                nodes.push(de);
+            }
+        }
+        if nodes.len() > 1 {
             bail!(
-                "spotter {call} is node {de}'s own call: its reports never count for that \
-                 node's spots, so every one would grade none"
+                "--paired compares one node with its reference; the spots carry {} nodes \
+                 ({}): grade each node's archive apart",
+                nodes.len(),
+                nodes.join(", ")
             );
         }
     }
-    let (mut archives, rbn_stats) = load_rbn_csv(&args.rbn)?;
+    let (archives, rbn_stats) = if transcript {
+        load_reference(&args.reference)?
+    } else {
+        load_rbn_csv(&args.rbn)?
+    };
     cfg.exclude_spotters = excludes.iter().cloned().collect();
-    let times = || archives.iter().flatten().map(|r| r.time);
-    let time_range = times().min().zip(times().max());
-    let n_reports = archives.iter().map(Vec::len).sum::<usize>();
 
-    // shadow-compare's rule: a node's own reports never count, with and
-    // without its SSID. Each node's spots are graded apart, excluding only
-    // that node's call, as its live comparator does, so a second node's
-    // archive in `--spots` never hides that node's reports from the first.
-    let mut nodes: BTreeMap<&str, Vec<GradeInput>> = BTreeMap::new();
-    for (de, spot) in &spots {
-        nodes.entry(de.as_str()).or_default().push(spot.clone());
-    }
-    let n_nodes = nodes.len();
-    let mut grades = Vec::new();
-    let mut nodes = nodes.into_iter().peekable();
-    while let Some((de, node_spots)) = nodes.next() {
+    if args.paired {
+        let node = spots.first().map(|(de, _, _)| de.as_str()).unwrap_or("");
         let mut node_cfg = cfg.clone();
-        node_cfg.exclude_spotters.extend(own_calls(de));
-        // The last node takes the reports; earlier ones grade a copy.
-        let node_reports = if nodes.peek().is_some() {
-            archives.clone()
-        } else {
-            std::mem::take(&mut archives)
-        };
-        grades.extend(grade_batch(&node_spots, node_reports, &node_cfg));
+        if !transcript {
+            node_cfg.exclude_spotters.extend(own_calls(node));
+        }
+        let node_spots: Vec<(GradeInput, SpotExtra)> = spots
+            .iter()
+            .map(|(_, s, e)| (s.clone(), e.clone()))
+            .collect();
+        let report = grade_paired::build(PairedInputs {
+            node,
+            reference_source: if transcript { "transcript" } else { "rbn" },
+            cfg: &node_cfg,
+            spots: &node_spots,
+            archives: &archives,
+            passbands: &args.passband_khz,
+            start: args.start,
+            end: args.end,
+        });
+        if args.json {
+            out.push_str(&grade_paired::render_json(&report)?);
+            return Ok(());
+        }
+        render_header(
+            args,
+            &cfg,
+            excludes,
+            &spots,
+            &spot_stats,
+            &archives,
+            &rbn_stats,
+            out,
+        )?;
+        return grade_paired::render_text(&report, out);
     }
-    grades.sort_by(|a, b| (a.window_close, &a.spot_id).cmp(&(b.window_close, &b.spot_id)));
 
+    let grades = grade_one_way(&cfg, transcript, &spots, &archives);
     if args.json {
         for g in &grades {
             writeln!(out, "{}", serde_json::to_string(g)?)?;
         }
         return Ok(());
     }
+    render_header(
+        args,
+        &cfg,
+        excludes,
+        &spots,
+        &spot_stats,
+        &archives,
+        &rbn_stats,
+        out,
+    )?;
+    writeln!(out)?;
+    render_table(&grades, out)?;
+    Ok(())
+}
 
+/// Every spot graded against every reference: one grade per spot, sorted
+/// by `(window_close, spot_id)`.
+fn grade_one_way(
+    cfg: &GradeConfig,
+    transcript: bool,
+    spots: &[(String, GradeInput, SpotExtra)],
+    archives: &[Vec<ReferenceReport>],
+) -> Vec<SpotGrade> {
+    let archives: Vec<Vec<RbnReport>> = archives
+        .iter()
+        .map(|a| a.iter().map(|r| r.report.clone()).collect())
+        .collect();
+    // shadow-compare's rule: a node's own reports never count, with and
+    // without its SSID. Each node's spots are graded apart, excluding only
+    // that node's call, as its live comparator does, so a second node's
+    // archive in `--spots` never hides that node's reports from the first.
+    // A transcript holds no other skimmer's reports, so it excludes none.
+    let mut nodes: BTreeMap<&str, Vec<GradeInput>> = BTreeMap::new();
+    for (de, spot, _) in spots {
+        nodes.entry(de.as_str()).or_default().push(spot.clone());
+    }
+    let mut grades = Vec::new();
+    let mut archives = Some(archives);
+    let mut nodes = nodes.into_iter().peekable();
+    while let Some((de, node_spots)) = nodes.next() {
+        let mut node_cfg = cfg.clone();
+        if !transcript {
+            node_cfg.exclude_spotters.extend(own_calls(de));
+        }
+        // The last node takes the reports; earlier ones grade a copy.
+        let node_reports = if nodes.peek().is_some() {
+            archives.clone().unwrap_or_default()
+        } else {
+            archives.take().unwrap_or_default()
+        };
+        grades.extend(grade_batch(&node_spots, node_reports, &node_cfg));
+    }
+    grades.sort_by(|a, b| (a.window_close, &a.spot_id).cmp(&(b.window_close, &b.spot_id)));
+    grades
+}
+
+/// The summary's header lines, shared by the one-way table and the paired
+/// report: what was read, which spotters count, and the tolerances.
+#[allow(clippy::too_many_arguments)]
+fn render_header(
+    args: &Args,
+    cfg: &GradeConfig,
+    excludes: Vec<String>,
+    spots: &[(String, GradeInput, SpotExtra)],
+    spot_stats: &SpotStats,
+    archives: &[Vec<ReferenceReport>],
+    rbn_stats: &RbnStats,
+    out: &mut String,
+) -> Result<()> {
+    let transcript = !args.reference.is_empty();
+    let times = || archives.iter().flatten().map(|r| r.report.time);
+    let time_range = times().min().zip(times().max());
+    let n_reports = archives.iter().map(Vec::len).sum::<usize>();
+    let n_nodes = spots
+        .iter()
+        .map(|(de, _, _)| de.as_str())
+        .collect::<BTreeSet<_>>()
+        .len();
     writeln!(
         out,
         "spots: {} from {} ({}, {})",
@@ -178,16 +371,26 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
         ),
         plural(spot_stats.torn, "torn line", "torn lines"),
     )?;
-    let mut rbn_line = format!(
-        "rbn: {} from {} ({})",
-        plural(n_reports, "CW report", "CW reports"),
-        plural(rbn_stats.files, "file", "files"),
-        plural(
-            rbn_stats.non_cw,
-            "non-CW row skipped",
-            "non-CW rows skipped"
-        ),
-    );
+    let mut rbn_line = if transcript {
+        format!(
+            "reference: {} from {} ({}, {})",
+            plural(n_reports, "CW report", "CW reports"),
+            plural(rbn_stats.files, "file", "files"),
+            plural(rbn_stats.non_cw, "non-CW line", "non-CW lines"),
+            plural(rbn_stats.other, "other line skipped", "other lines skipped"),
+        )
+    } else {
+        format!(
+            "rbn: {} from {} ({})",
+            plural(n_reports, "CW report", "CW reports"),
+            plural(rbn_stats.files, "file", "files"),
+            plural(
+                rbn_stats.non_cw,
+                "non-CW row skipped",
+                "non-CW rows skipped"
+            ),
+        )
+    };
     if let Some((lo, hi)) = time_range {
         let (lo_date, lo_time) = utc_date_time(lo);
         let (hi_date, hi_time) = utc_date_time(hi);
@@ -208,9 +411,11 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
     // from its own node's spots only.
     let mut shown = excludes;
     let mut own = Vec::new();
-    for de in &spot_stats.de_calls {
-        for c in own_calls(de) {
-            push_unique(&mut own, c);
+    if !transcript {
+        for de in &spot_stats.de_calls {
+            for c in own_calls(de) {
+                push_unique(&mut own, c);
+            }
         }
     }
     if n_nodes <= 1 {
@@ -223,7 +428,12 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
     } else {
         writeln!(out, "spotters: {spotters} (excluding {})", shown.join(", "))?;
     }
-    if !own.is_empty() {
+    if transcript {
+        writeln!(
+            out,
+            "own calls are not excluded from a --reference transcript"
+        )?;
+    } else if !own.is_empty() {
         writeln!(
             out,
             "own calls, excluded only from that node's spots: {}",
@@ -236,9 +446,13 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
          and {}% of RBN's median",
         cfg.window_secs, cfg.freq_tol_hz, cfg.speed_tol_wpm, cfg.speed_tol_pct
     )?;
-    writeln!(out)?;
-    render_table(&grades, out)?;
     Ok(())
+}
+
+/// `YYYY-MM-DD HH:MM:SSZ`.
+fn date_time(t: i64) -> String {
+    let (d, h) = utc_date_time(t);
+    format!("{d} {h}Z")
 }
 
 /// One band's row of the summary table.
@@ -260,7 +474,7 @@ fn grade_column(g: Grade) -> usize {
 }
 
 /// Rows run from the highest band down (10m first), `unknown` last.
-fn band_rank(band: &str) -> (usize, usize) {
+pub(crate) fn band_rank(band: &str) -> (usize, usize) {
     let table = manta_server::band::allocations();
     match table.iter().position(|(name, _, _)| *name == band) {
         Some(i) => (0, table.len() - i),
@@ -329,7 +543,7 @@ fn median_offset(offsets: &[i64]) -> String {
     format!("{median} Hz ({})", v.len())
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
@@ -367,6 +581,12 @@ fn grade_config(args: &Args) -> Result<(GradeConfig, Vec<String>)> {
             spotters = rc.spotters.clone();
             excludes = rc.exclude_spotters.clone();
         }
+    }
+    // MAN-97 D3: the paired window is manta's re-spot interval, not the
+    // live comparator's (`manta_spot::dedupe`'s `SUPPRESSION_SECONDS`,
+    // MAN-96 D-H); --config's other tolerances still apply.
+    if args.paired && args.window_secs.is_none() {
+        cfg.window_secs = PAIRED_WINDOW_SECS;
     }
     if let Some(w) = args.window_secs {
         if !(30..=3600).contains(&w) {
@@ -460,11 +680,13 @@ fn expand_paths(
 }
 
 /// SpotMessage JSON Lines to grade inputs, each with its `deCall`
-/// (uppercase; empty when absent). Lines carrying a `kind` key
+/// (uppercase; empty when absent) and its `snr`/`decodeConfidence` (only
+/// the paired report lists them). Lines carrying a `kind` key
 /// (`spotGrade` records) are skipped and counted. Only a file's final line
 /// with no newline (a write torn by a kill) may be malformed; any other
 /// malformed line is an error naming the file and line.
-fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, SpotStats)> {
+#[allow(clippy::type_complexity)]
+fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput, SpotExtra)>, SpotStats)> {
     let files = expand_paths(paths, "spots-*.jsonl", |n| {
         n.starts_with("spots-") && n.ends_with(".jsonl")
     })?;
@@ -523,7 +745,14 @@ fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput)>, Spot
             if !de.is_empty() && !stats.de_calls.contains(&de) {
                 stats.de_calls.push(de.clone());
             }
-            spots.push((de, spot));
+            let extra = SpotExtra {
+                snr: value.get("snr").and_then(serde_json::Value::as_i64),
+                decode_confidence: value
+                    .get("decodeConfidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|c| c.is_finite()),
+            };
+            spots.push((de, spot, extra));
         }
     }
     Ok((spots, stats))
@@ -537,8 +766,9 @@ const RBN_REQUIRED_COLUMNS: [&str; 4] = ["callsign", "freq", "dx", "date"];
 /// RBN daily-dump CSVs to CW reports, one list per file (`grade_batch`
 /// covers each file's own span): rows whose `tx_mode` (when the column
 /// exists) is not `CW` are dropped and counted; `freq` is in kHz; `date` is
-/// UTC; spotters lose a `-#` suffix.
-fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<Vec<RbnReport>>, RbnStats)> {
+/// UTC; spotters lose a `-#` suffix; the optional `db` column is the
+/// report's SNR.
+fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<Vec<ReferenceReport>>, RbnStats)> {
     let files = expand_paths(paths, "*.csv", |n| {
         Path::new(n)
             .extension()
@@ -580,7 +810,7 @@ fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<Vec<RbnReport>>, RbnStats)> {
             col("dx").unwrap_or_default(),
             col("date").unwrap_or_default(),
         );
-        let (c_tx_mode, c_speed) = (col("tx_mode"), col("speed"));
+        let (c_tx_mode, c_speed, c_db) = (col("tx_mode"), col("speed"), col("db"));
         for (i, line) in lines {
             if line.trim().is_empty() {
                 continue;
@@ -608,14 +838,47 @@ fn load_rbn_csv(paths: &[PathBuf]) -> Result<(Vec<Vec<RbnReport>>, RbnStats)> {
             let wpm = c_speed
                 .and_then(|c| field(c).parse::<f64>().ok())
                 .filter(|w| w.is_finite() && *w > 0.0);
-            reports.push(RbnReport {
-                spotter: normalize_spotter(field(c_spotter)),
-                call: field(c_dx).to_ascii_uppercase(),
-                freq_hz: freq_khz * 1000.0,
-                wpm,
-                time,
+            reports.push(ReferenceReport {
+                report: RbnReport {
+                    spotter: normalize_spotter(field(c_spotter)),
+                    call: field(c_dx).to_ascii_uppercase(),
+                    freq_hz: freq_khz * 1000.0,
+                    wpm,
+                    time,
+                },
+                snr_db: c_db.and_then(|c| field(c).parse::<i32>().ok()),
             });
         }
+        archives.push(reports);
+    }
+    Ok((archives, stats))
+}
+
+/// A skimmer's saved `DX de` lines to CW reports, one list per file (each
+/// file covers its own span, as each CSV does). A line without a UTC stamp
+/// takes its day from the file name (`day_from_file_name`).
+fn load_reference(paths: &[PathBuf]) -> Result<(Vec<Vec<ReferenceReport>>, RbnStats)> {
+    let files = expand_paths(paths, "*.txt or *.log", |n| {
+        Path::new(n)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("txt") || e.eq_ignore_ascii_case("log"))
+    })?;
+    let mut stats = RbnStats {
+        files: files.len(),
+        ..RbnStats::default()
+    };
+    let mut archives = Vec::new();
+    for path in &files {
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        let day = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(day_from_file_name);
+        let (reports, file_stats) =
+            parse_transcript(&body, day).map_err(|e| anyhow::anyhow!("{} {e}", path.display()))?;
+        stats.non_cw += file_stats.non_cw;
+        stats.other += file_stats.other;
         archives.push(reports);
     }
     Ok((archives, stats))
@@ -645,7 +908,7 @@ fn split_csv(line: &str) -> Vec<String> {
 
 /// Unix seconds to (`YYYY-MM-DD`, `HH:MM:SS`), UTC, proleptic Gregorian
 /// (Howard Hinnant's civil-from-days).
-fn utc_date_time(t: i64) -> (String, String) {
+pub(crate) fn utc_date_time(t: i64) -> (String, String) {
     let days = t.div_euclid(86_400);
     let secs = t.rem_euclid(86_400);
     let z = days + 719_468;
