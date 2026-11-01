@@ -15,6 +15,7 @@ pub mod lookup;
 pub mod message;
 pub mod notch;
 pub mod pattern;
+pub mod prior;
 pub mod reference;
 pub mod scp;
 pub mod support;

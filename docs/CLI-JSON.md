@@ -120,6 +120,20 @@ emitted. Every event has `event` and `trackId`.
 | `snr` | number | never | The track's SNR in dB, 2500 Hz reference (SPEC §2.3). |
 | `frequency` | number | never | The track's frequency at that hop, in Hz. Absolute only when the source has an RF reference. |
 
+### `ReadingsHeld`
+
+Emitted only with `[decode] prior = "on"`, while at least two word readings remain acoustically viable. A character emits a snapshot, and word settlement emits a final snapshot when still ambiguous. Readings contain only glyphs supported by the timing beam.
+
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `event` | string | `"ReadingsHeld"`. |
+| `trackId` | integer | Decoder track identity. |
+| `sampleTs` | integer | Input sample timestamp. |
+| `readings` | array | `[reading, gap]` pairs ranked by acoustic score plus bounded language bonus; gap is in nats relative to the leader, whose gap is zero. |
+| `settled` | boolean | True at word settlement; the leading reading is committed. |
+
+Example: `{"event":"ReadingsHeld","trackId":17,"sampleTs":7123400,"readings":[["W1AW",0.0],["R1AW",1.24]],"settled":false}`.
+
 ### `TimingUpdate`
 
 The track's learned sender timing. The [`timing`](#timing) keys are part of

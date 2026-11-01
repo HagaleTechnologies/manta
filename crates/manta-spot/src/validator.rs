@@ -948,7 +948,7 @@ impl Validator {
                 Vec::new()
             }
             // Sender-timing diagnostics (MAN-315): nothing to validate.
-            DecoderEvent::TimingUpdate { .. } => Vec::new(),
+            DecoderEvent::ReadingsHeld { .. } | DecoderEvent::TimingUpdate { .. } => Vec::new(),
             DecoderEvent::TrackClosed { track_id, closure } => {
                 // Round 7 redesign (PR #154): `SignalEnded` is the ONE point where
                 // every captured non-allowlisted Beacon candidate for

@@ -9,6 +9,8 @@ pub mod events;
 pub mod evidence;
 pub mod hsmm;
 pub mod noise;
+pub mod prior;
+mod readings;
 pub mod timing;
 pub mod tree;
 
