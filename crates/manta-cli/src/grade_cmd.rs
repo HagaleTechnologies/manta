@@ -236,61 +236,76 @@ fn render(args: &Args, out: &mut String) -> Result<()> {
         load_rbn_csv(&args.rbn)?
     };
     cfg.exclude_spotters = excludes.iter().cloned().collect();
-
+    let loaded = Loaded {
+        transcript,
+        cfg,
+        excludes,
+        spots,
+        spot_stats,
+        archives,
+        rbn_stats,
+    };
     if args.paired {
-        let node = spots.first().map(|(de, _, _)| de.as_str()).unwrap_or("");
-        let mut node_cfg = cfg.clone();
-        if !transcript {
-            node_cfg.exclude_spotters.extend(own_calls(node));
-        }
-        let node_spots: Vec<(GradeInput, SpotExtra)> = spots
-            .iter()
-            .map(|(_, s, e)| (s.clone(), e.clone()))
-            .collect();
-        let report = grade_paired::build(PairedInputs {
-            node,
-            reference_source: if transcript { "transcript" } else { "rbn" },
-            cfg: &node_cfg,
-            spots: &node_spots,
-            archives: &archives,
-            passbands: &args.passband_khz,
-            start: args.start,
-            end: args.end,
-        });
-        if args.json {
-            out.push_str(&grade_paired::render_json(&report)?);
-            return Ok(());
-        }
-        render_header(
-            args,
-            &cfg,
-            excludes,
-            &spots,
-            &spot_stats,
-            &archives,
-            &rbn_stats,
-            out,
-        )?;
-        return grade_paired::render_text(&report, out);
+        render_paired(args, &loaded, out)
+    } else {
+        render_one_way(args, &loaded, out)
     }
+}
 
-    let grades = grade_one_way(&cfg, transcript, &spots, &archives);
+/// What `render` read and resolved, for its two output paths.
+struct Loaded {
+    /// `--reference` (a transcript) rather than `--rbn`.
+    transcript: bool,
+    cfg: GradeConfig,
+    /// The exclusion list in display order.
+    excludes: Vec<String>,
+    spots: Vec<(String, GradeInput, SpotExtra)>,
+    spot_stats: SpotStats,
+    archives: Vec<Vec<ReferenceReport>>,
+    rbn_stats: RbnStats,
+}
+
+/// `--paired`: one node against its reference, both ways.
+fn render_paired(args: &Args, l: &Loaded, out: &mut String) -> Result<()> {
+    let node = l.spots.first().map(|(de, _, _)| de.as_str()).unwrap_or("");
+    let mut node_cfg = l.cfg.clone();
+    if !l.transcript {
+        node_cfg.exclude_spotters.extend(own_calls(node));
+    }
+    let node_spots: Vec<(GradeInput, SpotExtra)> = l
+        .spots
+        .iter()
+        .map(|(_, s, e)| (s.clone(), e.clone()))
+        .collect();
+    let report = grade_paired::build(PairedInputs {
+        node,
+        reference_source: if l.transcript { "transcript" } else { "rbn" },
+        cfg: &node_cfg,
+        spots: &node_spots,
+        archives: &l.archives,
+        passbands: &args.passband_khz,
+        start: args.start,
+        end: args.end,
+    });
+    if args.json {
+        out.push_str(&grade_paired::render_json(&report)?);
+        return Ok(());
+    }
+    render_header(l, out)?;
+    grade_paired::render_text(&report, out)
+}
+
+/// The one-way grade: the grade records with `--json`, else the header and
+/// the per-band table.
+fn render_one_way(args: &Args, l: &Loaded, out: &mut String) -> Result<()> {
+    let grades = grade_one_way(&l.cfg, l.transcript, &l.spots, &l.archives);
     if args.json {
         for g in &grades {
             writeln!(out, "{}", serde_json::to_string(g)?)?;
         }
         return Ok(());
     }
-    render_header(
-        args,
-        &cfg,
-        excludes,
-        &spots,
-        &spot_stats,
-        &archives,
-        &rbn_stats,
-        out,
-    )?;
+    render_header(l, out)?;
     writeln!(out)?;
     render_table(&grades, out)?;
     Ok(())
@@ -339,18 +354,17 @@ fn grade_one_way(
 
 /// The summary's header lines, shared by the one-way table and the paired
 /// report: what was read, which spotters count, and the tolerances.
-#[allow(clippy::too_many_arguments)]
-fn render_header(
-    args: &Args,
-    cfg: &GradeConfig,
-    excludes: Vec<String>,
-    spots: &[(String, GradeInput, SpotExtra)],
-    spot_stats: &SpotStats,
-    archives: &[Vec<ReferenceReport>],
-    rbn_stats: &RbnStats,
-    out: &mut String,
-) -> Result<()> {
-    let transcript = !args.reference.is_empty();
+fn render_header(l: &Loaded, out: &mut String) -> Result<()> {
+    let Loaded {
+        transcript,
+        cfg,
+        excludes,
+        spots,
+        spot_stats,
+        archives,
+        rbn_stats,
+    } = l;
+    let transcript = *transcript;
     let times = || archives.iter().flatten().map(|r| r.report.time);
     let time_range = times().min().zip(times().max());
     let n_reports = archives.iter().map(Vec::len).sum::<usize>();
@@ -409,7 +423,7 @@ fn render_header(
     // One node's own calls join the exclusion list. Several nodes' (spots
     // with no `deCall` count as a node) are listed apart: each is excluded
     // from its own node's spots only.
-    let mut shown = excludes;
+    let mut shown = excludes.clone();
     let mut own = Vec::new();
     if !transcript {
         for de in &spot_stats.de_calls {
