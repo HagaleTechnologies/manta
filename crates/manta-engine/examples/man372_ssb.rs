@@ -138,6 +138,7 @@ fn main() {
                             &mut iq,
                             FS,
                             &FskSpec {
+                                mark_below_space: false,
                                 mark_offset_hz: 12_040.0,
                                 shift_hz: 170.0,
                                 baud: 45.45,
@@ -213,6 +214,7 @@ fn main() {
                 &mut iq,
                 FS,
                 &FskSpec {
+                    mark_below_space: false,
                     mark_offset_hz: 12_040.0,
                     shift_hz: 170.0,
                     baud: 45.45,
