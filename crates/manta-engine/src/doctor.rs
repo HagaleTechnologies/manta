@@ -343,15 +343,20 @@ impl IqSource for SampleBoundedSource {
         self.inner.trusted_band_hz()
     }
 
-    // MAN-305: forward both gap hooks, as `listen()` reads them. With the
+    // MAN-305: forward the gap hooks, as `listen()` reads them. With the
     // trait defaults `doctor` would splice an outage it was told about and
-    // time spots after a short loss early by the lost samples.
+    // time spots after a short loss early by the lost samples; MAN-202 adds
+    // the unknown-length loss, which would otherwise decode as timing.
     fn take_discontinuity(&mut self) -> Option<u64> {
         self.inner.take_discontinuity()
     }
 
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.inner.take_missing_samples()
+    }
+
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
     }
 
     /// MAN-273: forwarded with `trusted_band_hz`.
@@ -632,12 +637,14 @@ mod tests {
     }
 
     /// MAN-305: `SampleBoundedSource` hands the inner source's outage and
-    /// spliced loss to `listen()`, each once.
+    /// spliced loss to `listen()`, each once; MAN-202: and its
+    /// unknown-length loss.
     #[test]
-    fn sample_bounded_source_forwards_both_gap_reports() {
+    fn sample_bounded_source_forwards_every_gap_report() {
         struct GapReportingSource {
             gap: Option<u64>,
             missing: Option<u64>,
+            unknown: bool,
         }
         impl IqSource for GapReportingSource {
             fn sample_rate(&self) -> f64 {
@@ -655,11 +662,15 @@ mod tests {
             fn take_missing_samples(&mut self) -> Option<u64> {
                 self.missing.take()
             }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
         }
         let mut src = SampleBoundedSource {
             inner: Box::new(GapReportingSource {
                 gap: Some(48_000),
                 missing: Some(11_900),
+                unknown: true,
             }),
             max_samples: 1_000,
             samples_read: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -668,8 +679,10 @@ mod tests {
         assert_eq!(src.read(&mut buf).unwrap(), 100);
         assert_eq!(src.take_discontinuity(), Some(48_000));
         assert_eq!(src.take_missing_samples(), Some(11_900));
+        assert!(src.take_unknown_gap());
         assert_eq!(src.take_discontinuity(), None);
         assert_eq!(src.take_missing_samples(), None);
+        assert!(!src.take_unknown_gap());
     }
 
     #[test]

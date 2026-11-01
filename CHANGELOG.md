@@ -106,6 +106,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-202: Rust API: `IqSource::take_unknown_gap()` and
+  `manta_input::ReadContinuity`; wrappers must forward the new hook. See
+  docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
 - MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
   protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
   overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
@@ -294,6 +297,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-202: with a SoapySDR input, a driver overflow no longer decodes the
+  dropped span as Morse timing. A wrong character (for example `K` read as
+  `T`) becomes a dropped character, and the word the overflow cut ends
+  there. Spot timestamps after an overflow are still early by the lost
+  time. File decodes cannot report such a gap, so this is not a
+  `### Decoder output` change under the rule above. See
+  docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
 - MAN-413: configs now reject duplicate `[[input]]` entry names even when
   an earlier entry's `bands` expand into labelled streams such as
   `x-60m-1` and `x-60m-2`. The error names the duplicate base name, avoiding
