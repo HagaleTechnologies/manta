@@ -28,8 +28,8 @@
 //! default hop count instead of round-tripping it through milliseconds.
 //! Millisecond keys convert with `manta_decode::ms_to_hops`, SPEC §1.1's
 //! single normative rounding rule; SPEC's millisecond defaults
-//! (8/5000/30000/25/30000) reproduce the hop defaults
-//! (3/1875/11250/9/11250) exactly.
+//! (50/5000/30000/25/30000) reproduce the hop defaults
+//! (19/1875/11250/9/11250) exactly.
 //!
 //! The bounds reject exactly the values the track manager treats as
 //! degenerate: `gc_hops = 0` closes every ACTIVE track immediately,
@@ -271,7 +271,7 @@ mod tests {
             r#"
             on_snr_db = 11.5
             off_snr_db = 3.0
-            confirm_ms = 8.0
+            confirm_ms = 50.0
             hang_ms = 5000.0
             gc_ms = 30000.0
             warmup_ms = 25.0
@@ -285,7 +285,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg, DetectorConfig::default());
-        assert_eq!(cfg.confirm_hops, 3);
+        assert_eq!(cfg.confirm_hops, 19);
         assert_eq!(cfg.hang_hops, 1875);
         assert_eq!(cfg.gc_hops, 11250);
         assert_eq!(cfg.warmup_hops, 9);

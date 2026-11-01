@@ -320,15 +320,23 @@ impl FloorBank {
     }
 }
 
-/// Per-channel two-look linear-power rise gate and EMA-based drop/SNR.
-/// Lifecycle confirmation and hang counters live in manta-engine.
+/// Per-channel two-look linear-power rise gate (optionally ORed with the
+/// EMA rise) and EMA-based drop/SNR. Lifecycle confirmation and hang
+/// counters live in manta-engine.
 pub struct Gate {
     smoothed_db: Vec<f64>,
     initialized: Vec<bool>,
     on_snr_db: f32,
     off_snr_db: f32,
     looks: Vec<PowerLooks>,
+    /// Optional EMA rise threshold, ORed with the two-look rise.
+    ema_on_snr_db: Option<f32>,
 }
+
+/// MAN-109: the two-look rise applies only on a channel whose recent
+/// window is the largest within this many channels; elsewhere only the
+/// EMA rise applies.
+const SKIRT_CHANNELS: usize = 2;
 
 // One ring per length, shared cursor across channels. The recent and previous
 // sums always describe adjacent, disjoint M-hop windows. Storage is allocated
@@ -378,6 +386,14 @@ impl PowerLooks {
             }
         }
     }
+    // A window beside a stronger channel integrates that signal's skirt
+    // and key clicks, which fall off away from it and which the EMA sees
+    // only as short bursts.
+    fn beside_stronger(&self, k: usize) -> bool {
+        let lo = k.saturating_sub(SKIRT_CHANNELS);
+        let hi = (k + SKIRT_CHANNELS).min(self.recent.len() - 1);
+        (lo..=hi).any(|j| j != k && self.recent[j] > self.recent[k])
+    }
     fn rises(&self, k: usize, threshold: f64) -> bool {
         self.filled == 2 * self.m
             && self.recent[k] >= threshold * self.m as f64
@@ -410,7 +426,16 @@ impl Gate {
             on_snr_db,
             off_snr_db,
             looks,
+            ema_on_snr_db: None,
         }
+    }
+
+    /// Also rise when the 40 ms EMA is at least `on_snr_db` over the
+    /// effective floor (SPEC §2.3's EMA rule), so a strong onset rises
+    /// before the integration windows fill.
+    pub fn with_ema_rise(mut self, on_snr_db: f32) -> Self {
+        self.ema_on_snr_db = Some(on_snr_db);
+        self
     }
 
     /// One hop's rise/drop booleans per channel, against `floor`'s current
@@ -472,7 +497,17 @@ impl Gate {
         (rise, drop)
     }
 
-    /// Judge frozen power windows for rise and the EMA for drop.
+    /// Channel `k`'s EMA rise alone, against the `with_ema_rise`
+    /// threshold. False when that path is off or `k` has not seeded.
+    pub fn ema_rise(&self, k: usize, floor: &FloorBank) -> bool {
+        self.initialized[k]
+            && self
+                .ema_on_snr_db
+                .is_some_and(|on| self.smoothed_db[k] >= floor.effective_floor_db(k) + on as f64)
+    }
+
+    /// Judge frozen power windows (and the EMA, if enabled) for rise and
+    /// the EMA for drop.
     fn judge(&self, k: usize, floor: &FloorBank) -> (bool, bool) {
         let f = floor.effective_floor_db(k);
         // A channel quartile can underestimate noise relative to integrated
@@ -488,8 +523,15 @@ impl Gate {
             block_floor
         };
         let threshold = 10.0_f64.powf((rise_floor + self.on_snr_db as f64) / 10.0);
+        let ema_rise = self
+            .ema_on_snr_db
+            .is_some_and(|on| self.smoothed_db[k] >= f + on as f64);
         (
-            self.looks.iter().any(|look| look.rises(k, threshold)),
+            ema_rise
+                || self
+                    .looks
+                    .iter()
+                    .any(|look| look.rises(k, threshold) && !look.beside_stronger(k)),
             self.smoothed_db[k] < f + self.off_snr_db as f64,
         )
     }
@@ -519,6 +561,32 @@ mod tests {
             assert!(!rise[0], "the integrated mean must clear the block floor");
             assert!(!drop[0], "drop must still use the channel's original floor");
         }
+    }
+
+    #[test]
+    fn two_look_rise_ignores_the_skirt_of_a_stronger_neighbor() {
+        // VR3 (+45 dB): the windows beside a strong carrier integrate its
+        // skirt above threshold; the EMA rise there stays off.
+        let bank = warmed_up_bank(8, -90.0);
+        let mut gate = Gate::new(8, 10.0, 3.0, &[38]);
+        let mut rise = Vec::new();
+        for _ in 0..100 {
+            (rise, _) = gate.update(
+                &[-90.0, -90.0, -45.0, -78.0, -78.0, -90.0, -90.0, -78.0],
+                &bank,
+            );
+        }
+        assert!(rise[2], "the strong channel rises");
+        assert!(!rise[3] && !rise[4], "within two channels: skirt");
+        assert!(rise[7], "a local window maximum rises on its windows");
+        let mut ema = Gate::new(8, 10.0, 3.0, &[38]).with_ema_rise(10.0);
+        for _ in 0..100 {
+            (rise, _) = ema.update(
+                &[-90.0, -90.0, -45.0, -78.0, -78.0, -90.0, -90.0, -78.0],
+                &bank,
+            );
+        }
+        assert!(rise[3] && rise[4], "the EMA rise still applies beside it");
     }
 
     #[test]

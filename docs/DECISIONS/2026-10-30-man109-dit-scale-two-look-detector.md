@@ -2,10 +2,53 @@
 
 The detector integrates linear power for rise. For either configured length
 M, both adjacent disjoint M-hop windows must be full and average at least
-its rise reference plus `on_snr_db`. The operating point is 11.5 dB,
-[38, 38] hops and three consecutive confirmation hops. Drop, hang and reported
-SNR retain the 40 ms dB EMA. Crash holds freeze both statistics. Existing
-spawn vetoes and lazy decoder qualification remain in place.
+its rise reference plus `on_snr_db`. The old EMA rise stays ORed in at
+`max(on_snr_db, 12 dB)`. Window rise applies only on a channel whose
+recent window is the largest within two channels, and only to confirm a
+CANDIDATE or wake a DORMANT track. The operating
+point is 11.5 dB, [38, 38] hops and 19 consecutive confirmation hops.
+Drop, hang and reported SNR retain the 40 ms dB EMA. Crash holds freeze
+both statistics. Existing spawn vetoes and lazy decoder qualification
+remain in place. The section "Repair after validation" explains why the
+three-hop point below was withdrawn.
+
+## Repair after validation
+
+Validation of the 11.5 dB/[38,38]/confirm=3 point found VR3 (30 WPM,
++45 dB) at CER 0.648 and nine engine tests failing; all pass on main.
+Two causes were measured. First, window-only rise needs 2*M hops before
+any rise, so a strong onset no longer spawned or promoted inside the
+fixtures' windows, and a three-hop confirmation changes the promotion hop
+MAN-166 found V10 sensitive to. Second, beside a +45 dB carrier the
+38-hop windows integrate its skirt and key clicks above threshold
+(tracks at +112 Hz and -137 Hz, reported SNR 15 and 13 dB), so those
+channels passed confirmation and took over the copy. The EMA sees that
+energy only as short bursts.
+
+The repair keeps the integrator and restores the legacy path beside it:
+EMA rise at no less than 12 dB and 19-hop confirmation. Window rise
+applies only where the channel's recent window is the largest within two
+channels. A 20 dB margin over a ±2, ±6 or ±20 channel span still let VR4's
+0.5 ms key clicks (which decay away from the carrier) promote two to eight
+extra tracks with the non-CW filter off; the local-maximum rule gives 1/1,
+as with the window path disabled. ACTIVE and HANG tracks step on the EMA
+rise alone, because full windows outlast a key-up gap and would pull a
+HANG track back to ACTIVE on every gap hop. `Gate::with_ema_rise` enables
+the EMA path; `two_look_rise_ignores_the_skirt_of_a_stronger_neighbor`
+pins the guard. The drain-order listen fixture returns to its original TK1A
+scene and default detector settings. VR3, the nine engine tests and the
+false-rate meter pass.
+
+At this point the false-rate meter measures 10/26/0 unconfirmed on noise
+seeds 1/2/3 and 10 on V1, equal to the old 12 dB baseline, with zero
+NotCw, HangExpired and false_lease_hops. The sensitivity sweep (same
+command, seed 1) matches Before in recall and bogus counts except AWGN
+6 dB, which recalls 9/10 at CER 0.10 (Before: 8/10 at 0.12); Watterson
+poor CER is within 0.02 of Before. The first full-recall AWGN point
+stays at 9 dB, so the three-point knee gain measured at confirm=3 below is
+not delivered by this point. Recovering it needs a separate, shorter
+confirmation count for window-only rise while EMA rise keeps 19 hops; that
+is follow-up work.
 
 ## Floor reference and tuning
 
@@ -140,7 +183,7 @@ Each station sends "CQ CQ DE &lt;call&gt; &lt;call&gt; K" for the whole recordin
 
 Regenerate: `manta bench sensitivity --conditions awgn,poor --wpm 25 --markdown`
 
-### After
+### After (confirm=3 point, withdrawn)
 
 **manta 0.1.0 sensitivity sweep**: legacy engine, default decoder settings · 10 stations per point · 60 s recordings · 1 trial · seed 1
 
@@ -193,11 +236,10 @@ baseline events in the same calibration/steady-state segments. They still
 require a filter-window-straddling event, preserve every pre-loss timestamp,
 and compare datagram-sized versus chunked reads. Hard-coded event samples
 from the EMA-era promotion time no longer existed in the baseline.
-The short-timeout drain-order fixture gains an H training prefix before
-TK1A at 70 WPM and explicitly selects the supported 10 dB/[23,38]/confirm=2
-configuration, so the call and its one-second timeout fit inside the
-two-second calibration fill. Its K1A output, unkeyed close and event-order
-assertions are unchanged. Crash-during-confirmation unit fixtures pin their
+The short-timeout drain-order fixture briefly gained an H training prefix
+and a 10 dB/[23,38]/confirm=2 override for the confirm=3 point; the repair
+returns it to its original TK1A scene and default detector settings, and
+its assertions are unchanged. Crash-during-confirmation unit fixtures pin their
 original 19-hop count; the direct V1 manager fixture now excludes zero
 pre-roll as production already does. These keep the fixtures about their
 original invariants while default confirmation changes.

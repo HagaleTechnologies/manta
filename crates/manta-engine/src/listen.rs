@@ -1916,7 +1916,7 @@ mod tests {
     fn k1a_then_carrier() -> Vec<Complex32> {
         let fs = 96_000.0;
         let (mut iq, _) = manta_testkit::scene::render_scene(&[], fs, 3.0, Some(11)).unwrap();
-        manta_testkit::noncw::add_cw_then_carrier(&mut iq, fs, 12_340.0, 20.0, "HTK1A", 70.0, 3.0);
+        manta_testkit::noncw::add_cw_then_carrier(&mut iq, fs, 12_340.0, 20.0, "TK1A", 70.0, 3.0);
         iq
     }
 
@@ -1926,12 +1926,6 @@ mod tests {
         let mut cfg = PipelineConfig::default();
         assert!(cfg.detector.non_cw_filter);
         cfg.detector.unkeyed_close_hops = 375;
-        // This drain-order fixture must finish the call and its one-second
-        // timeout inside the two-second fill. Use the supported shorter
-        // integration windows so the opening training token fits.
-        cfg.detector.integrator_hops = [23, 38];
-        cfg.detector.on_snr_db = 10.0;
-        cfg.detector.confirm_hops = 2;
         cfg
     }
 

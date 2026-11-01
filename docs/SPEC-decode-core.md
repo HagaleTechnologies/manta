@@ -286,9 +286,15 @@ Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
   recent disjoint full M-hop windows of linear power must average at least
   `10^((F_rise + on_snr_db)/10)`. `F_rise` is the greater of F and the
   block median quartile, also bounded by the startup block seed until the
-  full 250-entry ring is available. Partial windows cannot rise. Confirmation
-  requires three consecutive rise hops. The EMA remains the drop and SNR
-  statistic. Static crashes freeze both the EMA and the window sums (§2.7).
+  full 250-entry ring is available. Partial windows cannot rise. Window
+  rise applies only on a channel whose recent window is the largest within
+  two channels (a stronger signal's skirt and key clicks fall off away
+  from it). Rise is also true when `S ≥ F + max(on_snr_db, 12 dB)`, the
+  EMA rule, so a strong onset rises before the windows fill. Window rise
+  confirms a CANDIDATE and wakes a DORMANT track; ACTIVE and HANG use the
+  EMA rule alone, since full windows outlast a key-up gap. Confirmation
+  requires 19 consecutive rise hops (≈ 50 ms). The EMA remains the drop and SNR statistic. Static
+  crashes freeze both the EMA and the window sums (§2.7).
 - **Drop:** `S < F + 3 dB` (`detector.off_snr_db = 3.0`, i.e. 3 dB
   hysteresis) continuously for **hang = 5 000 ms** (1875 hops) — survives QSB
   troughs and inter-word gaps at slow speeds.
@@ -322,13 +328,13 @@ between HANG and CLOSED for a track that has decoded (MAN-108).
 | Transition | Condition |
 |---|---|
 | IDLE → CANDIDATE | rise condition first met on channel `k`, `k` is not owned by an existing track (§2.5), `k` is not RTTY-vetoed (§2.6), no static crash is being suppressed this hop (§2.7), `k` is not inside a co-modulation span (§2.8), and `k`'s centre is not outside the source's trusted band when one was supplied (§1.5, MAN-196), or outside the input's spawn band (MAN-310) |
-| CANDIDATE → ACTIVE | rise sustained `confirm_hops` (default 3) hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
+| CANDIDATE → ACTIVE | rise sustained `confirm_hops` (default 19) hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before `confirm_hops` hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
 | HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | HANG → DORMANT | hang timer expires on a track that has decoded a character while qualified, with `reacquire_ms > 0` (MAN-108) → decoder flushed exactly as a hang close flushes it, then released; `track_id`, centroid and ownership kept |
-| DORMANT → ACTIVE | rise sustained `confirm_hops` (default 3) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
+| DORMANT → ACTIVE | rise sustained `confirm_hops` (default 19) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
 | DORMANT → CLOSED | `reacquire_ms` expires with no re-acquisition → closed as a hang expiry (`HangExpired`, `ClosureKind::SignalEnded`); nothing left to flush |
 | ACTIVE/HANG → CLOSED | **garbage collect:** no character emitted for 30 000 ms (`detector.gc_ms`) — carrier or non-CW signal; the channel is marked *suppressed* for 60 s (re-detection allowed but logged) |
 | any → CLOSED | eviction: track cap reached and this is the lowest-SNR track (counted in metrics, per ARCHITECTURE §4); a DORMANT track's SNR is noise-level, so it goes first. Merging (§2.5) also applies to DORMANT tracks |
@@ -1945,7 +1951,7 @@ digital_window_filter = true
 on_snr_db = 11.5
 integrator_hops = [38, 38]           # each length in 1..=375 hops
 off_snr_db = 3.0
-confirm_ms = 8.0       # 3 hops
+confirm_ms = 50                     # 19 hops
 hang_ms = 5000                      # 1875 hops
 gc_ms = 30000                       # 11250 hops
 warmup_ms = 25                      # 9 hops
@@ -2245,9 +2251,10 @@ defaults.
 4. Stopband target tightened from the implied ~60 dB to **80 dB** (§1.2) —
    free given 8 taps/branch, and pileup scenes (V8) have ≥ 27 dB dynamic
    range between neighbors.
-5. **MAN-109 replaces EMA rise with two disjoint linear-power windows.**
-   The old 12 dB/19-hop rule suppressed 298 spurious ACTIVE tracks seen
-   at 6 dB on V1. Drop and SNR still use the 40 ms EMA. The operating point
+5. **MAN-109 adds rise from two disjoint linear-power windows.**
+   The old 12 dB/19-hop EMA rule, which suppressed 298 spurious ACTIVE
+   tracks seen at 6 dB on V1, stays ORed in at no less than 12 dB, with
+   the 19-hop confirmation. Drop and SNR still use the 40 ms EMA. The operating point
    and measurements are recorded in
    `docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md`.
 6. **Keying threshold is an additive band about the linear-amplitude

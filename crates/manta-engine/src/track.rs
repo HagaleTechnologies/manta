@@ -14,7 +14,7 @@ pub struct DetectorConfig {
     pub integrator_hops: [u16; 2],
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
-    /// SPEC §2.3/§2.4: rise sustained this many hops (default three) before CANDIDATE -> ACTIVE.
+    /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
     pub confirm_hops: u64,
     /// SPEC §2.3/§2.4: drop sustained this many hops (5000ms) before ACTIVE/HANG -> CLOSED,
     /// or, for a track that decoded a character while qualified and
@@ -124,14 +124,20 @@ impl std::str::FromStr for CrashFilter {
     }
 }
 
+/// MAN-109: the EMA rise path never goes below the 12 dB the old false-track
+/// measurements pinned, whatever `on_snr_db` the two-look path uses.
+pub const EMA_RISE_MIN_SNR_DB: f32 = 12.0;
+
 impl Default for DetectorConfig {
-    /// MAN-109 replaces EMA rise with two disjoint linear-power windows.
-    /// Default windows are 38 hops, threshold 11.5 dB over the quantile
-    /// floor, and confirmation is three consecutive pair-true hops.
+    /// MAN-109 adds rise from two disjoint linear-power windows. Default
+    /// windows are 38 hops at 11.5 dB over the quantile floor. The old EMA
+    /// rise stays ORed in at no less than 12 dB (`EMA_RISE_MIN_SNR_DB`), so
+    /// a strong onset still rises on its first hops, and confirmation
+    /// stays 19 consecutive rise hops (SPEC §2.3/§2.4).
     /// The old 12 dB/19-hop EMA rule suppressed the 298 noise tracks seen
     /// at 6 dB, but its correlated looks limited weak-signal detection.
-    /// MAN-166 found V10 Farnsworth bootstrap sensitive to promotion time;
-    /// the golden tests must still gate this new predicate.
+    /// MAN-166 found V10 Farnsworth bootstrap sensitive to promotion time,
+    /// which is why the EMA path and its 19-hop confirmation are kept.
     /// See docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md.
     ///
     /// **`track_cap` deviates from its prior 500** (ARCHITECTURE §4, not a
@@ -189,7 +195,7 @@ impl Default for DetectorConfig {
             on_snr_db: 11.5,
             integrator_hops: [38, 38],
             off_snr_db: 3.0,
-            confirm_hops: 3,
+            confirm_hops: 19,
             hang_hops: 1875,
             gc_hops: 11250,
             warmup_hops: 9,
@@ -1905,7 +1911,8 @@ impl TrackManager {
                 detector_cfg.on_snr_db,
                 detector_cfg.off_snr_db,
                 &detector_cfg.integrator_hops,
-            ),
+            )
+            .with_ema_rise(detector_cfg.on_snr_db.max(EMA_RISE_MIN_SNR_DB)),
             tracks: BTreeMap::new(),
             owner_of: vec![None; n_channels],
             next_id: 1,
@@ -2607,14 +2614,22 @@ impl TrackManager {
                                       // confirmation freezes the same way -- the held `rise` is not
                                       // evidence the signal returned -- while its expiry timer keeps
                                       // aging (`Lifecycle::age_dormant`), as a HANG track's does.
+                                      // MAN-109: the two-look windows stay full through a key-up gap,
+                                      // so their rise would pull a HANG track back to ACTIVE on every
+                                      // gap hop. They confirm a CANDIDATE and wake a DORMANT track;
+                                      // ACTIVE/HANG keep the EMA rise.
+            let rise_k = match prev_state {
+                LifecycleState::Candidate | LifecycleState::Dormant => rise[k],
+                _ => self.gate.ema_rise(k, &self.floor),
+            };
             let mut event = if suppress {
                 match prev_state {
                     LifecycleState::Candidate => LifecycleEvent::None,
                     LifecycleState::Dormant => track.lifecycle.age_dormant(),
-                    _ => track.lifecycle.on_hop(rise[k], drop[k], char_emitted),
+                    _ => track.lifecycle.on_hop(rise_k, drop[k], char_emitted),
                 }
             } else {
-                track.lifecycle.on_hop(rise[k], drop[k], char_emitted)
+                track.lifecycle.on_hop(rise_k, drop[k], char_emitted)
             };
             // MAN-108 (SPEC §2.4): DORMANT entry flushes and releases the
             // decoder (the flush goes ahead of this batch's pool output);
