@@ -12,7 +12,7 @@ use manta_server::rbn_compare::grade::{
 };
 use serde::Serialize;
 
-use crate::grade_cmd::{band_rank, plural, utc_date_time, SpotExtra};
+use crate::grade_cmd::{band_rank, date_time, plural, utc_date_time, SpotExtra};
 use crate::grade_transcript::ReferenceReport;
 
 /// The `--paired` window when `--window-secs` is not given: manta's re-spot
@@ -372,12 +372,6 @@ fn reference_span(times: &[i64], start: Option<i64>, end: Option<i64>) -> Option
     })
 }
 
-/// `YYYY-MM-DD HH:MM:SSZ`.
-fn date_time(t: i64) -> String {
-    let (d, h) = utc_date_time(t);
-    format!("{d} {h}Z")
-}
-
 /// `60.0%`, or `n/a` with nothing to divide by.
 fn rate(n: usize, d: usize) -> String {
     match ratio(n, d) {
@@ -461,7 +455,11 @@ pub(crate) fn render_text(r: &PairedReport, out: &mut String) -> Result<()> {
         ),
     )?;
     match &r.reference_span {
-        None => writeln!(out, "reference silence: n/a (no CW reports)")?,
+        None if f.loaded == 0 => writeln!(out, "reference silence: n/a (no CW reports)")?,
+        None => writeln!(
+            out,
+            "reference silence: n/a (no CW reports from an admitted spotter)"
+        )?,
         Some(ReferenceSpan {
             longest_silence_s: Some(gap),
             longest_silence_from: Some(at),
@@ -789,6 +787,21 @@ mod tests {
         assert_eq!(span.longest_silence_s, Some(13_800));
         assert_eq!(span.longest_silence_from, Some(at(2, 0)));
         assert_eq!(r.reference_reports.other_spotter, 1);
+        // Every report from another spotter: the span names the filter.
+        let only_n0call = GradeConfig {
+            spotters: BTreeSet::from(["N0CALL".to_string()]),
+            ..paired_cfg()
+        };
+        let mut text = String::new();
+        render_text(
+            &report(&[], &archives, &only_n0call, Some(DAY), Some(at(0, 30))),
+            &mut text,
+        )
+        .unwrap();
+        assert!(
+            text.contains("reference silence: n/a (no CW reports from an admitted spotter)\n"),
+            "{text}"
+        );
         let mut text = String::new();
         render_text(&r, &mut text).unwrap();
         assert!(

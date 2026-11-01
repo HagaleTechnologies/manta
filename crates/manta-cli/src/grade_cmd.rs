@@ -152,6 +152,11 @@ struct RbnStats {
     other: usize,
 }
 
+/// One loaded spot: its node's `deCall` (uppercase; empty when absent),
+/// the spot as grading reads it, and the fields only the paired report
+/// lists.
+type NodeSpot = (String, GradeInput, SpotExtra);
+
 /// The SpotMessage fields the paired report lists beside a spot, which
 /// grading itself never reads.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -259,7 +264,7 @@ struct Loaded {
     cfg: GradeConfig,
     /// The exclusion list in display order.
     excludes: Vec<String>,
-    spots: Vec<(String, GradeInput, SpotExtra)>,
+    spots: Vec<NodeSpot>,
     spot_stats: SpotStats,
     archives: Vec<Vec<ReferenceReport>>,
     rbn_stats: RbnStats,
@@ -316,7 +321,7 @@ fn render_one_way(args: &Args, l: &Loaded, out: &mut String) -> Result<()> {
 fn grade_one_way(
     cfg: &GradeConfig,
     transcript: bool,
-    spots: &[(String, GradeInput, SpotExtra)],
+    spots: &[NodeSpot],
     archives: &[Vec<ReferenceReport>],
 ) -> Vec<SpotGrade> {
     let archives: Vec<Vec<RbnReport>> = archives
@@ -464,7 +469,7 @@ fn render_header(l: &Loaded, out: &mut String) -> Result<()> {
 }
 
 /// `YYYY-MM-DD HH:MM:SSZ`.
-fn date_time(t: i64) -> String {
+pub(crate) fn date_time(t: i64) -> String {
     let (d, h) = utc_date_time(t);
     format!("{d} {h}Z")
 }
@@ -699,8 +704,7 @@ fn expand_paths(
 /// (`spotGrade` records) are skipped and counted. Only a file's final line
 /// with no newline (a write torn by a kill) may be malformed; any other
 /// malformed line is an error naming the file and line.
-#[allow(clippy::type_complexity)]
-fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<(String, GradeInput, SpotExtra)>, SpotStats)> {
+fn load_node_spots(paths: &[PathBuf]) -> Result<(Vec<NodeSpot>, SpotStats)> {
     let files = expand_paths(paths, "spots-*.jsonl", |n| {
         n.starts_with("spots-") && n.ends_with(".jsonl")
     })?;

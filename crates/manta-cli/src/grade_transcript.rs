@@ -36,21 +36,37 @@ const ROLLOVER_MINUTES: i64 = 12 * 60;
 
 /// UTC midnight of the last real `YYYY-MM-DD` in `name`, as Unix seconds.
 pub(crate) fn day_from_file_name(name: &str) -> Option<i64> {
-    let b = name.as_bytes();
-    let shape = |w: &[u8]| {
-        w.iter().enumerate().all(|(i, c)| match i {
+    (0..name.len().saturating_sub(9))
+        .rev()
+        // `get` is `None` off a char boundary; a date is ASCII throughout.
+        .filter_map(|i| name.get(i..i + 10))
+        .filter(|w| is_date_shaped(w))
+        .find_map(|w| manta_testkit::oracle::parse_utc_timestamp(&format!("{w}T00:00:00Z")).ok())
+}
+
+/// `YYYY-MM-DD` in shape (digits and two hyphens), not checked as a date.
+fn is_date_shaped(token: &str) -> bool {
+    let b = token.as_bytes();
+    b.len() == 10
+        && b.iter().enumerate().all(|(i, c)| match i {
             4 | 7 => *c == b'-',
             _ => c.is_ascii_digit(),
         })
-    };
-    (0..b.len().saturating_sub(9))
-        .rev()
-        .filter(|&i| shape(&b[i..i + 10]))
-        .find_map(|i| {
-            // All ten bytes are ASCII, so both ends are char boundaries.
-            manta_testkit::oracle::parse_utc_timestamp(&format!("{}T00:00:00Z", &name[i..i + 10]))
-                .ok()
-        })
+}
+
+/// The UTC stamp before `DX de`, and the `DX de` text: one token
+/// (`2026-10-31T00:05:00Z`), or a date and a time apart
+/// (`2026-10-31 00:05:00Z`). `None` when the line has no stamp form.
+fn split_stamp(line: &str) -> Option<(String, &str)> {
+    let (first, rest) = line.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    if rest.starts_with("DX de ") {
+        return Some((first.to_string(), rest));
+    }
+    let (second, rest) = rest.split_once(char::is_whitespace)?;
+    let rest = rest.trim_start();
+    (is_date_shaped(first) && rest.starts_with("DX de "))
+        .then(|| (format!("{first} {second}"), rest))
 }
 
 /// The minute of the day a `HHMMZ` token names, or `None` past 23:59.
@@ -67,6 +83,8 @@ pub(crate) fn parse_transcript(
     body: &str,
     day: Option<i64>,
 ) -> std::result::Result<(Vec<ReferenceReport>, TranscriptStats), String> {
+    // A file saved on Windows may start with a byte-order mark.
+    let body = body.strip_prefix('\u{feff}').unwrap_or(body);
     let mut reports = Vec::new();
     let mut stats = TranscriptStats::default();
     // The previous bare spot line's minute, and the days added so far.
@@ -81,17 +99,17 @@ pub(crate) fn parse_transcript(
         let (stamp, text) = if line.starts_with("DX de ") {
             (None, line)
         } else {
-            match line.split_once(char::is_whitespace) {
-                Some((token, rest)) if rest.trim_start().starts_with("DX de ") => {
-                    let t = manta_testkit::oracle::parse_utc_timestamp(token).map_err(|_| {
+            match split_stamp(line) {
+                Some((token, rest)) => {
+                    let t = manta_testkit::oracle::parse_utc_timestamp(&token).map_err(|_| {
                         format!(
                             "line {n}: bad UTC stamp {} before DX de",
-                            crate::fmt::quoted(token)
+                            crate::fmt::quoted(&token)
                         )
                     })?;
-                    (Some(t), rest.trim_start())
+                    (Some(t), rest)
                 }
-                _ => {
+                None => {
                     stats.other += 1;
                     continue;
                 }
@@ -250,6 +268,21 @@ mod tests {
                 other: 3
             }
         );
+    }
+
+    #[test]
+    fn a_stamp_may_be_a_date_and_a_time_apart() {
+        let body = "2026-10-31 00:05:00Z DX de W3XYZ-#:  14025.0  W1AW           CW    21 dB  25 WPM  CQ      0005Z\n";
+        let (reports, stats) = parse_ok(body, None);
+        assert_eq!(stats, TranscriptStats::default());
+        assert_eq!(reports[0].report.time, DAY + 300);
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_ignored() {
+        let body = "\u{feff}2026-10-31T00:05:00Z DX de W3XYZ-#:  14025.0  W1AW           CW    21 dB  25 WPM  CQ      0005Z\n";
+        let (reports, _) = parse_ok(body, None);
+        assert_eq!(reports[0].report.time, DAY + 300);
     }
 
     #[test]
