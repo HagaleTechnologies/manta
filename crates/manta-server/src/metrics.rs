@@ -10,6 +10,7 @@
 //! `manta_source_down_seconds_total`; MAN-96).
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
+use crate::spot_message::FtxMode;
 use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -829,6 +830,64 @@ impl RelayStats {
     }
 }
 
+/// MAN-323: what became of one FT8/FT4 slot a window reached; the `outcome`
+/// label of `manta_ftx_cycles_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FtxCycleOutcome {
+    /// Handed to the decoder.
+    Decoded,
+    /// Complete, but replaced by the next slot before the decoder reached it.
+    Dropped,
+    /// Not delivered whole: the slot in progress at startup or shutdown, or
+    /// one broken by a gap.
+    Incomplete,
+}
+
+impl FtxCycleOutcome {
+    pub const ALL: [Self; 3] = [Self::Decoded, Self::Dropped, Self::Incomplete];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Decoded => "decoded",
+            Self::Dropped => "dropped",
+            Self::Incomplete => "incomplete",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// MAN-323: one `(input, mode)` pair's series. An input that covers two
+/// windows of one mode (a wideband stream spanning two bands) shares one
+/// series between them: the cycle counts add up, and the gauge holds
+/// whichever window decoded last.
+#[derive(Debug)]
+struct FtxWindowStats {
+    input: String,
+    mode: FtxMode,
+    cycles: [u64; 3],
+    decode_seconds: f64,
+}
+
+/// MAN-323: the FT8/FT4 families. Empty, and rendering nothing, until an
+/// input registers a window it attempts.
+#[derive(Debug, Default)]
+struct FtxStats {
+    windows: Vec<FtxWindowStats>,
+    decodes: BTreeMap<FtxMode, u64>,
+    spots: BTreeMap<FtxMode, u64>,
+}
+
+impl FtxStats {
+    fn window(&mut self, input: &str, mode: FtxMode) -> Option<&mut FtxWindowStats> {
+        self.windows
+            .iter_mut()
+            .find(|w| w.input == input && w.mode == mode)
+    }
+}
+
 #[derive(Default)]
 pub struct Metrics {
     spots_total: AtomicU64,
@@ -948,6 +1007,8 @@ pub struct Metrics {
     /// MAN-320: one handle per configured `[[skimmer_relay]]` /
     /// `[[wsjtx_relay]]` block, disabled ones included.
     relays: RwLock<Vec<Arc<RelayStats>>>,
+    /// MAN-323: the `manta_ftx_` families, one series per attempted window.
+    ftx: Mutex<FtxStats>,
     /// MAN-128: captured once at construction -- see `StartedAt`'s doc
     /// comment for why this is not `#[derive(Default)]`-trivial and not
     /// seeded from `resolve_epoch`.
@@ -1906,6 +1967,56 @@ impl Metrics {
         stats
     }
 
+    /// MAN-323: makes one input's series for `mode` appear, at 0. Call it at
+    /// startup for every window an input attempts; a repeat call for the same
+    /// `(input, mode)`, such as a second window of that mode, is ignored.
+    pub fn register_ftx_window(&self, input: &str, mode: FtxMode) {
+        let mut ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if ftx.window(input, mode).is_none() {
+            ftx.windows.push(FtxWindowStats {
+                input: input.to_string(),
+                mode,
+                cycles: [0; 3],
+                decode_seconds: 0.0,
+            });
+        }
+        ftx.decodes.entry(mode).or_insert(0);
+        ftx.spots.entry(mode).or_insert(0);
+    }
+
+    /// MAN-323: one slot of a registered window. An unregistered window is
+    /// ignored, so no series appears that startup did not announce.
+    pub fn record_ftx_cycle(&self, input: &str, mode: FtxMode, outcome: FtxCycleOutcome) {
+        let mut ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if let Some(w) = ftx.window(input, mode) {
+            w.cycles[outcome.index()] += 1;
+        }
+    }
+
+    /// MAN-323: wall time of a registered window's most recent decode.
+    pub fn set_ftx_decode_seconds(&self, input: &str, mode: FtxMode, seconds: f64) {
+        let mut ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if let Some(w) = ftx.window(input, mode) {
+            w.decode_seconds = seconds;
+        }
+    }
+
+    /// MAN-323: `n` messages the decoder returned, any text.
+    pub fn record_ftx_decodes(&self, mode: FtxMode, n: u64) {
+        let mut ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if let Some(total) = ftx.decodes.get_mut(&mode) {
+            *total += n;
+        }
+    }
+
+    /// MAN-323: one FT8/FT4 spot published on the JSON stream.
+    pub fn record_ftx_spot(&self, mode: FtxMode) {
+        let mut ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if let Some(total) = ftx.spots.get_mut(&mode) {
+            *total += 1;
+        }
+    }
+
     fn uplink_targets_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<UplinkTarget>>> {
         self.uplink_targets
             .read()
@@ -2767,6 +2878,7 @@ impl Metrics {
         drop(targets);
 
         self.render_relays(&mut out);
+        self.render_ftx(&mut out);
 
         // MAN-128: process uptime/build-info.
         out.push_str(
@@ -2908,6 +3020,56 @@ impl Metrics {
 }
 
 impl Metrics {
+    /// MAN-323: the four FT8/FT4 families. Nothing at all, not even the
+    /// headers, until an input registers a window.
+    fn render_ftx(&self, out: &mut String) {
+        let ftx = self.ftx.lock().expect("ftx lock poisoned");
+        if ftx.windows.is_empty() {
+            return;
+        }
+        out.push_str("# HELP manta_ftx_cycles_total FT8/FT4 slots this input's window reached, by outcome.\n");
+        out.push_str("# TYPE manta_ftx_cycles_total counter\n");
+        for w in &ftx.windows {
+            for outcome in FtxCycleOutcome::ALL {
+                out.push_str(&format!(
+                    "manta_ftx_cycles_total{{input=\"{}\",mode=\"{}\",outcome=\"{}\"}} {}\n",
+                    escape_label_value(&w.input),
+                    w.mode.label(),
+                    outcome.label(),
+                    w.cycles[outcome.index()]
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP manta_ftx_decodes_total Messages the FT8/FT4 decoder returned, any text.\n",
+        );
+        out.push_str("# TYPE manta_ftx_decodes_total counter\n");
+        for (mode, n) in &ftx.decodes {
+            out.push_str(&format!(
+                "manta_ftx_decodes_total{{mode=\"{}\"}} {n}\n",
+                mode.label()
+            ));
+        }
+        out.push_str("# HELP manta_ftx_spots_total FT8/FT4 spots published on the JSON stream.\n");
+        out.push_str("# TYPE manta_ftx_spots_total counter\n");
+        for (mode, n) in &ftx.spots {
+            out.push_str(&format!(
+                "manta_ftx_spots_total{{mode=\"{}\"}} {n}\n",
+                mode.label()
+            ));
+        }
+        out.push_str("# HELP manta_ftx_decode_seconds Wall time of this window's most recent FT8/FT4 decode.\n");
+        out.push_str("# TYPE manta_ftx_decode_seconds gauge\n");
+        for w in &ftx.windows {
+            out.push_str(&format!(
+                "manta_ftx_decode_seconds{{input=\"{}\",mode=\"{}\"}} {}\n",
+                escape_label_value(&w.input),
+                w.mode.label(),
+                w.decode_seconds
+            ));
+        }
+    }
+
     /// MAN-320: the three relay families, one series per registered relay.
     fn render_relays(&self, out: &mut String) {
         let relays = self.relays.read().expect("relays lock poisoned");
@@ -5052,5 +5214,64 @@ mod tests {
             last = now;
         }
         assert_eq!(last, (5, 3));
+    }
+
+    /// MAN-323: no `manta_ftx_` line until a window registers; then its
+    /// three cycle series and its gauge at 0, and the per-mode counters.
+    #[test]
+    fn ftx_series_exist_only_for_registered_windows() {
+        let m = Metrics::new();
+        assert!(!m.render_prometheus_text().contains("manta_ftx_"));
+        m.record_ftx_cycle("kiwi-20m-10", FtxMode::Ft8, FtxCycleOutcome::Decoded);
+        m.record_ftx_spot(FtxMode::Ft8);
+        assert!(!m.render_prometheus_text().contains("manta_ftx_"));
+        m.register_ftx_window("kiwi-20m-10", FtxMode::Ft8);
+        let text = m.render_prometheus_text();
+        for line in [
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"decoded\"} 0",
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"dropped\"} 0",
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"incomplete\"} 0",
+            "manta_ftx_decodes_total{mode=\"FT8\"} 0",
+            "manta_ftx_spots_total{mode=\"FT8\"} 0",
+            "manta_ftx_decode_seconds{input=\"kiwi-20m-10\",mode=\"FT8\"} 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line} in {text}");
+        }
+        assert!(!text.contains("mode=\"FT4\""), "{text}");
+    }
+
+    #[test]
+    fn ftx_counters_render() {
+        let m = Metrics::new();
+        m.register_ftx_window("kiwi-20m-10", FtxMode::Ft8);
+        m.register_ftx_window("kiwi-20m-10", FtxMode::Ft4);
+        m.register_ftx_window("kiwi-20m-10", FtxMode::Ft8);
+        for _ in 0..40 {
+            m.record_ftx_cycle("kiwi-20m-10", FtxMode::Ft8, FtxCycleOutcome::Decoded);
+        }
+        m.record_ftx_cycle("kiwi-20m-10", FtxMode::Ft8, FtxCycleOutcome::Incomplete);
+        m.record_ftx_decodes(FtxMode::Ft8, 812);
+        for _ in 0..96 {
+            m.record_ftx_spot(FtxMode::Ft8);
+        }
+        m.set_ftx_decode_seconds("kiwi-20m-10", FtxMode::Ft4, 1.98);
+        let text = m.render_prometheus_text();
+        for line in [
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"decoded\"} 40",
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"dropped\"} 0",
+            "manta_ftx_cycles_total{input=\"kiwi-20m-10\",mode=\"FT8\",outcome=\"incomplete\"} 1",
+            "manta_ftx_decodes_total{mode=\"FT8\"} 812",
+            "manta_ftx_spots_total{mode=\"FT8\"} 96",
+            "manta_ftx_decode_seconds{input=\"kiwi-20m-10\",mode=\"FT4\"} 1.98",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line} in {text}");
+        }
+        assert_eq!(
+            text.lines()
+                .filter(|l| l.starts_with("manta_ftx_cycles_total{"))
+                .count(),
+            6,
+            "a repeated registration adds no series"
+        );
     }
 }

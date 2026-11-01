@@ -379,6 +379,125 @@ impl SpotMessage {
             seq,
         }
     }
+
+    /// MAN-323: the wire message for one FT8/FT4 `CQ` decoded from an IQ
+    /// stream. The same 30 keys as [`SpotMessage::from_spot`], with the
+    /// geography and `de*` fields resolved the same way. `timestamp` is the
+    /// slot's UTC start in whole seconds, `snr` the decoder's own estimate
+    /// (WSJT-X's 2500 Hz reference), `dxGrid` the grid the `CQ` carried, and
+    /// `wpm`/`baud`/`rst`/`decodeConfidence`/`channelizerResolutionHz` are `null`.
+    pub fn from_ftx(
+        spot: &FtxSpot,
+        station_call: &str,
+        station_location: Option<&crate::config::StationLocation>,
+        cty: &cty::Table,
+        decoder_version: &str,
+        session_nonce: u128,
+        seq: u64,
+    ) -> Self {
+        let dx = Geography::resolve(&spot.callsign, cty);
+        let de = Geography::resolve(crate::config::strip_ssid(station_call), cty);
+        let frequency_hz = spot.freq_hz.round() as i64;
+        let timestamp = spot.slot_start_secs();
+        Self {
+            id: ftx_spot_id(station_call, session_nonce, spot),
+            source: "skimmer",
+            timestamp,
+            ingested_at: timestamp,
+            frequency: frequency_hz,
+            band: crate::band::band_for_freq_hz(frequency_hz as f64).to_string(),
+            mode: spot.mode.label(),
+            dx_call: spot.callsign.clone(),
+            dx_grid: spot.grid.clone(),
+            dx_lat: dx.lat,
+            dx_lon: dx.lon,
+            dx_dxcc: dx.dxcc,
+            dx_continent: dx.continent,
+            dx_cq_zone: dx.cq_zone,
+            de_call: station_call.to_string(),
+            de_grid: station_location.map(|l| l.grid.clone()),
+            de_lat: station_location.map(|l| l.lat),
+            de_lon: station_location.map(|l| l.lon),
+            de_dxcc: de.dxcc,
+            de_continent: de.continent,
+            snr: Some(spot.snr_db),
+            snr_ref_hz: SNR_REF_HZ,
+            wpm: None,
+            baud: None,
+            rst: None,
+            qrl_query: false,
+            decode_confidence: None,
+            decoder_version: Some(decoder_version.to_string()),
+            channelizer_resolution_hz: None,
+            seq,
+        }
+    }
+}
+
+/// MAN-323: the digital modes manta decodes from its IQ streams. The wire
+/// `mode` value is [`FtxMode::label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FtxMode {
+    Ft8,
+    Ft4,
+}
+
+impl FtxMode {
+    /// `"FT8"` or `"FT4"`: the JSON `mode` and the metrics `mode` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ft8 => "FT8",
+            Self::Ft4 => "FT4",
+        }
+    }
+
+    /// The relay's mode key, so one `wsjtx::Dedupe` can hold FT8/FT4 spots.
+    pub fn relay_mode(self) -> crate::relay::RelayMode {
+        match self {
+            Self::Ft8 => crate::relay::RelayMode::Ft8,
+            Self::Ft4 => crate::relay::RelayMode::Ft4,
+        }
+    }
+}
+
+/// MAN-323: one FT8/FT4 `CQ` decoded from an IQ stream, as published on the
+/// JSON stream only (`SpotBus::publish_ftx`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FtxSpot {
+    pub mode: FtxMode,
+    /// The calling station, from the `CQ` message.
+    pub callsign: String,
+    /// The 4-character locator the `CQ` carried, when it carried one.
+    pub grid: Option<String>,
+    /// The mode's dial frequency plus the decoder's audio offset, Hz.
+    pub freq_hz: f64,
+    /// The decoder's SNR estimate, WSJT-X's 2500 Hz reference.
+    pub snr_db: i32,
+    /// UTC start of the slot the message was decoded in, Unix milliseconds.
+    pub slot_start_ms: i64,
+}
+
+impl FtxSpot {
+    /// The slot's UTC start in whole seconds, rounded down: an FT4 slot that
+    /// starts at :07.5 reads :07.
+    pub fn slot_start_secs(&self) -> i64 {
+        self.slot_start_ms.div_euclid(1000)
+    }
+}
+
+/// An FT8/FT4 spot's JSON `id`:
+/// `{station_call}:{session_nonce}:{MODE}:{slot_start_secs}:{callsign}`.
+/// Band and frequency are not part of it, so it is unique only while the
+/// publisher spots a call at most once per mode and slot. The same call heard
+/// in one slot on two bands, or by two inputs, would repeat an `id` unless
+/// the publisher holds the repeat back.
+pub fn ftx_spot_id(station_call: &str, session_nonce: u128, spot: &FtxSpot) -> String {
+    format!(
+        "{station_call}:{session_nonce}:{}:{}:{}",
+        spot.mode.label(),
+        spot.slot_start_secs(),
+        spot.callsign
+    )
 }
 
 #[cfg(test)]
@@ -1124,5 +1243,100 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         };
         assert_eq!(wire_baud(&cw_with_baud), None);
         assert_eq!(wire_wpm(&rtty_spot()), None);
+    }
+
+    fn w1aw_ft8() -> FtxSpot {
+        FtxSpot {
+            mode: FtxMode::Ft8,
+            callsign: "W1AW".to_string(),
+            grid: Some("FN31".to_string()),
+            freq_hz: 14_075_234.4,
+            snr_db: -10,
+            slot_start_ms: 1_730_462_415_000,
+        }
+    }
+
+    /// MAN-323 devex 3: an FT8 spot keeps the 30 keys in their order, with
+    /// the FTx-specific values and nulls.
+    #[test]
+    fn an_ft8_spot_renders_as_devex_3() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg = SpotMessage::from_ftx(&w1aw_ft8(), "W3XYZ", None, &cty, "v", 77, 42);
+        assert_eq!(msg.id, "W3XYZ:77:FT8:1730462415:W1AW");
+        let json = serde_json::to_value(&msg).unwrap();
+        let cw = serde_json::to_value(SpotMessage::from_spot(
+            &sample_spot(),
+            "W3XYZ",
+            None,
+            &cty,
+            "v",
+            0,
+            1,
+            0,
+        ))
+        .unwrap();
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v.as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(keys(&json), keys(&cw));
+        assert_eq!(json["mode"], "FT8");
+        assert_eq!(json["dxCall"], "W1AW");
+        assert_eq!(json["dxGrid"], "FN31");
+        assert_eq!(json["frequency"], 14_075_234);
+        assert_eq!(json["band"], "20m");
+        assert_eq!(json["snr"], -10);
+        assert_eq!(json["snrRefHz"], 2500);
+        assert_eq!(json["timestamp"], 1_730_462_415);
+        assert_eq!(json["ingestedAt"], 1_730_462_415);
+        assert_eq!(json["seq"], 42);
+        assert_eq!(json["qrlQuery"], false);
+        assert_eq!(json["dxDxcc"], 291);
+        for key in [
+            "wpm",
+            "baud",
+            "rst",
+            "decodeConfidence",
+            "channelizerResolutionHz",
+        ] {
+            assert!(json[key].is_null(), "{key}: {json}");
+        }
+    }
+
+    /// The FT8 example line in docs/SPOT-SCHEMA.md is this renderer's output.
+    #[test]
+    fn the_spot_schema_ft8_example_is_what_from_ftx_renders() {
+        let cty = cty::Table::parse(manta_spot::CTY_DAT);
+        let msg = SpotMessage::from_ftx(
+            &w1aw_ft8(),
+            "W3XYZ",
+            None,
+            &cty,
+            "manta-0.1.0+d144e36b1789",
+            1_730_462_400_123_456_789,
+            42,
+        );
+        let line = serde_json::to_string(&msg).unwrap();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/SPOT-SCHEMA.md");
+        let schema = std::fs::read_to_string(path).unwrap();
+        assert!(
+            schema.lines().any(|l| l == line),
+            "docs/SPOT-SCHEMA.md has no line {line}"
+        );
+    }
+
+    #[test]
+    fn an_ft4_slot_at_half_a_second_floors_the_timestamp() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let spot = FtxSpot {
+            mode: FtxMode::Ft4,
+            slot_start_ms: 1_730_462_407_500,
+            grid: None,
+            ..w1aw_ft8()
+        };
+        let msg = SpotMessage::from_ftx(&spot, "W3XYZ", None, &cty, "v", 1, 1);
+        assert_eq!(msg.timestamp, 1_730_462_407);
+        assert_eq!(msg.mode, "FT4");
+        assert_eq!(msg.dx_grid, None);
+        assert_eq!(msg.id, "W3XYZ:1:FT4:1730462407:W1AW");
     }
 }

@@ -17,6 +17,8 @@ path = "src/main.rs"
 
 [features]
 soapy = ["manta-input/soapy"]
+# MAN-323: FT8/FT4 decoding (pancetta-ft8); off by default, like soapy.
+ftx = ["manta-engine/ftx"]
 # Compatibility name: HPSDR input is included in every build.
 hpsdr = []
 
