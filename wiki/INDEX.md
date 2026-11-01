@@ -96,4 +96,5 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - [Why does a SoapySDR overflow drop a character instead of decoding through it?](../docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md) — MAN-202: an overflow loses samples of unknown count, reported by `take_unknown_gap()`; tracks keep their identity but drop the run that spans the gap and resync, trading about one dropped character for no misread one.
 - [Why can't a spliced loss move the sample clock between reads?](../docs/DECISIONS/2026-10-25-man423-pre-loss-hops-and-parked-backlogs.md) — MAN-423: the channelizer still holds a filter length of pre-loss samples, so a loss is held at its boundary in the hop→timestamp mapping; a parked protocol-2 source judges gaps from the start of the pause.
 
+- [Why does detector rise use two disjoint power windows and a block floor bound?](../docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md)
 - [What does the first RTTY decoder slice deliver?](../docs/DECISIONS/2026-10-30-man321-rtty-decoding.md) Diagnostic ITA2 text after recognition, with preroll and validated spots deferred.

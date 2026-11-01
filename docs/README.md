@@ -69,8 +69,9 @@ Then:
   ([decision record](DECISIONS/2026-10-10-man116-sensitivity-benchmark.md)).
 - [DECISIONS/README.md](DECISIONS/README.md): the measurement and gate
   records, such as the decode-core-v2 stage-2 gate.
-- [superpowers/](superpowers/): working design notes and plans. They are not
-  normative; the SPEC files and decision records are.
+- [archive/plans/](archive/plans/): an archive of the plans and design
+  specs AI agents wrote for the July to September 2026 work. A historical
+  record, not normative; the SPEC files and decision records are.
 
 ## Reference
 
