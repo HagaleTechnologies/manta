@@ -9,6 +9,7 @@ pub mod context;
 pub mod cty;
 pub mod decision;
 pub mod dedupe;
+pub mod exchange;
 pub mod gate;
 pub mod grammar;
 pub mod lookup;

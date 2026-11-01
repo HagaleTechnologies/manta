@@ -61,12 +61,12 @@ pub type ContextMatch = (String, SpotType, Range<usize>, Option<Range<usize>>);
 /// filler can therefore never create a spot by itself, and the transient
 /// "CQ WPX" window -- before the call arrives, where `CQ_CALL_RE` captures
 /// `WPX` -- is rejected downstream, the same as "CQ TEST" always was.
-const CQ_FILLER: &str = "CQ|TEST|CONTEST|WPX|WW|NA|SS|FD|DX";
+pub(crate) const CQ_FILLER: &str = "CQ|TEST|CONTEST|WPX|WW|NA|SS|FD|DX";
 
 /// Sign-off words that make a following bare `TEST` the run station's
 /// trailing "TU TEST" form, so the call after it is the next caller's, not
 /// the CQer's (MAN-104; see `parse_named_pattern`).
-const TEST_SIGN_OFF: [&str; 3] = ["TU", "TNX", "QSL"];
+pub(crate) const TEST_SIGN_OFF: [&str; 3] = ["TU", "TNX", "QSL"];
 
 static BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\bV\s+V\s+V\s+([A-Z0-9/]{3,15})\b").unwrap());
