@@ -1552,6 +1552,10 @@ impl Track {
     /// then the refiner, the crash hold's clean history and the phase
     /// history are reset, because their windows would span the splice. The
     /// decoder applies the gap when its pending drain reaches `first_ts`.
+    /// A track holding no decoder and no queued entry (a DORMANT track, or a
+    /// candidate that has queued nothing) has no state spanning the gap, so
+    /// it takes no marker: otherwise the decoder it leases later would
+    /// start in the post-gap resync and drop its first word for nothing.
     fn note_input_gap(&mut self, first_ts: u64) {
         self.drain_refiner_into_pending();
         if let Some(refiner) = self.refiner.as_mut() {
@@ -1560,7 +1564,9 @@ impl Track {
         self.refiner_hops_since_reset = 0;
         self.clean_hist.clear();
         self.phase_hist.clear();
-        self.input_gaps.push_back(first_ts);
+        if self.decoder.is_some() || !self.pending.is_empty() {
+            self.input_gaps.push_back(first_ts);
+        }
     }
 
     /// MAN-108 (SPEC §2.4): HANG -> DORMANT. Flushes the decoder exactly as
@@ -5893,6 +5899,18 @@ mod tests {
     }
 
     #[test]
+    fn a_track_with_no_decoder_and_no_queue_takes_no_gap_marker() {
+        let (mut tm, hops) = keyed_manager(3_000);
+        tm.process_hops(&hops[..2_000], |m| m * 256);
+        let id = *tm.tracks.keys().next().unwrap();
+        let t = tm.tracks.get_mut(&id).unwrap();
+        t.decoder = None;
+        t.pending.clear();
+        t.note_input_gap(hops[2_000].m * 256);
+        assert!(t.input_gaps.is_empty(), "nothing spans the gap");
+    }
+
+    #[test]
     fn input_gap_drains_the_refiners_backlog_before_resetting_it() {
         let n = 64;
         let mut tm = TrackManager::new(
@@ -5961,6 +5979,9 @@ mod tests {
         let id = *tm.tracks.keys().next().unwrap();
         let t = tm.tracks.get_mut(&id).unwrap();
         let leased = t.decoder.take().expect("the keyed track decodes");
+        // A pre-gap entry still queued for the lease.
+        let before = hops[1_999].m * 256;
+        t.pending.push((1.0, 1.0, None, before, 20.0, 14_000_000.0));
         t.note_input_gap(hops[2_000].m * 256);
         tm.process_hops(&hops[2_000..2_500], |m| m * 256);
         let t = tm.tracks.get_mut(&id).unwrap();

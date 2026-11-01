@@ -114,6 +114,9 @@ const SNR_BW_CORR_DB: f32 = 14.3;
 /// tracker is not ready and no mark has been seen yet: SPEC §4.1's slowest
 /// dit (8 WPM), so only a long space resynchronizes.
 const WARMUP_RESYNC_DIT_MS: f32 = 150.0;
+/// MAN-202: the shortest dit the warm-up resync unit may take, SPEC §4.1's
+/// 60 WPM clamp (`timing.rs` `DIT_CLAMP_MS`).
+const WARMUP_RESYNC_MIN_DIT_MS: f32 = 20.0;
 
 /// Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 pub struct TrackDecoder {
@@ -436,7 +439,12 @@ impl TrackDecoder {
         let unit = if self.tracker.ready() {
             self.gap_unit_ms()
         } else {
-            self.warmup_min_mark_ms.unwrap_or(WARMUP_RESYNC_DIT_MS)
+            // Clamped to SPEC §4.1's fastest dit (60 WPM): a one- or two-hop
+            // noise blip seen in warm-up must not shrink the unit so far
+            // that an element space reads as a character gap.
+            self.warmup_min_mark_ms
+                .unwrap_or(WARMUP_RESYNC_DIT_MS)
+                .max(WARMUP_RESYNC_MIN_DIT_MS)
         };
         self.gaps.clone().classify(ms, unit) != GapClass::InterElement
     }
