@@ -14,6 +14,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The longest a paced wait sleeps before it checks the stop flag again
+/// (MAN-453), as `manta-cli`'s reconnect backoff does.
+const PACED_WAIT_SLICE: Duration = Duration::from_millis(100);
+
 /// Opens the next pass of a looped recording. The same shape as
 /// `manta-cli`'s `reconnect::Opener`.
 pub type Reopen = Box<dyn FnMut() -> Result<Box<dyn IqSource>>>;
@@ -24,6 +28,7 @@ pub type Reopen = Box<dyn FnMut() -> Result<Box<dyn IqSource>>>;
 /// buffer about to be returned, against one start instant, so a late chunk
 /// is absorbed rather than compounded. Once the consumer is behind the
 /// recording it never sleeps: pacing degrades to unpaced, never stalls.
+/// With a stop flag (`with_stop_flag`), a set flag ends a wait early.
 pub struct PacedSource {
     inner: Box<dyn IqSource>,
     fs: f64,
@@ -37,6 +42,8 @@ pub struct PacedSource {
     /// charging that to the recording would shorten the window a client has
     /// to connect in (MAN-121 round 2).
     start: Option<Instant>,
+    /// Ends a wait early once set (MAN-453).
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl PacedSource {
@@ -53,7 +60,36 @@ impl PacedSource {
             delivered: 0,
             pending_gap: None,
             start: None,
+            stop: None,
         })
+    }
+
+    /// Ends a pacing wait within `PACED_WAIT_SLICE` once `stop` is set
+    /// (MAN-453). The read still returns what it read, so only the wait is
+    /// cut short: one recorded outage is one wait as long as the outage.
+    pub fn with_stop_flag(mut self, stop: Arc<AtomicBool>) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Sleeps `delay`, in slices when there is a stop flag, and returns early
+    /// once it is set.
+    fn wait(&self, delay: Duration) {
+        let Some(stop) = &self.stop else {
+            std::thread::sleep(delay);
+            return;
+        };
+        let deadline = Instant::now() + delay;
+        loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            std::thread::sleep(PACED_WAIT_SLICE.min(deadline - now));
+        }
     }
 
     /// Wall-clock since the first `read`, or zero before it.
@@ -119,7 +155,7 @@ impl IqSource for PacedSource {
         // so even `listen`'s first read (the whole 2 s calibration buffer)
         // waits for its own recording interval.
         if let Some(delay) = pacing_delay(self.delivered, self.fs, self.elapsed()) {
-            std::thread::sleep(delay);
+            self.wait(delay);
         }
         Ok(n)
     }
@@ -710,6 +746,58 @@ mod tests {
         );
         assert_eq!(paced.delivered, 4 + 1_000 + 8 + 5);
         assert_eq!(paced.take_discontinuity(), None);
+    }
+
+    /// MAN-453: a stop during a recorded outage's wait ends it within a
+    /// slice; the read keeps its samples and the gap, and the count is
+    /// unchanged.
+    #[test]
+    fn a_stop_ends_a_paced_gap_wait_and_keeps_the_read() {
+        // 1 kS/s, a 600 s gap before the second read.
+        let inner = gap_source(&[(None, 4), (Some(600_000), 8)], 1000.0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut paced = PacedSource::new(Box::new(inner))
+            .unwrap()
+            .with_stop_flag(stop.clone());
+        let setter = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(
+            read_gaps(&mut paced, 2),
+            vec![(4, None), (8, Some(600_000))]
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the stop took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(paced.delivered, 4 + 600_000 + 8);
+        setter.join().unwrap();
+    }
+
+    /// MAN-453: with the stop already set, a read does not wait at all.
+    #[test]
+    fn a_set_stop_flag_skips_the_pacing_wait() {
+        // 16000 samples at 8 kS/s would wait 2 s.
+        let samples = pattern(16_000);
+        let stop = Arc::new(AtomicBool::new(true));
+        let mut paced = PacedSource::new(Box::new(vec_source(samples.clone(), 8000.0)))
+            .unwrap()
+            .with_stop_flag(stop);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 16_000];
+        let start = Instant::now();
+        assert_eq!(paced.read(&mut buf).unwrap(), 16_000);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+        assert_eq!(buf, samples);
     }
 
     #[test]

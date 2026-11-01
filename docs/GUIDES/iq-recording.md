@@ -47,6 +47,10 @@ samples is 120 s at 48 kS/s.
 
   A restarted service therefore needs a new filename, or the old pair moved
   away first.
+- If the recording cannot start after the input opens (the directory
+  refuses the file, or the system has no thread left for the writer),
+  `run` exits 1 and removes what it created, so the same destination
+  works on the next start.
 - The directory must already exist and be writable by the service; manta
   creates no directories and does not rotate files. Under systemd, add the
   capture directory to the unit's writable paths, for example
@@ -131,6 +135,12 @@ does not finish in time:
 warning: IQ recording finalization timed out: session.cf32; completion is unconfirmed
 ```
 
+A recording reported this way was not published and will not be: its
+metadata stays `.partial`, which replay refuses. A writer that had already
+begun publishing when the 5 s ran out gets up to 2 s more and is reported
+as it ended. Only a publication that itself blocks longer than that, on a
+hung filesystem, can still appear after the warning.
+
 ## Replay a recording
 
 ```sh
@@ -200,6 +210,8 @@ Two limits apply to recordings with gaps:
 - `manta oracle` reads one continuous capture and refuses them.
 
 `--realtime` waits out each gap once, as the outage took that long live.
+A stop signal ends that wait within about 0.1 s, so a long recorded
+outage does not hold up shutdown.
 `--loop` keeps a gap at the end of the recording and reports it at the
 start of the next pass.
 
