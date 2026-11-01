@@ -2057,6 +2057,36 @@ fn rtty_spot(callsign: &str, freq_hz: f64) -> Spot {
     }
 }
 
+/// MAN-322 D5 on the shutdown path: the drain that flushes a client's
+/// queued spots at shutdown serves the listener's own mode only, as the
+/// live arm does. Spots published right before shutdown are drained, not
+/// read live, so a CW listener must still never write the RTTY one.
+#[tokio::test]
+async fn the_shutdown_drain_serves_only_the_listeners_mode() {
+    let (addr, bus, _metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let cw = sample_spot();
+    bus.publish(rtty_spot("W1AW", 14_080_170.0));
+    bus.publish(cw.clone());
+    bus.publish(rtty_spot("W2BBB", 14_085_000.0));
+    let _ = shutdown_tx.send(true);
+
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("connection never closed after the shutdown drain")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    assert_eq!(lines, [rbn_row(&bus, &cw)], "got {lines:?}");
+}
+
 /// Reads the next line, bounded so a missing spot fails instead of hanging.
 async fn next_line(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,

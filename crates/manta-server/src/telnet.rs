@@ -1070,6 +1070,11 @@ async fn handle_client(
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
+                            // MAN-322 D5: the drain serves this listener's
+                            // mode only, as the live arm does.
+                            if bus_spot.spot.mode != mode {
+                                continue;
+                            }
                             if let Some(min) = min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
