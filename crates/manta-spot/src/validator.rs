@@ -989,29 +989,22 @@ impl Validator {
                 track_id,
                 snr_2500_db,
                 freq_hz,
-                sample_ts: meta_ts,
                 ..
             } => {
-                let turn_silence_samples = self.turn_silence_samples;
                 let track = self.tracks.entry(*track_id).or_default();
                 let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
                 track.has_meta = true;
                 let sample_ts = track.last_sample_ts;
-                // MAN-201 D3: `TURN_SILENCE_SECONDS` with no character in
-                // progress after the newest word ends its turn, which
-                // settles that word's role; decide it now.
-                let silent_tail = track.current.text.is_empty()
-                    && track.words.back_mut().is_some_and(|back| {
-                        let silent = !back.ends_turn
-                            && meta_ts.saturating_sub(back.end_ts) >= turn_silence_samples;
-                        back.ends_turn |= silent;
-                        silent
-                    });
-                if silent_tail {
-                    return self.try_spot(*track_id, sample_ts, false);
-                }
+                // MAN-201 D3: no silence turn end is read from `TrackMeta`.
+                // Its timestamp runs ahead of a decoder that holds words
+                // back (the MAN-317 prior): measured on V8 with
+                // `prior = "on"`, comparing it with the newest word's
+                // boundary ended a turn after every word and spotted 40 of
+                // 50 clean calls instead of 45+. A silent tail settles on
+                // the next character (`CharDecoded`, same clock as the
+                // words) or at the track's close instead.
                 // Retry: a candidate held back by the has_meta gate is
                 // otherwise only ever re-evaluated by a later
                 // WordBoundary, which a short transmission may never
