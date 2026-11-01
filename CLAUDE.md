@@ -20,7 +20,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestry.test.sh
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
 packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_diff_safe,\
-decisions_index}
+decisions_index,field_node}
 cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
 cargo test -p manta-input -p manta-cli --features hpsdr --locked
 ```
