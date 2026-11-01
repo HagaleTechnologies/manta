@@ -95,11 +95,12 @@ required: a SkimSrv often covers bands manta does not.
 
 manta is taken to be up all night, so a manta outage shows as misses: it
 is a manta failure an operator must see. The reference is trusted only
-between each file's first and last report, so manta's unmatched spots
-outside that span grade `unknown` and leave every rate. Inside a file a
-reference outage shows only on the `reference silence` line (the longest
-gap between consecutive admitted reports inside the window), a hint never
-used to grade.
+between each file's first and last report from an admitted spotter, so
+manta's unmatched spots outside that span grade `unknown` and leave every
+rate; another skimmer's reports in the same file cover nothing. Inside a
+file a reference outage shows only on the `reference silence` line (the
+longest gap between consecutive admitted reports inside the window), a
+hint never used to grade.
 
 ### D6: own calls are not excluded from a transcript
 

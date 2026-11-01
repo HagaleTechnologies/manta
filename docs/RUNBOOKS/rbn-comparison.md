@@ -336,7 +336,8 @@ DX de W3XYZ-#:  14030.0  DL1ABC         19 dB  28 WPM  CQ      0110Z
   other line: a banner, a login prompt, a torn last line. Blank lines and
   CRLF endings are ignored.
 - Each file covers only the span from its first to its last CW report, as
-  each RBN CSV does, and spans join when at most 60 s apart.
+  each RBN CSV does, and spans join when at most 60 s apart. With
+  `--paired`, only reports from an admitted spotter count toward the span.
 - The node's own calls are not excluded: the transcript holds only that
   skimmer's spots, and a SkimSrv usually runs under the node's base call
   (manta `W3XYZ-1` beside SkimSrv `W3XYZ`). `--spotter W3XYZ` is accepted.
@@ -422,8 +423,10 @@ disagree + elsewhere + none + unknown the counted manta spots.
 
 - manta is taken to be up all night, so a manta outage shows as misses: an
   operator must see it. The reference is trusted only between each file's
-  first and last report, so manta's unmatched spots outside that span are
-  `unknown`, not false: a reference outage is not manta's fault.
+  first and last report from an admitted spotter, so manta's unmatched
+  spots outside that span are `unknown`, not false: a reference outage is
+  not manta's fault. Another skimmer's reports in the same file, as in an
+  RBN CSV, cover nothing.
 - Inside a file a reference outage shows only on the `reference silence`
   line. It is a hint to read the night's numbers with care, never used to
   grade.
