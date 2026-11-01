@@ -76,6 +76,11 @@ station_callsign = "N0CALL"
 #live_port = 7303                    # live-state stream (JSON Lines/WebSocket)
 #live_bind_addr = "127.0.0.1"        # live-state listener address
 
+# RTTY telnet server: the same greeting, commands and line_format as
+# telnet_port, serving RTTY spots only (telnet_port serves CW spots only).
+# Off unless set. Listens on bind_addr.
+#rtty_telnet_port = 7304             # RTTY-only DX-cluster telnet server
+
 # Telnet spot-line layout: "rbn" (the Reverse Beacon Network's layout,
 # which most loggers read) or "skimmer" (CW Skimmer's own layout, for
 # running behind an Aggregator).

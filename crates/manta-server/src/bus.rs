@@ -19,7 +19,7 @@
 //! program's spots never appear on manta's own outputs.
 
 use crate::relay::RelaySpot;
-use manta_spot::Spot;
+use manta_spot::{Spot, SpotMode};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -113,8 +113,12 @@ pub enum JsonItem {
 /// eviction pressure here is inherently rare (real callsign cardinality
 /// sits far under capacity; sustained floods are the exception, not the
 /// steady state).
+///
+/// Keyed on `(callsign, mode)` (MAN-322 D9): each telnet listener serves
+/// one mode, so `set dx filter unique` counts a call's occurrences in that
+/// listener's own mode.
 struct OccurrenceTracker {
-    counts: HashMap<String, (u32, u64)>,
+    counts: HashMap<(String, SpotMode), (u32, u64)>,
     next_touch: u64,
 }
 
@@ -126,11 +130,13 @@ impl OccurrenceTracker {
         }
     }
 
-    /// Records one occurrence of `callsign` and returns its new count.
-    fn touch(&mut self, callsign: &str) -> u32 {
+    /// Records one occurrence of `callsign` in `mode` and returns its new
+    /// count.
+    fn touch(&mut self, callsign: &str, mode: SpotMode) -> u32 {
         self.next_touch += 1;
         let touch = self.next_touch;
-        if let Some(entry) = self.counts.get_mut(callsign) {
+        let key = (callsign.to_string(), mode);
+        if let Some(entry) = self.counts.get_mut(&key) {
             entry.0 += 1;
             entry.1 = touch;
             return entry.0;
@@ -145,7 +151,7 @@ impl OccurrenceTracker {
                 self.counts.remove(&lru_key);
             }
         }
-        self.counts.insert(callsign.to_string(), (1, touch));
+        self.counts.insert(key, (1, touch));
         1
     }
 }
@@ -338,7 +344,7 @@ impl SpotBus {
                 .occurrence_counts
                 .lock()
                 .expect("occurrence_counts lock poisoned");
-            counts.touch(&spot.callsign)
+            counts.touch(&spot.callsign, spot.mode)
         };
         let bus_spot = BusSpot {
             spot,
@@ -775,6 +781,8 @@ mod tests {
             sample_ts,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1008,6 +1016,45 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().occurrence_count, 2);
     }
 
+    fn cw(callsign: &str) -> (String, SpotMode) {
+        (callsign.to_string(), SpotMode::Cw)
+    }
+
+    /// MAN-322 D9: a call's CW and RTTY occurrences are counted apart, on
+    /// the tracker and on the spots the bus publishes.
+    #[tokio::test]
+    async fn occurrence_counts_are_kept_per_mode() {
+        let mut tracker = OccurrenceTracker::new();
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 2);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Rtty), 1);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 3);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Rtty), 2);
+
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe();
+        let rtty = Spot {
+            mode: SpotMode::Rtty,
+            baud: Some(45.45),
+            ..sample_spot(0)
+        };
+        bus.publish(sample_spot(0));
+        bus.publish(sample_spot(1));
+        bus.publish(rtty);
+        let counts: Vec<(SpotMode, u32)> = [
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ]
+        .iter()
+        .map(|b| (b.spot.mode, b.occurrence_count))
+        .collect();
+        assert_eq!(
+            counts,
+            [(SpotMode::Cw, 1), (SpotMode::Cw, 2), (SpotMode::Rtty, 1)]
+        );
+    }
+
     #[test]
     fn occurrence_tracker_stays_bounded_under_an_unbounded_sequence_of_distinct_callsigns() {
         // MAN-62's core scenario: a source able to inject fabricated CW
@@ -1015,7 +1062,7 @@ mod tests {
         // not grow this map without bound.
         let mut tracker = OccurrenceTracker::new();
         for i in 0..(MAX_OCCURRENCE_ENTRIES + 5_000) {
-            tracker.touch(&format!("SYNTH{i}"));
+            tracker.touch(&format!("SYNTH{i}"), SpotMode::Cw);
         }
         assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
     }
@@ -1024,20 +1071,20 @@ mod tests {
     fn occurrence_tracker_evicts_the_least_recently_touched_entry_first() {
         let mut tracker = OccurrenceTracker::new();
         for i in 0..MAX_OCCURRENCE_ENTRIES {
-            tracker.touch(&format!("FILL{i}"));
+            tracker.touch(&format!("FILL{i}"), SpotMode::Cw);
         }
-        assert_eq!(tracker.counts.get("FILL0").unwrap().0, 1);
+        assert_eq!(tracker.counts.get(&cw("FILL0")).unwrap().0, 1);
 
         // One more distinct callsign past capacity must evict the
         // longest-untouched entry (FILL0, touched first and never since),
         // not some other arbitrary one.
-        tracker.touch("NEWCOMER");
+        tracker.touch("NEWCOMER", SpotMode::Cw);
         assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
         assert!(
-            !tracker.counts.contains_key("FILL0"),
+            !tracker.counts.contains_key(&cw("FILL0")),
             "the least-recently-touched entry must be evicted first"
         );
-        assert!(tracker.counts.contains_key("NEWCOMER"));
+        assert!(tracker.counts.contains_key(&cw("NEWCOMER")));
     }
 
     #[test]
@@ -1048,29 +1095,29 @@ mod tests {
         // technical notes called out as needing a real design decision:
         // LRU-on-touch (not FIFO-by-insertion) is what makes it hold.
         let mut tracker = OccurrenceTracker::new();
-        tracker.touch("REAL_STATION"); // inserted first -- FIFO would evict it first
+        tracker.touch("REAL_STATION", SpotMode::Cw); // inserted first -- FIFO would evict it first
 
         for i in 0..MAX_OCCURRENCE_ENTRIES {
-            tracker.touch(&format!("FLOOD{i}"));
+            tracker.touch(&format!("FLOOD{i}"), SpotMode::Cw);
             if i % 100 == 0 {
-                tracker.touch("REAL_STATION"); // stays fresh throughout
+                tracker.touch("REAL_STATION", SpotMode::Cw); // stays fresh throughout
             }
         }
 
         assert!(
-            tracker.counts.contains_key("REAL_STATION"),
+            tracker.counts.contains_key(&cw("REAL_STATION")),
             "a repeatedly-touched real callsign must survive sustained flood eviction pressure"
         );
-        assert!(tracker.counts.get("REAL_STATION").unwrap().0 > 1);
+        assert!(tracker.counts.get(&cw("REAL_STATION")).unwrap().0 > 1);
     }
 
     #[test]
     fn occurrence_tracker_counts_correctly_alongside_bounded_eviction() {
         let mut tracker = OccurrenceTracker::new();
-        assert_eq!(tracker.touch("K5ARH"), 1);
-        assert_eq!(tracker.touch("K5ARH"), 2);
-        assert_eq!(tracker.touch("JA1ABC"), 1);
-        assert_eq!(tracker.touch("K5ARH"), 3);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 2);
+        assert_eq!(tracker.touch("JA1ABC", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 3);
     }
 
     #[test]

@@ -210,6 +210,8 @@ fn v52_emission_state_serializes_camel_case_and_documented_labels() {
         sample_ts: 4_123_456,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     };
     let json = serde_json::to_string(&base).unwrap();
     assert!(

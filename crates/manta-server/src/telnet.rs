@@ -16,6 +16,7 @@ use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::rbn;
 use crate::tasks::{ClientTasks, ConnectionLimiter, IpQuota};
+use manta_spot::SpotMode;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -275,6 +276,11 @@ fn sanitize_login(raw: &str) -> Option<String> {
 
 /// Accepts connections on `listener` until it errors, spawning one task
 /// per client. Never returns under normal operation.
+///
+/// MAN-322 D5: each listener serves one `mode`. `[server].telnet_port`
+/// serves CW only; the opt-in `rtty_telnet_port` serves RTTY only. A spot
+/// of the other mode never reaches the listener's clients, live or through
+/// `sh/dx`.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve(
     listener: TcpListener,
@@ -288,6 +294,7 @@ pub async fn serve(
     ip_command_limiter: IpRateLimiter,
     drain_deadline: Duration,
     line_format: rbn::LineFormat,
+    mode: SpotMode,
 ) {
     let quota_reject_log_limiter =
         IpRateLimiter::new(QUOTA_REJECT_LOG_MAX_PER_WINDOW, QUOTA_REJECT_LOG_WINDOW);
@@ -367,6 +374,7 @@ pub async fn serve(
                 rejection_log_limiter,
                 drain_deadline,
                 line_format,
+                mode,
             )
             .await;
             // MAN-59 review: a socket error mid-session (e.g. a
@@ -408,7 +416,8 @@ pub async fn serve(
         ip_command_limiter,
         log_enabled,
         rejection_log_limiter,
-        line_format
+        line_format,
+        mode
     ),
     fields(peer = %peer)
 )]
@@ -426,6 +435,7 @@ async fn handle_client(
     rejection_log_limiter: IpRateLimiter,
     drain_deadline: Duration,
     line_format: rbn::LineFormat,
+    mode: SpotMode,
 ) -> Result<(), ClientError> {
     if log_enabled {
         tracing::info!("telnet: client connected");
@@ -625,6 +635,13 @@ async fn handle_client(
             spot = rx.recv(), if !shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
+                        // MAN-322 D5: another mode's spot is not this
+                        // listener's to serve. Skipped before the unique
+                        // filter and not counted as a suppression: no
+                        // filter of this client's withheld it.
+                        if bus_spot.spot.mode != mode {
+                            continue;
+                        }
                         if let Some(min) = min_unique {
                             if bus_spot.occurrence_count <= min {
                                 metrics.record_filter_suppressed(1);
@@ -791,7 +808,7 @@ async fn handle_client(
                         // AFTER count selection, without backfilling, as
                         // before MAN-92.
                         let mut history =
-                            select_history_at(&bus, &query, unix_now_secs()).into_iter();
+                            select_history_at(&bus, &query, unix_now_secs(), mode).into_iter();
                         loop {
                             // MAN-45 remediate (round-16 P1, finding 2):
                             // checked BEFORE pulling the next history
@@ -1125,21 +1142,34 @@ const DEFAULT_SHOW_DX_COUNT: usize = 10;
 ///
 /// Band, mode and minutes filtering run over the whole retained history
 /// BEFORE count truncation, so `sh/dx 5 BAND 20m` returns the five newest
-/// 20m entries even when newer 40m ones exist. A minutes window keeps every
+/// 20m entries even when newer 40m ones exist. Only `listener_mode`'s
+/// entries are ever selected (MAN-322 D5). A minutes window keeps every
 /// match (no ten-row default); it is matched against each entry's heard
 /// time -- the Zulu time the row shows -- inclusive at both ends, so an
 /// entry stamped in the future is excluded. Every request is still bounded
 /// by the bus's heard-time window, newest-entry floor and `bus::MAX_HISTORY_SPOTS`
 /// ceiling (MAN-93).
-fn select_history_at(bus: &SpotBus, query: &ShowDxQuery, now_unix_secs: i64) -> Vec<BusSpot> {
-    // manta decodes CW only: CW matches every spot, RTTY none.
-    if query.mode == Some(QueryMode::Rtty) {
+fn select_history_at(
+    bus: &SpotBus,
+    query: &ShowDxQuery,
+    now_unix_secs: i64,
+    listener_mode: SpotMode,
+) -> Vec<BusSpot> {
+    // MAN-322 D5: a mode word intersects with the listener's own mode, so
+    // naming the other mode selects nothing. It still never filters the
+    // live stream (MAN-92); the listener's mode does that.
+    let query_mode = query.mode.map(|m| match m {
+        QueryMode::Cw => SpotMode::Cw,
+        QueryMode::Rtty => SpotMode::Rtty,
+    });
+    if query_mode.is_some_and(|m| m != listener_mode) {
         return Vec::new();
     }
     let in_band = |entry: &BusSpot| {
-        query
-            .band
-            .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
+        entry.spot.mode == listener_mode
+            && query
+                .band
+                .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
     };
     match query.selection {
         HistorySelection::Count(n) => {
@@ -1304,6 +1334,8 @@ mod tests {
             sample_ts: secs_after_epoch,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1329,28 +1361,44 @@ mod tests {
     #[test]
     fn legacy_count_selection_returns_the_newest_entries_oldest_first() {
         let bus = selector_bus();
-        assert!(select_history_at(&bus, &ShowDxQuery::DEFAULT, 0).is_empty());
+        assert!(select_history_at(&bus, &ShowDxQuery::DEFAULT, 0, SpotMode::Cw).is_empty());
         for i in 0..15 {
             bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
         }
         let expected_default: Vec<String> = (5..15).map(|i| format!("K{i}AA")).collect();
         assert_eq!(
-            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            calls(&select_history_at(
+                &bus,
+                &ShowDxQuery::DEFAULT,
+                0,
+                SpotMode::Cw
+            )),
             expected_default
         );
         assert_eq!(
             calls(&select_history_at(
                 &bus,
                 &q(HistorySelection::Count(Some(3)), None, None),
-                0
+                0,
+                SpotMode::Cw
             )),
             ["K12AA", "K13AA", "K14AA"]
         );
-        assert!(
-            select_history_at(&bus, &q(HistorySelection::Count(Some(0)), None, None), 0).is_empty()
-        );
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Count(Some(0)), None, None),
+            0,
+            SpotMode::Cw
+        )
+        .is_empty());
         assert_eq!(
-            select_history_at(&bus, &q(HistorySelection::Count(Some(1000)), None, None), 0).len(),
+            select_history_at(
+                &bus,
+                &q(HistorySelection::Count(Some(1000)), None, None),
+                0,
+                SpotMode::Cw
+            )
+            .len(),
             15
         );
     }
@@ -1370,13 +1418,19 @@ mod tests {
                 calls(&select_history_at(
                     &bus,
                     &q(selection, None, None),
-                    SELECTOR_EPOCH_SECS + 600
+                    SELECTOR_EPOCH_SECS + 600,
+                    SpotMode::Cw
                 )),
                 expected
             );
         }
         assert_eq!(
-            calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0)),
+            calls(&select_history_at(
+                &bus,
+                &ShowDxQuery::DEFAULT,
+                0,
+                SpotMode::Cw
+            )),
             expected[590..]
         );
     }
@@ -1392,7 +1446,8 @@ mod tests {
             calls(&select_history_at(
                 &bus,
                 &q(HistorySelection::Count(Some(usize::MAX)), None, None),
-                0
+                0,
+                SpotMode::Cw
             )),
             expected
         );
@@ -1419,7 +1474,8 @@ mod tests {
             calls(&select_history_at(
                 &bus,
                 &q(HistorySelection::Count(Some(2)), Some("20m"), None),
-                0
+                0,
+                SpotMode::Cw
             )),
             ["K2BBB", "K3CCC"]
         );
@@ -1431,14 +1487,16 @@ mod tests {
                     Some("20m"),
                     Some(QueryMode::Cw)
                 ),
-                0
+                0,
+                SpotMode::Cw
             )),
             ["K1AAA", "K2BBB", "K3CCC"]
         );
         assert!(select_history_at(
             &bus,
             &q(HistorySelection::Count(None), Some("15m"), None),
-            0
+            0,
+            SpotMode::Cw
         )
         .is_empty());
     }
@@ -1462,6 +1520,7 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Count(None), Some(name), None),
                 0,
+                SpotMode::Cw,
             ))
             .into_iter()
             .map(str::to_string)
@@ -1496,20 +1555,22 @@ mod tests {
         let now = SELECTOR_EPOCH_SECS + 1_000;
         let one_minute = q(HistorySelection::Window { secs: 60 }, None, None);
         assert_eq!(
-            calls(&select_history_at(&bus, &one_minute, now)),
+            calls(&select_history_at(&bus, &one_minute, now, SpotMode::Cw)),
             ["K1NOW", "K1EDGE", "K1MID"]
         );
         assert!(select_history_at(
             &bus,
             &q(HistorySelection::Window { secs: 0 }, None, None),
-            now
+            now,
+            SpotMode::Cw
         )
         .is_empty());
         assert_eq!(
             calls(&select_history_at(
                 &bus,
                 &q(HistorySelection::Window { secs: i64::MAX }, None, None),
-                now
+                now,
+                SpotMode::Cw
             )),
             ["K1NOW", "K1EDGE", "K1STALE", "K1MID"]
         );
@@ -1526,7 +1587,8 @@ mod tests {
             select_history_at(
                 &bus,
                 &q(HistorySelection::Window { secs: 600 }, None, None),
-                now
+                now,
+                SpotMode::Cw
             )
             .len(),
             15
@@ -1542,47 +1604,75 @@ mod tests {
         let now = SELECTOR_EPOCH_SECS + 3_600;
         let window = HistorySelection::Window { secs: 20 * 60 };
         assert_eq!(
-            calls(&select_history_at(&bus, &q(window, None, None), now)),
+            calls(&select_history_at(
+                &bus,
+                &q(window, None, None),
+                now,
+                SpotMode::Cw
+            )),
             ["K2NEW", "W3NEW"]
         );
         assert_eq!(
             calls(&select_history_at(
                 &bus,
                 &q(window, Some("20m"), Some(QueryMode::Cw)),
-                now
+                now,
+                SpotMode::Cw
             )),
             ["K2NEW"]
         );
     }
 
+    /// MAN-322 D5: each listener selects only its own mode's history, and
+    /// a mode word intersects with it. Count truncation runs after the mode
+    /// filter, so a listener's default ten rows are ten of its own.
     #[test]
-    fn cw_matches_all_of_mantas_spots_and_rtty_none() {
+    fn each_listener_mode_selects_only_its_own_history() {
         let bus = selector_bus();
         bus.publish(heard("K1AAA", TWENTY, 0));
-        bus.publish(heard("W2BBB", FORTY, 1));
-        let unfiltered = calls(&select_history_at(&bus, &ShowDxQuery::DEFAULT, 0))
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            calls(&select_history_at(
-                &bus,
-                &q(HistorySelection::Count(None), None, Some(QueryMode::Cw)),
-                0
-            )),
-            unfiltered
-        );
+        bus.publish(Spot {
+            mode: SpotMode::Rtty,
+            baud: Some(45.45),
+            ..heard("W2BBB", 14_080_170.0, 1)
+        });
+        for i in 0..12 {
+            bus.publish(heard(&format!("K{i}CW"), FORTY, 2 + i));
+        }
+        let now = SELECTOR_EPOCH_SECS + 20;
         for selection in [
             HistorySelection::Count(None),
             HistorySelection::Window { secs: i64::MAX },
         ] {
-            assert!(select_history_at(
-                &bus,
-                &q(selection, None, Some(QueryMode::Rtty)),
-                SELECTOR_EPOCH_SECS + 10
-            )
-            .is_empty());
+            for (listener, word, expected) in [
+                (SpotMode::Rtty, None, vec!["W2BBB"]),
+                (SpotMode::Rtty, Some(QueryMode::Rtty), vec!["W2BBB"]),
+                (SpotMode::Rtty, Some(QueryMode::Cw), vec![]),
+                (SpotMode::Cw, Some(QueryMode::Rtty), vec![]),
+            ] {
+                assert_eq!(
+                    calls(&select_history_at(
+                        &bus,
+                        &q(selection, None, word),
+                        now,
+                        listener
+                    )),
+                    expected,
+                    "{listener:?} listener, mode word {word:?}, {selection:?}"
+                );
+            }
+            for word in [None, Some(QueryMode::Cw)] {
+                let cw = select_history_at(&bus, &q(selection, None, word), now, SpotMode::Cw);
+                assert!(
+                    cw.iter().all(|e| e.spot.mode == SpotMode::Cw),
+                    "{selection:?}"
+                );
+                assert!(!calls(&cw).contains(&"W2BBB"), "{selection:?}");
+            }
         }
+        // Ten CW rows by default, none of them displaced by the RTTY entry.
+        let cw_default = select_history_at(&bus, &ShowDxQuery::DEFAULT, now, SpotMode::Cw);
+        let expected: Vec<String> = (2..12).map(|i| format!("K{i}CW")).collect();
+        assert_eq!(calls(&cw_default), expected);
     }
 
     #[test]

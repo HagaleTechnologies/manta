@@ -3519,6 +3519,8 @@ fn cli_json_doc_lists_every_field_both_ways() {
             sample_ts: 2_006_272,
             rst: Some("599".into()),
             qrl_query: true,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }],
         timing: Some(timing),
         rtty: vec![RttySignalReport {
