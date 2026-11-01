@@ -53,6 +53,14 @@ MAN-324's live-state tap, and the pipeline tests compare spots with and
 without a recording sink on V1 and V7 and on a two-input session. Because
 spots do not change, the CHANGELOG entry is under Added, not Decoder output.
 
+Two limits came out of the implementation review. A feed sends at most
+10000 levels: at up to 6 bytes a level, a wider source (16384 channels at
+1.536 MS/s) would exceed UDP's 65507-byte payload on every frame, so `run`
+warns and sends nothing for it instead (no resampling, D1 still holds). An
+IPv4-mapped IPv6 destination such as `[::ffff:224.0.0.1]:13064` is checked
+as the IPv4 address it maps, so D3's multicast and broadcast refusal covers
+it too.
+
 ## The datagram
 
 A 192 kS/s HPSDR centred on 14.050 MHz, input `hpsdr`, `SpectrumData`

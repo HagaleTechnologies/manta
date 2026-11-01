@@ -7158,9 +7158,14 @@ fn run_command() -> Result<std::process::ExitCode> {
             if spectrum_out.is_some() && needs_dial_freq(true, has_rf_aware_source, dial_freq_hz) {
                 bail!(spectrum_feed::NEEDS_RF_MESSAGE);
             }
+            // The input's name: its `name` key, else its type (MAN-13).
+            let spectrum_input = loaded
+                .inputs
+                .first()
+                .map_or(source_name, |n| n.name.as_str());
             let spectrum_bound = spectrum_out
                 .as_ref()
-                .map(|out| spectrum_feed::bind(source_name, out))
+                .map(|out| spectrum_feed::bind(spectrum_input, out))
                 .transpose()?;
             if config_path.is_some() && loaded.server.is_none() {
                 logging::note(&format!(

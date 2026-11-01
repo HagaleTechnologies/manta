@@ -619,17 +619,20 @@ fn spectrum_out(t: &InputToml) -> std::result::Result<Option<SpectrumOut>, Strin
     };
     let dest: std::net::SocketAddr = text.parse().map_err(|_| {
         format!(
-            "input.spectrum_udp must be an IP address and port such as \"127.0.0.1:13064\", \
+            "input.spectrum_udp must be an IP address and port such as \"127.0.0.1:{}\", \
              got {}",
+            manta_server::spectrum::N1MM_SPECTRUM_PORT,
             crate::fmt::quoted(text)
         )
     })?;
-    let ip = dest.ip();
+    // An IPv4-mapped IPv6 address is checked as the IPv4 address it is.
+    let ip = dest.ip().to_canonical();
     let broadcast = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
     if dest.port() == 0 || ip.is_unspecified() || ip.is_multicast() || broadcast {
         return Err(format!(
             "input.spectrum_udp must be the unicast address and port of the computer running \
-             N1MM+, such as \"127.0.0.1:13064\"; got {}",
+             N1MM+, such as \"127.0.0.1:{}\"; got {}",
+            manta_server::spectrum::N1MM_SPECTRUM_PORT,
             crate::fmt::quoted(text)
         ));
     }
@@ -2296,6 +2299,8 @@ mod tests {
             "[::]:13064",
             "239.1.2.3:13064",
             "[ff02::1]:13064",
+            "[::ffff:255.255.255.255]:13064",
+            "[::ffff:224.0.0.1]:13064",
             "255.255.255.255:13064",
         ] {
             let err = err_of(&format!("{SPECTRUM_HPSDR}spectrum_udp = \"{text}\"\n"));

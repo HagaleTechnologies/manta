@@ -63,10 +63,7 @@ pub(crate) type StartedFeed = (Arc<dyn SpectrumSink>, JoinHandle<()>);
 
 /// Starts `feed`'s sender thread. Its counters join `/metrics` only with
 /// `[server]`; the first `send_to` failure logs one warning.
-pub(crate) fn start(
-    feed: BoundFeed,
-    metrics: Option<&Metrics>,
-) -> Result<StartedFeed> {
+pub(crate) fn start(feed: BoundFeed, metrics: Option<&Metrics>) -> Result<StartedFeed> {
     let stats = match metrics {
         Some(m) => m.register_spectrum(feed.input.clone()),
         None => Arc::new(SpectrumStats::default()),
@@ -95,11 +92,11 @@ fn send_error_warning(input: &str, dest: SocketAddr, e: &std::io::Error) -> Stri
     )
 }
 
-/// Trims a kHz value to at most three decimals, as the datagram prints it.
-fn khz(hz: f64) -> String {
-    let s = format!("{:.3}", hz / 1000.0);
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
+/// The most levels one feed sends: at up to 6 bytes a level ("65535,")
+/// plus the XML around them, a datagram stays under UDP's 65507-byte
+/// payload limit. A wider source (16384 channels at 1.536 MS/s) sends
+/// nothing rather than failing every `send_to`.
+const MAX_LEVELS: usize = 10_000;
 
 /// The startup note (design section 2), from the same span the engine uses.
 pub(crate) fn startup_note(feed: &BoundFeed, span: &SpectrumSpan) -> String {
@@ -108,8 +105,8 @@ pub(crate) fn startup_note(feed: &BoundFeed, span: &SpectrumSpan) -> String {
          Spectrum Display, 3 per second",
         feed.input,
         span.bins.len(),
-        khz(span.low_hz),
-        khz(span.high_hz),
+        spectrum::khz(span.low_hz),
+        spectrum::khz(span.high_hz),
         feed.dest,
         feed.name
     )
@@ -121,6 +118,15 @@ pub(crate) fn no_span_warning(feed: &BoundFeed) -> String {
     format!(
         "warning: spectrum: input \"{}\" reports no RF passband the spectrum feed can send; \
          sending nothing to {}",
+        feed.input, feed.dest
+    )
+}
+
+/// The warning when the source has more channels than one datagram holds.
+fn too_wide_warning(feed: &BoundFeed, levels: usize) -> String {
+    format!(
+        "warning: spectrum: input \"{}\" would send {levels} levels, more than one UDP datagram \
+         holds ({MAX_LEVELS}); sending nothing to {}",
         feed.input, feed.dest
     )
 }
@@ -138,6 +144,10 @@ pub(crate) fn open(
     let factor =
         manta_spot::calibration_factor_from_ppm(freq_correction_ppm).map_err(|e| anyhow!(e))?;
     match manta_engine::spectrum_span(sample_rate, center_freq_hz, rf_passband_hz, factor) {
+        Some(span) if span.bins.len() > MAX_LEVELS => {
+            crate::logging::warning(&too_wide_warning(&feed, span.bins.len()));
+            Ok(None)
+        }
         Some(span) => {
             crate::logging::note(&startup_note(&feed, &span));
             start(feed, metrics).map(Some)

@@ -58,7 +58,7 @@ pub fn levels(power_db: &[f32]) -> Vec<u16> {
 
 /// Hz as kHz with at most 3 decimals, trailing zeros (and a bare dot)
 /// trimmed: `14_000_000.0` is `14000`, `14_145_906.25` is `14145.906`.
-fn khz(hz: f64) -> String {
+pub fn khz(hz: f64) -> String {
     let text = format!("{:.3}", hz / 1000.0);
     let text = text.trim_end_matches('0').trim_end_matches('.');
     if text == "-0" {
@@ -196,10 +196,6 @@ impl FrameSender {
         {
             self.stats.record_drop(SpectrumDrop::QueueFull);
         }
-    }
-
-    pub fn stats(&self) -> &Arc<SpectrumStats> {
-        &self.stats
     }
 }
 
