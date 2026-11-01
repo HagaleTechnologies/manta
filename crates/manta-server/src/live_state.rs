@@ -327,6 +327,8 @@ pub fn reason_label(r: Reason) -> &'static str {
         Reason::BeaconSpeed => "beaconSpeed",
         Reason::BeaconOverflow => "beaconOverflow",
         Reason::BeaconDiscarded => "beaconDiscarded",
+        Reason::LookupPending => "lookupPending",
+        Reason::LookupNotFound => "lookupNotFound",
     }
 }
 
@@ -621,6 +623,18 @@ mod tests {
                 Reason::BeaconDiscarded,
                 "withheld",
                 "beaconDiscarded",
+            ),
+            (
+                Verdict::Deferred,
+                Reason::LookupPending,
+                "deferred",
+                "lookupPending",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::LookupNotFound,
+                "withheld",
+                "lookupNotFound",
             ),
         ];
         for (verdict, reason, decision_s, reason_s) in cases {

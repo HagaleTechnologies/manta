@@ -1897,6 +1897,8 @@ const RTTY_LOG_CAP: usize = 4096;
 /// are absolute Hz before any ppm calibration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RttyLogEntry {
+    /// Latest diagnostic text decoded after recognition, at most 256 characters.
+    pub decoded_text: String,
     /// `manta_dsp::fsk::FskSignal::id`, stable while the signal is marked.
     pub id: u32,
     /// Upper tone.
@@ -2254,6 +2256,7 @@ impl TrackManager {
                 .find(|e| e.id == s.id && e.cleared_sample_ts.is_none())
             {
                 Some(e) => {
+                    e.decoded_text.clone_from(&s.decoded_text);
                     e.mark_hz = mark_hz;
                     e.space_hz = space_hz;
                     e.shift_hz = s.nominal_shift_hz;
@@ -2261,6 +2264,7 @@ impl TrackManager {
                 }
                 None => self.rtty_log.push(RttyLogEntry {
                     id: s.id,
+                    decoded_text: s.decoded_text.clone(),
                     mark_hz,
                     space_hz,
                     shift_hz: s.nominal_shift_hz,
@@ -3503,6 +3507,15 @@ impl TrackManager {
     /// Shared body of `finish` (`discontinuity == false`: genuine stream
     /// end, `SignalEnded`) and `finish_for_discontinuity` (`true`).
     fn close_all(&mut self, discontinuity: bool) -> Vec<DecoderEvent> {
+        // The final partial detector block may contain diagnostic characters
+        // newer than the last one-second recognition notification.
+        if let Some(fsk) = &self.fsk {
+            for entry in &mut self.rtty_log {
+                if let Some(signal) = fsk.signals().iter().find(|s| s.id == entry.id) {
+                    entry.decoded_text.clone_from(&signal.decoded_text);
+                }
+            }
+        }
         use rayon::prelude::*;
         // MAN-194: end-of-stream is another point where every remaining
         // track's refiner stops receiving new input -- drain each one's
@@ -3973,6 +3986,7 @@ mod tests {
             &mut iq,
             fs,
             &FskSpec {
+                mark_below_space: false,
                 mark_offset_hz: 15_000.0,
                 shift_hz: 170.0,
                 baud: 45.45,
@@ -4021,6 +4035,7 @@ mod tests {
         let fill = |tm: &mut TrackManager| {
             for id in 0..=RTTY_LOG_CAP as u32 {
                 tm.rtty_log.push(RttyLogEntry {
+                    decoded_text: String::new(),
                     id,
                     mark_hz: 14_085_170.0,
                     space_hz: 14_085_000.0,

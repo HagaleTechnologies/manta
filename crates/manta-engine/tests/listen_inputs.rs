@@ -992,3 +992,47 @@ fn a_signal_on_the_split_point_is_spotted_once() {
         got.spots
     );
 }
+
+/// MAN-318: answers `NotFound` for one call and `Exists` for the rest.
+struct NotFoundFor(&'static str);
+
+impl manta_spot::CallsignLookup for NotFoundFor {
+    fn check(&self, call: &str) -> manta_spot::LookupStatus {
+        manta_spot::LookupStatus::Known(if call == self.0 {
+            manta_spot::Existence::NotFound
+        } else {
+            manta_spot::Existence::Exists
+        })
+    }
+    fn settled(&self) -> Vec<(String, manta_spot::Existence)> {
+        Vec::new()
+    }
+    fn settle_all(&self) -> Vec<(String, manta_spot::Existence)> {
+        Vec::new()
+    }
+}
+
+#[test]
+fn a_lookup_on_the_shared_validator_holds_every_inputs_spots() {
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut spots = Vec::new();
+    listen_inputs(
+        open_inputs(vec![plain("a", seg_a()), plain("b", seg_b_true())], stop).unwrap(),
+        &PipelineConfig::default(),
+        SessionClock::Replay,
+        SharedObservers {
+            callsign_lookup: Some(Arc::new(NotFoundFor("W1AW"))),
+            ..Default::default()
+        },
+        |_| {},
+        |s| spots.push(s.clone()),
+        |_input, _n| {},
+        |_end| {},
+    )
+    .unwrap();
+    assert_eq!(
+        call_counts(&spots),
+        counts(&[("JA1ABC", 1), ("ZL2XYZ", 1)]),
+        "W1AW is heard on both inputs and withheld on both"
+    );
+}

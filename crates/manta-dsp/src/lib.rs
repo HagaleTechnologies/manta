@@ -20,5 +20,6 @@ pub mod fsk;
 pub mod hilbert;
 pub mod proto;
 pub mod refine;
+pub mod rtty;
 pub mod sample_guard;
 pub mod single;

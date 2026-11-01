@@ -97,6 +97,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
+  protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
+  overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
+  Each change is logged, and `/metrics` gains `manta_input_attenuation_db`
+  and `manta_input_attenuation_changes_total`.
 - MAN-309: `manta run --record-iq PATH` (or `record_iq` in each `[input]`/
   `[[input]]`) records the IQ it decodes, from any input, to a little-endian cf32 file plus `PATH.meta.jsonl` (rate,
   centre, start time, source passband and guards, input gaps). `decode`
@@ -280,6 +285,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-413: configs now reject duplicate `[[input]]` entry names even when
+  an earlier entry's `bands` expand into labelled streams such as
+  `x-60m-1` and `x-60m-2`. The error names the duplicate base name, avoiding
+  ambiguous `--input` selection and calibration saves to the wrong receiver.
 - MAN-343: `manta grade` reads each `--spots`/`--rbn` file once, however it
   is named (directly and through its directory, with `./` or `..`, or
   through a symlink). Before, a file named twice was graded twice, and a

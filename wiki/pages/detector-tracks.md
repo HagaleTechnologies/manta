@@ -8,8 +8,8 @@ sources:
   - docs/SPEC-decode-core.md#2-noise-floor--signal-presence-detection
   - ARCHITECTURE.md
 verified:
-  commit: d0fd24d
-  date: 2026-10-16
+  commit: f182847
+  date: 2026-10-30
 links:
   - pfb-channelizer
   - decode-chain
@@ -19,10 +19,10 @@ The detector estimates a per-channel noise floor by order statistics (a quantile
 ## How it works
 
 - Floor estimator + neighborhood/effective floor + gate: SPEC §2.1–2.3 (`manta-dsp::floor`).
-- Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`).
+- Track lifecycle state machine (IDLE → CANDIDATE → ACTIVE → HANG → CLOSED): SPEC §2.4 (`manta-engine::track`, now implemented — see `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md`). MAN-108's DORMANT, between HANG and CLOSED, releases a decoded track's decoder but keeps its `track_id` and channels for `detector.reacquire_ms`, so a faded signal resumes under one `track_id` ([decision record](../../docs/DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md)).
 - Adjacent-channel ownership so one signal yields exactly one track (no cross-channel ghost decodes): SPEC §2.5. This invariant is a V7/V8w pass criterion — see [[golden-vector-freeze]].
-- Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though external exposition as Prometheus metrics is explicit M3 scope (ARCHITECTURE §8), not yet wired.
-- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id, closure }` (`closure` is `SignalEnded`, or `Bookkeeping` for a merge, eviction, silent-track GC, RTTY suppression or source discontinuity, none of which means the signal ended; see SPEC §5 and `ClosureKind` in `manta-decode::events`; `process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
+- Track cap with lowest-SNR eviction; merges (SPEC §2.5) and evictions (ARCHITECTURE §4) are counted in-process via `TrackManager::close_counts` (issue #26) — **no silent coverage loss**, though they are not yet Prometheus metrics (ARCHITECTURE §8 lists evictions as still aspirational).
+- Every close that ever emitted a real `DecoderEvent` also produces a `DecoderEvent::TrackClosed { track_id, closure }` (`closure` is `SignalEnded`, or `Bookkeeping` for a merge, eviction, silent-track GC, RTTY suppression, unkeyed close or source discontinuity, none of which means the signal ended; see SPEC §5 and `ClosureKind` in `manta-decode::events`; `process_hops`/`finish()`, gated on `Track::has_emitted`) — the teardown signal [[spot-validation]]'s per-track_id state depends on. Normative contract: `docs/DECISIONS/2026-09-02-man19-track-closed-teardown-invariant.md`.
 
 ## Why it is shaped this way
 
@@ -90,6 +90,9 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   loud keyed tone's click skirt forms a span over the tone itself. See
   SPEC-decode-core.md §2.8 and the
   [decision record](../../docs/DECISIONS/2026-10-13-man313-non-cw-rejection.md).
+- MAN-372: SPEC §2.8 rule C′ marks a speech-shaped band region like a
+  span; `in_speech_band(k)` gates rules D and D′ and vetoes spawns only.
+  See the [decision record](../../docs/DECISIONS/2026-10-21-man372-speech-band-veto.md).
 - MAN-271 short transmissions: a single 2-character burst can never show
   rule D's `cycles >= 1` (the gate's 40 ms EMA bridges every gap — one
   ACTIVE run) or 150-hop span, so SPEC §2.8 rule D′ qualifies it at the

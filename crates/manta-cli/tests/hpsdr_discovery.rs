@@ -19,7 +19,7 @@ struct FakeDiscoveryRadio {
 
 impl FakeDiscoveryRadio {
     fn new(macs: Vec<[u8; 6]>) -> Self {
-        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(10)))
             .unwrap();

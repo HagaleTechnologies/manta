@@ -57,7 +57,7 @@ fn free_ports<const N: usize>() -> [u16; N] {
 }
 
 fn free_udp_port() -> u16 {
-    UdpSocket::bind("0.0.0.0:0")
+    UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()

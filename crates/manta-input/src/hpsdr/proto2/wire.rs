@@ -88,9 +88,20 @@ const HP_DRIVE: usize = 345;
 const HP_ALEX1: usize = 1428;
 /// High-priority `[1432..1436]`: alex0, BE u32 (D6 high-priority row).
 const HP_ALEX0: usize = 1432;
-/// High-priority `[1442]` and `[1443]` = 0: 0 dB step attenuators (D6
-/// high-priority row).
-const HP_STEP_ATTENUATORS: [usize; 2] = [1442, 1443];
+/// High-priority `[1443]`: ADC0's step attenuator, 0..=31 dB in 1 dB units;
+/// `[1442]` is ADC1's and stays 0 (MAN-308 D2; MAN-305 D6 set both to 0).
+const HP_STEP_ATTENUATOR_ADC0: usize = 1443;
+/// High-priority `[1442]`: ADC1's step attenuator, always 0 dB (MAN-308 D2).
+const HP_STEP_ATTENUATOR_ADC1: usize = 1442;
+/// The step attenuator's range, dB (MAN-308 D2).
+pub const MAX_STEP_ATTENUATION_DB: u8 = 31;
+
+/// Length of a high-priority status datagram (radio `port + 1` → host).
+pub const STATUS_LEN: usize = 60;
+/// Status `[5]`: ADC overload bits, bit i = ADC i, 1 = overload (MAN-308 D2).
+const STATUS_ADC_OVERLOAD: usize = 5;
+/// ADC0's overload bit in status `[5]` (MAN-308 D2).
+pub const ADC0_OVERLOAD: u8 = 0x01;
 
 /// IQ datagram `[12..14]`: bits per sample, BE u16 (D9).
 const IQ_BITS: usize = 12;
@@ -330,13 +341,16 @@ pub fn tx_specific_packet(seq: u32) -> [u8; TX_SPECIFIC_LEN] {
 }
 
 /// High-priority packet (D6): `run` sets byte 4 bit 0; the phase word goes
-/// to DDC0 and to the DUC; the Alex words to bytes 1428..1436.
+/// to DDC0 and to the DUC; the Alex words to bytes 1428..1436; ADC0's step
+/// attenuation to byte 1443, capped at [`MAX_STEP_ATTENUATION_DB`], and 0 dB
+/// to ADC1's byte 1442 (MAN-308 D2).
 pub fn high_priority_packet(
     seq: u32,
     run: bool,
     phase_word: u32,
     alex0: u32,
     alex1: u32,
+    step_attenuation_db: u8,
 ) -> Vec<u8> {
     let mut p = vec![0u8; HIGH_PRIORITY_LEN];
     put_u32(&mut p, SEQ_OFFSET, seq);
@@ -346,10 +360,15 @@ pub fn high_priority_packet(
     p[HP_DRIVE] = 0;
     put_u32(&mut p, HP_ALEX1, alex1);
     put_u32(&mut p, HP_ALEX0, alex0);
-    for at in HP_STEP_ATTENUATORS {
-        p[at] = 0;
-    }
+    p[HP_STEP_ATTENUATOR_ADC1] = 0;
+    p[HP_STEP_ATTENUATOR_ADC0] = step_attenuation_db.min(MAX_STEP_ATTENUATION_DB);
     p
+}
+
+/// The ADC overload bits of a high-priority status datagram (radio
+/// `port + 1` → host); `None` for any other length (MAN-308 D2).
+pub fn adc_overload_bits(buf: &[u8]) -> Option<u8> {
+    (buf.len() == STATUS_LEN).then(|| buf[STATUS_ADC_OVERLOAD])
 }
 
 /// Write `v` big-endian at `p[at..at + 4]`.
@@ -546,7 +565,7 @@ mod tests {
     #[test]
     fn high_priority_run_phase_word_and_filters() {
         let (a0, a1) = alex_words(orion().scheme, 7_030_000.0);
-        let p = high_priority_packet(3, true, phase_word(7_030_000.0), a0, a1);
+        let p = high_priority_packet(3, true, phase_word(7_030_000.0), a0, a1, 0);
         assert_eq!(p.len(), 1444);
         assert_eq!(&p[0..4], &[0, 0, 0, 3]);
         assert_eq!(p[4], 0x01);
@@ -563,11 +582,33 @@ mod tests {
     #[test]
     fn high_priority_stop_clears_run_only() {
         let w = phase_word(14_000_000.0);
-        let run = high_priority_packet(9, true, w, 0x0010_0002, 0x0010_0000);
-        let stop = high_priority_packet(9, false, w, 0x0010_0002, 0x0010_0000);
+        let run = high_priority_packet(9, true, w, 0x0010_0002, 0x0010_0000, 12);
+        let stop = high_priority_packet(9, false, w, 0x0010_0002, 0x0010_0000, 12);
         assert_eq!(stop[4], 0x00);
         let differ: Vec<usize> = (0..run.len()).filter(|&i| run[i] != stop[i]).collect();
         assert_eq!(differ, vec![4]);
+    }
+
+    #[test]
+    fn high_priority_writes_adc0_step_attenuation_to_byte_1443() {
+        let (a0, a1) = alex_words(orion().scheme, 7_030_000.0);
+        let p = high_priority_packet(3, true, phase_word(7_030_000.0), a0, a1, 12);
+        assert_eq!(p[1443], 12, "ADC0");
+        assert_eq!(p[1442], 0, "ADC1");
+        assert_rest_zero(&p, &[0..5, 9..13, 329..333, 1428..1436, 1443..1444]);
+        let capped = high_priority_packet(3, true, 0, 0, 0, 40);
+        assert_eq!(capped[1443], MAX_STEP_ATTENUATION_DB);
+        assert_eq!(capped[1442], 0);
+    }
+
+    #[test]
+    fn status_overload_bits_read_byte_5_of_a_60_byte_datagram() {
+        assert_eq!(adc_overload_bits(&[0u8; 60]), Some(0));
+        let mut d = [0u8; 60];
+        d[5] = 0x03;
+        assert_eq!(adc_overload_bits(&d), Some(0x03));
+        assert_eq!(adc_overload_bits(&d[..59]), None);
+        assert_eq!(adc_overload_bits(&[0x03u8; 61]), None);
     }
 
     #[test]

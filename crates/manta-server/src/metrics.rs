@@ -190,6 +190,17 @@ pub struct InputHealth {
     pub malformed_packets: u64,
 }
 
+/// MAN-308: one input's automatic attenuation, translated by `manta-cli`
+/// (no `manta-input` dependency here, ARCHITECTURE §3/§8). Absolute values;
+/// `set_input_attenuation` overwrites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InputAttenuation {
+    /// The step attenuation manta last set on the radio's ADC0, dB.
+    pub db: u8,
+    /// Changes automatic attenuation has made since the daemon started.
+    pub changes: u64,
+}
+
 /// Escapes a Prometheus label VALUE (not a label name, which is always one
 /// of this codebase's own `&'static str`s). MAN-128: the uplink target
 /// label is the first one in this codebase derived from operator-supplied
@@ -261,6 +272,53 @@ impl ListRefreshOutcome {
             ListRefreshOutcome::Failed => 2,
         }
     }
+}
+
+/// MAN-318: one callsign request's result -- the `outcome` label of
+/// `manta_callsign_lookups_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallsignLookupOutcome {
+    /// QRZ.com lists the call.
+    Found,
+    /// QRZ.com answered that it does not list the call.
+    NotFound,
+    /// No answer: a timeout, a network or HTTP error, a refused login, or
+    /// skipped while lookups pause after one of those.
+    Failed,
+}
+
+impl CallsignLookupOutcome {
+    /// Render order of `manta_callsign_lookups_total`'s outcomes.
+    const ALL: [CallsignLookupOutcome; 3] = [
+        CallsignLookupOutcome::Found,
+        CallsignLookupOutcome::NotFound,
+        CallsignLookupOutcome::Failed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CallsignLookupOutcome::Found => "found",
+            CallsignLookupOutcome::NotFound => "not_found",
+            CallsignLookupOutcome::Failed => "failed",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            CallsignLookupOutcome::Found => 0,
+            CallsignLookupOutcome::NotFound => 1,
+            CallsignLookupOutcome::Failed => 2,
+        }
+    }
+}
+
+/// MAN-318: the `manta_callsign_lookup*` series, once the lookup is on.
+#[derive(Debug, Default, Clone, Copy)]
+struct CallsignLookupCounts {
+    /// `manta_callsign_lookups_total`, by `CallsignLookupOutcome::index`.
+    totals: [u64; 3],
+    withheld: u64,
+    unverified: u64,
 }
 
 /// MAN-316: one reference list's series across the three `manta_list_*`
@@ -865,6 +923,10 @@ pub struct Metrics {
     /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
     /// Unlike `input_health`, every source publishes it, at 0 from startup.
     input_bad_samples: RwLock<BTreeMap<String, u64>>,
+    /// MAN-308: automatic attenuation per source, fed by `manta-cli`'s
+    /// 1 Hz poller. Only an hpsdr input with `auto_attenuation` that opened
+    /// as protocol 2 publishes, so every other source has no series.
+    input_attenuation: RwLock<BTreeMap<String, InputAttenuation>>,
     /// MAN-14: each input's hearing -- spots, distinct calls, cross-input
     /// dedupe withholds, silence -- in registration (config) order. Only
     /// the multi-input daemon registers rows, so a one-input `/metrics`,
@@ -874,6 +936,9 @@ pub struct Metrics {
     /// startup resolution and list refresher. Ordered so `/metrics`
     /// renders the lists in a stable order.
     lists: Mutex<BTreeMap<&'static str, ListMetrics>>,
+    /// MAN-318: `None` until `enable_callsign_lookup`, so a run without
+    /// `[callsign_lookup]` publishes no samples.
+    callsign_lookup: Mutex<Option<CallsignLookupCounts>>,
     /// MAN-128: one handle per configured `[[rbn_uplink]]` target,
     /// registered in config order before `uplink::serve` is spawned for it
     /// (so a never-connected or disabled target still renders). The seven
@@ -1632,6 +1697,15 @@ impl Metrics {
             .insert(source.to_string(), health);
     }
 
+    /// MAN-308: `source`'s automatic attenuation level and change count.
+    /// Overwrites: the values are absolute.
+    pub fn set_input_attenuation(&self, source: &str, attenuation: InputAttenuation) {
+        self.input_attenuation
+            .write()
+            .expect("input_attenuation lock poisoned")
+            .insert(source.to_string(), attenuation);
+    }
+
     /// MAN-234: the engine's running count of replaced input samples for
     /// `source`. Keeps the maximum, so a stale or out-of-order injection
     /// can never make the counter go backwards.
@@ -1756,6 +1830,41 @@ impl Metrics {
         if outcome != ListRefreshOutcome::Failed {
             entry.last_success = Some(at);
         }
+    }
+
+    /// MAN-318: the callsign lookup is on for this run, so its three
+    /// families publish, starting at 0. Idempotent.
+    pub fn enable_callsign_lookup(&self) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default);
+    }
+
+    /// MAN-318: counts one callsign request's outcome.
+    pub fn record_callsign_lookup(&self, outcome: CallsignLookupOutcome) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .totals[outcome.index()] += 1;
+    }
+
+    /// MAN-318: `n` more spots withheld because QRZ.com does not list the call.
+    pub fn record_callsign_lookup_withheld(&self, n: u64) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .withheld += n;
+    }
+
+    /// MAN-318: `n` more spots published without a QRZ.com answer.
+    pub fn record_callsign_lookup_unverified(&self, n: u64) {
+        self.callsign_lookup_counts()
+            .get_or_insert_with(Default::default)
+            .unverified += n;
+    }
+
+    /// MAN-318: tolerating a poisoned lock, as `list_metrics` does.
+    fn callsign_lookup_counts(&self) -> std::sync::MutexGuard<'_, Option<CallsignLookupCounts>> {
+        self.callsign_lookup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// MAN-316: `list` was last confirmed current at `at` without an
@@ -2324,6 +2433,35 @@ impl Metrics {
             ));
         }
 
+        // MAN-308: automatic attenuation, only for inputs that run it.
+        let attenuation = self
+            .input_attenuation
+            .read()
+            .expect("input_attenuation lock poisoned");
+        out.push_str(
+            "# HELP manta_input_attenuation_db Step attenuation automatic attenuation has set on the radio's ADC0, in dB, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_attenuation_db gauge\n");
+        for (source, a) in attenuation.iter() {
+            out.push_str(&format!(
+                "manta_input_attenuation_db{{source=\"{}\"}} {}\n",
+                escape_label_value(source),
+                a.db
+            ));
+        }
+        out.push_str(
+            "# HELP manta_input_attenuation_changes_total Step attenuator changes automatic attenuation has made, per source.\n",
+        );
+        out.push_str("# TYPE manta_input_attenuation_changes_total counter\n");
+        for (source, a) in attenuation.iter() {
+            out.push_str(&format!(
+                "manta_input_attenuation_changes_total{{source=\"{}\"}} {}\n",
+                escape_label_value(source),
+                a.changes
+            ));
+        }
+        drop(attenuation);
+
         // MAN-14: each input's hearing, multi-input only, 0 from startup.
         // One read for all four families. `[[input]]` names are
         // `[A-Za-z0-9._-]`, so they need no label escaping.
@@ -2411,6 +2549,41 @@ impl Metrics {
             }
         }
         drop(lists);
+
+        let lookup = *self.callsign_lookup_counts();
+        out.push_str(
+            "# HELP manta_callsign_lookups_total Callsign lookups by outcome: found and not_found are QRZ.com's answers; failed is no answer (none within 10 s, a network or HTTP error, a refused login, or skipped while lookups pause after one of those).\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookups_total counter\n");
+        if let Some(c) = &lookup {
+            for outcome in CallsignLookupOutcome::ALL {
+                out.push_str(&format!(
+                    "manta_callsign_lookups_total{{outcome=\"{}\"}} {}\n",
+                    outcome.label(),
+                    c.totals[outcome.index()]
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP manta_callsign_lookup_withheld_total Spots not published because QRZ.com does not list the callsign (a fresh or a cached answer).\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookup_withheld_total counter\n");
+        if let Some(c) = &lookup {
+            out.push_str(&format!(
+                "manta_callsign_lookup_withheld_total {}\n",
+                c.withheld
+            ));
+        }
+        out.push_str(
+            "# HELP manta_callsign_lookup_unverified_total Spots published without a QRZ.com answer: the lookup failed, was unanswered 10 s after the spot was held, or the lookup queue was full.\n",
+        );
+        out.push_str("# TYPE manta_callsign_lookup_unverified_total counter\n");
+        if let Some(c) = &lookup {
+            out.push_str(&format!(
+                "manta_callsign_lookup_unverified_total {}\n",
+                c.unverified
+            ));
+        }
 
         out.push_str("# HELP manta_uplink_sent_total Spots forwarded to the RBN uplink target.\n");
         out.push_str("# TYPE manta_uplink_sent_total counter\n");
@@ -3292,6 +3465,36 @@ mod tests {
     }
 
     // MAN-56: input-layer packet loss/malformed counters.
+
+    #[test]
+    fn input_attenuation_has_no_samples_until_set() {
+        let text = Metrics::new().render_prometheus_text();
+        assert!(text.contains("# TYPE manta_input_attenuation_db gauge\n"));
+        assert!(text.contains("# TYPE manta_input_attenuation_changes_total counter\n"));
+        assert!(!text.contains("manta_input_attenuation_db{"), "{text}");
+        assert!(
+            !text.contains("manta_input_attenuation_changes_total{"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn input_attenuation_renders_gauge_and_counter_per_source() {
+        let m = Metrics::new();
+        m.set_input_attenuation("hpsdr", InputAttenuation { db: 12, changes: 2 });
+        m.set_input_attenuation("40m", InputAttenuation { db: 0, changes: 0 });
+        let text = m.render_prometheus_text();
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 12\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"hpsdr\"} 2\n"));
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"40m\"} 0\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"40m\"} 0\n"));
+        // A second set overwrites rather than adds.
+        m.set_input_attenuation("hpsdr", InputAttenuation { db: 6, changes: 3 });
+        let text = m.render_prometheus_text();
+        assert!(text.contains("\nmanta_input_attenuation_db{source=\"hpsdr\"} 6\n"));
+        assert!(text.contains("\nmanta_input_attenuation_changes_total{source=\"hpsdr\"} 3\n"));
+        assert!(!text.contains("manta_input_attenuation_db{source=\"hpsdr\"} 12"));
+    }
 
     #[test]
     fn renders_per_source_input_health_as_labeled_counters() {
@@ -4593,6 +4796,67 @@ mod tests {
         text.lines()
             .filter(|l| l.starts_with(&format!("{family}{{")))
             .collect()
+    }
+
+    fn callsign_lookup_samples(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter(|l| l.starts_with("manta_callsign_lookup"))
+            .collect()
+    }
+
+    #[test]
+    fn callsign_lookup_families_render_help_without_samples_until_enabled() {
+        let text = Metrics::new().render_prometheus_text();
+        for family in [
+            "manta_callsign_lookups_total",
+            "manta_callsign_lookup_withheld_total",
+            "manta_callsign_lookup_unverified_total",
+        ] {
+            assert!(
+                text.contains(&format!("# TYPE {family} counter\n")),
+                "{family}"
+            );
+        }
+        assert!(callsign_lookup_samples(&text).is_empty());
+    }
+
+    #[test]
+    fn callsign_lookup_series_start_at_zero_when_enabled() {
+        let m = Metrics::new();
+        m.enable_callsign_lookup();
+        assert_eq!(
+            callsign_lookup_samples(&m.render_prometheus_text()),
+            [
+                r#"manta_callsign_lookups_total{outcome="found"} 0"#,
+                r#"manta_callsign_lookups_total{outcome="not_found"} 0"#,
+                r#"manta_callsign_lookups_total{outcome="failed"} 0"#,
+                "manta_callsign_lookup_withheld_total 0",
+                "manta_callsign_lookup_unverified_total 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn callsign_lookup_counts_accumulate() {
+        let m = Metrics::new();
+        m.enable_callsign_lookup();
+        m.record_callsign_lookup(CallsignLookupOutcome::Found);
+        m.record_callsign_lookup(CallsignLookupOutcome::Found);
+        m.record_callsign_lookup(CallsignLookupOutcome::NotFound);
+        m.record_callsign_lookup(CallsignLookupOutcome::Failed);
+        m.record_callsign_lookup_withheld(3);
+        m.record_callsign_lookup_unverified(2);
+        m.enable_callsign_lookup(); // idempotent: keeps the counts
+        assert_eq!(
+            callsign_lookup_samples(&m.render_prometheus_text()),
+            [
+                r#"manta_callsign_lookups_total{outcome="found"} 2"#,
+                r#"manta_callsign_lookups_total{outcome="not_found"} 1"#,
+                r#"manta_callsign_lookups_total{outcome="failed"} 1"#,
+                "manta_callsign_lookup_withheld_total 3",
+                "manta_callsign_lookup_unverified_total 2",
+            ]
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ use num_complex::Complex32;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
@@ -121,6 +122,17 @@ fn iq_packet(receivers: usize, seq: u32, start: usize, samples: &[Vec<Complex32>
     }
     packet
 }
+/// A scheduling delay must stretch delivery, not become a burst: owing more
+/// than `max_debt` of samples would machine-gun up to 64 packets per loop
+/// iteration and can overflow the receive path, losing samples for good.
+/// Falling behind wall time is harmless — the decoder consumes by sample
+/// count — so the debt is dropped, never repaid.
+fn clamp_due(due: Instant, now: Instant, max_debt: Duration) -> Instant {
+    match now.checked_sub(max_debt) {
+        Some(floor) if due < floor => floor,
+        _ => due,
+    }
+}
 impl Radio {
     fn start(capacity: Option<u8>, samples: Option<IqSamples>) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -198,8 +210,11 @@ impl Radio {
                         if let Some(samples) = &samples {
                             let receivers = records.lock().unwrap()[&peer].count.unwrap() as usize;
                             let per_packet = 2 * (504 / (6 * receivers + 2));
-                            // Bound each burst so control/stop traffic is serviced
-                            // even when the test runner falls behind wall time.
+                            const MAX_SEND_DEBT: Duration = Duration::from_millis(10);
+                            due = clamp_due(due, Instant::now(), MAX_SEND_DEBT);
+                            // Beyond the debt clamp above, each burst stays
+                            // bounded so control/stop traffic is serviced
+                            // even when the runner falls behind wall time.
                             for _ in 0..64 {
                                 if Instant::now() < due {
                                     break;
@@ -315,8 +330,15 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, why: impl 
         thread::sleep(Duration::from_millis(30));
     }
 }
+<<<<<<< HEAD
 /// Waits for the condition while resetting the stall clock on each new progress
 /// value. The hard ceiling bounds even a wait that keeps making progress.
+=======
+/// Waits for `condition`, tolerating slowness: the clock that can fail the
+/// wait is reset whenever `progress()` returns a new value, and a hard
+/// `ceiling` bounds the total. A total stall fails after `idle` — exactly
+/// as fast as today's fixed budget — so real breakage still fails.
+>>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
 fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
     idle: Duration,
     ceiling: Duration,
@@ -353,6 +375,7 @@ fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
         thread::sleep(Duration::from_millis(30));
     }
 }
+<<<<<<< HEAD
 
 #[test]
 fn wait_until_progress_returns_when_condition_holds() {
@@ -425,6 +448,19 @@ fn wait_until_progress_fails_at_ceiling_despite_progress() {
     assert!(start.elapsed() < ceiling * 3);
 }
 
+=======
+/// The two multi-receiver decode tests each run a 4x192 kHz daemon; on a
+/// 3-4 vCPU CI runner they saturate the box when run concurrently and the
+/// spot waits starve (MAN-454). Heavy tests take this for their whole body.
+static HEAVY: Mutex<()> = Mutex::new(());
+fn queue_drop_lines(metrics: &str) -> Vec<String> {
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("manta_input_queue_dropped_samples_total"))
+        .map(|line| line.to_string())
+        .collect()
+}
+>>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
 fn request(port: u16, path: &str) -> String {
     let Ok(mut stream) = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
@@ -504,6 +540,7 @@ fn assert_allocation(session: &Session, frequencies: &[u32]) {
 
 #[test]
 fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
+    let _heavy = HEAVY.lock().unwrap_or_else(|p| p.into_inner());
     let radio = Radio::start(Some(4), Some(fixture()));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manta.toml");
@@ -576,9 +613,24 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
     let _reader = ReaderGuard(json_stop, Some(json));
     radio.mode.store(1, Ordering::Relaxed);
     wait_until_progress(
+<<<<<<< HEAD
         Duration::from_secs(80),  // Keep the existing budget for a complete stall.
         Duration::from_secs(300), // Bound total time even when spots keep arriving.
         || daemon.output.lock().unwrap().len(),
+=======
+        Duration::from_secs(80),
+        Duration::from_secs(300),
+        || -> Vec<String> {
+            let spots = daemon.output.lock().unwrap();
+            let mut calls: Vec<String> = spots
+                .iter()
+                .filter_map(|s| s["dxCall"].as_str().map(str::to_string))
+                .collect();
+            calls.sort();
+            calls.dedup();
+            calls
+        },
+>>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
         || {
             let spots = daemon.output.lock().unwrap();
             CALLS
@@ -587,8 +639,9 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
         },
         || {
             format!(
-                "spots {:?}; {}",
+                "spots {:?}; queue {}; {}",
                 daemon.output.lock().unwrap(),
+                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
                 daemon.errors.lock().unwrap()
             )
         },
@@ -724,6 +777,7 @@ fn selected_check_uses_receiver_zero_and_does_not_probe() {
 
 #[test]
 fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receivers() {
+    let _heavy = HEAVY.lock().unwrap_or_else(|p| p.into_inner());
     let radio = Radio::start(Some(4), Some(fixture()));
     // The independent radio uses a distinct call. It starts with malformed
     // data, then supplies real IQ during the first radio's outage.
@@ -736,8 +790,10 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
     let daemon = Daemon::start(&path);
     daemon.ready();
     radio.mode.store(1, Ordering::Relaxed);
-    wait_until(
+    wait_until_progress(
         Duration::from_secs(70),
+        Duration::from_secs(300),
+        || daemon.output.lock().unwrap().len(),
         || {
             daemon
                 .output
@@ -746,7 +802,14 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .iter()
                 .any(|s| s["dxCall"] == "JA1ABC")
         },
-        || daemon.errors.lock().unwrap().clone(),
+        || {
+            format!(
+                "spots {:?}; queue {}; {}",
+                daemon.output.lock().unwrap(),
+                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                daemon.errors.lock().unwrap()
+            )
+        },
     );
     let spot = daemon
         .output
@@ -768,8 +831,10 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         Duration::from_secs(20),
     );
     independent.mode.store(1, Ordering::Relaxed);
-    wait_until(
+    wait_until_progress(
         Duration::from_secs(70),
+        Duration::from_secs(300),
+        || daemon.output.lock().unwrap().len(),
         || {
             daemon
                 .output
@@ -778,7 +843,14 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .iter()
                 .any(|s| s["dxCall"] == "VK2ABC")
         },
-        || daemon.errors.lock().unwrap().clone(),
+        || {
+            format!(
+                "spots {:?}; queue {}; {}",
+                daemon.output.lock().unwrap(),
+                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                daemon.errors.lock().unwrap()
+            )
+        },
     );
     let health = request(ports[2], "/healthz");
     assert!(health.contains("source independent: healthy"), "{health}");
@@ -791,8 +863,10 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         &[("80m", true), ("40m", true)],
         Duration::from_secs(30),
     );
-    wait_until(
+    wait_until_progress(
         Duration::from_secs(70),
+        Duration::from_secs(300),
+        || daemon.output.lock().unwrap().len(),
         || {
             daemon
                 .output
@@ -801,7 +875,14 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
                 .iter()
                 .any(|s| s["dxCall"] == "DL1ABC")
         },
-        || daemon.errors.lock().unwrap().clone(),
+        || {
+            format!(
+                "spots {:?}; queue {}; {}",
+                daemon.output.lock().unwrap(),
+                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                daemon.errors.lock().unwrap()
+            )
+        },
     );
     let spot = daemon
         .output
@@ -869,4 +950,150 @@ fn failed_startup_retires_another_groups_completed_radio() {
         || format!("{:?}", opened.generations()),
     );
     assert_eq!(opened.generations().len(), 1);
+}
+
+fn panic_message(result: &Result<(), Box<dyn std::any::Any + Send>>) -> String {
+    let payload = match result {
+        Ok(()) => panic!("expected the wait to fail"),
+        Err(payload) => payload,
+    };
+    if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else {
+        panic!("panic payload was not a string")
+    }
+}
+
+#[test]
+fn wait_until_progress_returns_when_condition_holds() {
+    let mut snapshots = 0;
+    wait_until_progress(
+        Duration::from_millis(60),
+        Duration::from_secs(5),
+        || {
+            snapshots += 1;
+            snapshots
+        },
+        || true,
+        || "condition already holds".into(),
+    );
+    assert_eq!(snapshots, 1, "an already-met goal must not poll progress");
+}
+
+#[test]
+fn wait_until_progress_fails_after_idle_with_no_progress() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        wait_until_progress(
+            Duration::from_millis(120),
+            Duration::from_secs(30),
+            || 0usize,
+            || false,
+            || "spots never arrive".into(),
+        );
+    }));
+    let message = panic_message(&result);
+    assert!(message.contains("no progress"), "{message}");
+    assert!(message.contains("0"), "last progress snapshot: {message}");
+}
+
+#[test]
+fn wait_until_progress_outlives_a_fixed_deadline_while_progressing() {
+    let idle = Duration::from_millis(200);
+    let steps = Arc::new(AtomicUsize::new(0));
+    let stepper = steps.clone();
+    let start = Instant::now();
+    wait_until_progress(
+        idle,
+        Duration::from_secs(30),
+        || stepper.fetch_add(1, Ordering::Relaxed) + 1,
+        || steps.load(Ordering::Relaxed) >= 16,
+        || "condition holds only after the fixed budget would have failed".into(),
+    );
+    // 16 polls at ~30 ms is well past `idle`; the old fixed budget would
+    // have failed this wait at 200 ms.
+    assert!(start.elapsed() >= idle + idle, "{:?}", start.elapsed());
+}
+
+#[test]
+fn wait_until_progress_fails_at_ceiling_despite_progress() {
+    let start = Instant::now();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        wait_until_progress(
+            Duration::from_millis(100),
+            Duration::from_millis(300),
+            Instant::now,
+            || false,
+            || "goal never met".into(),
+        );
+    }));
+    let elapsed = start.elapsed();
+    let message = panic_message(&result);
+    assert!(message.contains("ceiling"), "{message}");
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+}
+
+#[test]
+fn wait_until_fixed_budget_still_panics() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        wait_until(Duration::from_millis(60), || false, || "never true".into());
+    }));
+    assert!(panic_message(&result).contains("deadline"));
+}
+
+#[test]
+fn queue_drop_lines_extracts_only_the_queue_drop_series() {
+    let body = concat!(
+        "# HELP manta_input_queue_dropped_samples_total Samples dropped from a bounded queue.\n",
+        "# TYPE manta_input_queue_dropped_samples_total counter\n",
+        "manta_input_malformed_packets_total{source=\"80m\"} 3\n",
+        "not a metric line at all\n",
+        "manta_input_queue_dropped_samples_total{source=\"80m\"} 12\n",
+        "manta_input_queue_dropped_samples_total{source=\"40m\"} 0\n",
+    );
+    assert_eq!(
+        queue_drop_lines(body),
+        vec![
+            "manta_input_queue_dropped_samples_total{source=\"80m\"} 12".to_string(),
+            "manta_input_queue_dropped_samples_total{source=\"40m\"} 0".to_string(),
+        ]
+    );
+    assert!(queue_drop_lines("").is_empty());
+}
+
+#[test]
+fn heavy_guard_admits_one_holder_at_a_time() {
+    let holder = HEAVY.lock().unwrap_or_else(|p| p.into_inner());
+    let observed = Arc::new(Mutex::new(Vec::<bool>::new()));
+    let seen = observed.clone();
+    let contender = thread::spawn(move || {
+        seen.lock().unwrap().push(HEAVY.try_lock().is_err());
+        let held = HEAVY.lock().unwrap_or_else(|p| p.into_inner());
+        seen.lock().unwrap().push(true);
+        drop(held);
+    });
+    wait_until(
+        Duration::from_secs(5),
+        || {
+            let seen = observed.lock().unwrap();
+            seen.len() == 1 && seen[0]
+        },
+        || "contender must observe contention while the guard is held".into(),
+    );
+    drop(holder);
+    contender.join().unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![true, true]);
+}
+
+#[test]
+fn clamp_due_never_owes_more_than_the_debt_cap() {
+    let now = Instant::now();
+    let cap = Duration::from_millis(10);
+    let far_behind = now - Duration::from_secs(5);
+    assert_eq!(clamp_due(far_behind, now, cap), now - cap);
+    let within_debt = now - cap / 2;
+    assert_eq!(clamp_due(within_debt, now, cap), within_debt);
+    let ahead = now + Duration::from_secs(1);
+    assert_eq!(clamp_due(ahead, now, cap), ahead);
 }

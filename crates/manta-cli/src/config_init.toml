@@ -185,6 +185,21 @@
 #enabled = true                       # false keeps the block but does not listen
 
 
+# --- Callsign lookup (QRZ.com) ------------------------------------------------
+# Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
+# spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
+# kept 24 h. Live sources only: a file replay looks nothing up. Calls on
+# [spot].allowlist are never looked up. Needs a QRZ.com account; QRZ says its
+# XML service needs a Logbook Data subscription beyond testing. Restart-only.
+
+#[callsign_lookup]
+
+#enabled = false                     # true withholds spots whose callsign QRZ.com does not list
+#qrz_username = ""                    # your QRZ.com user name; required when enabled
+#qrz_password = ""                    # required when enabled; or MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD
+#qrz_url = "https://xmldata.qrz.com/xml/current/"  # https://; http:// only to a loopback test server
+
+
 # --- Receiver ----------------------------------------------------------------
 # With `type` and every receiver setting commented out, manta listens to
 # the system's default sound card, or to whatever source the command line
@@ -220,6 +235,7 @@
 #mac = "02:11:22:33:44:55"           # hpsdr only: pin a discovered radio; cannot be combined with host
 #port = 8073                         # default 8073 for kiwi, 1024 for hpsdr, 5004 for ka9q
 #protocol = "auto"                   # hpsdr: "auto" asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking
+#auto_attenuation = false            # hpsdr protocol 2: raise the radio's attenuator on ADC overload, lower it after 10 min quiet
 #password = ""                       # kiwi only; leave empty for public receivers
 
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):

@@ -23,6 +23,9 @@ per graded spot (MAN-301); see [`spotGrade` records](#spotgrade-records).
   Raw TCP receives it once the 500 ms classification ends, then live records only.
 - Every spot and `spotGrade` carries `seq`, starting at 1 and increasing by 1
   per record in the session. A plain WebSocket connection also receives only live records.
+- `seq` is publish order. With `[callsign_lookup]` on (MAN-318), a spot can be
+  published up to about 10 s after its `timestamp`, after spots with later
+  timestamps. The fields are unchanged.
 - WebSocket clients can resume with `GET /?session=<session>&since=<last seq processed>`.
   The server sends the hello, then retained records after `since`, then live records.
   A same-session cursor from `historyFrom - 1` through `hello.seq` resumes fully.
