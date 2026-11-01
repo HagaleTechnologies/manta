@@ -30,7 +30,9 @@ the git history and `docs/DECISIONS/`.
   today. RTTY spots, once the engine produces them, reach telnet only
   through the new opt-in `[server].rtty_telnet_port` (`telnet_port` stays
   CW-only), and carry `RTTY` and `<baud> BPS` on the telnet and uplink
-  line. See docs/DECISIONS/2026-11-01-man322-rtty-spot-outputs.md.
+  line. With that port set, `/metrics` adds
+  `manta_listener_up{listener="rtty_telnet"}`. See
+  docs/DECISIONS/2026-11-01-man322-rtty-spot-outputs.md.
 - MAN-106 first slice: candidates with no finite positive character
   confidence are withheld as `noEvidence`. CLI JSON spots gain
   `emissionState`, based on whether the pattern tier's repetition

@@ -138,7 +138,11 @@ The decisions, each with what it rules out:
   wiki alone; docs/CONFIG.md is the key reference and this record is the
   normative one. The `config init` scaffold and `manta.example.toml` each
   carry a commented `rtty_telnet_port` line, because the docs tests require
-  every loader key in both, so the change is 41 files.
+  every loader key in both. That made 41 files, so docs/METRICS.md is left
+  alone too and the change is 40 files. This record carries what its rows
+  would say: the `rtty_telnet` label (the table above), the telnet client
+  gauge counting both telnet listeners, and the spot-loss counters
+  charging a scoped listener for other-mode spots (Known limits).
 
 Three defaults stand until the owner says otherwise:
 
@@ -185,9 +189,10 @@ manta spots of either mode.
 
 ## Known limits
 
-- **Loss counters on a scoped listener.** When a telnet client's write
-  fails or it lags, the listener counts every queued spot as lost,
-  including spots of the other mode it would have skipped. No RTTY spot
+- **Loss counters on a scoped listener.** When a telnet client leaves
+  with a backlog (its write fails, it lags, or shutdown abandons its
+  queue), the listener counts every queued spot as lost, including spots
+  of the other mode it would have skipped. No RTTY spot
   exists yet, so today's numbers do not change.
 - **No mode label on spot metrics.** `manta_spots_total` and
   `manta_spots_by_band_total{band,type}` keep their labels. The engine
@@ -237,3 +242,12 @@ The MAN-321 engine slice sets `Spot.mode = SpotMode::Rtty` and `baud` on
 the spots its RTTY decode path produces. The outputs above need no further
 change. That slice should also add the `mode` label to the spot metrics and
 decide whether cross-input dedupe keys on mode.
+
+docs/METRICS.md still lists `listener` as `telnet`, `json`, `metrics` or
+`live` (D11). A docs follow-up adds `rtty_telnet` to the
+`manta_listener_up` row (registered only when `[server].rtty_telnet_port`
+is set) and says on the `manta_telnet_clients_connected` row that the
+gauge counts both telnet listeners. The `manta_spots_dropped_*` rows, which
+every spot client shares, should say that a client on a mode-scoped telnet
+listener that leaves with a backlog is charged for the other-mode spots it
+would have skipped.
