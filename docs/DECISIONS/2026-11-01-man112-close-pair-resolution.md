@@ -278,3 +278,35 @@ paragraph records the stopped attempts and directs the next phase to run
 the all-target build and close-pair goldens on the current tree first.
 The birth-centre seeding and immediate ownership refresh were introduced
 after the first stopped attempt; the late retry did not verify them.
+
+## Remediation of the interrupted implement gate
+
+The all-target build completed on 2026-11-01 in the remediation worker.
+Exit 143 in the implement receipt was a stopped process, not a compiler error.
+Runtime verification exposed two channel-selection defects in the final tree.
+
+Before a neighbor has its own track, max-power selection can read that
+neighbor's carrier. In the mid-bin 125 Hz scene this happened during startup
+and left signal 0 at CER 0.2055. Selection now rejects an outer owned channel
+when two consecutive observations exceed the phase SNR gate and its measured
+carrier is more than 0.6 channel from this track's centroid. It chooses the
+strongest remaining exclusive, non-cooling owned channel. Missing evidence
+and the existing fallback when no channel qualifies are retained. Channels
+within one channel of the centroid retain the prior selection behavior.
+The synthetic untracked-neighbor test fails without this check and passes
+with it. All eight enabled close-pair goldens pass with the check.
+
+Restored V7 also exposed a straddle override that activated too far from
+the midpoint. A centroid shift from 106.667 to 106.64 switched input from
+107 to 106. Transition sidelobes then biased phase tracking farther away
+and corrupted copy. The override now applies within 0.1 channel of the
+midpoint, rather than 0.15. The boundary regression protects the observed
+106.64 case. Both V7 engines, V9, V10 legacy and V51 pass the focused suite.
+These are deterministic fixture results, not a new claim about the full
+separation matrix or live input. The experimental frontend remains off.
+
+The class sweep found the production association call in `step_hop` and
+its decoder-input selection on the same path. Birth admission already has
+its own phase gate. No second production association caller was found.
+The full repository gate is recorded in the remediation phase receipt;
+the earlier incomplete-handover receipt above remains historical evidence.
