@@ -86,7 +86,7 @@ impl SpotMode {
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
 ///
 /// Serialized only by the CLI (`decode --json`'s `spots`, `run --json`'s
-/// `{"spot": …}`) through [`SpotJson`]; field names follow the JSON spot
+/// `{"spot": …}`) through `SpotJson`; field names follow the JSON spot
 /// stream (MAN-139, docs/CLI-JSON.md). manta-server builds its own
 /// `SpotMessage` instead.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
