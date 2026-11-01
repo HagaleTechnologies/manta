@@ -15,6 +15,7 @@ pub mod lookup;
 pub mod message;
 pub mod notch;
 pub mod pattern;
+pub mod prior;
 pub mod reference;
 pub mod scp;
 pub mod support;
@@ -30,7 +31,8 @@ pub use notch::{FreqRange, NotchList};
 pub use pattern::{PatternTier, ValidationLevel};
 pub use support::Support;
 pub use validator::{
-    calibration_factor_from_ppm, InvalidCalibration, Spot, SuppressionCounts, Validator,
+    calibration_factor_from_ppm, EmissionState, InvalidCalibration, Spot, SuppressionCounts,
+    Validator,
 };
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see

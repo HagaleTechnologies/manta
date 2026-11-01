@@ -1,16 +1,19 @@
 //! Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 
-use crate::beam::{decode_char, BeamConfig};
+use crate::beam::{class_sigma, decode_char, decode_char_readings, BeamConfig};
 use crate::edge_demod::EdgeDemod;
 use crate::envelope::{Demod, DemodConfig, Run};
 use crate::events::DecoderEvent;
 use crate::evidence::{Evidence, EvidenceConfig, HopEvidence};
 use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
 use crate::noise::{NoiseConfig, NoiseTracker};
+use crate::prior::WordPrior;
+use crate::readings::ReadingsBeam;
 use crate::timing::{GapClass, GapClassifier, SenderTiming, SpeedTracker, TimingClass};
 use crate::tree::{pattern_for, Glyph};
 use crate::HOP_MS;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// Decode engine selection (SPEC v2 §0): which timing/beam chain and which
 /// keying-decision front end feeds it. `Hsmm` (`TrackDecoder::push_hop_hsmm`)
@@ -43,6 +46,12 @@ impl std::str::FromStr for Engine {
 /// Tunables for one track's decode chain: demod + beam + flush threshold. SPEC §9.
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
+    /// Enable bounded word readings. Default off until recorded and live gates pass.
+    pub prior_enabled: bool,
+    pub prior: Option<Arc<dyn WordPrior>>,
+    pub prior_weight: f32,
+    pub reading_margin: f32,
+    pub held_readings: usize,
     pub demod: DemodConfig,
     pub beam: BeamConfig,
     /// SPEC §9 decode.flush_gap_dits
@@ -67,6 +76,11 @@ pub struct DecodeConfig {
 impl Default for DecodeConfig {
     fn default() -> Self {
         DecodeConfig {
+            prior_enabled: false,
+            prior: None,
+            prior_weight: 2.0,
+            reading_margin: 3.0,
+            held_readings: 4,
             demod: DemodConfig::default(),
             beam: BeamConfig::default(),
             flush_gap_dits: 7.0,
@@ -98,6 +112,7 @@ const SNR_BW_CORR_DB: f32 = 14.3;
 
 /// Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 pub struct TrackDecoder {
+    readings: ReadingsBeam,
     track_id: u32,
     cfg: DecodeConfig,
     demod: Demod,
@@ -196,6 +211,7 @@ impl TrackDecoder {
         // CHAR_GAP_DITS doc comment).
         let gaps = GapClassifier::new();
         TrackDecoder {
+            readings: ReadingsBeam::default(),
             track_id,
             cfg,
             demod,
@@ -686,9 +702,11 @@ impl TrackDecoder {
             let ts = self.last_ts;
             self.emit_char(ts, &mut events);
             if !self.word_flushed {
+                self.settle_readings(ts, &mut events);
                 events.push(DecoderEvent::word_boundary(self.track_id, ts));
             }
         }
+        self.settle_readings(self.last_ts, &mut events);
         self.flush_final_speed(&mut events);
         self.emit_timing(&mut events);
         events
@@ -869,6 +887,7 @@ impl TrackDecoder {
                 GapClass::InterChar => self.emit_char(run.start_ts, events),
                 GapClass::InterWord => {
                     self.emit_char(run.start_ts, events);
+                    self.settle_readings(run.start_ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, run.start_ts));
                     if self.word_decoded > 1 {
                         self.single_flush_gaps.clear();
@@ -1032,6 +1051,7 @@ impl TrackDecoder {
                     self.single_flush_gaps.clear();
                 }
                 if !self.word_flushed {
+                    self.settle_readings(ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
@@ -1081,6 +1101,7 @@ impl TrackDecoder {
                 }
                 self.emit_char(ts, events);
                 if !self.word_flushed {
+                    self.settle_readings(ts, events);
                     events.push(DecoderEvent::word_boundary(self.track_id, ts));
                 }
                 self.word_chars = 0;
@@ -1091,21 +1112,118 @@ impl TrackDecoder {
         }
     }
 
+    fn settle_readings(&mut self, sample_ts: u64, events: &mut Vec<DecoderEvent>) {
+        if !self.cfg.prior_enabled {
+            return;
+        }
+        let settlement = self
+            .readings
+            .settle(self.cfg.prior.as_deref(), self.cfg.prior_weight);
+        let readings = settlement.readings;
+        for (glyph, confidence, ts) in settlement.chars {
+            events.push(DecoderEvent::char_decoded(
+                self.track_id,
+                ts,
+                glyph,
+                confidence,
+            ));
+        }
+        if readings.len() >= 2 {
+            events.push(DecoderEvent::ReadingsHeld {
+                track_id: self.track_id,
+                sample_ts,
+                readings,
+                settled: true,
+            });
+        }
+    }
+
     fn emit_char(&mut self, sample_ts: u64, events: &mut Vec<DecoderEvent>) {
         if self.cur_marks.is_empty() {
             return;
         }
-        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy reads the
-        // keying-rail SNR directly; EdgeLegacy/Hsmm use the evidence-derived
-        // estimate (SPEC v2 §2.3) stashed in `last_snr`.
+        // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy prefers
+        // the engine-supplied floor-based estimate (§2.3 / MAN-102,
+        // pushed down by `set_snr_2500_db` on every queued hop), falling
+        // back to the keying-rail estimate when driven standalone;
+        // EdgeLegacy/Hsmm use the evidence-derived estimate (SPEC v2
+        // §2.3) stashed in `last_snr`. Same precedence `tick_meta` uses
+        // for the reported value. Before MAN-106 the Legacy branch read
+        // the rail estimate directly, which sits ~8 dB under the floor
+        // value and pins `q` at its 0.3 floor across the operating band
+        // (see docs/DECISIONS/2026-10-30-man106-q-snr-input.md).
         let snr = if self.cfg.engine == Engine::Legacy {
-            self.demod.snr_2500_db()
+            self.snr_2500_db.or_else(|| self.demod.snr_2500_db())
         } else {
             self.last_snr
         };
         let q = snr.map(|snr| (snr / 20.0).clamp(0.3, 1.0)).unwrap_or(1.0);
         let marks = std::mem::take(&mut self.cur_marks);
         self.word_chars = self.word_chars.saturating_add(1);
+        if self.cfg.prior_enabled {
+            let timing = self.sender.estimates(self.tracker.dit_estimate_ms());
+            let sigma = |estimate: Option<crate::timing::ClassEstimate>| {
+                estimate.map(|e| class_sigma(&e, 8, self.cfg.beam.sigma))
+            };
+            let mean = |estimate: Option<crate::timing::ClassEstimate>, fallback: f32| {
+                estimate
+                    .filter(|e| e.n >= 8)
+                    .map_or(fallback, |e| e.mean_dits * timing.dit_ms)
+            };
+            match decode_char_readings(
+                &marks,
+                mean(timing.dot, self.tracker.mu_dit_ms()),
+                mean(timing.dash, self.tracker.mu_dah_ms()),
+                sigma(timing.dot),
+                sigma(timing.dash),
+                q,
+                &self.cfg.beam,
+            ) {
+                Some(mut candidates) => {
+                    // Keep confidence comparable with prior-off for unchanged
+                    // glyphs. The prior itself never increases confidence.
+                    if let Some(legacy) = decode_char(
+                        &marks,
+                        self.tracker.mu_dit_ms(),
+                        self.tracker.mu_dah_ms(),
+                        q,
+                        &self.cfg.beam,
+                    ) {
+                        for candidate in &mut candidates {
+                            if candidate.glyph == legacy.glyph {
+                                candidate.confidence = legacy.confidence;
+                            }
+                        }
+                    }
+                    self.word_decoded = self.word_decoded.saturating_add(1);
+                    // Train from acoustic evidence only, never from the prior's winner.
+                    self.observe_marks(candidates[0].glyph, &marks);
+                    self.readings.push(
+                        &candidates,
+                        sample_ts,
+                        self.cfg.reading_margin,
+                        self.cfg.held_readings,
+                    );
+                    let readings = self
+                        .readings
+                        .snapshot(self.cfg.prior.as_deref(), self.cfg.prior_weight);
+                    if readings.len() >= 2 {
+                        events.push(DecoderEvent::ReadingsHeld {
+                            track_id: self.track_id,
+                            sample_ts,
+                            readings,
+                            settled: false,
+                        });
+                    }
+                }
+                None => {
+                    self.garble_count += 1;
+                    // A garble must not join two unrelated fragments into a listed word.
+                    self.settle_readings(sample_ts, events);
+                }
+            }
+            return;
+        }
         match decode_char(
             &marks,
             self.tracker.mu_dit_ms(),
@@ -1195,6 +1313,88 @@ mod tests {
         }
         push(0.0, 8 * dit_hops); // tail so the last word flushes by timeout
         env
+    }
+
+    #[test]
+    fn prior_defaults_off() {
+        assert!(!DecodeConfig::default().prior_enabled);
+        assert!(DecodeConfig::default().prior.is_none());
+    }
+
+    fn prior_events(enabled: bool) -> Vec<DecoderEvent> {
+        let mut decoder = TrackDecoder::new(
+            7,
+            DecodeConfig {
+                prior_enabled: enabled,
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope("CQ W1AW", 23).into_iter().enumerate() {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        events
+    }
+
+    #[test]
+    fn prior_off_stream_is_byte_identical() {
+        // Explicit off and the public default must select the same path,
+        // including event cadence and timestamps. Golden V1/V2/V3 lock the
+        // historical output independently.
+        let mut decoder = TrackDecoder::new(7, DecodeConfig::default());
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope("CQ W1AW", 23).into_iter().enumerate() {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        assert_eq!(
+            serde_json::to_vec(&events).unwrap(),
+            serde_json::to_vec(&prior_events(false)).unwrap()
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::ReadingsHeld { .. })));
+    }
+
+    #[test]
+    fn prior_on_commits_word_at_settlement_preserving_timestamps() {
+        let off = prior_events(false);
+        let on = prior_events(true);
+        let chars = |events: &[DecoderEvent]| {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::CharDecoded {
+                        glyph, sample_ts, ..
+                    } => Some((*glyph, *sample_ts)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chars(&off), chars(&on));
+        assert_eq!(events_to_text(&on), "CQ W1AW");
+        // Per-word commits are adjacent even when meta/timing events occur
+        // during reception of the word.
+        let w = on
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    DecoderEvent::CharDecoded {
+                        glyph: Glyph::Char('W'),
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(on[w..w + 4]
+            .iter()
+            .all(|e| matches!(e, DecoderEvent::CharDecoded { .. })));
+        assert_eq!(
+            serde_json::to_vec(&on).unwrap(),
+            serde_json::to_vec(&prior_events(true)).unwrap()
+        );
     }
 
     /// Rectangular envelope helper with `depth_db` keying depth (the existing
@@ -2160,6 +2360,71 @@ mod tests {
             meta,
             Some(rail_snr),
             "TrackMeta must carry the rail estimate exactly when no engine-supplied SNR is set"
+        );
+    }
+
+    /// MAN-106: Legacy `q` must read the engine-supplied floor-based SNR
+    /// when one is set (the production path), so a 12 dB estimate yields
+    /// q = 0.6 and character confidence regains dynamic range instead of
+    /// pinning at the 0.3 rail floor.
+    fn char_confidences_with(snr: Option<f32>) -> (Vec<f32>, Option<f32>) {
+        let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+        let mut events = Vec::new();
+        let env = rect_envelope("CQ TEST W5AU W5AU TEST", 18);
+        for (i, a) in env.into_iter().enumerate() {
+            if let Some(snr) = snr {
+                dec.set_snr_2500_db(snr);
+            }
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        let confs = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    glyph: Glyph::Char(_),
+                    confidence,
+                    ..
+                } => Some(*confidence),
+                _ => None,
+            })
+            .collect();
+        (confs, dec.demod.snr_2500_db())
+    }
+
+    #[test]
+    fn legacy_q_follows_the_engine_supplied_snr() {
+        let (confs, _) = char_confidences_with(Some(12.0));
+        assert!(!confs.is_empty());
+        // q = clamp(12/20, 0.3, 1.0) = 0.6; a clean character's softmax
+        // is 1.0 for a single surviving hypothesis, so its confidence is
+        // exactly q, and no character can exceed it.
+        let q = 0.6f32;
+        let max = confs.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            (max - q).abs() < 1e-3,
+            "some clean character must carry softmax*q = {q}, got max {max} of {confs:?}"
+        );
+        assert!(
+            confs.iter().all(|c| *c <= q + 1e-3),
+            "no character confidence may exceed q, got {confs:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_q_falls_back_to_the_rail_estimate_when_standalone() {
+        let (confs, rail) = char_confidences_with(None);
+        let rail = rail.expect("keyed envelope brings the demod to Running");
+        let q = (rail / 20.0).clamp(0.3, 1.0);
+        assert!(!confs.is_empty());
+        assert!(
+            confs.iter().all(|c| *c <= q + 1e-3),
+            "standalone confidence must follow the rail-derived q {q} (rail {rail} dB), got {confs:?}"
+        );
+        let max = confs.iter().cloned().fold(0.0f32, f32::max);
+        assert!(
+            (max - q).abs() < 1e-3,
+            "rail-derived q {q} (rail {rail} dB) must be reached, got max {max} of {confs:?}"
         );
     }
 

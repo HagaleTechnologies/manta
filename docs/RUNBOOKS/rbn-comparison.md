@@ -294,6 +294,51 @@ Live and offline grades can differ in one known way: a live RBN report is
 timed by when it arrived, an archived one by RBN's own timestamp. That
 matters only for a report within a few seconds of a window edge.
 
+## Grading with the language prior enabled (MAN-317)
+
+The prior ships off. Passing synthetic vectors alone does not authorize a
+default flip. Collect a complete, paired seven-day live comparison before
+proposing that change. No recorded node log for this experiment ships in the
+repository, and this ticket does not claim that the live week passed.
+
+Run the same binary on the same recorded IQ or simultaneous identical SDR
+streams, once with `[decode] prior = "off"` and once with `prior = "on"`.
+Keep every other setting fixed, including the SCP/cty versions, calls-heard
+file, validation level, receiver frequencies and RBN tolerances. Save the
+configs and list hashes with both sets of node logs. Use separate output
+directories and listener ports for parallel nodes. Prior-enabled config:
+
+```toml
+[decode]
+prior = "on"
+prior_weight = 2.0
+reading_margin = 3.0
+held_readings = 4
+```
+
+Grade both sets against the same complete daily RBN archives and the same
+reference skimmer and exclusions:
+
+```sh
+scripts/score-against-rbn.py --node-log prior-off/ --rbn rbn-week/ --spotter K5TR
+scripts/score-against-rbn.py --node-log prior-on/ --rbn rbn-week/ --spotter K5TR
+```
+
+The script grades already-produced logs; the prior config belongs to the
+node that produced them. It cannot apply a different decoder to a spot log.
+Compare `manta grade`'s `band, spots, match, disagree, elsewhere, none,
+unknown` summaries. Compute the `none` rate as `none / (spots - unknown)`
+on each paired band and over all bands with covered observations. Require
+at least one covered spot in each compared population and require the
+prior-on rate not to exceed the prior-off rate. Report raw counts, missing
+coverage and every band alongside the aggregate; do not count `unknown`
+as evidence that the prior is correct.
+
+Attach those summaries and the archived inputs to the separate default-flip
+change. It must also show zero bogus calls on prior-on V8, V8w and VC3 with
+the existing validation floors intact. A failed precision or live-rate bar
+keeps the default off.
+
 ## Secondary skimmers and your own spots
 
 Reports from your own callsign, with and without SSID, never count:

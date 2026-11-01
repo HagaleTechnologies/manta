@@ -1,5 +1,6 @@
 //! Character-local beam search over the Morse tree. SPEC §4.3–§4.5, §10.3.
 
+use crate::timing::ClassEstimate;
 use crate::tree::{Element, Glyph, MorseTree, NodeId, Prosign};
 
 /// Tunables for the character-local beam search. SPEC §9, §4.4.
@@ -59,16 +60,63 @@ pub fn decode_char(
     q: f32,
     cfg: &BeamConfig,
 ) -> Option<CharDecode> {
+    decode_char_readings(marks_ms, mu_dit_ms, mu_dah_ms, None, None, q, cfg).map(|readings| {
+        let winner = readings[0];
+        CharDecode {
+            glyph: winner.glyph,
+            confidence: winner.confidence,
+        }
+    })
+}
+
+/// One acoustically supported character with its unnormalized log likelihood.
+#[derive(Debug, Clone, Copy)]
+pub struct CharReading {
+    pub glyph: Glyph,
+    pub score: f32,
+    pub confidence: f32,
+}
+
+/// Convert sender variance in dits to log-duration sigma by the delta method.
+/// Sparse or invalid estimates keep the configured early-track sigma. The
+/// finite floor prevents zero variance from producing an infinite likelihood.
+pub fn class_sigma(est: &ClassEstimate, floor: u32, fallback: f32) -> f32 {
+    if est.n < floor
+        || !est.mean_dits.is_finite()
+        || est.mean_dits <= 0.0
+        || !est.var_dits2.is_finite()
+        || est.var_dits2 < 0.0
+    {
+        return fallback;
+    }
+    (est.var_dits2.sqrt() / est.mean_dits).max(0.02)
+}
+
+/// Return every glyph-bearing survivor, ordered by acoustic likelihood.
+/// `None` denotes garble; a single question mark denotes glyphless survivors.
+/// When sender sigmas differ, retain their normalizers: omitting these would
+/// reward a broad duration class merely for having a flatter likelihood.
+/// The duration Jacobian and common Gaussian constant cancel between paths.
+pub fn decode_char_readings(
+    marks_ms: &[f32],
+    mu_dit_ms: f32,
+    mu_dah_ms: f32,
+    dot_sigma: Option<f32>,
+    dash_sigma: Option<f32>,
+    q: f32,
+    cfg: &BeamConfig,
+) -> Option<Vec<CharReading>> {
     if marks_ms.is_empty() {
         return None;
     }
     // SPEC §4.4 error prosign: >= 6 dit-classified marks, no dah.
     let boundary = (mu_dit_ms * mu_dah_ms).sqrt();
     if marks_ms.len() >= 6 && marks_ms.iter().all(|&d| d < boundary) {
-        return Some(CharDecode {
+        return Some(vec![CharReading {
             glyph: Glyph::Prosign(Prosign::Err),
+            score: 0.0,
             confidence: q,
-        });
+        }]);
     }
 
     let tree = MorseTree::shared();
@@ -80,13 +128,22 @@ pub fn decode_char(
     for &d in marks_ms {
         let mut next: Vec<Hyp> = Vec::with_capacity(hyps.len() * 2);
         for h in &hyps {
-            for (e, mu) in [(Element::Dit, mu_dit_ms), (Element::Dah, mu_dah_ms)] {
+            for (e, mu, learned_sigma) in [
+                (Element::Dit, mu_dit_ms, dot_sigma),
+                (Element::Dah, mu_dah_ms, dash_sigma),
+            ] {
+                let sigma = learned_sigma.unwrap_or(cfg.sigma);
+                let normalizer = if dot_sigma.is_some() || dash_sigma.is_some() {
+                    (sigma / cfg.sigma).ln()
+                } else {
+                    0.0
+                };
                 if let Some(child) = tree.child(h.node, e) {
                     let mut path = h.path.clone();
                     path.push(e);
                     next.push(Hyp {
                         node: child,
-                        score: h.score + log_likelihood(d, mu, cfg.sigma),
+                        score: h.score + log_likelihood(d, mu, sigma) - normalizer,
                         path,
                     });
                 }
@@ -111,10 +168,11 @@ pub fn decode_char(
         .filter(|h| tree.glyph(h.node).is_some())
         .collect();
     if survivors.is_empty() {
-        return Some(CharDecode {
+        return Some(vec![CharReading {
             glyph: Glyph::Char('?'),
+            score: 0.0,
             confidence: 0.0,
-        });
+        }]);
     }
     // SPEC §4.5 softmax with max-subtraction, fixed order; winner is survivors[0].
     let smax = survivors[0].score;
@@ -122,11 +180,16 @@ pub fn decode_char(
     for h in &survivors {
         denom += (h.score - smax).exp();
     }
-    let confidence = (1.0 / denom) * q;
-    Some(CharDecode {
-        glyph: tree.glyph(survivors[0].node).unwrap(),
-        confidence,
-    })
+    Some(
+        survivors
+            .into_iter()
+            .map(|h| CharReading {
+                glyph: tree.glyph(h.node).unwrap(),
+                score: h.score,
+                confidence: ((h.score - smax).exp() / denom) * q,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -210,5 +273,137 @@ mod tests {
         let b = decode_char(&marks, 60.0, 180.0, 0.8, &CFG).unwrap();
         assert_eq!(a.glyph, b.glyph);
         assert_eq!(a.confidence.to_bits(), b.confidence.to_bits());
+    }
+
+    #[test]
+    fn ambiguous_third_mark_keeps_w_and_r_readings_ranked() {
+        let readings =
+            decode_char_readings(&[60.0, 180.0, 103.0], 60.0, 180.0, None, None, 1.0, &CFG)
+                .unwrap();
+        let w = readings
+            .iter()
+            .find(|r| r.glyph == Glyph::Char('W'))
+            .unwrap();
+        let r = readings
+            .iter()
+            .find(|r| r.glyph == Glyph::Char('R'))
+            .unwrap();
+        assert!(r.score > w.score);
+        assert!(r.score - w.score < 1.0);
+        assert!(readings.windows(2).all(|r| r[0].score >= r[1].score));
+    }
+
+    #[test]
+    fn per_sender_sigma_rescores_candidates() {
+        let marks = [60.0, 180.0, 103.0];
+        let broad =
+            decode_char_readings(&marks, 60.0, 180.0, Some(0.5), Some(0.5), 1.0, &CFG).unwrap();
+        let narrow =
+            decode_char_readings(&marks, 60.0, 180.0, Some(0.5), Some(0.05), 1.0, &CFG).unwrap();
+        let gap = |readings: &[CharReading]| {
+            let r = readings
+                .iter()
+                .find(|r| r.glyph == Glyph::Char('R'))
+                .unwrap()
+                .score;
+            let w = readings
+                .iter()
+                .find(|r| r.glyph == Glyph::Char('W'))
+                .unwrap()
+                .score;
+            r - w
+        };
+        assert!(gap(&broad).abs() < 1.0);
+        assert!(gap(&narrow) > 20.0);
+    }
+
+    #[test]
+    fn sparse_class_falls_back_to_configured_sigma() {
+        let estimate = crate::timing::ClassEstimate {
+            mean_dits: 3.0,
+            var_dits2: 0.09,
+            n: 7,
+        };
+        assert_eq!(class_sigma(&estimate, 8, CFG.sigma), CFG.sigma);
+        let learned = crate::timing::ClassEstimate { n: 8, ..estimate };
+        assert!((class_sigma(&learned, 8, CFG.sigma) - 0.1).abs() < 1e-6);
+        let zero = crate::timing::ClassEstimate {
+            var_dits2: 0.0,
+            ..learned
+        };
+        assert!(class_sigma(&zero, 8, CFG.sigma) > 0.0);
+    }
+
+    #[test]
+    fn class_sigma_matches_direct_log_space_ew_estimate() {
+        // The delta method is a local approximation. Compare it against the
+        // same EW update in log space for modest sender jitter.
+        let alpha = 0.1;
+        let mut mean = 0.0f32;
+        let mut variance = 0.0f32;
+        let mut log_mean = 0.0f32;
+        let mut log_variance = 0.0f32;
+        for i in 0..200 {
+            let x = 3.0 + (i % 5) as f32 * 0.05 - 0.1;
+            if i == 0 {
+                mean = x;
+                log_mean = x.ln();
+            } else {
+                let delta = x - mean;
+                mean += alpha * delta;
+                variance = (1.0 - alpha) * (variance + alpha * delta * delta);
+                let log_delta = x.ln() - log_mean;
+                log_mean += alpha * log_delta;
+                log_variance = (1.0 - alpha) * (log_variance + alpha * log_delta * log_delta);
+            }
+        }
+        let estimate = crate::timing::ClassEstimate {
+            mean_dits: mean,
+            var_dits2: variance,
+            n: 200,
+        };
+        let delta_sigma = class_sigma(&estimate, 8, CFG.sigma);
+        let direct_sigma = log_variance.sqrt();
+        assert!((delta_sigma - direct_sigma).abs() / direct_sigma < 0.02);
+    }
+
+    #[test]
+    fn readings_match_decode_char_winner_in_all_modes() {
+        let one = BeamConfig { width: 1, ..CFG };
+        let glyphless = decode_char_readings(
+            &[60.0, 60.0, 180.0, 180.0],
+            60.0,
+            180.0,
+            None,
+            None,
+            1.0,
+            &one,
+        )
+        .unwrap();
+        assert_eq!(glyphless[0].glyph, Glyph::Char('?'));
+        assert_eq!(glyphless[0].confidence, 0.0);
+        assert!(decode_char_readings(&[180.0; 8], 60.0, 180.0, None, None, 1.0, &CFG).is_none());
+        let error = decode_char_readings(&[60.0; 8], 60.0, 180.0, None, None, 0.8, &CFG).unwrap();
+        assert_eq!(error[0].glyph, Glyph::Prosign(Prosign::Err));
+        assert_eq!(error[0].confidence, 0.8);
+        for marks in [
+            vec![],
+            vec![60.0, 180.0],
+            vec![100.0, 140.0, 70.0],
+            vec![60.0; 8],
+            vec![180.0; 8],
+            vec![180.0; 6],
+        ] {
+            let old = decode_char(&marks, 60.0, 180.0, 0.8, &CFG);
+            let readings = decode_char_readings(&marks, 60.0, 180.0, None, None, 0.8, &CFG);
+            match (old, readings) {
+                (None, None) => {}
+                (Some(old), Some(readings)) => {
+                    assert_eq!(old.glyph, readings[0].glyph);
+                    assert_eq!(old.confidence.to_bits(), readings[0].confidence.to_bits());
+                }
+                _ => panic!("garble outcome differs"),
+            }
+        }
     }
 }
