@@ -97,3 +97,5 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 
 - [Why does detector rise use two disjoint power windows and a block floor bound?](../docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md)
 - [What does the first RTTY decoder slice deliver?](../docs/DECISIONS/2026-10-30-man321-rtty-decoding.md) Diagnostic ITA2 text after recognition, with preroll and validated spots deferred.
+
+- [Why does a close neighbor invalidate the three-bin ownership parabola?](../docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md) MAN-112 uses gated phase positions and frequency-exclusive association.

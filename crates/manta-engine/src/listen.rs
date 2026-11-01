@@ -805,6 +805,7 @@ pub fn listen_with_observers(
 
     let lifecycle = observers.track_lifecycle.as_deref();
     let mut close_base = CloseCounts::default();
+    let mut spawn_base = 0;
 
     let mut seg = new_segment(
         fs,
@@ -907,6 +908,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -933,6 +935,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -1003,6 +1006,7 @@ pub fn listen_with_observers(
             let next_id = seg.tm.next_track_id();
             if lifecycle.is_some() {
                 close_base = close_base + seg.tm.close_counts();
+                spawn_base += seg.tm.total_spawns();
             }
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
@@ -1070,6 +1074,7 @@ pub fn listen_with_observers(
             obs.publish_counts(
                 close_base + seg.tm.close_counts(),
                 validator.gate_records_total(),
+                spawn_base + seg.tm.total_spawns(),
             );
             obs.publish_chunk(seg.tm.active_track_count());
         }
@@ -1112,6 +1117,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
         obs.clear_active();
     }

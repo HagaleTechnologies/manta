@@ -70,6 +70,9 @@ pub struct DecodeConfig {
     /// `manta-dsp::refine::Refiner` when this is > 0 (MAN-168/MAN-194);
     /// `oracle` does not apply it.
     pub refine_bw_hz: f32,
+    /// MAN-112 experimental Rust-only decoder frontend. Not a TOML option;
+    /// promotion requires the carrier-offset and neighboring-signal gates.
+    pub steered_frontend: bool,
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -89,6 +92,7 @@ impl Default for DecodeConfig {
             noise: NoiseConfig::default(),
             hsmm: HsmmConfig::default(),
             refine_bw_hz: 0.0,
+            steered_frontend: false,
         }
     }
 }
