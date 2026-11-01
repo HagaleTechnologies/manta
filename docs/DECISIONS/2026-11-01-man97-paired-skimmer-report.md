@@ -49,7 +49,8 @@ a smaller step back stays on the same day. A date-less line with no day in
 its file name, or a stamp that is not a UTC time, is an error naming the
 file and line. Non-CW spot lines and other lines (banners, prompts, a torn
 last line) are counted, not errors. Each file is one archive, covering its
-first to last CW report, exactly as each RBN CSV is.
+first to last CW report, exactly as each RBN CSV is; with `--paired`, its
+first to last report from an admitted spotter (D5).
 
 `--rbn` and `--reference` are one required, mutually exclusive choice.
 With `--rbn` every existing output is byte-identical.
@@ -95,11 +96,12 @@ required: a SkimSrv often covers bands manta does not.
 
 manta is taken to be up all night, so a manta outage shows as misses: it
 is a manta failure an operator must see. The reference is trusted only
-between each file's first and last report, so manta's unmatched spots
-outside that span grade `unknown` and leave every rate. Inside a file a
-reference outage shows only on the `reference silence` line (the longest
-gap between consecutive admitted reports inside the window), a hint never
-used to grade.
+between each file's first and last report from an admitted spotter, so
+manta's unmatched spots outside that span grade `unknown` and leave every
+rate; another skimmer's reports in the same file cover nothing. Inside a
+file a reference outage shows only on the `reference silence` line (the
+longest gap between consecutive admitted reports inside the window), a
+hint never used to grade.
 
 ### D6: own calls are not excluded from a transcript
 

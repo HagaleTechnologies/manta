@@ -211,17 +211,29 @@ pub(crate) fn build(inputs: PairedInputs<'_>) -> PairedReport {
         }
     }
     manta.counted = counted_spots.len();
-    let rbn_archives: Vec<Vec<RbnReport>> = archives
-        .iter()
-        .map(|a| a.iter().map(|r| r.report.clone()).collect())
-        .collect();
-    let forward = grade_batch(&counted_spots, rbn_archives, cfg);
 
     // The reference's side: passband, window, spotter filter, grammar. The
     // reverse grade is `None` exactly where the spotter filter rejects.
     let reports: Vec<&ReferenceReport> = archives.iter().flatten().collect();
     let plain: Vec<RbnReport> = reports.iter().map(|r| r.report.clone()).collect();
     let backward = grade_references(&plain, &all_spots, cfg);
+
+    // Each file's span comes from its admitted spotters' reports only, so
+    // another skimmer in an RBN CSV or a mixed transcript cannot cover a
+    // window for the reference. A rejected report could not match anyway.
+    let mut admitted = backward.iter();
+    let rbn_archives: Vec<Vec<RbnReport>> = archives
+        .iter()
+        .map(|a| {
+            a.iter()
+                .zip(admitted.by_ref())
+                .filter(|(_, g)| g.is_some())
+                .map(|(r, _)| r.report.clone())
+                .collect()
+        })
+        .collect();
+    let forward = grade_batch(&counted_spots, rbn_archives, cfg);
+
     let mut reference = ReferenceCounts {
         loaded: reports.len(),
         ..ReferenceCounts::default()
@@ -808,6 +820,44 @@ mod tests {
             text.contains("reference silence: longest 3:50:00 from 2026-10-31 02:00:00Z\n"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn only_an_admitted_spotter_s_reports_cover_a_window() {
+        let spots = [
+            spot("a", "W1AW", 14_025_000, DAY + H),
+            spot("b", "K1ABC", 14_020_000, DAY + 2 * H),
+        ];
+        // The selected skimmer reported nothing; another spotter's reports
+        // span the night (an RBN CSV, or a transcript holding two spotters).
+        let cfg = GradeConfig {
+            spotters: BTreeSet::from(["W3XYZ".to_string()]),
+            ..paired_cfg()
+        };
+        let other = vec![
+            rep("K5TR", "N4RV", 14_021.0, DAY),
+            rep("K5TR", "N4RV", 14_021.0, DAY + 3 * H),
+        ];
+        let r = report(&spots, std::slice::from_ref(&other), &cfg, None, None);
+        assert!(r.reference_span.is_none());
+        assert_eq!(r.manta_spots.unknown, 2);
+        assert_eq!(r.manta_spots.none, 0);
+        assert_eq!(r.candidate_false_rate, None);
+        assert!(r.candidate_false.is_empty());
+        // The selected skimmer's own span ends at 01:15: it covers the
+        // 01:00 spot's window, not the 02:00 one's, in one mixed file or
+        // in a file of its own after the other spotter's.
+        let own = vec![
+            rep("W3XYZ", "N4RV", 14_021.0, DAY),
+            rep("W3XYZ", "N4RV", 14_021.0, DAY + H + 900),
+        ];
+        let mixed: Vec<ReferenceReport> = own.iter().chain(&other).cloned().collect();
+        for archives in [vec![mixed], vec![other, own]] {
+            let r = report(&spots, &archives, &cfg, None, None);
+            assert_eq!((r.manta_spots.none, r.manta_spots.unknown), (1, 1));
+            assert_eq!(r.candidate_false.len(), 1);
+            assert_eq!(r.candidate_false[0].spot_id, "a");
+        }
     }
 
     #[test]
