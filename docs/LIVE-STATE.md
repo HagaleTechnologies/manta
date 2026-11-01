@@ -266,13 +266,14 @@ candidate's later decision can follow its track's closure.
 | `withheld` | `"beaconSpeed"` | A deferred beacon rejected when its track ended: its speed was never confirmed, or is above 45 WPM. |
 | `withheld` | `"beaconOverflow"` | A deferred beacon evicted, oldest first, because a ninth was deferred on its track (at most 8 wait at once). |
 | `withheld` | `"beaconDiscarded"` | A deferred beacon dropped because its track closed for bookkeeping with no survivor. |
+| `withheld` | `"noEvidence"` | No character of the candidate carried finite positive decoder confidence, so no public emission regardless of database membership (MAN-106). |
 | `deferred` | `"lookupPending"` | `[callsign_lookup]` is on and QRZ.com has not answered for this call yet. A later decision settles it: `spotted`, or `withheld`/`lookupNotFound`. That later decision keeps the decode's `timestamp` and can arrive after the track's `trackClosed`. |
 | `withheld` | `"lookupNotFound"` | QRZ.com does not list the call (a fresh or a cached answer). |
 
-The fourteen `reason` strings are `blocklist`, `notch`, `grammar`, `cty`,
+The fifteen `reason` strings are `blocklist`, `notch`, `grammar`, `cty`,
 `repetition`, `variant`, `dedupe`, `powerStepGuard`, `beaconPending`,
-`beaconSpeed`, `beaconOverflow`, `beaconDiscarded`, `lookupPending` and
-`lookupNotFound`.
+`beaconSpeed`, `beaconOverflow`, `beaconDiscarded`, `noEvidence`,
+`lookupPending` and `lookupNotFound`.
 
 With `[callsign_lookup]` on (MAN-318), `spotted` still means published: a
 candidate held for its lookup first gets `deferred`/`lookupPending`, and its
