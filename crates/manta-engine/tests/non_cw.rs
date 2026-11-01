@@ -342,6 +342,7 @@ fn weak_cw_beside_a_louder_signal_still_decodes() {
                     &mut iq,
                     FS,
                     &FskSpec {
+                        mark_below_space: false,
                         mark_offset_hz: loud_off,
                         shift_hz: 170.0,
                         baud: 45.45,

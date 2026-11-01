@@ -288,6 +288,9 @@ fn bad_samples_suffix(n: u64) -> String {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RttySignalReport {
+    /// Bounded diagnostic text decoded after recognition. This is not a spot.
+    #[serde(default)]
+    pub decoded_text: String,
     /// Upper tone.
     pub mark_hz: f64,
     /// Lower tone.
@@ -311,6 +314,7 @@ impl RttySignalReport {
             space_hz: entry.space_hz * calibration_factor,
             shift_hz: entry.shift_hz,
             measured_shift_hz: entry.measured_shift_hz,
+            decoded_text: entry.decoded_text.clone(),
             marked_sample_ts: entry.marked_sample_ts,
             cleared_sample_ts: entry.cleared_sample_ts,
             id: entry.id,
@@ -575,8 +579,8 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             .base
             .checked_add(consumed)
             .context("input discontinuity overflows the sample clock")?;
-        append_rtty(&mut rtty, &seg.tm, calibration_factor, Some(end));
         events.extend(seg.tm.finish_for_discontinuity());
+        append_rtty(&mut rtty, &seg.tm, calibration_factor, Some(end));
         bad_samples += seg.ch.bad_samples();
         let base = end
             .checked_add(missing)
@@ -601,17 +605,17 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         .base
         .checked_add(consumed)
         .context("input sample clock overflows")?;
+    events.extend(if terminal_gap {
+        seg.tm.finish_for_discontinuity()
+    } else {
+        seg.tm.finish()
+    });
     append_rtty(
         &mut rtty,
         &seg.tm,
         calibration_factor,
         terminal_gap.then_some(end),
     );
-    events.extend(if terminal_gap {
-        seg.tm.finish_for_discontinuity()
-    } else {
-        seg.tm.finish()
-    });
 
     // MAN-314: a marked RTTY signal is a finding on its own, so input with
     // RTTY but no CW decoder output still returns a report (empty CW
@@ -1011,6 +1015,7 @@ mod tests {
                 space_hz: 14_080_000.0,
                 shift_hz: 170.0,
                 measured_shift_hz: 170.5,
+                decoded_text: String::new(),
                 marked_sample_ts: 96_000,
                 cleared_sample_ts: None,
                 id: 7,
@@ -1036,6 +1041,7 @@ mod tests {
         assert_eq!(
             json_keys_in_order(&rtty),
             [
+                "decodedText",
                 "markHz",
                 "spaceHz",
                 "shiftHz",

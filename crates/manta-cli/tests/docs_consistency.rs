@@ -3514,6 +3514,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
         }],
         timing: Some(timing),
         rtty: vec![RttySignalReport {
+            decoded_text: String::new(),
             mark_hz: 14_080_170.0,
             space_hz: 14_080_000.0,
             shift_hz: 170.0,
