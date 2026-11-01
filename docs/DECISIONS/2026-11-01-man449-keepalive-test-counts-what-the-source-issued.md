@@ -1,12 +1,12 @@
 # MAN-449: the keepalive-cadence test counts what the source issued and re-observes only a lost datagram
 
-Date: 2026-11-01. Ticket: MAN-449, filed from two `test (windows-latest)`
+Date: 2026-11-01. Ticket: MAN-449, filed from `test (windows-latest)`
 failures of `hpsdr::proto2::tests::keepalive_resends_on_cadence` on main.
 
 ## Context
 
 The test opens a protocol-2 source against `FakeP2Radio`, reads for one
-second over loopback UDP and counted the keepalives the fake recorded. It
+second over loopback UDP, and until now counted the keepalives the fake recorded. It
 failed six times on `windows-latest` on main from 2026-10-23 to 2026-10-26
 (jobs 120213903839, 120719033058, 120887576850, 121409698527, 121556343915,
 121595704815), about 2.7% of the 226 Windows jobs that ran it since
@@ -51,12 +51,11 @@ datagram on each of the four streams passes every time.
 
 ## Not done
 
-- The fixture's recorder loop (timed `recv_from` every 10 ms) is unchanged.
-- `overload_raises_adc0_attenuation_on_the_wire` keeps the same exact
-  high-priority sequence assert through the same fixture, and
-  `hpsdr::discovery::tests::auto_retries_discovery_four_times_within_the_window`
-  keeps `probe_fake`'s exact count (it failed 4 times on Windows with
-  `left: 3, right: 4`). Both are for a follow-up ticket.
+For a follow-up ticket: the fixture's recorder loop (a timed `recv_from`
+every 10 ms) is unchanged; `overload_raises_adc0_attenuation_on_the_wire`
+keeps the same exact high-priority sequence assert through the same
+fixture; `hpsdr::discovery::tests::auto_retries_discovery_four_times_within_the_window`
+keeps `probe_fake`'s exact count (4 Windows failures, `left: 3, right: 4`).
 
 ## Residual risk
 
