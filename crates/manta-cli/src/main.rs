@@ -5745,6 +5745,25 @@ fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) 
     has_server && !rf_aware && dial_freq_hz.is_none()
 }
 
+/// MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's sidecar by
+/// opening it and maps any open error to "no RF frequency". For a file
+/// that exists, that error (an unsupported sample rate, a malformed
+/// header) is the real problem, so a dial guard calls this first to
+/// report it rather than ask for a dial frequency that would not help.
+fn report_iq_open_error(spec: &LiveSourceSpec, dial_freq_hz: Option<f64>) -> Result<()> {
+    if let LiveSourceSpec::File {
+        path,
+        source_iq: true,
+        raw,
+    } = spec
+    {
+        if path.exists() {
+            open_iq_source_file(path, *raw, dial_freq_hz)?;
+        }
+    }
+    Ok(())
+}
+
 /// How `manta doctor` names the configured receiver. Never includes the
 /// KiwiSDR password.
 fn receiver_desc(spec: &LiveSourceSpec) -> doctor_checks::ReceiverDesc {
@@ -7128,22 +7147,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
             if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
-                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
-                // sidecar by opening it and maps any open error to "no RF
-                // frequency". For a file that exists, that error (an
-                // unsupported sample rate, a malformed header) is the real
-                // problem, so report it rather than asking for a dial
-                // frequency that would not help.
-                if let LiveSourceSpec::File {
-                    path,
-                    source_iq: true,
-                    raw,
-                } = spec
-                {
-                    if path.exists() {
-                        open_iq_source_file(path, *raw, dial_freq_hz)?;
-                    }
-                }
+                report_iq_open_error(spec, dial_freq_hz)?;
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -7156,6 +7160,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // or without [server], and its socket is bound before any
             // source I/O (as `[[wsjtx_relay]]` sockets are).
             if spectrum_out.is_some() && needs_dial_freq(true, has_rf_aware_source, dial_freq_hz) {
+                report_iq_open_error(spec, dial_freq_hz)?;
                 bail!(spectrum_feed::NEEDS_RF_MESSAGE);
             }
             // The input's name: its `name` key, else its type (MAN-13).
