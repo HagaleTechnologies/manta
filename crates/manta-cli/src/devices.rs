@@ -285,7 +285,7 @@ mod tests {
     fn enumerate_hpsdr_finds_a_fake_on_an_ephemeral_port() {
         use std::net::UdpSocket;
         use std::time::{Duration, Instant};
-        let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();

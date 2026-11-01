@@ -33,7 +33,8 @@ variable: they dial that address even when `MANTA_CONFIG` names a missing or
 invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
 the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
-set from the environment. An unknown table, key or `MANTA_*` variable is an
+set from the environment. `[callsign_lookup]` can, through
+`MANTA_CALLSIGN_LOOKUP_*`, so the QRZ.com password can stay out of the file. An unknown table, key or `MANTA_*` variable is an
 error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
 variables and are skipped at run time.
 
@@ -56,10 +57,10 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all nine | yes |
+| `run` (alias `listen`) | all ten | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all nine, resolved exactly as `run` resolves them | yes |
+| `config check` | all ten, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
@@ -290,6 +291,45 @@ manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 is listed twice
 manta.toml: [[wsjtx_relay]]: listen "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
 ```
 
+## [callsign_lookup]
+
+Spots only callsigns QRZ.com lists (MAN-318), off by default. A call QRZ.com
+reports as not found is not spotted on any surface (telnet, JSON/WebSocket,
+the RBN uplink, stdout); stderr says `callsign lookup: <CALL> not spotted:
+QRZ.com does not list it (answer kept 24 h)` and
+`manta_callsign_lookup_withheld_total` counts it. Validation runs every other
+check first and asks QRZ.com last, so a call it would reject anyway costs no
+lookup. A spot waits at most 10 s for an answer: one QRZ.com does not give in
+time, a network error or a refused login spots it anyway, counted in
+`manta_callsign_lookup_unverified_total` (see
+[METRICS.md](METRICS.md#metric-families)). Answers, found or not found, are
+kept 24 h in memory, so a call is looked up at most once a day per run;
+failures are never kept. A held spot is published up to 10 s after its
+`timestamp`, after spots decoded later.
+
+- **Live sources only.** A file replay prints `note: callsign lookup is off
+  for file replay, so the run is repeatable` and looks nothing up. Works with
+  or without `[server]` (without it, no metrics). Restart-only: a SIGHUP that
+  changes the table keeps the running values.
+- **Exempt calls.** Calls on `[spot].allowlist` are never looked up and spot
+  as before. QRZ.com does not list every licensed station: put known
+  exceptions on the allowlist.
+- **Account.** Needs a QRZ.com account; QRZ says its XML service needs a
+  Logbook Data subscription beyond testing. A wrong password makes QRZ.com
+  block the user name for 10 minutes, so manta tries a refused login again
+  only after 600 s (24 h after QRZ's `Connection refused`).
+- **Network.** Outbound HTTPS to `xmldata.qrz.com:443`, honouring
+  `HTTPS_PROXY`. The password and session key go only in TLS POST bodies,
+  never in a URL or a log line. At shutdown a stop waits up to 10 s more for
+  answers still in flight.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `false` | live: `run` | `true` withholds spots whose callsign QRZ.com does not list. |
+| `qrz_username` | `""` | live: `run` | Your QRZ.com user name; required when enabled. `MANTA_CALLSIGN_LOOKUP_QRZ_USERNAME` sets it. |
+| `qrz_password` | `""` | live: `run` | Required when enabled. `config check` prints only `set` or `none`. Keep it out of the file with `MANTA_CALLSIGN_LOOKUP_QRZ_PASSWORD`. |
+| `qrz_url` | `"https://xmldata.qrz.com/xml/current/"` | live: `run` | QRZ.com's XML service. Must be `https://`; `http://` is accepted only to a loopback address (`127.0.0.0/8`, `::1`, `localhost`), for tests and local proxies. |
+
 ## [input]
 
 The receiver. `decode` never reads the source keys, and a command-line source
@@ -315,6 +355,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `mac` | none; example `"02:11:22:33:44:55"`; unset selects the only discovered radio | live: `type = "hpsdr"` | Pin a radio across address changes. `--hpsdr-mac` or `MANTA_INPUT_MAC` sets it. Accepts colon, dash or bare hexadecimal spelling, case-insensitively; summaries print uppercase colon-separated bytes. Cannot be combined with host. |
 | `port` | `8073`; `1024` for hpsdr; `5004` for ka9q | live: `type = "kiwi"`, `"hpsdr"` or `"ka9q"` | Receiver port, 1 to 65535; for ka9q, the group's RTP data port; for an hpsdr protocol-2 radio, the base of its port map (see [HPSDR protocol 2](#hpsdr-protocol-2)). `--kiwi-port`, `--hpsdr-port` or `--ka9q-port` overrides it. |
 | `protocol` | `"auto"` | live: `type = "hpsdr"` | openHPSDR protocol the radio speaks: `"auto"`, `"1"` or `"2"`; the integers `1` and `2` are accepted too. `"auto"` sends a discovery probe to `host` on every open and uses protocol 2 when the radio answers as protocol 2, protocol 1 otherwise (a warning names the key when the radio does not answer within 1 s). `"1"` (Hermes-Lite 2) and `"2"` (ANAN) skip the probe. `--hpsdr-protocol` or `MANTA_INPUT_PROTOCOL` (read verbatim as a string) overrides it. Any other `type` refuses the key. |
+| `auto_attenuation` | `false` | live: `type = "hpsdr"` with protocol 2; restart required | `true` lets manta set the radio's ADC0 step attenuator: ADC overload reported for 2 s adds 6 dB (up to 30 dB), and 10 minutes with none removes 6 dB. Off by default because it changes the radio's settings. Refused with `protocol = "1"` and on a radio with several receivers; under `"auto"` a radio that answers as protocol 1 gets a warning and is left alone. `MANTA_INPUT_AUTO_ATTENUATION` sets it. See [Automatic attenuation](#automatic-attenuation). |
 | `password` | `""` | live: `type = "kiwi"` | KiwiSDR password; empty for a public receiver. `config check` prints only whether it is set. `--kiwi-password` overrides it. |
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. |
@@ -381,6 +422,37 @@ datagrams by the radio's source port.
   front-end filters are bypassed (ANT1, no high-pass, the 6 m low-pass).
 
 See [DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md](DECISIONS/2026-10-19-man305-hpsdr-protocol-2-input.md).
+
+#### Automatic attenuation
+
+MAN-308: with `auto_attenuation = true`, manta reads the radio's
+high-priority status datagram (from `port + 1`) and drives ADC0's step
+attenuator:
+
+- ADC overload reported for 2 s (reports no more than 500 ms apart count as
+  one overload) adds 6 dB, up to 30 dB. Overload that continues adds
+  another 6 dB every 2 s.
+- 10 minutes with no overload reported removes 6 dB, and every further quiet
+  10 minutes another 6 dB, down to 0 dB.
+
+It writes to the radio, so it is off by default. Another program driving
+the same radio's attenuator would fight it. It needs protocol 2: config
+load refuses it with `protocol = "1"` and on a radio that several
+`[[input]]` entries share, and under `"auto"` a radio that answers as
+protocol 1 gets a warning naming the key and is left alone.
+
+Each change prints one line, for example:
+
+```
+note: HPSDR radio 192.0.2.10:1024: ADC overload for 2 s; automatic attenuation raised the step attenuator from 0 dB to 6 dB
+note: HPSDR radio 192.0.2.10:1024: no ADC overload for 10 min; automatic attenuation lowered the step attenuator from 12 dB to 6 dB
+```
+
+With a `[server]` table, `/metrics` carries `manta_input_attenuation_db` and
+`manta_input_attenuation_changes_total` (see [METRICS.md](METRICS.md)). A
+reconnect keeps the level manta had learned; a manta restart starts at
+0 dB. See
+[DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md](DECISIONS/2026-10-27-man308-hpsdr-auto-attenuation.md).
 
 ### Band plans: bands
 
@@ -457,7 +529,25 @@ Raspberry Pi 4 core per 192 kS/s stream, 14 streams at 96 kS/s need about
 seven cores.
 
 **Environment.** `MANTA_INPUT_BANDS=all`, `MANTA_INPUT_BANDS=7030` or
-`MANTA_INPUT_BANDS='["40m","20m"]'`.
+`MANTA_INPUT_BANDS='["40m","20m"]'`. For a single `[input]` or one-entry
+`[[input]]`, a nonempty environment selector replaces the file's tuning
+mode:
+
+```sh
+# File sets freq_hz = 7040000; skim 7030 kHz instead.
+MANTA_INPUT_BANDS=7030 manta config check --config manta.toml
+# File sets bands = "7030"; tune to 7040000 Hz instead.
+MANTA_INPUT_FREQ_HZ=7040000 manta config check --config manta.toml
+```
+
+The first drops the file's `freq_hz`. The second drops the file's `bands`
+and its `tuning_range_hz`, if present. Other input settings stay in place.
+Setting both environment selectors to nonempty values is an error naming
+both variables. Empty values count as unset and leave file settings in
+place. An explicit `MANTA_INPUT_TUNING_RANGE_HZ` still needs bands; it is
+not discarded with the file's range. With two or more `[[input]]` entries,
+`MANTA_INPUT_*` overrides remain ambiguous and are refused. Tuning changes
+need a restart. See [the MAN-414 decision](DECISIONS/2026-10-29-man414-environment-tuning-mode.md).
 
 `config check` and `run` print the plan and every skipped or clipped band
 as notes before their output:
@@ -525,6 +615,7 @@ own schedule. See
 | `notch_path` | none; example `"notches.txt"`; unset notches no frequency | live: `run`, `soak`, `doctor`, `decode`; reloads on SIGHUP | File of `low_hz-high_hz` ranges never spotted, one per line. A relative path set in the file is relative to the file's directory; from `--notch`, which overrides it, or `MANTA_SPOT_NOTCH_PATH` it is relative to the working directory. |
 | `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
 | `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
+| `calls_heard_path` | none; example `"calls-heard.txt"` | restart-only: `run`, `soak`, `doctor`, `decode` | Optional local calls-heard file. One CALL per line with an optional count, e.g. `W1AW 12`. Blank and `#`/`!!` comment lines are skipped; a missing file supplies no frequency evidence. Relative paths resolve against the config file directory, or the working directory for `MANTA_SPOT_CALLS_HEARD_PATH`. SIGHUP does not reload this file. No download is performed. |
 | `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url`, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
 | `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
 | `cty_url` | `"http://www.country-files.com/cty/cty.dat"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `cty.dat`. Only `http://` URLs: `https://` is refused at load, because manta has no TLS support. Redirects and chunked responses count as failures. Point it at a local mirror to share one download. |
@@ -609,6 +700,10 @@ the measured best values.
 | Key | Default | Wired | Notes |
 |---|---|---|---|
 | `engine` | `"legacy"` | live | `"legacy"`, `"edge-legacy"` or `"hsmm"`. `--engine` overrides it on `run`, `decode`, `oracle` and `bench sensitivity`; `hsmm` is experimental, see [DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md](DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md). |
+| `prior` | `"off"` | restart-only: legacy and edge-legacy | `"on"` holds acoustically viable word readings and reweights them with bounded list evidence. The default stays off until recorded and live RBN regression gates pass. `--prior on|off` overrides it on `run`, `decode`, `oracle` and `bench sensitivity`; `MANTA_DECODE_PRIOR` sets it for live commands. The HSMM engine rejects an enabled prior. |
+| `prior_weight` | `2.0` | restart-only: legacy and edge-legacy | Maximum language bonus per reading in nats. Must be finite and at least zero. |
+| `reading_margin` | `3.0` | restart-only: legacy and edge-legacy | Acoustic score margin in nats. Readings beyond it are dropped before language scoring. Must be finite and at least 0.1. |
+| `held_readings` | `4` | restart-only: legacy and edge-legacy | Maximum word readings retained, from 1 through 16. Acoustic score and lexical order determine retention. |
 | `timing_sigma` | `0.25` | live: legacy and edge-legacy | Timing tolerance when matching dots and dashes; at least 0.001. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
 | `beam_width` | `4` | live: legacy and edge-legacy | Character guesses kept at each step; at least 1. |
 | `debounce_ms` | `12.0` | live: legacy and edge-legacy | Shortest key-down or key-up accepted, ms; above 0. |

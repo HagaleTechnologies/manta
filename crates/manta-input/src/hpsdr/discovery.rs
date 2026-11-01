@@ -190,6 +190,65 @@ fn remember(found: &mut BTreeMap<[u8; 6], DiscoveredRadio>, radio: DiscoveredRad
     }
 }
 
+/// Keep replies to loopback probes off the socket used for LAN broadcasts.
+struct DiscoverySockets {
+    loopback: Option<UdpSocket>,
+    broadcast: Option<UdpSocket>,
+}
+
+fn open_discovery_sockets(destinations: &[SocketAddr]) -> io::Result<DiscoverySockets> {
+    let open = |ip| -> io::Result<UdpSocket> {
+        let socket = UdpSocket::bind((ip, 0))?;
+        // Loopback broadcast (127.255.255.255) needs this too.
+        socket.set_broadcast(true)?;
+        Ok(socket)
+    };
+    Ok(DiscoverySockets {
+        loopback: destinations
+            .iter()
+            .any(|dest| dest.ip().is_loopback())
+            .then(|| open(Ipv4Addr::LOCALHOST))
+            .transpose()?,
+        broadcast: destinations
+            .iter()
+            .any(|dest| !dest.ip().is_loopback())
+            .then(|| open(Ipv4Addr::UNSPECIFIED))
+            .transpose()?,
+    })
+}
+
+fn send_discovery_round(sockets: &DiscoverySockets, destinations: &[SocketAddr]) -> io::Result<()> {
+    // Some platforms cannot route loopback broadcast. A successful
+    // destination still yields a useful scan; report when all fail.
+    let mut sent = false;
+    let mut last_error = None;
+    for (socket, loopback) in sockets
+        .loopback
+        .iter()
+        .map(|s| (s, true))
+        .chain(sockets.broadcast.iter().map(|s| (s, false)))
+    {
+        for dest in destinations
+            .iter()
+            .filter(|dest| dest.ip().is_loopback() == loopback)
+        {
+            for request in [&discovery_request_p1()[..], &discovery_request_p2()[..]] {
+                match socket.send_to(request, dest) {
+                    Ok(_) => sent = true,
+                    Err(err) => last_error = Some(err),
+                }
+            }
+        }
+    }
+    if sent {
+        Ok(())
+    } else {
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "no discovery destinations")
+        }))
+    }
+}
+
 /// Send both request shapes, then collect until the deadline. Destination
 /// ports are supplied by the caller; `port` restricts replies to that radio
 /// service. An I/O failure is distinct from a successful scan with no answers.
@@ -198,8 +257,16 @@ pub fn discover(
     destinations: &[SocketAddr],
     timeout: Duration,
 ) -> io::Result<Vec<DiscoveredRadio>> {
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.set_broadcast(true)?;
+    let sockets = open_discovery_sockets(destinations)?;
+    if destinations.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no discovery destinations",
+        ));
+    }
+    let socket_count =
+        u32::from(sockets.loopback.is_some()) + u32::from(sockets.broadcast.is_some());
+    let read_slice = READ_SLICE / socket_count;
     let start = Instant::now();
     let deadline = start + timeout;
     let mut rounds = 0;
@@ -207,43 +274,30 @@ pub fn discover(
     let mut buf = [0; 2048];
     while Instant::now() < deadline {
         if rounds < REQUEST_ROUNDS && start.elapsed() >= DISCOVERY_RETRY_INTERVAL * rounds {
-            // Some platforms cannot route loopback broadcast. A successful
-            // destination still yields a useful scan; report when all fail.
-            let mut sent = false;
-            let mut last_error = None;
-            for dest in destinations {
-                for request in [&discovery_request_p1()[..], &discovery_request_p2()[..]] {
-                    match socket.send_to(request, dest) {
-                        Ok(_) => sent = true,
-                        Err(err) => last_error = Some(err),
-                    }
-                }
-            }
-            if !sent {
-                return Err(last_error.unwrap_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "no discovery destinations")
-                }));
-            }
+            send_discovery_round(&sockets, destinations)?;
             rounds += 1;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        socket.set_read_timeout(Some(remaining.min(READ_SLICE)))?;
-        match socket.recv_from(&mut buf) {
-            Ok((n, addr)) if addr.port() == port => {
-                if let Some(mut radio) = parse_reply(&buf[..n]) {
-                    radio.ip = addr.ip();
-                    remember(&mut found, radio);
-                }
+        // Divide the read slice across sockets so a mixed scan keeps the
+        // same retry cadence and deadline as a single-socket scan.
+        for socket in sockets.loopback.iter().chain(sockets.broadcast.iter()) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            Ok(_) => {}
-            // Includes Windows' `ConnectionReset` for an ICMP
-            // port-unreachable, which the `127.0.0.1` destination draws when
-            // no simulator listens there.
-            Err(err) if is_retry(err.kind()) => {}
-            Err(err) => return Err(err),
+            socket.set_read_timeout(Some(remaining.min(read_slice)))?;
+            match socket.recv_from(&mut buf) {
+                Ok((n, addr)) if addr.port() == port => {
+                    if let Some(mut radio) = parse_reply(&buf[..n]) {
+                        radio.ip = addr.ip();
+                        remember(&mut found, radio);
+                    }
+                }
+                Ok(_) => {}
+                // Includes Windows' ConnectionReset for an ICMP port-unreachable
+                // when no simulator listens on 127.0.0.1.
+                Err(err) if is_retry(err.kind()) => {}
+                Err(err) => return Err(err),
+            }
         }
     }
     Ok(found.into_values().collect())
@@ -516,7 +570,7 @@ fn resolve_ipv4(host: &str, port: u16) -> Result<Ipv4Addr> {
 pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
     let radio_ip = IpAddr::V4(resolve_ipv4(host, port)?);
     let radio = SocketAddr::new(radio_ip, port);
-    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+    let socket = crate::local_bind::bind_udp_for(radio_ip)
         .with_context(|| format!("binding a UDP socket for HPSDR discovery of {host}:{port}"))?;
     socket
         .set_read_timeout(Some(POLL))
@@ -821,6 +875,70 @@ mod tests {
     }
 
     #[test]
+    fn loopback_only_destinations_open_no_wildcard_socket() {
+        let destinations = [
+            SocketAddr::from(([127, 0, 0, 1], 1024)),
+            SocketAddr::from(([127, 255, 255, 255], 1024)),
+        ];
+        let sockets = open_discovery_sockets(&destinations).unwrap();
+        assert!(sockets.broadcast.is_none());
+        let loopback = sockets.loopback.unwrap();
+        assert_eq!(
+            loopback.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        assert!(loopback.broadcast().unwrap());
+    }
+
+    #[test]
+    fn broadcast_destinations_keep_a_wildcard_broadcast_socket() {
+        let sockets = open_discovery_sockets(&broadcast_destinations(1024)).unwrap();
+        let broadcast = sockets.broadcast.unwrap();
+        assert_eq!(
+            broadcast.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+        assert!(broadcast.broadcast().unwrap());
+        let loopback = sockets.loopback.unwrap();
+        assert_eq!(
+            loopback.local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+        // 127.255.255.255 is sent on this socket and needs SO_BROADCAST too.
+        assert!(loopback.broadcast().unwrap());
+    }
+
+    #[test]
+    fn broadcast_only_destinations_open_no_loopback_socket() {
+        let destinations = [SocketAddr::from(([255, 255, 255, 255], 1024))];
+        let sockets = open_discovery_sockets(&destinations).unwrap();
+        assert!(sockets.loopback.is_none());
+        assert_eq!(
+            sockets.broadcast.unwrap().local_addr().unwrap().ip(),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        );
+    }
+
+    #[test]
+    fn discover_finds_a_loopback_fake_with_broadcast_destinations_present() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let dest = socket.local_addr().unwrap();
+        let responder = thread::spawn(move || {
+            let mut buf = [0; 100];
+            let (n, addr) = socket.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &discovery_request_p1());
+            socket.send_to(&p1(2), addr).unwrap();
+        });
+        let destinations = broadcast_destinations(dest.port());
+        let found = discover(dest.port(), &destinations, Duration::from_millis(200)).unwrap();
+        responder.join().unwrap();
+        assert_eq!(found, vec![radio()]);
+    }
+
+    #[test]
     fn discover_finds_a_fake_radio_on_a_loopback_destination() {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -844,6 +962,19 @@ mod tests {
         assert!(discover(dest.port(), &[dest], DISCOVERY_TIMEOUT)
             .unwrap()
             .is_empty());
+        assert!(start.elapsed() < Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn discover_with_broadcast_is_bounded_when_nothing_answers() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let start = Instant::now();
+        assert!(
+            discover(port, &broadcast_destinations(port), DISCOVERY_TIMEOUT)
+                .unwrap()
+                .is_empty()
+        );
         assert!(start.elapsed() < Duration::from_millis(2500));
     }
 

@@ -211,7 +211,7 @@ impl LiveTap {
             }
             // MAN-315: the live-state stream carries no sender timing; it
             // stays on the event stream and `decode --json`.
-            DecoderEvent::TimingUpdate { .. } => {}
+            DecoderEvent::ReadingsHeld { .. } | DecoderEvent::TimingUpdate { .. } => {}
             DecoderEvent::TrackClosed { track_id, .. } => {
                 if self.dirty.remove(track_id) {
                     self.publish_track(*track_id, validator);

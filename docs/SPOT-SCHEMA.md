@@ -23,6 +23,9 @@ per graded spot (MAN-301); see [`spotGrade` records](#spotgrade-records).
   Raw TCP receives it once the 500 ms classification ends, then live records only.
 - Every spot and `spotGrade` carries `seq`, starting at 1 and increasing by 1
   per record in the session. A plain WebSocket connection also receives only live records.
+- `seq` is publish order. With `[callsign_lookup]` on (MAN-318), a spot can be
+  published up to about 10 s after its `timestamp`, after spots with later
+  timestamps. The fields are unchanged.
 - WebSocket clients can resume with `GET /?session=<session>&since=<last seq processed>`.
   The server sends the hello, then retained records after `since`, then live records.
   A same-session cursor from `historyFrom - 1` through `hello.seq` resumes fully.
@@ -103,6 +106,12 @@ vendored `cty.dat` (or the file given by `--cty` or `[spot].cty_path`) and
 the vendored ADIF entity table `dxcc.tsv`, except the reporting station's
 position: `deGrid`/`deLat`/`deLon` come only from the `[server]` location
 keys (MAN-138), never `cty.dat`.
+
+CLI `--json` additionally carries `emissionState`, either `confirmed` or
+`tentative`, according to whether the pattern tier's repetition requirement
+was met. Both states publish. This field is absent from the :7301 stream.
+Candidates with no finite positive character confidence never emit a spot;
+their live-state decision has reason `noEvidence` (MAN-106).
 
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|

@@ -186,6 +186,7 @@ fn event_ts(e: &DecoderEvent) -> Option<u64> {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }
         | DecoderEvent::TrackPromoted { sample_ts, .. }
+        | DecoderEvent::ReadingsHeld { sample_ts, .. }
         | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
         _ => None,
     }
@@ -197,6 +198,7 @@ fn event_track(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::ReadingsHeld { track_id, .. }
         | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
@@ -389,6 +391,7 @@ fn rtty_rows_span_a_gap_with_distinct_ids() {
         &mut iq,
         fs,
         &manta_testkit::fsk::FskSpec {
+            mark_below_space: false,
             mark_offset_hz: 15_000.0,
             shift_hz: 170.0,
             baud: 45.45,

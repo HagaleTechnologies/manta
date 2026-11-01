@@ -7,6 +7,11 @@
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
+/// MAN-318: the fake radiod and live-`run` helpers, moved from
+/// `ka9q_input.rs`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod ka9q;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};

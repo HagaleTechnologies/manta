@@ -224,6 +224,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         resolved, loaded, ..
     } = prepare_source(
         CliOverrides {
+            prior: None,
             device: args.device,
             source: args.path.or(args.source),
             source_iq: args.source_iq,
@@ -247,6 +248,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
                 protocol: args.hpsdr_protocol.into(),
                 freq: args.hpsdr_freq_hz,
                 rate: args.hpsdr_rate_hz,
+                auto_attenuation: None,
             },
             ka9q: Ka9qOpts {
                 group: args.ka9q_group,

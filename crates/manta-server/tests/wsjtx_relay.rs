@@ -357,7 +357,13 @@ async fn a_malformed_datagram_is_counted_and_the_listener_keeps_going() {
     assert_eq!(h.next_spot().await.callsign, "K1ABC");
 }
 
-#[tokio::test(start_paused = true)]
+/// MAN-478: real UDP under `start_paused` raced on macOS. The clock could
+/// auto-advance past the 60 s window before kqueue reported the second
+/// heartbeat, which then counted as heard 10 s late and kept the relay up
+/// at the "61 s of silence" check. Each datagram is now sent and seen in
+/// real time; time is paused only for the silent stretches, when no
+/// assertion waits on socket I/O.
+#[tokio::test]
 async fn up_follows_datagrams_within_60_s() {
     let h = spawn_relay().await;
     assert!(!h.stats.up());
@@ -371,10 +377,19 @@ async fn up_follows_datagrams_within_60_s() {
     .await
     .expect("a heartbeat sets up");
 
+    tokio::time::pause();
     tokio::time::sleep(Duration::from_secs(50)).await;
     assert!(h.stats.up());
+    tokio::time::resume();
+    // The relay's 60 s deadline is now 10 s of real time away. A malformed
+    // datagram (counted, but not a sign of life) sent after the heartbeat
+    // on the same loopback socket fences it: once it is counted, the
+    // heartbeat has been heard.
     h.send(&heartbeat("WSJT-X")).await;
-    tokio::time::sleep(Duration::from_millis(10)).await;
+    h.send(b"not a wsjt-x datagram").await;
+    h.dropped(DropReason::BadDatagram, 1).await;
+    assert!(h.stats.up());
+    tokio::time::pause();
     // 70 s after the first heartbeat, 20 s after the second: still up.
     tokio::time::sleep(Duration::from_secs(20)).await;
     assert!(h.stats.up());

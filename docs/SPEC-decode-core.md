@@ -1430,10 +1430,16 @@ c_char ← c_char · q,  q = clamp(SNR_2500 / 20 dB, 0.3, 1.0)
 `q` folds channel quality in so that a clean-timed character in the mud never
 reaches full confidence. Emitted per character in the decoder output stream.
 
-`q`'s `SNR_2500` is still the demod's own §3.2 keying-rail estimate
-(`Demod::snr_2500_db`), not `TrackMeta.snr_2500_db`'s §2.3 floor-based value
-below — deliberately (MAN-102 / decision D3): the two were the same value by
-coincidence before MAN-102, and are now intentionally decoupled, not merged.
+`q`'s `SNR_2500` is the engine-supplied floor-based estimate (§2.3 /
+MAN-102, pushed down via `set_snr_2500_db` on every queued hop), with the
+demod's own §3.2 keying-rail estimate (`Demod::snr_2500_db`) as the
+fallback when the decoder is driven standalone. Amended by MAN-106
+(docs/DECISIONS/2026-10-30-man106-q-snr-input.md), which reversed MAN-102
+decision D3's pin for the confidence path only: the rail estimate sits
+~8 dB under the floor value across the operating band, pinning `q` at its
+0.3 floor (100% of decoded characters at AWGN 3/6 dB, 69% on the V8w
+scene), so spot confidence carried no dynamic range. `TrackMeta`'s
+reported value was already the floor-based one; the two now agree.
 
 ### 4.6 Per-callsign confidence (consumed by `manta-spot`)
 
@@ -1461,7 +1467,16 @@ c_call = (Π cᵢ)^(1/n) · (1 − 0.5^r)
 Geometric mean (one garbled character tanks it, correctly) times a
 repetition factor: `r=1 → 0.5`, `r=2 → 0.75`, `r=3 → 0.875`. The validator's
 own adjustments (cty/SCP hits, per ARCHITECTURE §6) multiply on top of this
-and are specified in `manta-spot`, not here. The first-spot gate requires
+and are specified in `manta-spot`, not here.
+
+MAN-106 adds an evidence gate before confidence composition: a candidate
+with no finite positive character confidence is withheld as
+`Reason::NoEvidence`. Database membership and beacon exemptions cannot
+bypass this gate. Published spots carry `emissionState` in CLI JSON:
+`confirmed` when the pattern tier's repetition requirement is met, else
+`tentative`. Both states publish. Confidence is still the uncalibrated
+composition above; empirical calibration and its probability-based state
+rule are deferred to a follow-up slice. The first-spot gate requires
 the pattern tier's count (2 for a common
 pattern, 3 for a listed pattern, 5 for an unlisted pattern at the default
 `normal` level; `minimal` requires 2 for every pattern, MAN-95); a
@@ -1556,6 +1571,44 @@ currently live rather than growing with track history. See
 comparison, and the MAN-100 decision record for the measured rationale
 behind the prefix-only asymmetry.
 
+### 4.7 Optional word readings and language prior (MAN-317)
+
+`[decode] prior = "off"` is the default and preserves the character-local
+path above. With `prior = "on"`, the legacy and edge-legacy engines retain
+complete word readings across character boundaries. The mark sequence and
+gap classifier still determine which characters can exist. A language list
+cannot insert, complete or substitute a reading.
+
+Each candidate character has the sum of its mark log-likelihoods. Learned
+sender dot/dash variance determines each class's log-space spread once the
+class has enough observations; sparse classes use `timing_sigma`. Scores
+compare paths over the same marks, with no alternative segmentation.
+The word beam expands only with those acoustic candidates. It drops readings
+more than `reading_margin` nats behind the acoustic leader, then retains at
+most `held_readings` readings in deterministic score and lexical order.
+Readings are limited to 24 glyphs to bound retention. An `<ERR>` (§4.4)
+keeps only the acoustic leader, whose characters and the `<ERR>` still emit
+at settlement, and the characters after it are ranked as a new word, the
+text the validator keeps.
+
+The prior adds a nonnegative bonus capped at `prior_weight` nats per word.
+Its evidence is exact SCP membership, logarithmic calls-heard counts,
+allocated country prefixes, and common CW words. Unknown valid calls stay
+eligible. The prior never rescues a reading dropped by acoustic pruning.
+At word settlement the largest acoustic-plus-prior score wins. Characters
+then emit with their original timestamps before the word boundary. Confidence
+continues to describe acoustic evidence, not dictionary membership.
+
+`ReadingsHeld` reports every retained reading and its nonnegative score gap
+to the leader when at least two remain, after each character and again on
+settlement. The leader gap is zero; the settlement leader is the committed
+word. The prior-off path emits no such diagnostics. Existing spot schemas,
+repetition gates and validation thresholds are unchanged.
+
+The default may change only in a separate release after prior-on V8, V8w
+and VC3 precision gates pass and a paired week of live RBN grades shows no
+rise in the `none` rate. The runbook specifies that operational measurement.
+
 ---
 
 ## 5. Decoder output
@@ -1565,6 +1618,8 @@ Per track, an ordered event stream:
 ```
 CharDecoded    { track_id, sample_ts: u64, char: char | Token, confidence: f32 }
 WordBoundary   { track_id, sample_ts: u64 }
+ReadingsHeld   { track_id, sample_ts: u64, readings: [(String, f32)], settled: bool }
+                 (MAN-317; prior-on only; reading and gap-to-leader in nats)
 SpeedUpdate    { track_id, wpm: f32 }          (emitted on ≥ 1 WPM change)
 TrackMeta      { track_id, sample_ts: u64, snr_2500_db: f32, freq_centroid: f64 }  (1 Hz cadence)
 TrackPromoted  { track_id, sample_ts: u64, freq_hz: f64 }  (detector-internal;
@@ -1673,7 +1728,9 @@ rules:
 1. **No RNG** anywhere in `manta-dsp` / `manta-decode`. (The testkit's
    jitter models use seeded `rand_chacha`; seeds are part of the test vector.)
 2. **No wall clock** in the decode path (§5). All timers are hop/sample
-   counters.
+   counters. The MAN-318 callsign lookup (`[callsign_lookup]`) reads a wall
+   clock and the network, but runs only for live sources, so a run from an
+   IQ file is unaffected.
 3. **Fixed iteration order:** tracks are processed in ascending birth order
    (track_id, a monotonic u32) each hop; channels in ascending index. Any map
    keyed by track/channel in an output-affecting path is a `BTreeMap` or
@@ -1745,6 +1802,7 @@ in the fixture manifest. Text payload (unless stated):
 | V31 | decimated-clean-20 | Same scene as V1 (20 WPM, +20 dB, offset +12.34 kHz, W1AW), synthesized at 192 kHz then decimated to 48 kHz via `manta_dsp::decimate::Decimator` | AWGN only, no jitter | char ≥ 98%; 1 track; freq error ≤ 10 Hz |
 | V34 | fade-good-reacquire | 20 WPM, +3 dB, offset +9.1 kHz, W1AW, 120 s; fade seed `0x0BAD`, noise seed `0x4D41_4E01_3B95` (MAN-108) | Watterson CCIR-good, no jitter | 1 promoted track within 300 Hz; W1AW spotted, every W1AW spot on that track; CER ≤ 0.20; with `detector.reacquire_ms = 0` the same WAV promotes ≥ 2 tracks (the scene still fades past the hang) |
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
+| V52 | zero-evidence | `CQ DE W1AW W1AW K` event sequences at the validator event contract, every `char_decoded` confidence 0.0 (with and without SCP), plus positive-control and mixed-`?` variants | n/a (event stream, not audio) | no spot from the all-zero streams and a withheld `NoEvidence` decision; positive evidence still spots; a mixed word still spots; a two-rep clean CQ spot is `confirmed`, a single-rep allowlisted spot `tentative`; `emissionState` serializes `confirmed`/`tentative` (MAN-106) |
 
 V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
 frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz
@@ -1992,7 +2050,7 @@ flush_gap_dits = 7.0
 #   file:  path*, iq, realtime, loop
 #   kiwi:  host*, freq_hz*, port, password
 #   soapy: driver*, freq_hz*, rate_hz*, gain_db   (build with --features soapy)
-#   hpsdr: host, mac, freq_hz*, rate_hz*, port, protocol (included in every build)
+#   hpsdr: host, mac, freq_hz*, rate_hz*, port, protocol, auto_attenuation (included in every build)
 #   ka9q:  group*, port, ssrc, interface
 # Any source flag on the command line (--device, --source, --kiwi-host,
 # --soapy-driver, --hpsdr-host, --ka9q-group) replaces a typed [input]
@@ -2002,6 +2060,7 @@ flush_gap_dits = 7.0
 # mac = "02:11:22:33:44:55"   # hpsdr: pin by MAC instead of host; never set both
 # port = 8073                 # kiwi (default 8073), hpsdr (default 1024), ka9q (default 5004)
 # protocol = "auto"           # hpsdr: "auto" (default) asks the radio; "1" (Hermes-Lite 2) or "2" (ANAN) skips asking (--hpsdr-protocol)
+# auto_attenuation = false    # hpsdr protocol 2: raise the step attenuator on ADC overload, lower it after 10 min quiet
 # freq_hz = 7030000.0         # kiwi, soapy, hpsdr: RF center frequency, Hz
 # password = ""               # kiwi (default "")
 # The other types' keys:
@@ -2172,8 +2231,8 @@ rather than normative constants of this spec, and
 **Precedence and the environment.** `run`, `soak`, `doctor` and
 `calibrate` resolve every key as: command-line flag, then
 `MANTA_<TABLE>_<KEY>` environment variable (`MANTA_INPUT_FREQ_CORRECTION_PPM` is `input.freq_correction_ppm`;
-`<TABLE>` is one of `SERVER`, `RBN_COMPARE`, `INPUT`, `SPOT`, `DETECTOR`,
-`DECODE`), then the config file, then the default above. `--config`
+`<TABLE>` is one of `SERVER`, `RBN_COMPARE`, `CALLSIGN_LOOKUP`, `INPUT`,
+`SPOT`, `DETECTOR`, `DECODE`), then the config file, then the default above. `--config`
 names the file; without it they read `MANTA_CONFIG`. An environment value is parsed as a
 TOML value (`9300` is an integer, `["W1AW","K1ABC"]` an array), falling
 back to a bare string -- except for the string-typed keys, which are
@@ -2184,14 +2243,16 @@ always taken verbatim: `server.station_callsign`, `server.bind_addr`,
 `input.password`, `input.driver`, `spot.blocklist_path`,
 `spot.notch_path`, `spot.cty_path`, `spot.scp_path`, `spot.pattern_path`,
 `spot.validation_level`, `decode.engine`,
-`detector.crash_filter`, `rbn_compare.feed_host` and
-`rbn_compare.login_callsign`. Relative
+`detector.crash_filter`, `rbn_compare.feed_host`,
+`rbn_compare.login_callsign`, `callsign_lookup.qrz_username`,
+`callsign_lookup.qrz_password` and `callsign_lookup.qrz_url`. Relative
 paths from the file resolve against the file's directory; those from a flag or the
 environment resolve against the working directory. `[[rbn_uplink]]`
 cannot be set from the environment. `[rbn_compare]` (MAN-301) is, like
 `[server]`, operational rather than a decode-core constant, so the key
 block above omits it; its keys and defaults are in
-`docs/RUNBOOKS/rbn-comparison.md`. `calibrate` is the only command that
+`docs/RUNBOOKS/rbn-comparison.md`. `[callsign_lookup]` (MAN-318) is another
+such operational table, documented in `docs/CONFIG.md`. `calibrate` is the only command that
 edits an existing config file, and it writes only `input.freq_correction_ppm`, after
 confirmation (MAN-127,
 `docs/DECISIONS/2026-10-11-man127-calibrate-command.md`).

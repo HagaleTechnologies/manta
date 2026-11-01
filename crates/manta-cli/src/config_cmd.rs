@@ -400,6 +400,25 @@ fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &st
     )
 }
 
+/// MAN-318: the password prints only as `set`/`none`.
+fn callsign_lookup_summary(cl: &crate::config::CallsignLookupConfig) -> String {
+    format!(
+        "callsign_lookup: enabled={} qrz_username={} qrz_password={} qrz_url={}",
+        cl.enabled,
+        if cl.qrz_username.is_empty() {
+            "none"
+        } else {
+            &cl.qrz_username
+        },
+        if cl.qrz_password.is_empty() {
+            "none"
+        } else {
+            "set"
+        },
+        cl.qrz_url
+    )
+}
+
 fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     let mut lines = vec![origin_line.to_string()];
     lines.push(if loaded.env_vars.is_empty() {
@@ -535,6 +554,11 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         ));
     }
 
+    lines.push(match &loaded.callsign_lookup {
+        None => "callsign_lookup: none".to_string(),
+        Some(cl) => callsign_lookup_summary(cl),
+    });
+
     // MAN-13: one `input <name>:` line per entry when there are several;
     // the single-input line is unchanged.
     if loaded.inputs.len() >= 2 {
@@ -583,6 +607,12 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .as_ref()
             .map_or("bundled".to_string(), |p| p.display().to_string()),
     ));
+
+    if let Some(path) = &spot.calls_heard_path {
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" calls_heard_path={}", path.display()));
+        }
+    }
 
     let detector = set_keys(loaded, "detector", &[]);
     lines.push(if detector.is_empty() {
@@ -654,6 +684,7 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             freq_hz,
             rate_hz,
             receivers,
+            auto_attenuation,
         }) => {
             // MAN-305 §3: the protocol as the operator writes it.
             let protocol = match protocol {
@@ -669,6 +700,10 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             );
             if let Some(mac) = mac {
                 line.push_str(&format!(" mac={mac}"));
+            }
+            // MAN-308: only when on, so every existing summary is unchanged.
+            if *auto_attenuation {
+                line.push_str(" auto_attenuation=true");
             }
             line
         }
@@ -1120,6 +1155,12 @@ mod tests {
             "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
              rate_hz=192000"
         );
+        let body = format!("{body}auto_attenuation = true\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
+             rate_hz=192000 auto_attenuation=true"
+        );
     }
 
     #[test]
@@ -1278,6 +1319,24 @@ mod tests {
         for l in &lines {
             assert!(!l.contains("hunter2secret"), "{l}");
         }
+    }
+
+    #[test]
+    fn summary_never_prints_the_qrz_password() {
+        let lines = lines_of(
+            "[callsign_lookup]\nenabled = true\nqrz_username = \"N1TEST\"\n\
+             qrz_password = \"hunter2secret\"\n",
+        );
+        assert_eq!(
+            line(&lines, "callsign_lookup:"),
+            "callsign_lookup: enabled=true qrz_username=N1TEST qrz_password=set \
+             qrz_url=https://xmldata.qrz.com/xml/current/"
+        );
+        for l in &lines {
+            assert!(!l.contains("hunter2secret"), "{l}");
+        }
+        let lines = lines_of("[input]\ntype = \"audio\"\n");
+        assert_eq!(line(&lines, "callsign_lookup:"), "callsign_lookup: none");
     }
 
     #[test]
@@ -1873,6 +1932,7 @@ mod tests {
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "calls_heard_path"),
         ("spot", "list_cache_dir"),
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),
@@ -1982,7 +2042,7 @@ mod tests {
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
-            ("input", "protocol") => {
+            ("input", "protocol" | "auto_attenuation") => {
                 "[input]\ntype = \"hpsdr\"\nhost = \"h\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n"
                     .to_string()
             }
@@ -2008,6 +2068,7 @@ mod tests {
             "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "skimmer_relay" => a.skimmer_relay == b.skimmer_relay,
             "wsjtx_relay" => a.wsjtx_relay == b.wsjtx_relay,
+            "callsign_lookup" => a.callsign_lookup == b.callsign_lookup,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,
             "detector" => a.detector == b.detector,

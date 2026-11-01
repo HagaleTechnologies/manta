@@ -48,6 +48,8 @@ toml = { workspace = true }
 toml_edit = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# MAN-318: QRZ.com callsign lookups over HTTPS (rustls + ring, bundled webpki-roots).
+ureq = { workspace = true }
 
 # MAN-127: config_edit.rs copies the config's DACL onto the temp file it
 # replaces the config with; std's set_permissions carries only the
