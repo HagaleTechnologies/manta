@@ -48,9 +48,12 @@ reproduced at `4581725`:
   would have added up to 32 s for 16 inputs. The writer's settle step
   (`fetch_update` to `SETTLED` unless `CANCELLED`) also decides whether it
   warns: a cancelled writer stays silent, since `finish` has already said
-  "unconfirmed". One case remains: a publication that blocks longer than
-  the grace (a hung filesystem) is reported "unconfirmed" and may still
-  appear. There is no rollback: it would be another call on the same hung
+  "unconfirmed". One case remains: on a filesystem where publishing blocks
+  longer than the grace, a recording is reported "unconfirmed" and may
+  still appear. The grace is shared and `run` finishes recordings one after
+  another, so one recording's blocked publication can spend the grace of a
+  later one that claimed publication meanwhile; that later one is then
+  cancelled with no grace left. There is no rollback: it would be another call on the same hung
   filesystem, and the process exits right after `finish_recordings`.
   Publishing on the caller's thread would also close the race, but a hung
   link would then block shutdown silently until SIGKILL. A mutex held

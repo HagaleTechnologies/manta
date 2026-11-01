@@ -1134,6 +1134,9 @@ mod tests {
         release.send(()).unwrap();
         wait_until_dropped(&published);
         assert!(!published.load(Ordering::Acquire));
+        // Give the writer's settle-and-report step time to run, had it not
+        // been cancelled.
+        std::thread::sleep(Duration::from_millis(50));
         assert!(notices.get().is_empty(), "{:?}", notices.get());
     }
 

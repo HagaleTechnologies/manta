@@ -9700,22 +9700,6 @@ mod tests {
         );
     }
 
-    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
-    /// must never fire before a handler's own drain deadline, or
-    /// `shutdown_timeout` aborts a drain that was still inside its budget
-    /// and the abandoned queue goes uncounted again -- the exact failure
-    /// rounds 15 and 16 both landed on from different directions. The
-    /// margin covers task scheduling, not another spot's write.
-    ///
-    /// MAN-45 remediate (round-16 P1, finding 2): `CLIENT_DRAIN_DEADLINE`
-    /// alone under-counts the true worst case -- a handler already mid-
-    /// write when shutdown fires doesn't even START its own drain
-    /// deadline until that in-progress `select!` branch resolves. Asserts
-    /// the FULL relationship (`2 * telnet::WRITE_TIMEOUT +
-    /// CLIENT_DRAIN_DEADLINE`, telnet's live-spot write being the largest
-    /// such in-progress branch across all three handlers), not just the
-    /// drain deadline in isolation -- see `SHUTDOWN_DRAIN_DEADLINE`'s own
-    /// doc comment for the full argument.
     /// MAN-453: every recording waits out the rest of one 5 s deadline, then
     /// the rest of one 2 s publication grace after it, not a grace each.
     #[test]
@@ -9743,6 +9727,22 @@ mod tests {
         assert!(RECORDING_FINISH_TIMEOUT + RECORDING_PUBLICATION_GRACE <= SHUTDOWN_DRAIN_DEADLINE);
     }
 
+    /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
+    /// must never fire before a handler's own drain deadline, or
+    /// `shutdown_timeout` aborts a drain that was still inside its budget
+    /// and the abandoned queue goes uncounted again -- the exact failure
+    /// rounds 15 and 16 both landed on from different directions. The
+    /// margin covers task scheduling, not another spot's write.
+    ///
+    /// MAN-45 remediate (round-16 P1, finding 2): `CLIENT_DRAIN_DEADLINE`
+    /// alone under-counts the true worst case -- a handler already mid-
+    /// write when shutdown fires doesn't even START its own drain
+    /// deadline until that in-progress `select!` branch resolves. Asserts
+    /// the FULL relationship (`2 * telnet::WRITE_TIMEOUT +
+    /// CLIENT_DRAIN_DEADLINE`, telnet's live-spot write being the largest
+    /// such in-progress branch across all three handlers), not just the
+    /// drain deadline in isolation -- see `SHUTDOWN_DRAIN_DEADLINE`'s own
+    /// doc comment for the full argument.
     #[test]
     fn the_outer_shutdown_deadline_outlives_every_handlers_own_drain_deadline() {
         let worst_case_before_drain_starts = 2 * manta_server::telnet::WRITE_TIMEOUT;

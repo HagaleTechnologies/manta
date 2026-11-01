@@ -138,8 +138,9 @@ warning: IQ recording finalization timed out: session.cf32; completion is unconf
 A recording reported this way was not published and will not be: its
 metadata stays `.partial`, which replay refuses. A writer that had already
 begun publishing when the 5 s ran out gets up to 2 s more and is reported
-as it ended. Only a publication that itself blocks longer than that, on a
-hung filesystem, can still appear after the warning.
+as it ended. Only on a filesystem where publishing blocks longer than
+that (a hung disk, which every recording of the run shares) can a
+recording still appear after the warning.
 
 ## Replay a recording
 
