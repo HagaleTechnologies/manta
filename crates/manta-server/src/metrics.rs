@@ -10,11 +10,8 @@
 //! `manta_source_down_seconds_total`; MAN-96).
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
-<<<<<<< HEAD
 use crate::spectrum::{SpectrumDrop, SpectrumStats};
-=======
 use crate::spot_message::FtxMode;
->>>>>>> 644640b6e72cffbc34a95e7d45ec6e704b33b661
 use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -1011,14 +1008,11 @@ pub struct Metrics {
     /// MAN-320: one handle per configured `[[skimmer_relay]]` /
     /// `[[wsjtx_relay]]` block, disabled ones included.
     relays: RwLock<Vec<Arc<RelayStats>>>,
-<<<<<<< HEAD
     /// MAN-141: one handle per input with `spectrum_udp`, keyed by the
     /// `input` label, in registration order.
     spectrum_feeds: RwLock<Vec<(String, Arc<SpectrumStats>)>>,
-=======
     /// MAN-323: the `manta_ftx_` families, one series per attempted window.
     ftx: Mutex<FtxStats>,
->>>>>>> 644640b6e72cffbc34a95e7d45ec6e704b33b661
     /// MAN-128: captured once at construction -- see `StartedAt`'s doc
     /// comment for why this is not `#[derive(Default)]`-trivial and not
     /// seeded from `resolve_epoch`.
@@ -1977,7 +1971,6 @@ impl Metrics {
         stats
     }
 
-<<<<<<< HEAD
     /// MAN-141: registers one input's N1MM+ spectrum feed and returns its
     /// counters. Call it before the metrics listener starts: registration
     /// is what makes the feed's series appear on `/metrics`, at 0.
@@ -1988,7 +1981,8 @@ impl Metrics {
             .expect("spectrum_feeds lock poisoned")
             .push((input, stats.clone()));
         stats
-=======
+    }
+
     /// MAN-323: makes one input's series for `mode` appear, at 0. Call it at
     /// startup for every window an input attempts; a repeat call for the same
     /// `(input, mode)`, such as a second window of that mode, is ignored.
@@ -2037,7 +2031,6 @@ impl Metrics {
         if let Some(total) = ftx.spots.get_mut(&mode) {
             *total += 1;
         }
->>>>>>> 644640b6e72cffbc34a95e7d45ec6e704b33b661
     }
 
     fn uplink_targets_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<UplinkTarget>>> {
@@ -2901,11 +2894,8 @@ impl Metrics {
         drop(targets);
 
         self.render_relays(&mut out);
-<<<<<<< HEAD
         self.render_spectrum_feeds(&mut out);
-=======
         self.render_ftx(&mut out);
->>>>>>> 644640b6e72cffbc34a95e7d45ec6e704b33b661
 
         // MAN-128: process uptime/build-info.
         out.push_str(
@@ -5276,7 +5266,6 @@ mod tests {
         assert_eq!(last, (5, 3));
     }
 
-<<<<<<< HEAD
     /// MAN-141: a registered feed renders both families from 0, with every
     /// reason; a Metrics with no feed renders no `manta_spectrum_` line.
     #[test]
@@ -5296,7 +5285,8 @@ mod tests {
              manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"rate_limit\"} 0\n\
              manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"send_error\"} 0\n";
         assert!(text.contains(expected), "{text}");
-=======
+    }
+
     /// MAN-323: no `manta_ftx_` line until a window registers; then its
     /// three cycle series and its gauge at 0, and the per-mode counters.
     #[test]
@@ -5354,6 +5344,5 @@ mod tests {
             6,
             "a repeated registration adds no series"
         );
->>>>>>> 644640b6e72cffbc34a95e7d45ec6e704b33b661
     }
 }
