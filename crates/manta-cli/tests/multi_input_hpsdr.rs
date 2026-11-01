@@ -330,15 +330,10 @@ fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool, why: impl 
         thread::sleep(Duration::from_millis(30));
     }
 }
-<<<<<<< HEAD
-/// Waits for the condition while resetting the stall clock on each new progress
-/// value. The hard ceiling bounds even a wait that keeps making progress.
-=======
 /// Waits for `condition`, tolerating slowness: the clock that can fail the
 /// wait is reset whenever `progress()` returns a new value, and a hard
 /// `ceiling` bounds the total. A total stall fails after `idle` — exactly
 /// as fast as today's fixed budget — so real breakage still fails.
->>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
 fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
     idle: Duration,
     ceiling: Duration,
@@ -375,80 +370,6 @@ fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
         thread::sleep(Duration::from_millis(30));
     }
 }
-<<<<<<< HEAD
-
-#[test]
-fn wait_until_progress_returns_when_condition_holds() {
-    let progress = Arc::new(AtomicUsize::new(0));
-    wait_until_progress(
-        Duration::from_millis(120),
-        Duration::from_millis(900),
-        || progress.fetch_add(1, Ordering::Relaxed),
-        || true,
-        || panic!("a satisfied condition needs no failure diagnostic"),
-    );
-    assert_eq!(progress.load(Ordering::Relaxed), 1);
-}
-
-#[test]
-fn wait_until_progress_fails_after_idle_with_no_progress() {
-    let idle = Duration::from_millis(120);
-    let start = Instant::now();
-    let failure = std::panic::catch_unwind(|| {
-        wait_until_progress(
-            idle,
-            Duration::from_millis(900),
-            || 0,
-            || false,
-            || "stalled fixture".into(),
-        );
-    })
-    .expect_err("a stalled wait must fail");
-    let message = failure.downcast_ref::<String>().unwrap();
-    assert!(message.contains("no progress"), "{message}");
-    assert!(message.contains("stalled fixture"), "{message}");
-    assert!(start.elapsed() >= idle);
-    assert!(start.elapsed() < idle * 3);
-}
-
-#[test]
-fn wait_until_progress_outlives_idle_while_progressing() {
-    let progress = Arc::new(AtomicUsize::new(0));
-    let idle = Duration::from_millis(120);
-    let start = Instant::now();
-    wait_until_progress(
-        idle,
-        Duration::from_millis(900),
-        || progress.fetch_add(1, Ordering::Relaxed),
-        || progress.load(Ordering::Relaxed) >= 7,
-        || "progressing fixture".into(),
-    );
-    assert!(start.elapsed() > idle);
-}
-
-#[test]
-fn wait_until_progress_fails_at_ceiling_despite_progress() {
-    let progress = Arc::new(AtomicUsize::new(0));
-    let ceiling = Duration::from_millis(180);
-    let start = Instant::now();
-    let failure = std::panic::catch_unwind(|| {
-        wait_until_progress(
-            Duration::from_millis(120),
-            ceiling,
-            || progress.fetch_add(1, Ordering::Relaxed),
-            || false,
-            || "unmet fixture goal".into(),
-        );
-    })
-    .expect_err("even a progressing wait must be bounded");
-    let message = failure.downcast_ref::<String>().unwrap();
-    assert!(message.contains("ceiling"), "{message}");
-    assert!(message.contains("unmet fixture goal"), "{message}");
-    assert!(start.elapsed() >= ceiling);
-    assert!(start.elapsed() < ceiling * 3);
-}
-
-=======
 /// The two multi-receiver decode tests each run a 4x192 kHz daemon; on a
 /// 3-4 vCPU CI runner they saturate the box when run concurrently and the
 /// spot waits starve (MAN-454). Heavy tests take this for their whole body.
@@ -460,7 +381,6 @@ fn queue_drop_lines(metrics: &str) -> Vec<String> {
         .map(|line| line.to_string())
         .collect()
 }
->>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
 fn request(port: u16, path: &str) -> String {
     let Ok(mut stream) = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
@@ -613,11 +533,6 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
     let _reader = ReaderGuard(json_stop, Some(json));
     radio.mode.store(1, Ordering::Relaxed);
     wait_until_progress(
-<<<<<<< HEAD
-        Duration::from_secs(80),  // Keep the existing budget for a complete stall.
-        Duration::from_secs(300), // Bound total time even when spots keep arriving.
-        || daemon.output.lock().unwrap().len(),
-=======
         Duration::from_secs(80),
         Duration::from_secs(300),
         || -> Vec<String> {
@@ -630,7 +545,6 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
             calls.dedup();
             calls
         },
->>>>>>> 38e41fe441f523f3a67453905ddedf7488eae83b
         || {
             let spots = daemon.output.lock().unwrap();
             CALLS
