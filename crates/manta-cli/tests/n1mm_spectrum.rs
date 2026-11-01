@@ -5,6 +5,9 @@
 //! documents. The in-process tests run on every platform; the `manta run`
 //! tests are Unix-only, as `relay_acceptance.rs` is.
 
+#[cfg(unix)]
+mod common;
+
 use manta_server::spectrum::{self, Frame, SpectrumDrop, SpectrumStats};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -264,9 +267,19 @@ fn the_sender_thread_ends_when_its_handle_drops() {
 
 #[cfg(unix)]
 mod run {
+    use super::common::{expect_line, line_channel, KillOnDrop};
     use super::FakeN1mm;
+    use std::collections::BTreeSet;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Output};
+    use std::process::{Command, Output, Stdio};
+    use std::time::{Duration, Instant};
+
+    /// Each of the with-server waits' budgets: one for the banner, then a
+    /// second for the datagrams and their counts (a 5 s receive may overrun
+    /// it once).
+    const TIMEOUT: Duration = Duration::from_secs(60);
 
     /// A 5 s V1 IQ WAV at 48 kS/s, centred on 14 MHz, sidecar included.
     fn v1_48k(dir: &Path) -> PathBuf {
@@ -280,7 +293,7 @@ mod run {
     }
 
     /// `manta run --config <config>` with no inherited MANTA_* variables.
-    fn manta_run(dir: &Path, config: &str) -> Output {
+    fn manta_command(dir: &Path, config: &str) -> Command {
         let path = dir.join("manta.toml");
         std::fs::write(&path, config).unwrap();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
@@ -289,7 +302,25 @@ mod run {
                 cmd.env_remove(key);
             }
         }
-        cmd.args(["run", "--config"]).arg(&path).output().unwrap()
+        cmd.args(["run", "--config"]).arg(&path);
+        cmd
+    }
+
+    fn manta_run(dir: &Path, config: &str) -> Output {
+        manta_command(dir, config).output().unwrap()
+    }
+
+    /// One `GET /metrics`: the whole response, or `None` while the
+    /// endpoint does not answer.
+    fn scrape(addr: SocketAddr) -> Option<String> {
+        let mut stream = TcpStream::connect(addr).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .ok()?;
+        let mut body = String::new();
+        stream.read_to_string(&mut body).ok()?;
+        Some(body)
     }
 
     fn drain(n1mm: &FakeN1mm) -> Vec<super::Received> {
@@ -341,6 +372,114 @@ mod run {
             (peak_khz - 14_012.34).abs() <= 0.094,
             "peak at {peak_khz} kHz"
         );
+    }
+
+    /// The `[server]` table of the with-server runs: every port 0, and
+    /// `metrics_max_requests_per_ip = 0` so polling `/metrics` never gets a
+    /// 429 (MAN-64).
+    const SERVER: &str = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+         metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n\
+         metrics_max_requests_per_ip = 0\nstatus_interval_secs = 0\n\n";
+
+    /// `manta run` with [`SERVER`] and `inputs`, whose replays loop, so the
+    /// daemon runs until this returns and kills it. Checks that `n1mm`
+    /// receives the replay's span from every input in `names`, and that
+    /// each input's counters are on that server's `/metrics` (D11), its
+    /// datagram count at 1 or more.
+    fn feeds_with_a_server(dir: &Path, n1mm: &FakeN1mm, inputs: &str, names: &[&str]) {
+        let mut daemon = KillOnDrop(
+            manta_command(dir, &format!("{SERVER}{inputs}"))
+                .env("RUST_LOG", "info")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stderr = line_channel(daemon.0.stderr.take().unwrap());
+        let banner = expect_line(&stderr, &["listening:", "metrics="], TIMEOUT);
+        let metrics: SocketAddr = banner
+            .split("metrics=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|addr| addr.parse().ok())
+            .unwrap_or_else(|| panic!("no metrics address in {banner:?}"));
+
+        let deadline = Instant::now() + TIMEOUT;
+        let expected: BTreeSet<String> = names.iter().map(|n| format!("manta {n}")).collect();
+        let mut unseen = expected.clone();
+        while !unseen.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "no datagram from {unseen:?} within {TIMEOUT:?}"
+            );
+            if let Some(d) = n1mm.try_recv() {
+                assert!(expected.contains(&d.name), "unexpected source {:?}", d.name);
+                assert_eq!(d.low_khz, 13_976.0);
+                assert_eq!(d.high_khz, 14_023.906);
+                assert_eq!(d.values.len(), 512);
+                unseen.remove(&d.name);
+            }
+        }
+
+        // Each counter covers at least the datagram just received.
+        for name in names {
+            let sent = format!("manta_spectrum_datagrams_total{{input=\"{name}\"}} ");
+            let body = loop {
+                let body = scrape(metrics).unwrap_or_default();
+                let count = body
+                    .lines()
+                    .find_map(|l| l.strip_prefix(sent.as_str()))
+                    .and_then(|v| v.trim().parse::<u64>().ok());
+                if count.is_some_and(|n| n >= 1) {
+                    break body;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "no {sent}of 1 or more on /metrics within {TIMEOUT:?}: {body}"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            for reason in ["queue_full", "rate_limit", "send_error"] {
+                let series = format!(
+                    "manta_spectrum_dropped_total{{input=\"{name}\",reason=\"{reason}\"}} "
+                );
+                assert!(
+                    body.lines().any(|l| l.starts_with(&series)),
+                    "no {series}series in {body}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn manta_run_feeds_n1mm_with_a_server_and_counts_on_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = v1_48k(dir.path());
+        let n1mm = FakeN1mm::bind();
+        let input = format!(
+            "[input]\ntype = \"file\"\npath = {:?}\niq = true\nloop = true\n\
+             spectrum_udp = \"{}\"\n",
+            wav.to_str().unwrap(),
+            n1mm.addr()
+        );
+        feeds_with_a_server(dir.path(), &n1mm, &input, &["file"]);
+    }
+
+    #[test]
+    fn two_inputs_feed_n1mm_with_a_server_and_count_on_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = v1_48k(dir.path());
+        let n1mm = FakeN1mm::bind();
+        let mut inputs = String::new();
+        for name in ["a", "b"] {
+            inputs.push_str(&format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {:?}\niq = true\n\
+                 loop = true\nspectrum_udp = \"{}\"\n\n",
+                wav.to_str().unwrap(),
+                n1mm.addr()
+            ));
+        }
+        feeds_with_a_server(dir.path(), &n1mm, &inputs, &["a", "b"]);
     }
 
     #[test]
