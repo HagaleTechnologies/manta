@@ -660,6 +660,12 @@ pub(crate) struct Track {
     /// set on the decoder before that entry's `push_hop` so `TrackMeta`
     /// pairs it with the same hop's `sample_ts` (MAN-211).
     pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
+    /// MAN-202: unknown-length input gaps this track has yet to apply, as
+    /// the `sample_ts` of the first post-gap hop (`TrackManager::note_input_gap`).
+    /// The pending drains call `TrackDecoder::note_input_gap` before the
+    /// first entry stamped at or after each one, so the gap lands at the
+    /// same hop whatever the batch split or the decoder lease timing.
+    input_gaps: VecDeque<u64>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -1197,6 +1203,7 @@ impl Track {
             birth_channel,
             decoder: None,
             pending: Vec::new(),
+            input_gaps: VecDeque::new(),
             has_emitted: false,
             refiner: None,
             refiner_channel: None,
@@ -1487,22 +1494,16 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment
-        // (review round 2, finding 2: keyed to `hop_count() %
-        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-            self.snr_peak_db = self.snr_peak_db.max(snr_db);
-            decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
-            decoder.set_freq_hz(freq_hz);
-            let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                self.snr_peak_db = f32::NEG_INFINITY;
-            }
-            sample_rail_ratio_at_boundary(decoder, quality);
-            events.extend(hop_events);
-        }
+        push_pending(
+            decoder,
+            &mut self.snr_peak_db,
+            pending,
+            &mut self.input_gaps,
+            quality,
+            &mut events,
+        );
+        apply_remaining_gaps(decoder, &mut self.input_gaps, &mut events);
         events.extend(decoder.finish());
         publish_garbles(decoder, &mut self.garbles_published, quality);
         events
@@ -1530,25 +1531,36 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment
-        // (review round 2, finding 2: keyed to `hop_count() %
-        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-            self.snr_peak_db = self.snr_peak_db.max(snr_db);
-            decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
-            decoder.set_freq_hz(freq_hz);
-            let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                self.snr_peak_db = f32::NEG_INFINITY;
-            }
-            sample_rail_ratio_at_boundary(decoder, quality);
-            events.extend(hop_events);
-        }
+        push_pending(
+            decoder,
+            &mut self.snr_peak_db,
+            pending,
+            &mut self.input_gaps,
+            quality,
+            &mut events,
+        );
+        apply_remaining_gaps(decoder, &mut self.input_gaps, &mut events);
         events.extend(decoder.finish_speed_only());
         publish_garbles(decoder, &mut self.garbles_published, quality);
         events
+    }
+
+    /// MAN-202: an unknown-length input gap reaches this track at the hop
+    /// stamped `first_ts`. The refiner's backlog is drained into `pending`
+    /// first (MAN-194's order: those entries are pre-gap and complete),
+    /// then the refiner, the crash hold's clean history and the phase
+    /// history are reset, because their windows would span the splice. The
+    /// decoder applies the gap when its pending drain reaches `first_ts`.
+    fn note_input_gap(&mut self, first_ts: u64) {
+        self.drain_refiner_into_pending();
+        if let Some(refiner) = self.refiner.as_mut() {
+            refiner.reset();
+        }
+        self.refiner_hops_since_reset = 0;
+        self.clean_hist.clear();
+        self.phase_hist.clear();
+        self.input_gaps.push_back(first_ts);
     }
 
     /// MAN-108 (SPEC §2.4): HANG -> DORMANT. Flushes the decoder exactly as
@@ -1562,6 +1574,7 @@ impl Track {
         let events = self.finish_decoder(quality);
         self.decoder = None;
         self.pending.clear();
+        self.input_gaps.clear();
         self.refiner = None;
         self.refiner_channel = None;
         self.refiner_hops_since_reset = 0;
@@ -1841,6 +1854,11 @@ pub struct TrackManager {
     /// decoder's events (a `SpeedUpdate` sorts at ts 0) cannot sort after a
     /// same-batch woken decoder's under the batch's stable sort.
     dormant_flush: Vec<DecoderEvent>,
+    /// MAN-202: hops at which an unknown-length input gap applies
+    /// (`note_input_gap`), oldest first.
+    input_gap_hops: VecDeque<u64>,
+    /// MAN-202: how many unknown-length input gaps this manager has applied.
+    continuity_epoch: u64,
     /// MAN-108: DORMANT -> ACTIVE re-acquisitions so far. See
     /// `reacquisition_count`; counted in test builds only.
     #[cfg(test)]
@@ -1993,6 +2011,8 @@ impl TrackManager {
             total_spawns: 0,
             crash: CrashDetector::new(n_channels),
             dormant_flush: Vec::new(),
+            input_gap_hops: VecDeque::new(),
+            continuity_epoch: 0,
             #[cfg(test)]
             reacquisitions: 0,
             prev_hop: None,
@@ -3367,6 +3387,17 @@ impl TrackManager {
             if h.m < self.preroll_hops {
                 continue;
             }
+            // MAN-202: an unknown-length input gap applies at the first hop
+            // holding a post-gap sample, before that hop's bookkeeping, so
+            // where the caller's read or batch boundaries fall cannot move it.
+            while self.input_gap_hops.front().is_some_and(|&g| h.m >= g) {
+                self.input_gap_hops.pop_front();
+                self.continuity_epoch += 1;
+                let ts = hop_to_sample_ts(h.m);
+                for t in self.tracks.values_mut() {
+                    t.note_input_gap(ts);
+                }
+            }
             let (closed, promoted, closure_flush) = self.step_hop(h, hop_to_sample_ts(h.m));
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
@@ -3504,6 +3535,32 @@ impl TrackManager {
         self.close_all(true)
     }
 
+    /// MAN-202: the input lost samples of unknown count immediately before
+    /// data sample `data_pos` of this segment; `first_hop` is
+    /// [`first_hop_after_gap`]`(data_pos, hop)`, the first hop whose window
+    /// holds a post-gap sample. At that hop every track then present has
+    /// its continuity-dependent decode state invalidated
+    /// (`TrackDecoder::note_input_gap`; refiner and crash history reset).
+    /// No track closes and the sample clock does not move: the count is
+    /// unknown, so there is nothing to advance by.
+    pub fn note_input_gap(&mut self, first_hop: u64) {
+        if let Some(&back) = self.input_gap_hops.back() {
+            debug_assert!(first_hop >= back, "gap hops must not go backwards");
+            if back == first_hop {
+                return;
+            }
+        }
+        self.input_gap_hops.push_back(first_hop);
+    }
+
+    /// MAN-202: how many unknown-length input gaps this manager has applied.
+    /// Read by tests; the engine itself keys nothing off it yet (the event
+    /// epoch is a follow-up).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn continuity_epoch(&self) -> u64 {
+        self.continuity_epoch
+    }
+
     /// Shared body of `finish` (`discontinuity == false`: genuine stream
     /// end, `SignalEnded`) and `finish_for_discontinuity` (`true`).
     fn close_all(&mut self, discontinuity: bool) -> Vec<DecoderEvent> {
@@ -3525,6 +3582,15 @@ impl TrackManager {
         // parallel decode pass below sees a fully-populated `pending`.
         for track in self.tracks.values_mut() {
             track.drain_refiner_into_pending();
+        }
+        // MAN-202: a gap noted but not yet reached still applies, after
+        // every queued entry, so the flush forces nothing across it.
+        if !self.input_gap_hops.is_empty() {
+            self.continuity_epoch += self.input_gap_hops.len() as u64;
+            self.input_gap_hops.clear();
+            for track in self.tracks.values_mut() {
+                track.note_input_gap(u64::MAX);
+            }
         }
         // `finish_decoder` drains `pending` through `push_hop` before
         // calling `TrackDecoder::finish()` -- exactly what the backlog
@@ -3626,46 +3692,15 @@ impl TrackManager {
                         decoder,
                         &mut t.snr_peak_db,
                         &mut t.garbles_published,
+                        &mut t.input_gaps,
                         pending,
                     ))
                 }
             })
             .par_bridge()
-            .flat_map_iter(|(decoder, peak, garbles_published, pending)| {
+            .flat_map_iter(|(decoder, peak, garbles_published, gaps, pending)| {
                 let mut out = Vec::new();
-                for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-                    // MAN-102: SPEC §2.3's floor-based estimate, in the
-                    // 2500 Hz reference bandwidth, held at its peak since
-                    // this track's last SPEC §5 reporting boundary (see
-                    // `snr_peak_db`'s and `pending`'s doc comments on
-                    // `Track`). The reset below is keyed to the boundary
-                    // itself (`hop_count() % META_INTERVAL_HOPS == 0`), not
-                    // to `TrackMeta` actually being emitted: before
-                    // `Demod::running()` (init/retrying, SPEC §3.2) no
-                    // `TrackMeta` fires at all, and resetting only on
-                    // emission left the peak window unbounded for however
-                    // long init took instead of one interval (review round
-                    // 2, finding 2). This still lands on the exact hop a
-                    // report fires when one does (review round 1 findings
-                    // 2/3): the boundary check is the same hop the decoder
-                    // itself gates `TrackMeta` emission on. Consumed only by
-                    // the `Legacy` engine (`TrackDecoder::tick_meta`);
-                    // `EdgeLegacy`/`Hsmm` source their own SPEC v2 §2.3
-                    // evidence-derived estimate instead, so this call is
-                    // harmless but inert for those two engines.
-                    *peak = peak.max(snr_db);
-                    decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
-                    // MAN-211: this entry's own hop's centroid, so a
-                    // `TrackMeta` this push emits pairs it with the same
-                    // hop's `sample_ts`.
-                    decoder.set_freq_hz(freq_hz);
-                    let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-                    if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                        *peak = f32::NEG_INFINITY;
-                    }
-                    sample_rail_ratio_at_boundary(decoder, quality);
-                    out.extend(hop_events);
-                }
+                push_pending(decoder, peak, pending, gaps, quality, &mut out);
                 publish_garbles(decoder, garbles_published, quality);
                 out
             })
@@ -3673,6 +3708,77 @@ impl TrackManager {
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         events
     }
+}
+
+/// Push one track's queued `pending` entries through its decoder: the
+/// shared body of `TrackManager::drain_pool`, `Track::finish_decoder` and
+/// `Track::finish_decoder_speed_only`.
+///
+/// MAN-102: SPEC §2.3's floor-based estimate, in the 2500 Hz reference
+/// bandwidth, held at its peak since this track's last SPEC §5 reporting
+/// boundary (see `snr_peak_db`'s and `pending`'s doc comments on `Track`).
+/// The reset below is keyed to the boundary itself (`hop_count() %
+/// META_INTERVAL_HOPS == 0`), not to `TrackMeta` actually being emitted:
+/// before `Demod::running()` (init/retrying, SPEC §3.2) no `TrackMeta`
+/// fires at all, and resetting only on emission left the peak window
+/// unbounded for however long init took instead of one interval (review
+/// round 2, finding 2). This still lands on the exact hop a report fires
+/// when one does (review round 1 findings 2/3): the boundary check is the
+/// same hop the decoder itself gates `TrackMeta` emission on. Consumed only
+/// by the `Legacy` engine (`TrackDecoder::tick_meta`); `EdgeLegacy`/`Hsmm`
+/// source their own SPEC v2 §2.3 evidence-derived estimate instead, so this
+/// call is harmless but inert for those two engines. MAN-211: each entry's
+/// own hop's centroid is set first, so a `TrackMeta` the push emits pairs
+/// it with the same hop's `sample_ts`.
+///
+/// MAN-202: every gap marker in `gaps` is applied
+/// (`TrackDecoder::note_input_gap`) before the first entry stamped at or
+/// after it, so one copy of this loop applies gaps for all three callers.
+fn push_pending(
+    decoder: &mut TrackDecoder,
+    peak: &mut f32,
+    pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
+    gaps: &mut VecDeque<u64>,
+    quality: Option<&DecodeQualityObserver>,
+    out: &mut Vec<DecoderEvent>,
+) {
+    for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
+        while gaps.front().is_some_and(|&g| ts >= g) {
+            gaps.pop_front();
+            out.extend(decoder.note_input_gap());
+        }
+        *peak = peak.max(snr_db);
+        decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
+        decoder.set_freq_hz(freq_hz);
+        let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
+        if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
+            *peak = f32::NEG_INFINITY;
+        }
+        sample_rail_ratio_at_boundary(decoder, quality);
+        out.extend(hop_events);
+    }
+}
+
+/// MAN-202: a track closing before its decoder reached a gap marker's hop
+/// still applies the gap, so the closing flush forces nothing from a run
+/// that spans it.
+fn apply_remaining_gaps(
+    decoder: &mut TrackDecoder,
+    gaps: &mut VecDeque<u64>,
+    out: &mut Vec<DecoderEvent>,
+) {
+    while gaps.pop_front().is_some() {
+        out.extend(decoder.note_input_gap());
+    }
+}
+
+/// MAN-202: the first hop whose window holds data sample `data_pos`. Hop `m`
+/// is computed from channelizer input `[m·hop, m·hop + filter_len)`
+/// (`Channelizer::process`), and every segment feeds `filter_len` zeros
+/// before data sample 0, so hop `m` covers data `[m·hop − filter_len,
+/// m·hop)` and the first one reaching `data_pos` is `data_pos / hop + 1`.
+pub(crate) fn first_hop_after_gap(data_pos: u64, hop: u64) -> u64 {
+    data_pos / hop + 1
 }
 
 /// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
