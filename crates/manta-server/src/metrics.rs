@@ -10,6 +10,7 @@
 //! `manta_source_down_seconds_total`; MAN-96).
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
+use crate::spectrum::{SpectrumDrop, SpectrumStats};
 use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -948,6 +949,9 @@ pub struct Metrics {
     /// MAN-320: one handle per configured `[[skimmer_relay]]` /
     /// `[[wsjtx_relay]]` block, disabled ones included.
     relays: RwLock<Vec<Arc<RelayStats>>>,
+    /// MAN-141: one handle per input with `spectrum_udp`, keyed by the
+    /// `input` label, in registration order.
+    spectrum_feeds: RwLock<Vec<(String, Arc<SpectrumStats>)>>,
     /// MAN-128: captured once at construction -- see `StartedAt`'s doc
     /// comment for why this is not `#[derive(Default)]`-trivial and not
     /// seeded from `resolve_epoch`.
@@ -1906,6 +1910,18 @@ impl Metrics {
         stats
     }
 
+    /// MAN-141: registers one input's N1MM+ spectrum feed and returns its
+    /// counters. Call it before the metrics listener starts: registration
+    /// is what makes the feed's series appear on `/metrics`, at 0.
+    pub fn register_spectrum(&self, input: String) -> Arc<SpectrumStats> {
+        let stats = Arc::new(SpectrumStats::default());
+        self.spectrum_feeds
+            .write()
+            .expect("spectrum_feeds lock poisoned")
+            .push((input, stats.clone()));
+        stats
+    }
+
     fn uplink_targets_snapshot(&self) -> std::sync::RwLockReadGuard<'_, Vec<Arc<UplinkTarget>>> {
         self.uplink_targets
             .read()
@@ -2767,6 +2783,7 @@ impl Metrics {
         drop(targets);
 
         self.render_relays(&mut out);
+        self.render_spectrum_feeds(&mut out);
 
         // MAN-128: process uptime/build-info.
         out.push_str(
@@ -2941,6 +2958,41 @@ impl Metrics {
                     r.kind().label(),
                     reason.label(),
                     r.dropped_total(*reason)
+                ));
+            }
+        }
+    }
+}
+
+impl Metrics {
+    /// MAN-141: the two spectrum-feed families, one set of series per
+    /// registered feed; nothing at all without a feed.
+    fn render_spectrum_feeds(&self, out: &mut String) {
+        let feeds = self
+            .spectrum_feeds
+            .read()
+            .expect("spectrum_feeds lock poisoned");
+        if feeds.is_empty() {
+            return;
+        }
+        out.push_str("# HELP manta_spectrum_datagrams_total Spectrum datagrams this input handed to the OS for N1MM+.\n");
+        out.push_str("# TYPE manta_spectrum_datagrams_total counter\n");
+        for (input, s) in feeds.iter() {
+            out.push_str(&format!(
+                "manta_spectrum_datagrams_total{{input=\"{}\"}} {}\n",
+                escape_label_value(input),
+                s.datagrams()
+            ));
+        }
+        out.push_str("# HELP manta_spectrum_dropped_total Spectrum frames this input did not send, by reason.\n");
+        out.push_str("# TYPE manta_spectrum_dropped_total counter\n");
+        for (input, s) in feeds.iter() {
+            for reason in SpectrumDrop::ALL {
+                out.push_str(&format!(
+                    "manta_spectrum_dropped_total{{input=\"{}\",reason=\"{}\"}} {}\n",
+                    escape_label_value(input),
+                    reason.label(),
+                    s.dropped(reason)
                 ));
             }
         }
@@ -5050,5 +5102,26 @@ mod tests {
             last = now;
         }
         assert_eq!(last, (5, 3));
+    }
+
+    /// MAN-141: a registered feed renders both families from 0, with every
+    /// reason; a Metrics with no feed renders no `manta_spectrum_` line.
+    #[test]
+    fn spectrum_feeds_render_their_counters_from_zero() {
+        let none = Metrics::new().render_prometheus_text();
+        assert!(!none.contains("manta_spectrum_"), "{none}");
+
+        let m = Metrics::new();
+        m.register_spectrum("hpsdr".to_string());
+        let text = m.render_prometheus_text();
+        let expected = "# HELP manta_spectrum_datagrams_total Spectrum datagrams this input handed to the OS for N1MM+.\n\
+             # TYPE manta_spectrum_datagrams_total counter\n\
+             manta_spectrum_datagrams_total{input=\"hpsdr\"} 0\n\
+             # HELP manta_spectrum_dropped_total Spectrum frames this input did not send, by reason.\n\
+             # TYPE manta_spectrum_dropped_total counter\n\
+             manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"queue_full\"} 0\n\
+             manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"rate_limit\"} 0\n\
+             manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"send_error\"} 0\n";
+        assert!(text.contains(expected), "{text}");
     }
 }

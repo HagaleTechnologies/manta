@@ -6,6 +6,7 @@
 use crate::latency::DecodeLatencyObserver;
 use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
+use crate::spectrum::{SpectrumAccumulator, SpectrumFeed, SpectrumSink};
 use crate::track::CloseCounts;
 use crate::PipelineConfig;
 use anyhow::Result;
@@ -111,6 +112,14 @@ pub struct ListenObservers {
     /// `None` (the default) skips the step, so `listen()`'s existing
     /// callers pay nothing.
     pub callsign_lookup: Option<Arc<dyn manta_spot::CallsignLookup>>,
+    /// MAN-141: the spectrum tap -- every channel inside the source's RF
+    /// passband, its linear power averaged over
+    /// `SPECTRUM_HOPS_PER_FRAME` usable hops (a third of a stream second)
+    /// and calibrated by `PipelineConfig::freq_correction_ppm`, published
+    /// per frame. Write-only from the decode path, so spots are unchanged.
+    /// A source with no RF centre publishes nothing. `None` (the default)
+    /// skips everything, so `listen()`'s existing callers pay nothing.
+    pub spectrum: Option<Arc<dyn SpectrumSink>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -386,9 +395,22 @@ struct Segment {
     pad_hops: u64,
     /// MAN-423: spliced losses this segment's hops still to come may precede.
     held: HeldLosses,
+    /// MAN-141: `Some` only when a spectrum sink is set and the source has
+    /// an RF centre; new per segment, so a frame never spans a discontinuity.
+    spectrum: Option<SpectrumAccumulator>,
 }
 
 impl Segment {
+    /// MAN-141: every channelizer call goes through here, so the spectrum tap
+    /// sees every hop the track manager sees.
+    fn channelize(&mut self, iq: &[Complex32]) -> Vec<manta_dsp::channelizer::HopOutput> {
+        let hops = self.ch.process(iq);
+        if let Some(acc) = self.spectrum.as_mut() {
+            acc.fold(&hops, self.pad_hops);
+        }
+        hops
+    }
+
     /// The startup calibration fill, through `process_hops` one
     /// `CHUNK_SAMPLES` piece at a time like steady-state reads (MAN-374):
     /// `step_hop`'s timers read decoder evidence only `drain_pool` updates,
@@ -397,7 +419,7 @@ impl Segment {
     fn process_fill(&mut self, fill: &[Complex32], seg_base: u64) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
         for piece in fill.chunks(CHUNK_SAMPLES) {
-            let hops = self.ch.process(piece);
+            let hops = self.channelize(piece);
             events.extend(self.tm.process_hops(&hops, |m| {
                 self.held.hop_ts(seg_base, self.pad_hops, self.hop, m)
             }));
@@ -480,6 +502,7 @@ fn new_segment(
     next_id: u32,
     quality: Option<Arc<DecodeQualityObserver>>,
     occupancy: bool,
+    spectrum: Option<&SpectrumFeed>,
 ) -> Result<Segment> {
     let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -522,12 +545,15 @@ fn new_segment(
     if occupancy {
         tm.enable_occupancy_window();
     }
+    // MAN-141: a new, empty spectrum frame per segment.
+    let spectrum = spectrum.and_then(|feed| feed.accumulator(fs, center_freq_hz, rf_passband_hz));
     Ok(Segment {
         ch,
         tm,
         hop,
         pad_hops,
         held: HeldLosses::default(),
+        spectrum,
     })
 }
 
@@ -750,6 +776,11 @@ pub fn listen_with_observers(
         .clone()
         .map(|sink| LiveTap::new(sink, fs, calibration_factor));
     let occupancy = live.is_some();
+    // MAN-141: the spectrum tap, calibrated like every emitted frequency.
+    let spectrum = observers.spectrum.clone().map(|sink| SpectrumFeed {
+        sink,
+        calibration_factor,
+    });
     let mut ctx = EmitCtx {
         lists: observers.operator_lists.as_deref(),
         quality: observers.decode_quality.as_deref(),
@@ -818,6 +849,7 @@ pub fn listen_with_observers(
         1,
         observers.decode_quality.clone(),
         occupancy,
+        spectrum.as_ref(),
     )?;
     let mut seg_base: u64 = 0;
 
@@ -887,7 +919,8 @@ pub fn listen_with_observers(
     // fill has returned, not before it: its `on_tracks` call is the first
     // per-batch callback, and the daemon reads that first call as "the
     // calibration read has returned" (MAN-122's `ready: decoding` event).
-    let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+    let hops = seg.channelize(&padding);
+    let events = seg.tm.process_hops(&hops, |m| {
         seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
     });
     emit(
@@ -1023,6 +1056,7 @@ pub fn listen_with_observers(
                 next_id,
                 observers.decode_quality.clone(),
                 occupancy,
+                spectrum.as_ref(),
             ) {
                 Ok(seg) => seg,
                 Err(e) => {
@@ -1031,7 +1065,8 @@ pub fn listen_with_observers(
                     return Err(e);
                 }
             };
-            let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+            let hops = seg.channelize(&padding);
+            let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
             });
             emit(
@@ -1050,7 +1085,8 @@ pub fn listen_with_observers(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-        let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
+        let hops = seg.channelize(&chunk[..n]);
+        let events = seg.tm.process_hops(&hops, |m| {
             seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
         });
         emit(
@@ -1329,6 +1365,8 @@ pub(crate) struct FrontObservers {
     pub(crate) live_ids: bool,
     /// The input's index, for its band samples.
     pub(crate) input: usize,
+    /// MAN-141: this input's spectrum sink.
+    pub(crate) spectrum: Option<Arc<dyn SpectrumSink>>,
 }
 
 /// Maps a batch's local timestamps onto the common clock and calibrates
@@ -1405,6 +1443,11 @@ pub(crate) fn run_input_front(
     let analytic = src.analytic_guard_hz() > 0.0;
     let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
+    // MAN-141: this input's spectrum tap, with its own calibration.
+    let spectrum = observers.spectrum.clone().map(|sink| SpectrumFeed {
+        sink,
+        calibration_factor,
+    });
     let mut seg = new_segment(
         fs,
         center_freq_hz,
@@ -1417,6 +1460,7 @@ pub(crate) fn run_input_front(
         ids.first,
         observers.decode_quality.clone(),
         observers.live_ids,
+        spectrum.as_ref(),
     )?;
     let mut seg_base: u64 = 0;
     let mut seg_consumed: u64 = 0;
@@ -1484,7 +1528,8 @@ pub(crate) fn run_input_front(
     // batches as before, and `tick` still fires on the batch that closes
     // the fill.
     let fill_end = seg_base + filled as u64;
-    let events = seg.tm.process_hops(&seg.ch.process(&padding[..]), |m| {
+    let hops = seg.channelize(&padding[..]);
+    let events = seg.tm.process_hops(&hops, |m| {
         seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
     });
     let b = batch(events, fill_end, &seg.tm);
@@ -1554,8 +1599,10 @@ pub(crate) fn run_input_front(
                 next_id,
                 observers.decode_quality.clone(),
                 observers.live_ids,
+                spectrum.as_ref(),
             )?;
-            let events = seg.tm.process_hops(&seg.ch.process(&padding), |m| {
+            let hops = seg.channelize(&padding);
+            let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
             });
             pending.push(batch(events, seg_base, &seg.tm));
@@ -1564,7 +1611,8 @@ pub(crate) fn run_input_front(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-        let events = seg.tm.process_hops(&seg.ch.process(&chunk[..n]), |m| {
+        let hops = seg.channelize(&chunk[..n]);
+        let events = seg.tm.process_hops(&hops, |m| {
             seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
         });
         seg_consumed += n as u64;
@@ -2298,6 +2346,154 @@ mod tests {
             }
         }
         assert!(saw_track);
+    }
+
+    // ---- MAN-141: the spectrum tap over real vectors ----
+
+    use crate::spectrum::tests::RecordingSpectrumSink;
+
+    /// `run_vector`'s twin with a spectrum sink instead of a live one.
+    fn run_vector_spectrum(
+        spec: &manta_testkit::vectors::VectorSpec,
+        cfg: &PipelineConfig,
+        spectrum: Option<Arc<RecordingSpectrumSink>>,
+    ) -> Vec<crate::Spot> {
+        let rendered = manta_testkit::vectors::render(spec).unwrap();
+        let src = Box::new(FixedFreqSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let observers = ListenObservers {
+            spectrum: spectrum.map(|s| s as Arc<dyn SpectrumSink>),
+            ..Default::default()
+        };
+        let mut spots = Vec::new();
+        listen_with_observers(
+            src,
+            cfg,
+            Arc::new(AtomicBool::new(false)),
+            observers,
+            |_| {},
+            |s| spots.push(s.clone()),
+            |_| {},
+        )
+        .unwrap();
+        spots
+    }
+
+    /// Usable hops (`m >= pad_hops`) a channelizer at `fs` makes from its
+    /// padding plus `samples` stream samples.
+    fn usable_hops(fs: f64, samples: usize) -> usize {
+        let ch = manta_dsp::channelizer::Channelizer::new(fs, 14_000_000.0).unwrap();
+        let hop = ch.hop();
+        let pad_hops = ch.filter_len().div_ceil(hop);
+        samples / hop + 1 - pad_hops
+    }
+
+    #[test]
+    fn spectrum_tap_never_changes_spots() {
+        let mut v7 = manta_testkit::vectors::v7();
+        v7.duration_s = 30.0;
+        for spec in [v1_30s(), v7] {
+            let cfg = PipelineConfig::default();
+            let without = run_vector_spectrum(&spec, &cfg, None);
+            let sink = RecordingSpectrumSink::new();
+            let with = run_vector_spectrum(&spec, &cfg, Some(sink.clone()));
+            assert!(!without.is_empty());
+            assert_eq!(without, with);
+            assert!(!sink.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn spectrum_tap_sends_v1_frames_three_per_stream_second() {
+        let spec = v1_30s();
+        let sink = RecordingSpectrumSink::new();
+        run_vector_spectrum(&spec, &PipelineConfig::default(), Some(sink.clone()));
+        let frames = sink.take();
+        // 30 s at 96 kS/s: 11219 usable hops, 89 whole frames.
+        let samples = (spec.fs * spec.duration_s) as usize;
+        assert_eq!(usable_hops(spec.fs, samples), 11_219);
+        assert!((88..=90).contains(&frames.len()), "{}", frames.len());
+        assert_eq!(frames.len(), 11_219 / crate::SPECTRUM_HOPS_PER_FRAME);
+        for f in &frames {
+            assert_eq!(f.power_db.len(), 1024);
+            assert_eq!((f.low_hz, f.high_hz), (13_952_000.0, 14_047_906.25));
+        }
+        // Averaged over frames 4 onward, W1AW's bin is the strongest. Not
+        // per frame: a 333 ms frame can fall inside a 420 ms word gap at
+        // 20 WPM and hold only noise.
+        let mut mean = vec![0.0f64; 1024];
+        for f in &frames[4..] {
+            for (m, &d) in mean.iter_mut().zip(&f.power_db) {
+                *m += 10f64.powf(d as f64 / 10.0);
+            }
+        }
+        let (i, _) = mean
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap();
+        let peak_hz = 13_952_000.0 + i as f64 * 93.75;
+        assert!((peak_hz - 14_012_340.0).abs() <= 93.75, "{peak_hz}");
+    }
+
+    #[test]
+    fn spectrum_tap_applies_the_frequency_calibration() {
+        let cfg = PipelineConfig {
+            freq_correction_ppm: 10.0,
+            ..Default::default()
+        };
+        let factor = manta_spot::calibration_factor_from_ppm(10.0).unwrap();
+        assert_eq!(factor, 1.0 + 10e-6);
+        let sink = RecordingSpectrumSink::new();
+        run_vector_spectrum(&v1_30s(), &cfg, Some(sink.clone()));
+        let frames = sink.take();
+        assert!(!frames.is_empty());
+        for f in &frames {
+            assert_eq!(f.low_hz, 13_952_000.0 * factor);
+            assert_eq!(f.high_hz, 14_047_906.25 * factor);
+        }
+    }
+
+    #[test]
+    fn spectrum_tap_restarts_its_frame_on_a_discontinuity() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 30.0;
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let len = rendered.samples.len();
+        let src: Box<dyn manta_input::IqSource> = Box::new(GapSource::new(
+            rendered.samples,
+            spec.fs,
+            spec.center_freq_hz,
+            (spec.fs as u64) * 3600,
+        ));
+        let sink = RecordingSpectrumSink::new();
+        listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                spectrum: Some(sink.clone() as Arc<dyn SpectrumSink>),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        // Two segments of the whole vector each, each its own frames: a
+        // frame never carries hops from both sides of the gap, and each
+        // segment's partial last frame is dropped.
+        let per_segment = usable_hops(spec.fs, len) / crate::SPECTRUM_HOPS_PER_FRAME;
+        assert_eq!(sink.take().len(), 2 * per_segment);
+        // One continuous run of both copies would make one frame more.
+        assert_ne!(
+            2 * per_segment,
+            usable_hops(spec.fs, 2 * len) / crate::SPECTRUM_HOPS_PER_FRAME
+        );
     }
 
     /// A minimal in-memory IqSource for testing, reporting a fixed,

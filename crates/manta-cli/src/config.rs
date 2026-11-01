@@ -94,6 +94,9 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("input", "device"),
     ("input", "path"),
     ("input", "record_iq"),
+    // MAN-141: `MANTA_INPUT_SPECTRUM_NAME=20` is the string "20".
+    ("input", "spectrum_udp"),
+    ("input", "spectrum_name"),
     ("input", "iq_format"),
     ("input", "host"),
     ("input", "mac"),
@@ -510,6 +513,10 @@ struct InputToml {
     replay_epoch: Option<i64>,
     /// MAN-309: `run` records this input's IQ here.
     record_iq: Option<PathBuf>,
+    /// MAN-141: `run` sends this input's spectrum to N1MM+ at this
+    /// `IP:port`, under `spectrum_name` (default `manta <name>`).
+    spectrum_udp: Option<String>,
+    spectrum_name: Option<String>,
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -575,6 +582,70 @@ pub(crate) struct SharedInput {
     pub replay_epoch: Option<i64>,
     /// MAN-309: `run` records this input's IQ to this path.
     pub record_iq: Option<PathBuf>,
+    /// MAN-141: `run` sends this input's spectrum to N1MM+'s Spectrum
+    /// Display.
+    pub spectrum: Option<SpectrumOut>,
+}
+
+/// MAN-141: `input.spectrum_udp` and `input.spectrum_name`, checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpectrumOut {
+    /// The N1MM+ computer's unicast address and port.
+    pub dest: std::net::SocketAddr,
+    /// `input.spectrum_name`; `None` sends as `manta <input name>`.
+    pub name: Option<String>,
+}
+
+impl SpectrumOut {
+    /// The source name N1MM+ lists for the input named `input`.
+    pub fn source_name(&self, input: &str) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("manta {input}"))
+    }
+}
+
+/// MAN-141: the longest `input.spectrum_name`.
+const MAX_SPECTRUM_NAME_CHARS: usize = 64;
+
+/// MAN-141: `input.spectrum_udp`/`input.spectrum_name` as a feed, or `None`
+/// when neither is set.
+fn spectrum_out(t: &InputToml) -> std::result::Result<Option<SpectrumOut>, String> {
+    let Some(text) = t.spectrum_udp.as_deref() else {
+        return match t.spectrum_name {
+            Some(_) => Err("input.spectrum_name needs input.spectrum_udp".to_string()),
+            None => Ok(None),
+        };
+    };
+    let dest: std::net::SocketAddr = text.parse().map_err(|_| {
+        format!(
+            "input.spectrum_udp must be an IP address and port such as \"127.0.0.1:13064\", \
+             got {}",
+            crate::fmt::quoted(text)
+        )
+    })?;
+    let ip = dest.ip();
+    let broadcast = matches!(ip, std::net::IpAddr::V4(v4) if v4.is_broadcast());
+    if dest.port() == 0 || ip.is_unspecified() || ip.is_multicast() || broadcast {
+        return Err(format!(
+            "input.spectrum_udp must be the unicast address and port of the computer running \
+             N1MM+, such as \"127.0.0.1:13064\"; got {}",
+            crate::fmt::quoted(text)
+        ));
+    }
+    if let Some(name) = &t.spectrum_name {
+        let chars = name.chars().count();
+        if chars == 0 || chars > MAX_SPECTRUM_NAME_CHARS || name.chars().any(char::is_control) {
+            return Err(format!(
+                "input.spectrum_name must be 1 to {MAX_SPECTRUM_NAME_CHARS} characters with no \
+                 control characters"
+            ));
+        }
+    }
+    Ok(Some(SpectrumOut {
+        dest,
+        name: t.spectrum_name.clone(),
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -829,6 +900,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
                 );
             }
             check_stream_names(&inputs, &origin)?;
+            check_spectrum_feeds(&inputs, &origin)?;
             if inputs.len() > 1 {
                 check_input_entries(&inputs, &origin)?;
             }
@@ -1217,6 +1289,7 @@ fn take_input_array(
         );
     }
     check_stream_names(&inputs, origin)?;
+    check_spectrum_feeds(&inputs, origin)?;
     check_input_entries(&inputs, origin)?;
     validate_hpsdr_allocations(&inputs, origin)?;
     Ok(inputs)
@@ -1471,6 +1544,16 @@ fn take_entry(
             plan.band_list()
         ));
     }
+    // MAN-141: N1MM+ tells sources apart by name only.
+    if n > 1 && t.spectrum_name.is_some() {
+        return Err(format!(
+            "input.bands plans {} ({}), but input.spectrum_name names one N1MM+ source for all \
+             of them; drop spectrum_name (each stream sends as \"manta <stream name>\"), or \
+             list bands that fit one stream",
+            band_plan::count_streams(n),
+            plan.band_list()
+        ));
+    }
     let shown = texts
         .iter()
         .map(|t| format!("\"{t}\""))
@@ -1581,6 +1664,27 @@ fn check_stream_names(inputs: &[NamedInput], origin: &str) -> Result<()> {
     Ok(())
 }
 
+/// MAN-141: two feeds to one N1MM+ under one source name would draw as one.
+fn check_spectrum_feeds(inputs: &[NamedInput], origin: &str) -> Result<()> {
+    let feeds: Vec<_> = inputs
+        .iter()
+        .filter_map(|n| {
+            let out = n.input.shared.spectrum.as_ref()?;
+            Some((out.dest, out.source_name(&n.name)))
+        })
+        .collect();
+    for (i, (dest, name)) in feeds.iter().enumerate() {
+        if feeds[..i].iter().any(|(d, n)| d == dest && n == name) {
+            bail!(
+                "{origin}: two inputs send spectrum to {dest} as {}; give each its own \
+                 spectrum_name",
+                crate::fmt::quoted(name)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// MAN-13: the rules that relate several `[[input]]` entries.
 fn check_input_entries(inputs: &[NamedInput], origin: &str) -> Result<()> {
     let is_file = |n: &NamedInput| matches!(n.input.source, Some(SourceFromFile::File { .. }));
@@ -1683,6 +1787,7 @@ fn validate_input(
             .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
         record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
+        spectrum: spectrum_out(&t)?,
     };
     check_input_keys(&t)?;
     let Some(kind) = t.kind else {
@@ -2140,6 +2245,212 @@ mod tests {
         .unwrap();
         assert_eq!(l.inputs.len(), 1);
         assert!(l.inputs[0].input.shared.record_iq.is_some());
+    }
+
+    const SPECTRUM_HPSDR: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.20\"\n\
+                                  freq_hz = 14050000.0\nrate_hz = 192000.0\n";
+
+    #[test]
+    fn spectrum_udp_loads_as_a_socket_address() {
+        // MAN-141: an IPv4 or IPv6 address and port; no name by default.
+        for text in ["127.0.0.1:13064", "[::1]:13064"] {
+            let l = load_file(&format!("{SPECTRUM_HPSDR}spectrum_udp = \"{text}\"\n")).unwrap();
+            let out = l.input.shared.spectrum.clone().unwrap();
+            assert_eq!(out.dest, text.parse::<std::net::SocketAddr>().unwrap());
+            assert_eq!(out.name, None);
+            assert_eq!(out.source_name(&l.inputs[0].name), "manta hpsdr");
+        }
+        let l = load_file(&format!(
+            "{SPECTRUM_HPSDR}spectrum_udp = \"127.0.0.1:13064\"\nspectrum_name = \"Rig 2\"\n"
+        ))
+        .unwrap();
+        let out = l.input.shared.spectrum.unwrap();
+        assert_eq!(out.name.as_deref(), Some("Rig 2"));
+        assert_eq!(out.source_name("hpsdr"), "Rig 2");
+        // Neither key: no feed.
+        assert_eq!(
+            load_file(SPECTRUM_HPSDR).unwrap().input.shared.spectrum,
+            None
+        );
+    }
+
+    #[test]
+    fn spectrum_udp_refuses_a_host_name() {
+        let err = err_of(&format!(
+            "{SPECTRUM_HPSDR}spectrum_udp = \"localhost:13064\"\n"
+        ));
+        assert!(
+            err.contains(
+                "input.spectrum_udp must be an IP address and port such as \
+                 \"127.0.0.1:13064\", got \"localhost:13064\""
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn spectrum_udp_refuses_port_zero_unspecified_multicast_and_broadcast() {
+        for text in [
+            "127.0.0.1:0",
+            "0.0.0.0:13064",
+            "[::]:13064",
+            "239.1.2.3:13064",
+            "[ff02::1]:13064",
+            "255.255.255.255:13064",
+        ] {
+            let err = err_of(&format!("{SPECTRUM_HPSDR}spectrum_udp = \"{text}\"\n"));
+            assert!(
+                err.contains(&format!(
+                    "input.spectrum_udp must be the unicast address and port of the computer \
+                     running N1MM+, such as \"127.0.0.1:13064\"; got \"{text}\""
+                )),
+                "{text}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn spectrum_name_needs_spectrum_udp() {
+        let err = err_of(&format!("{SPECTRUM_HPSDR}spectrum_name = \"Rig 2\"\n"));
+        assert!(
+            err.contains("input.spectrum_name needs input.spectrum_udp"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn spectrum_name_refuses_empty_too_long_and_control_characters() {
+        let long = "x".repeat(65);
+        for name in ["", long.as_str(), "Rig\\t2"] {
+            let err = err_of(&format!(
+                "{SPECTRUM_HPSDR}spectrum_udp = \"127.0.0.1:13064\"\nspectrum_name = \"{name}\"\n"
+            ));
+            assert!(
+                err.contains(
+                    "input.spectrum_name must be 1 to 64 characters with no control characters"
+                ),
+                "{name:?}: {err}"
+            );
+        }
+        // 64 characters, spaces and non-ASCII letters are fine.
+        let ok = "é".repeat(64);
+        let l = load_file(&format!(
+            "{SPECTRUM_HPSDR}spectrum_udp = \"127.0.0.1:13064\"\nspectrum_name = \"{ok}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(l.input.shared.spectrum.unwrap().name, Some(ok));
+    }
+
+    #[test]
+    fn bands_with_several_streams_refuse_spectrum_name() {
+        let err = err_of(
+            "[[input]]\nname = \"hf\"\ntype = \"kiwi\"\nhost = \"h\"\n\
+             bands = [\"7030\", \"14030\"]\nspectrum_udp = \"127.0.0.1:13064\"\n\
+             spectrum_name = \"Rig 2\"\n",
+        );
+        assert!(
+            err.contains(
+                "input.bands plans 2 streams (7030 kHz, 14030 kHz), but input.spectrum_name \
+                 names one N1MM+ source for all of them; drop spectrum_name (each stream sends \
+                 as \"manta <stream name>\"), or list bands that fit one stream"
+            ),
+            "{err}"
+        );
+        // One stream keeps its name.
+        let l = load_file(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = [\"7030\"]\n\
+             spectrum_udp = \"127.0.0.1:13064\"\nspectrum_name = \"Rig 2\"\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs.len(), 1);
+        assert_eq!(
+            l.inputs[0]
+                .input
+                .shared
+                .spectrum
+                .as_ref()
+                .unwrap()
+                .source_name("kiwi"),
+            "Rig 2"
+        );
+    }
+
+    #[test]
+    fn bands_with_several_streams_send_each_as_its_own_source() {
+        let l = load_file(
+            "[[input]]\nname = \"hf\"\ntype = \"kiwi\"\nhost = \"h\"\n\
+             bands = [\"7030\", \"14030\"]\nspectrum_udp = \"127.0.0.1:13064\"\n",
+        )
+        .unwrap();
+        let names: Vec<String> = l
+            .inputs
+            .iter()
+            .map(|n| {
+                n.input
+                    .shared
+                    .spectrum
+                    .as_ref()
+                    .unwrap()
+                    .source_name(&n.name)
+            })
+            .collect();
+        assert_eq!(names, ["manta hf-7030", "manta hf-14030"]);
+    }
+
+    #[test]
+    fn two_inputs_with_one_destination_and_name_are_refused() {
+        let entry = |name: &str, extra: &str| {
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"kiwi\"\nhost = \"h\"\n\
+                 freq_hz = 14030000.0\nspectrum_udp = \"127.0.0.1:13064\"\n{extra}"
+            )
+        };
+        let body = format!(
+            "{}{}",
+            entry("a", "spectrum_name = \"manta 20m\"\n"),
+            entry("b", "spectrum_name = \"manta 20m\"\n")
+        );
+        let err = err_of(&body);
+        assert!(
+            err.contains(
+                "two inputs send spectrum to 127.0.0.1:13064 as \"manta 20m\"; give each its \
+                 own spectrum_name"
+            ),
+            "{err}"
+        );
+        // A name that equals another input's default collides too.
+        let err = err_of(&format!(
+            "{}{}",
+            entry("a", ""),
+            entry("b", "spectrum_name = \"manta a\"\n")
+        ));
+        assert!(err.contains("as \"manta a\""), "{err}");
+        // Default names differ per input, and another port is another N1MM+.
+        load_file(&format!("{}{}", entry("a", ""), entry("b", ""))).unwrap();
+        let other_port = entry("b", "spectrum_name = \"manta 20m\"\n")
+            .replace("127.0.0.1:13064", "127.0.0.1:13065");
+        load_file(&format!(
+            "{}{other_port}",
+            entry("a", "spectrum_name = \"manta 20m\"\n")
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn spectrum_keys_from_the_environment_stay_strings() {
+        let l = load_env(
+            Some(SPECTRUM_HPSDR),
+            &[
+                ("MANTA_INPUT_SPECTRUM_UDP", "127.0.0.1:13064"),
+                ("MANTA_INPUT_SPECTRUM_NAME", "20"),
+            ],
+        )
+        .unwrap();
+        let out = l.input.shared.spectrum.unwrap();
+        assert_eq!(out.dest, "127.0.0.1:13064".parse().unwrap());
+        assert_eq!(out.name.as_deref(), Some("20"));
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "spectrum_udp")));
+        assert!(STRING_TYPED_ENV_KEYS.contains(&("input", "spectrum_name")));
     }
 
     #[test]

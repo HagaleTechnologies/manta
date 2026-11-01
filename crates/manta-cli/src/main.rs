@@ -47,6 +47,7 @@ mod relay_socket;
 mod reload;
 mod silent;
 mod source_check;
+mod spectrum_feed;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -5322,6 +5323,8 @@ struct ResolvedInput {
     capture_rate_hz: Option<f64>,
     /// MAN-309: `run` records this input's IQ here (`record_iq`).
     record_iq: Option<PathBuf>,
+    /// MAN-141: `run` sends this input's spectrum here (`spectrum_udp`).
+    spectrum: Option<config::SpectrumOut>,
     /// MAN-310: this stream's share of a split band plan.
     spawn_band_hz: Option<(f64, f64)>,
 }
@@ -5520,6 +5523,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
                     record_iq: n.input.shared.record_iq.clone(),
+                    spectrum: n.input.shared.spectrum.clone(),
                     spawn_band_hz: n.spawn_band_hz,
                 })
             })
@@ -7020,6 +7024,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 Some(_) => None,
                 None => loaded.input.shared.record_iq.clone(),
             });
+            // MAN-141: `input.spectrum_udp`, dropped with the rest of the
+            // file's input when a source flag replaced it.
+            let spectrum_out = match resolved.replaced_file_source {
+                Some(_) => None,
+                None => loaded.input.shared.spectrum.clone(),
+            };
             // An existing --source is an existing destination too.
             if let Some(path) = &record_iq {
                 check_record_destination(path)?;
@@ -7142,6 +7152,16 @@ fn run_command() -> Result<std::process::ExitCode> {
                      MANTA_INPUT_CENTER_FREQ_HZ, or input.center_freq_hz"
                 );
             }
+            // MAN-141: a spectrum feed needs a real RF frequency too, with
+            // or without [server], and its socket is bound before any
+            // source I/O (as `[[wsjtx_relay]]` sockets are).
+            if spectrum_out.is_some() && needs_dial_freq(true, has_rf_aware_source, dial_freq_hz) {
+                bail!(spectrum_feed::NEEDS_RF_MESSAGE);
+            }
+            let spectrum_bound = spectrum_out
+                .as_ref()
+                .map(|out| spectrum_feed::bind(source_name, out))
+                .transpose()?;
             if config_path.is_some() && loaded.server.is_none() {
                 logging::note(&format!(
                     "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
@@ -7683,6 +7703,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
             let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
+            // MAN-141: the feed's span comes from the opened source, the
+            // same numbers the engine's tap uses.
+            let (spectrum_sink, spectrum_thread) = match spectrum_bound {
+                Some(feed) => spectrum_feed::open(
+                    feed,
+                    src.sample_rate(),
+                    src.center_freq_hz(),
+                    src.rf_passband_hz(),
+                    resolved.freq_correction_ppm,
+                    spot_server.as_ref().map(|server| server.metrics.as_ref()),
+                )?
+                .unzip(),
+                None => (None, None),
+            };
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -7711,6 +7745,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }),
                     detector_confirmations: None,
                     track_lifecycle: None,
+                    spectrum: spectrum_sink,
                 },
                 |ev| {
                     if json {
@@ -7848,6 +7883,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-309: the source is gone, so the queue is closed; the
             // writer finalizes during the drain and is collected after it.
             let recording_deadline = close_recordings(recording.as_slice());
+            // MAN-141: the engine dropped its sink, so the sender thread has
+            // sent what was queued and ends.
+            if let Some(thread) = spectrum_thread {
+                let _ = thread.join();
+            }
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -8086,6 +8126,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
                 errln!("{note}");
             }
+            if let Some(note) = spectrum_feed::ignored_note("soak", &loaded) {
+                errln!("{note}");
+            }
             if let Some(note) = record_iq_ignored_note("soak", &loaded) {
                 errln!("{note}");
             }
@@ -8286,6 +8329,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
+                errln!("{note}");
+            }
+            if let Some(note) = spectrum_feed::ignored_note("doctor", &loaded) {
                 errln!("{note}");
             }
             if let Some(note) = record_iq_ignored_note("doctor", &loaded) {
@@ -10565,6 +10611,36 @@ mod tests {
         );
         assert_eq!(
             record_iq_ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn spectrum_needs_an_rf_reference_like_a_server_does() {
+        // MAN-141: `run`'s feed guard is MAN-34's rule with a server
+        // assumed: plain audio without a dial is refused, with one is not.
+        let audio = LiveSourceSpec::AudioDevice(None);
+        assert!(needs_dial_freq(true, audio.is_rf_aware(), None));
+        assert!(!needs_dial_freq(
+            true,
+            audio.is_rf_aware(),
+            Some(14_000_000.0)
+        ));
+        assert!(spectrum_feed::NEEDS_RF_MESSAGE.contains("set input.center_freq_hz"));
+    }
+
+    #[test]
+    fn soak_and_doctor_say_they_ignore_spectrum_udp() {
+        let loaded = loaded_from("[input]\ntype = \"audio\"\nspectrum_udp = \"127.0.0.1:13064\"\n");
+        let note = spectrum_feed::ignored_note("soak", &loaded).unwrap();
+        assert!(
+            note.starts_with(
+                "note: soak does not send spectrum; ignoring input.spectrum_udp from "
+            ),
+            "{note}"
+        );
+        assert_eq!(
+            spectrum_feed::ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
             None
         );
     }

@@ -23,7 +23,11 @@ pub use multi::{
     MAX_INPUTS,
 };
 pub mod quality;
+pub mod spectrum;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
+pub use spectrum::{
+    spectrum_span, SpectrumFrame, SpectrumSink, SpectrumSpan, SPECTRUM_HOPS_PER_FRAME,
+};
 pub mod calibrate;
 pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
