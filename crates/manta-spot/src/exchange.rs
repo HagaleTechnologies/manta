@@ -48,8 +48,7 @@
 //! A run is settled once a word follows it, its last word ends a turn, or
 //! the caller says the window is complete. Every rule reads only the words
 //! before the run, the run and the one token after it, so a settled role
-//! never changes as words are appended. See
-//! docs/DECISIONS/2026-11-01-man201-callsign-roles.md.
+//! never changes as words are appended (MAN-201).
 
 use crate::context::{SpotType, CQ_FILLER, TEST_SIGN_OFF};
 use crate::{grammar, message};
@@ -507,6 +506,8 @@ mod tests {
     use Role::*;
 
     type Row = (String, Role, Option<SpotType>, bool);
+    /// (call, role, spot type) of one occurrence.
+    type Expected = (String, Role, Option<SpotType>);
 
     fn words(text: &str) -> Vec<ExchangeWord<'_>> {
         text.split_whitespace()
@@ -536,14 +537,14 @@ mod tests {
     }
 
     /// (call, role, spot type) for a complete window.
-    fn roles3(text: &str) -> Vec<(String, Role, Option<SpotType>)> {
+    fn roles3(text: &str) -> Vec<Expected> {
         roles(text, true)
             .into_iter()
             .map(|(c, r, t, _)| (c, r, t))
             .collect()
     }
 
-    fn r(call: &str, role: Role, ty: Option<SpotType>) -> (String, Role, Option<SpotType>) {
+    fn r(call: &str, role: Role, ty: Option<SpotType>) -> Expected {
         (call.to_string(), role, ty)
     }
 
@@ -553,7 +554,7 @@ mod tests {
 
     /// The controlled role corpus: every occurrence of every row, labelled
     /// independently. Its gate is zero role inversions.
-    fn corpus() -> Vec<(&'static str, Vec<(String, Role, Option<SpotType>)>)> {
+    fn corpus() -> Vec<(&'static str, Vec<Expected>)> {
         vec![
             (
                 "DE W1AW DE K1ABC",
