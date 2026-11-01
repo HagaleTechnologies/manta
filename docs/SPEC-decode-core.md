@@ -1737,7 +1737,9 @@ restarts; the marks in progress become a character only if the open space
 had already reached a character gap before the loss; a word with committed
 characters closes with a `WordBoundary` at the last pre-gap hop; warm-up
 runs and flush-learning state are cleared; and post-gap runs are discarded
-until a space of at least a character gap closes (resync). Speed, gap
+until a space of at least a character gap closes (resync); before tracker
+readiness, whole post-gap marks set only the unit that space is measured in.
+Speed, gap
 classification, sender timing, rails, noise, track identity, the floor and
 the channelizer are kept. No track closes because of the gap. A
 discontinuity reported on the same read wins, and an unknown gap pending at

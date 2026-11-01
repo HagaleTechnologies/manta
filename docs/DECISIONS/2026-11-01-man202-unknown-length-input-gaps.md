@@ -98,7 +98,9 @@ Reporting `take_discontinuity(Some(0))` invents a count, which `GapScaler`,
      cleared, so nothing is replayed or learned across the gap;
    - post-gap runs are discarded until a space of at least a character gap
      closes (resync), because the first post-gap mark may be truncated
-     mid-element;
+     mid-element; before tracker readiness the later, whole post-gap marks
+     set the unit that space is measured in and teach nothing else, or a
+     fast sender's spaces would never reach the no-marks-yet 150 ms unit;
    - the refiner's backlog is drained into `pending`, then the refiner FIR,
      `clean_hist` and `phase_hist` are reset (the MAN-194 order), because
      their windows span the splice;

@@ -210,8 +210,12 @@ pub struct TrackDecoder {
     continuity_epoch: u32,
     /// MAN-202: the shortest mark fed to the tracker before readiness. The
     /// tracker's dit centroid is 0 until then, so the post-gap resync
-    /// measures spaces in this instead.
+    /// measures spaces in this instead. A complete post-gap mark lowers it
+    /// too, so a gap before the first mark can still resynchronize.
     warmup_min_mark_ms: Option<f32>,
+    /// MAN-202: a mark has been discarded since the last gap. The first
+    /// post-gap mark may be truncated and sets no scale; later ones are whole.
+    post_gap_mark_seen: bool,
 }
 
 impl TrackDecoder {
@@ -264,6 +268,7 @@ impl TrackDecoder {
             after_gap: false,
             continuity_epoch: 0,
             warmup_min_mark_ms: None,
+            post_gap_mark_seen: false,
         }
     }
 
@@ -425,6 +430,7 @@ impl TrackDecoder {
         self.single_flush_ms = None;
         self.pending.clear();
         self.after_gap = true;
+        self.post_gap_mark_seen = false;
         self.continuity_epoch = self.continuity_epoch.wrapping_add(1);
     }
 
@@ -433,7 +439,8 @@ impl TrackDecoder {
     /// folds long gaps into the Farnsworth statistics, and a space cut by an
     /// unknown gap must teach nothing.
     /// Before readiness the tracker's centroid is 0, so the unit is the
-    /// shortest mark seen so far (`WARMUP_RESYNC_DIT_MS` with none).
+    /// shortest whole mark seen so far, before or after the gap
+    /// (`WARMUP_RESYNC_DIT_MS` with none).
     fn reaches_char_gap(&self, hops: u32) -> bool {
         let ms = hops as f32 * HOP_MS as f32;
         let unit = if self.tracker.ready() {
@@ -969,7 +976,18 @@ impl TrackDecoder {
             // mid-element; only a closed space of at least a character gap
             // is a boundary (`reaches_char_gap`, which also covers the
             // tracker's zero centroid before readiness).
-            if !run.mark && self.reaches_char_gap(run.hops) {
+            if run.mark {
+                // Before readiness a whole post-gap mark may be the only
+                // timing scale there is: with none, a fast sender's spaces
+                // never reach the resync unit and the track stays silent.
+                // It updates this resync unit alone, not the tracker.
+                if self.post_gap_mark_seen && !self.tracker.ready() {
+                    let ms = run.hops as f32 * HOP_MS as f32;
+                    self.warmup_min_mark_ms =
+                        Some(self.warmup_min_mark_ms.map_or(ms, |m| m.min(ms)));
+                }
+                self.post_gap_mark_seen = true;
+            } else if self.reaches_char_gap(run.hops) {
                 self.after_gap = false;
             }
             return; // nothing learned, nothing assembled
@@ -2593,6 +2611,23 @@ mod tests {
         assert!(
             got.iter().all(|&(ts, _)| ts > resync_ts && ts > gaps[0]),
             "no warm-up run before the gap is replayed into a character: {got:?}"
+        );
+    }
+
+    #[test]
+    fn input_gap_before_the_first_mark_resyncs_on_fast_continuous_text() {
+        // 40 WPM (dit 11 hops, 29 ms): even a word gap is about 205 ms, under
+        // the 300 ms the no-marks-yet resync unit asks for, so only the
+        // complete post-gap marks can set a scale that lets the decoder out.
+        let text = ["PARIS"; 12].join(" ");
+        let env = rect_envelope(&text, 11);
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(100, 10)]);
+        assert_eq!(gaps.len(), 1);
+        let decoded = events_to_text(&events);
+        assert!(is_subsequence(&decoded, &text), "{decoded:?}");
+        assert!(
+            chars(&events).len() >= text.len() / 2,
+            "a gap before the first mark must not silence the track: {decoded:?}"
         );
     }
 
