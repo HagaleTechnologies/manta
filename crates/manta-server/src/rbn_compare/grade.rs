@@ -1562,7 +1562,10 @@ mod tests {
     fn reference_report_found_ignores_frequency_and_speed_gaps() {
         let r = rep("W3XYZ", "W1AW", 14_025.0, Some(25.0), T0);
         let s = spot("a", "W1AW", 14_026_400, Some(35), T0);
-        assert_eq!(recall_of(&r, &[s.clone()], &cfg()).recall, Recall::Found);
+        assert_eq!(
+            recall_of(&r, std::slice::from_ref(&s), &cfg()).recall,
+            Recall::Found
+        );
         // The forward pass calls the same pair a disagreement, not a miss.
         assert_eq!(graded((s, vec![r]), true, &cfg()).grade, Grade::Disagree);
     }

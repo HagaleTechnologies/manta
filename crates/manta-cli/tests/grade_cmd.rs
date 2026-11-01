@@ -1335,29 +1335,90 @@ fn paired_ignores_manta_env_vars() {
     assert_eq!(stdout(&out), read_pair_fixture("expected-paired.txt"));
 }
 
-/// Object keys as `a` and `a.b`, arrays of objects as `a[].b`, in wire
-/// order (each array's first element names its keys).
-fn flatten_keys(v: &serde_json::Value, prefix: &str, out: &mut Vec<String>) {
-    let serde_json::Value::Object(map) = v else {
-        return;
-    };
-    let mut keys: Vec<&String> = map.keys().collect();
-    // Wire order within this object, whatever order the Map iterates in.
-    let text = serde_json::to_string(v).unwrap();
-    keys.sort_by_key(|k| text.find(&format!("\"{k}\":")).expect("key on the wire"));
-    for k in keys {
-        let path = format!("{prefix}{k}");
-        out.push(path.clone());
-        match &map[k] {
-            child @ serde_json::Value::Object(_) => flatten_keys(child, &format!("{path}."), out),
-            serde_json::Value::Array(items) => {
-                if let Some(first @ serde_json::Value::Object(_)) = items.first() {
-                    flatten_keys(first, &format!("{path}[]."), out);
+/// Every key of a JSON line, in wire order, as `a` and `a.b` for objects
+/// and `a[].b` for arrays of objects (each array's first element names its
+/// keys). Scans the raw text: `serde_json::Value` keeps no key order.
+fn wire_key_paths(text: &str) -> Vec<String> {
+    enum Frame {
+        Obj {
+            prefix: String,
+            emit: bool,
+            key: String,
+        },
+        Arr {
+            path: String,
+            index: usize,
+            emit: bool,
+        },
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut last_string: Option<String> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                let mut s = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => s.extend(chars.next()),
+                        '"' => break,
+                        _ => s.push(c),
+                    }
+                }
+                last_string = Some(s);
+                continue;
+            }
+            ':' => {
+                if let (Some(Frame::Obj { prefix, emit, key }), Some(k)) =
+                    (stack.last_mut(), last_string.take())
+                {
+                    if *emit {
+                        out.push(format!("{prefix}{k}"));
+                    }
+                    *key = k;
+                }
+            }
+            '{' | '[' => {
+                let (path, emit) = match stack.last() {
+                    None => (String::new(), true),
+                    Some(Frame::Obj { prefix, emit, key }) => (format!("{prefix}{key}"), *emit),
+                    Some(Frame::Arr { path, index, emit }) => {
+                        (format!("{path}[]"), *emit && *index == 0)
+                    }
+                };
+                stack.push(if c == '{' {
+                    let prefix = if path.is_empty() {
+                        path
+                    } else {
+                        format!("{path}.")
+                    };
+                    Frame::Obj {
+                        prefix,
+                        emit,
+                        key: String::new(),
+                    }
+                } else {
+                    Frame::Arr {
+                        path,
+                        index: 0,
+                        emit,
+                    }
+                });
+            }
+            '}' | ']' => {
+                stack.pop();
+            }
+            ',' => {
+                if let Some(Frame::Arr { index, .. }) = stack.last_mut() {
+                    *index += 1;
                 }
             }
             _ => {}
         }
+        last_string = None;
     }
+    out
 }
 
 #[test]
@@ -1365,9 +1426,7 @@ fn paired_json_keys_are_documented_in_the_runbook() {
     let out = paired_fixture(&["--json"]);
     assert_success(&out);
     let line = stdout(&out);
-    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-    let mut keys = Vec::new();
-    flatten_keys(&v, "", &mut keys);
+    let keys = wire_key_paths(&line);
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/RUNBOOKS/rbn-comparison.md"

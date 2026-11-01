@@ -105,6 +105,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-97: `manta grade --paired` compares one node's spots with a
+  co-located reference skimmer both ways and prints recall, the reports
+  manta missed and its candidate false spots, as text or one JSON object
+  (`--json`), over `--passband-khz` and an optional `--start`/`--end`. The
+  reference is a skimmer's saved `DX de` telnet output (`--reference`, for
+  example CW Skimmer Server's) or RBN CSVs with `--spotter`. `--reference`
+  also works for the one-way table. See
+  `docs/RUNBOOKS/rbn-comparison.md`.
 - MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
   protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
   overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
