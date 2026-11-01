@@ -37,7 +37,11 @@ HANG track back to ACTIVE on every gap hop. `Gate::with_ema_rise` enables
 the EMA path; `two_look_rise_ignores_the_skirt_of_a_stronger_neighbor`
 pins the guard. The drain-order listen fixture returns to its original TK1A
 scene and default detector settings. VR3, the nine engine tests and the
-false-rate meter pass.
+false-rate meter pass. The two-channel scan wraps, as `is_local_peak`
+does, so a carrier at channel 1 or `n-2` also guards channel `n-1` or 0
+across DC (`two_look_skirt_check_wraps_across_dc`). The wrap only
+withholds window rise, so it cannot add tracks; the meter and sweep
+figures below predate it.
 
 At this point the false-rate meter measures 10/26/0 unconfirmed on noise
 seeds 1/2/3 and 10 on V1, equal to the old 12 dB baseline, with zero

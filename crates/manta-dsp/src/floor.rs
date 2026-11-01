@@ -334,8 +334,8 @@ pub struct Gate {
 }
 
 /// MAN-109: the two-look rise applies only on a channel whose recent
-/// window is the largest within this many channels; elsewhere only the
-/// EMA rise applies.
+/// window is the largest within this many channels (wrapping); elsewhere
+/// only the EMA rise applies.
 const SKIRT_CHANNELS: usize = 2;
 
 // One ring per length, shared cursor across channels. The recent and previous
@@ -388,11 +388,14 @@ impl PowerLooks {
     }
     // A window beside a stronger channel integrates that signal's skirt
     // and key clicks, which fall off away from it and which the EMA sees
-    // only as short bursts.
+    // only as short bursts. Neighbours wrap: channels 0 and n-1 are
+    // adjacent in FFT bin order.
     fn beside_stronger(&self, k: usize) -> bool {
-        let lo = k.saturating_sub(SKIRT_CHANNELS);
-        let hi = (k + SKIRT_CHANNELS).min(self.recent.len() - 1);
-        (lo..=hi).any(|j| j != k && self.recent[j] > self.recent[k])
+        let n = self.recent.len() as isize;
+        let s = SKIRT_CHANNELS as isize;
+        (-s..=s)
+            .map(|d| (k as isize + d).rem_euclid(n) as usize)
+            .any(|j| j != k && self.recent[j] > self.recent[k])
     }
     fn rises(&self, k: usize, threshold: f64) -> bool {
         self.filled == 2 * self.m
@@ -587,6 +590,25 @@ mod tests {
             );
         }
         assert!(rise[3] && rise[4], "the EMA rise still applies beside it");
+    }
+
+    #[test]
+    fn two_look_skirt_check_wraps_across_dc() {
+        // Channels 0 and n-1 are adjacent in FFT bin order (SPEC §1.1), so
+        // a carrier at 1 (or n-2) puts n-1 (or 0) two channels from it.
+        let bank = warmed_up_bank(16, -90.0);
+        for (strong, skirt) in [(1, 15), (14, 0)] {
+            let mut powers = [-90.0; 16];
+            powers[strong] = -45.0;
+            powers[skirt] = -78.0;
+            let mut gate = Gate::new(16, 10.0, 3.0, &[38]);
+            let mut rise = Vec::new();
+            for _ in 0..100 {
+                (rise, _) = gate.update(&powers, &bank);
+            }
+            assert!(rise[strong], "the strong channel {strong} rises");
+            assert!(!rise[skirt], "channel {skirt} is {strong}'s skirt");
+        }
     }
 
     #[test]

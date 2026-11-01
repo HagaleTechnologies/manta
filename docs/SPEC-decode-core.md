@@ -288,8 +288,9 @@ Per channel, smoothed power `S[k, m]`: EMA of `PdB[k, m]` with time constant
   block median quartile, also bounded by the startup block seed until the
   full 250-entry ring is available. Partial windows cannot rise. Window
   rise applies only on a channel whose recent window is the largest within
-  two channels (a stronger signal's skirt and key clicks fall off away
-  from it). Rise is also true when `S ≥ F + max(on_snr_db, 12 dB)`, the
+  two channels, neighbours wrapping (a stronger signal's skirt and key
+  clicks fall off away from it).
+  Rise is also true when `S ≥ F + max(on_snr_db, 12 dB)`, the
   EMA rule, so a strong onset rises before the windows fill. Window rise
   confirms a CANDIDATE and wakes a DORMANT track; ACTIVE and HANG use the
   EMA rule alone, since full windows outlast a key-up gap. Confirmation

@@ -24,9 +24,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
 - MAN-109: add rise from two disjoint power windows alongside the 12 dB EMA rise; keep the 19-hop confirmation and the EMA for drop and SNR.
-=======
 - MAN-106 first slice: candidates with no finite positive character
   confidence are withheld as `noEvidence`. CLI JSON spots gain
   `emissionState`, based on whether the pattern tier's repetition
@@ -35,7 +33,6 @@ the git history and `docs/DECISIONS/`.
   fallback. Confidence remains an uncalibrated score; bench reporting and
   fitted calibration are deferred to the next slice. See
   docs/DECISIONS/2026-10-30-man106-q-snr-input.md.
->>>>>>> d144e36b17899fcafe32db42ceb64c24ca5b87d6
 - MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
   `T0M`) now decodes as its own words. The speed tracker read five equal
   dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`
