@@ -3,8 +3,11 @@
 **Status:** in progress. The engine slice is implemented: the pinned
 decoder dependency behind the `ftx` feature, the coverage rule, the
 streaming USB demodulator, the UTC slot slicer and the IQ tap with its
-decode service. The JSON spot path, the `[input].digital_modes` key, the
-CLI wiring and the operator docs follow in the next slice of this ticket.
+decode service. The JSON spot path in `manta-server` is implemented too:
+the `FtxSpot` record, `SpotBus::publish_ftx`, its rendering on the `:7301`
+stream and the four `manta_ftx_` metric families. Nothing calls them yet.
+The `[input].digital_modes` key, the CLI wiring and the operator docs
+follow in the next slice of this ticket.
 Blocked on pancetta PR #550: move the pin to the `pancetta-ft8` tag before
 merging.
 
@@ -79,10 +82,29 @@ and `v0.9.6`; no `pancetta-ft8-v*` tag existed.
   process-wide one-thread rayon pool, so the decoder never competes with
   the CW decoder pool.
 
+- **D11. Wire.** An FT8/FT4 spot is its own JSON-only bus record,
+  `JsonItem::Ftx`, holding `FtxSpot { mode, callsign, grid, freq_hz,
+  snr_db, slot_start_ms }`. `SpotBus::publish_ftx` gives it the next `seq`
+  and a place in the resume history, aged by its slot start, and sends it
+  on the JSON channel only: telnet, the RBN uplink and `recent()` never see
+  it. `SpotMessage::from_ftx` renders the same 29 keys as a CW spot, with
+  `mode` `"FT8"`/`"FT4"`, `dxGrid` from the `CQ`, `timestamp` the slot start
+  rounded down to whole seconds, the decoder's SNR on the 2500 Hz
+  reference, and `wpm`, `rst`, `decodeConfidence` and
+  `channelizerResolutionHz` null. The `id` is
+  `station_callsign:session_nonce:MODE:slot_start:dxCall`. Rejected: folding
+  FTx spots into `manta_spot::Spot`, which would put them on telnet and the
+  uplink and is MAN-322's `Spot.mode` work.
+- **Metrics.** `manta_ftx_cycles_total{input,mode,outcome}`,
+  `manta_ftx_decodes_total{mode}`, `manta_ftx_spots_total{mode}` and
+  `manta_ftx_decode_seconds{input,mode}` render only once a window is
+  registered with `Metrics::register_ftx_window`, so a run without FT8/FT4
+  shows no `manta_ftx_` line, not even a header.
+
 The next slice carries the remaining decisions of the plan: the config
 key and its load rules (D4), replay ordering across inputs (D9), the CQ
-spot rule and dedupe (D10), the JSON wire record (D11), the clock check
-(D12), and the cost notes (D13).
+spot rule and dedupe (D10), the clock check (D12), and the cost notes
+(D13).
 
 ## Evidence
 
@@ -95,6 +117,13 @@ spot rule and dedupe (D10), the JSON wire record (D11), the clock check
 - The test signals are GFSK synthesised from tone strings that ft8_lib's
   own encoder printed (`gen_ft8` at the vendored `9fec6ca`), in
   `manta_testkit::ftx`. No binary fixture is committed.
+- `cargo test -p manta-server --test json_stream_acceptance
+  an_ft8_spot_reaches_the_json_stream_labelled_ft8`: a TCP and a WebSocket
+  client each receive the published FT8 spot as a 29-key line with
+  `"mode":"FT8"`, `"dxGrid":"FN31"` and `"wpm":null`, and the telnet
+  channel receives nothing. The FT8 example in `docs/SPOT-SCHEMA.md` is
+  pinned to `from_ftx`'s output by
+  `the_spot_schema_ft8_example_is_what_from_ftx_renders`.
 - `the_ft8_lib_c_decoder_is_linked_not_stubbed` asserts
   `pancetta_ft8::ft8lib_is_available()`: pancetta's build falls back to a
   stub with reduced recall when the submodule is missing.
@@ -117,10 +146,10 @@ spot rule and dedupe (D10), the JSON wire record (D11), the clock check
 
 ## Follow-ups
 
-- This ticket's next slice: the JSON spot record and metrics in
-  `manta-server`, `[input].digital_modes`, the startup coverage lines, the
-  CLI wiring of `attach`, the daemon acceptance tests and the operator
-  docs.
+- This ticket's next slice: `[input].digital_modes`, the startup coverage
+  lines, the CLI wiring of `attach` and of the sink that calls
+  `SpotBus::publish_ftx` and the `manta_ftx_` metrics, the daemon
+  acceptance tests and the operator docs.
 - Move the pin to the `pancetta-ft8` tag once PR #550 merges.
 - Release builds with `ftx`, once ft8_lib builds on every release target.
 - A diff of dispensa Q-0085 against `docs/decoder-crate.md`.
