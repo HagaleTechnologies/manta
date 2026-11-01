@@ -10,12 +10,17 @@ This no-go covers running manta's decode pipeline (manta-dsp, manta-decode,
 manta-engine and manta-spot) on the Zynq-7000 ARM cores of any Red Pitaya or
 QMTech Zynq board. Two Cortex-A9 cores at 667 MHz cannot carry manta's front
 end: one 192 kS/s DDC is predicted to need 0.9 to 3.4 of the board's 2.0
-cores, and 8 DDCs need at least 4.7 cores even in the most favourable case.
-The problem it would solve does not bind on this board either, because every
-Red Pitaya has Gigabit Ethernet and its gateware stops at 8 DDCs (78.2 Mbps).
+cores, and 8 DDCs at 192 kS/s need at least 4.7 cores even in the most
+favourable case. On-device decode only pays off at high DDC counts, where the
+link would be the limit, and that is where the CPU misses most. The problem it
+would solve does not bind on this board either, because every Red Pitaya has
+Gigabit Ethernet and its gateware stops at 8 DDCs (78.2 Mbps).
 The record does not cover a channelizer in the Zynq's programmable logic, or
 any other SoC. The Hermes-Lite 2 has no onboard general-purpose compute and is
-out of scope.
+out of scope. Reopen only when all three hold: a real Cortex-A9 measurement
+exists, the front-end cost per stream has fallen about fivefold, and the
+deployment needs fewer or narrower streams than 8 DDCs at 192 kS/s (see "What
+would change the answer").
 
 ## Scope and method: no hardware
 
@@ -56,9 +61,11 @@ cores, and do not let MAN-13's design assume it. The reasons, in order of
 weight:
 
 1. The CPU budget misses by a wide margin under every assumption tried,
-   including the strictest lower bound. No scaling factor in the plausible
-   range makes 8 DDCs fit, and one 192 kS/s DDC alone uses most of the SoC at
-   the central estimate (see "Scaling to the Zynq").
+   including the clock-ratio bound. No scaling factor in the plausible range
+   makes 8 DDCs at 192 or 96 kS/s fit, 8 DDCs at 48 kS/s fit only at that
+   bound, and one 192 kS/s DDC alone uses the whole SoC at the central
+   estimate (see "Scaling to the Zynq"). The configurations that do fit (one
+   or two DDCs) need no on-device decode: their IQ is at most about 10 Mbps.
 2. The problem on-device decode would solve does not exist on this hardware.
    The Red Pitaya has a Gigabit port and a gateware cap of 8 DDCs (see "The
    bandwidth premise").
@@ -198,10 +205,18 @@ SNR into a 20 s complex scene and calls `manta_engine::decode_samples`
 (`crates/manta-engine/src/lib.rs:327`), the same entry point the repo's gate
 uses (`crates/manta-engine/tests/cpu_budget.rs`). It reads `getrusage`
 user plus system CPU time around the call and divides by the audio duration
-minus the 2 s detector warmup, the repo's own convention. It ran with
+minus a hard-coded 2 s detector warmup. It ran with
 `RAYON_NUM_THREADS=1 taskset -c 5`, so each figure is single-core work, twice.
 Host: AMD Ryzen 9 5950X (16 cores, 32 threads, 5085 MHz max), shared, load
 average 21 to 31, commit `4581725`, 2026-11-01.
+
+The 2 s is the pre-MAN-115 warmup. The current default is 9 hops, 24 ms
+(`warmup_hops: 9` at `crates/manta-engine/src/track.rs:201`; the gate derives
+it at runtime, `crates/manta-engine/tests/cpu_budget.rs:195-218`). Every
+matrix figure below is therefore about 11% high (20 s of CPU over 18 s
+instead of about 20 s). The figures are kept as measured, and the scaling
+table below inherits them. The correction moves no conclusion: the optimistic
+corner uses the real-binary floor, which subtracts no warmup.
 
 ```
 fs=192000 signals=  1  cpu/audio=0.131x / 0.137x    (two runs)
@@ -218,10 +233,15 @@ fs= 48000 signals= 10  cpu/audio=0.038x / 0.033x
 Peak RSS across the whole matrix was 51 to 65 MB, which includes the 31 MB
 rendered input buffer, so the pipeline itself is tens of MB.
 
-**Cross-check on the real binary.** `manta decode` on the 60 s, 192 kS/s `v1`
-recording used 5.35 CPU-seconds with a 20.5 MB peak RSS: 0.089 core-seconds
-per audio-second, multi-threaded, on the same loaded host. That is the low end
-of the table above, so 0.089 is the "cheapest floor" in the optimistic corner.
+**Cross-check on the real binary.** `manta decode` on the `v1` recording
+(120 s at 96 kS/s, one signal; `crates/manta-testkit/src/vectors.rs:43-44`)
+used 5.35 CPU-seconds with a 20.5 MB peak RSS, multi-threaded, on the same
+loaded host. That is 0.045 core-seconds per audio-second at 96 kS/s, or 0.089
+per 192 kS/s stream by the linear rate scaling the matrix shows. It is the low
+end of the table above, so 0.089 per 192 kS/s DDC is the "cheapest floor" in
+the optimistic corner. (The research phase described this file as 60 s at
+192 kS/s. The 5.35 CPU-seconds and the 0.089 per 192 kS/s stream do not
+change with that correction; the per-audio-second prediction below does.)
 
 What the numbers say:
 
@@ -256,7 +276,12 @@ measurement:
   4,420 MHz (87% of 5,085 MHz, per `lscpu`) against 667 MHz. IPC and SIMD only
   add to this, since the A9 is a 2-issue core and the host's rustfft path uses
   runtime-detected AVX while the A9 gets none (see "Cross-compile findings").
-  This is the strictest defensible bound and is optimistic for the A9.
+  It bounds the A9-to-host ratio for uncontended host time. The native figures
+  came from a shared host, so SMT contention may inflate them, and the cores
+  needed at k = 6.6 are a lower bound only as far as that contention is small.
+  The margin covers it: 8 DDCs at 192 kS/s in the optimistic corner (4.7
+  cores) would fit in 2.0 cores only if contention had inflated the native
+  floor by more than 2.3 times.
 - **k = 15, a central assumption.** The clock ratio times an IPC and SIMD gap
   of about 2.3. This is a judgement, not a sourced figure.
 - **k = 25, a pessimistic assumption.**
@@ -277,10 +302,12 @@ also running Linux and the HPSDR server thread:
 
 **Optimistic corner for 8 DDCs** (cheapest measured floor 0.089, k = 6.6):
 4.7 cores at 192 kS/s, 2.4 at 96 kS/s and 1.2 at 48 kS/s. Only 8 DDCs at
-48 kS/s fits, and only under the strictest bound, with nothing left for Linux.
-Eight DDCs at 48 kS/s each cover 48 kHz, so that fit would not skim a band like
-20 m (14.000 to 14.070 MHz) at full width. The 300-signal gate scene (0.84
-native) would need 5.5 to 21 cores.
+48 kS/s fits, and only at the clock-ratio bound: 1.2 cores in this corner, or
+1.9 of 2.0 cores with the 10-signal matrix figure, which leaves almost nothing
+for Linux and the HPSDR server. At the central estimate it needs 4.3 cores.
+Each 48 kS/s DDC covers 48 kHz, less than the 70 kHz of 20 m CW (14.000 to
+14.070 MHz), so a band needs two of them and 8 DDCs cover at most four bands.
+The 300-signal gate scene (0.84 native) would need 5.5 to 21 cores.
 
 **Cross-check with no x86 involved.** The repo's Pi 4 target is "one 192 kS/s
 passband in one Raspberry Pi 4 core"
@@ -296,9 +323,9 @@ vendor and second-hand figures. On either, the Zynq cannot reach the repo's
 own target of one core per 192 kS/s passband.
 
 **A prediction a hardware run could falsify** (see "Needs real hardware"):
-`manta decode` of the 60 s `v1` recording would need about 35 to 134
-CPU-seconds on the A9, or 0.6 to 2.2 core-seconds per audio-second. This is
-the 0.089 floor scaled by k = 6.6 to 25, not a measurement.
+`manta decode` of the 120 s, 96 kS/s `v1` recording would need about 35 to 134
+CPU-seconds on the A9, or 0.3 to 1.1 core-seconds per audio-second. This is
+the measured 5.35 CPU-seconds scaled by k = 6.6 to 25, not a measurement.
 
 ## Cross-compile findings
 
@@ -396,8 +423,10 @@ per 100 Mbps link; in code it is `LINK_BUDGET_MBPS = 78.4`
   88 to 98 Mbps), which has no onboard compute, and two or more Pitayas behind
   a single 100 Mbps uplink. On-device decode on a Pitaya helps neither.
 - **The real scaling limit for high DDC counts is host CPU**, not the link.
-  [multiple-receivers.md](../GUIDES/multiple-receivers.md) already says a
-  192 kS/s passband is about one Pi 4 core, and MAN-307
+  [multiple-receivers.md](../GUIDES/multiple-receivers.md) sets a target of
+  one 192 kS/s passband per Pi 4 core (a target, not a measurement; MAN-18
+  estimates the Pi 4 misses its 300-track budget by about 5.3 times), and
+  MAN-307
   ([2026-10-19-man307-hpsdr-multiple-receivers.md](2026-10-19-man307-hpsdr-multiple-receivers.md))
   runs one decode front end per receiver. On-device decode would move that
   load onto a core about a quarter as fast.
@@ -424,10 +453,13 @@ Reopen only if all three hold:
 2. The front-end cost per 192 kS/s stream falls about fivefold from today's
    0.134 core-s/s on the reference host. For example, 8 DDCs at 96 kS/s in 1.5
    usable A9 cores at k = 15 needs 0.0125 native core-s/s per 96 kS/s DDC, or
-   0.025 per 192 kS/s equivalent, against 0.134 now.
-3. The deployment needs fewer, narrower streams than the 8-DDC case, since the
-   only configurations in the table that come close to fitting are 1 or 2 DDCs
-   at 48 kS/s.
+   0.025 per 192 kS/s equivalent, against 0.134 now. (With the 11% warmup
+   correction from "Measured cost", today's figure is about 0.12, and the drop
+   is still about fivefold.)
+3. The deployment needs fewer or narrower streams than 8 DDCs at 192 kS/s.
+   Even after a fivefold drop, that case needs about 3.9 A9 cores at k = 15
+   (19.4 / 5). At today's cost, the only rows that fit at the central estimate
+   are 1 or 2 DDCs at 48 kS/s.
 
 A move to a faster SoC removes the premise instead of reopening this, since a
 Pi-class host on the same switch is already the supported shape.
@@ -437,8 +469,8 @@ Pi-class host on the same switch is already the supported shape.
 These are steps only Tony can do. They are not part of MAN-54's acceptance:
 
 1. Copy the armv7 binary and Alpine's `libasound.so.2` to a Red Pitaya running
-   the Alpine image, and time `manta decode` on the 60 s `v1` recording. The
-   prediction above is 35 to 134 CPU-seconds.
+   the Alpine image, and time `manta decode` on the 120 s `v1` recording
+   (`manta gen v1`). The prediction above is 35 to 134 CPU-seconds.
 2. Measure the existing `sdr-receiver-hpsdr` thread's CPU load at 8 DDCs and
    192 kS/s with `top`. This record infers it is low from reading the code
    only.
