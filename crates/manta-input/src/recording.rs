@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Frames per queued block.
 pub const RECORDING_BLOCK_FRAMES: usize = 4096;
@@ -44,8 +44,9 @@ pub enum RecordingOutcome {
     },
     /// The recording failed; the message says why.
     Failed(String),
-    /// The writer did not finish within the deadline; completion is
-    /// unconfirmed.
+    /// The writer did not finish within the deadline. The final metadata
+    /// is not published and will not be, unless publication had begun and
+    /// itself outlasted the grace (MAN-453); completion is unconfirmed.
     TimedOut(PathBuf),
 }
 
@@ -73,12 +74,29 @@ const REASON_STOPPED: u8 = 0;
 const REASON_EOF: u8 = 1;
 const REASON_BACKPRESSURE: u8 = 2;
 
+// `Shared::state` (MAN-453): `finish` and the writer each move it once,
+// with a compare-exchange, so exactly one decides whether the pair is
+// published.
+/// The writer has not begun publishing, and `finish` is still waiting.
+const PENDING: u8 = 0;
+/// The writer has claimed publication; `finish` waits for it.
+const PUBLISHING: u8 = 1;
+/// The writer's outcome is final and on its way to `finish`.
+const SETTLED: u8 = 2;
+/// `finish` reported `TimedOut`: the writer publishes nothing it has not
+/// begun and reports nothing.
+const CANCELLED: u8 = 3;
+
 struct Shared {
     sender: Mutex<Option<Sender<Msg>>>,
     /// The charge of every message sent and not yet written.
     queued: AtomicUsize,
     reason: AtomicU8,
-    cancelled: AtomicBool,
+    /// `PENDING`, `PUBLISHING`, `SETTLED` or `CANCELLED`.
+    state: AtomicU8,
+    /// The writer's outcome, stored before it moves `state` to `SETTLED`,
+    /// so `finish` has it even while the writer's warning blocks.
+    outcome: Mutex<Option<RecordingOutcome>>,
     notified: AtomicBool,
     notice: Option<RecordingNotice>,
 }
@@ -128,6 +146,16 @@ pub fn start_recording<S: IqSource + ?Sized>(
     start: std::time::SystemTime,
     notice: Option<RecordingNotice>,
 ) -> Result<(RecordingSource<S>, RecordingHandle)> {
+    start_recording_with(inner, path, start, notice, spawn_writer)
+}
+
+fn start_recording_with<S: IqSource + ?Sized>(
+    inner: Box<S>,
+    path: &Path,
+    start: std::time::SystemTime,
+    notice: Option<RecordingNotice>,
+    spawn: SpawnWriter,
+) -> Result<(RecordingSource<S>, RecordingHandle)> {
     let meta = metadata_path(path);
     let partial = partial_metadata_path(path);
     if path.exists() {
@@ -166,7 +194,7 @@ pub fn start_recording<S: IqSource + ?Sized>(
     let header = RecordingHeader::for_source(&*inner, start);
     let publish_path = path.to_path_buf();
     let publish: Publish = Box::new(move || publish_metadata(&publish_path));
-    Ok(start_with_sinks(
+    start_with_sinks(
         inner,
         path,
         header,
@@ -174,10 +202,32 @@ pub fn start_recording<S: IqSource + ?Sized>(
         Box::new(std::io::BufWriter::new(meta_file)),
         publish,
         notice,
-    ))
+        spawn,
+    )
+    .inspect_err(|_| {
+        // The writer never ran: both files are this call's (`create_new`
+        // above), still empty, and closed, since the refused spawn dropped
+        // the task that owned them.
+        let _ = std::fs::remove_file(&partial);
+        let _ = std::fs::remove_file(path);
+    })
 }
 
 type Publish = Box<dyn FnOnce() -> std::io::Result<()> + Send>;
+
+/// The writer's work, handed to `SpawnWriter`.
+type WriterTask = Box<dyn FnOnce() + Send>;
+
+/// Starts the writer thread: a parameter so a test can refuse it
+/// (MAN-453), as `Publish` lets a test fail publication.
+type SpawnWriter = fn(WriterTask) -> std::io::Result<()>;
+
+fn spawn_writer(task: WriterTask) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("manta-iq-recorder".into())
+        .spawn(task)
+        .map(drop)
+}
 
 /// Renames `PATH.meta.jsonl.partial` to `PATH.meta.jsonl` without replacing
 /// an existing file: a hard link fails on an existing target.
@@ -193,6 +243,8 @@ fn publish_metadata(path: &Path) -> std::io::Result<()> {
     }
 }
 
+// The sinks, publication and spawn steps are seams the tests replace.
+#[allow(clippy::too_many_arguments)]
 fn start_with_sinks<S: IqSource + ?Sized>(
     inner: Box<S>,
     path: &Path,
@@ -201,42 +253,54 @@ fn start_with_sinks<S: IqSource + ?Sized>(
     meta: Box<dyn Write + Send>,
     publish: Publish,
     notice: Option<RecordingNotice>,
-) -> (RecordingSource<S>, RecordingHandle) {
+    spawn: SpawnWriter,
+) -> Result<(RecordingSource<S>, RecordingHandle)> {
     let (tx, rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         sender: Mutex::new(Some(tx)),
         queued: AtomicUsize::new(0),
         reason: AtomicU8::new(REASON_STOPPED),
-        cancelled: AtomicBool::new(false),
+        state: AtomicU8::new(PENDING),
+        outcome: Mutex::new(None),
         notified: AtomicBool::new(false),
         notice,
     });
     let worker_shared = shared.clone();
     let worker_path = path.to_path_buf();
-    std::thread::Builder::new()
-        .name("manta-iq-recorder".into())
-        .spawn(move || {
-            let outcome = write_recording(
-                &worker_path,
-                header,
-                rx,
-                payload,
-                meta,
-                publish,
-                &worker_shared,
-            );
-            // After a timed-out `finish` the caller has already reported
-            // the recording as unconfirmed; say nothing more.
-            if let RecordingOutcome::Failed(msg) = &outcome {
-                if !worker_shared.cancelled.load(Ordering::Acquire) {
-                    worker_shared.notify(msg);
-                }
-            }
-            let _ = done_tx.send(outcome);
-        })
-        .expect("spawn the IQ recording thread");
-    (
+    let task: WriterTask = Box::new(move || {
+        let outcome = write_recording(
+            &worker_path,
+            header,
+            rx,
+            payload,
+            meta,
+            publish,
+            &worker_shared,
+        );
+        if let Ok(mut slot) = worker_shared.outcome.lock() {
+            *slot = Some(outcome.clone());
+        }
+        // Settled unless `finish` gave up first; only a settled failure is
+        // reported, since a timed-out `finish` has already said "unconfirmed".
+        let settled = worker_shared
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| {
+                (s != CANCELLED).then_some(SETTLED)
+            })
+            .is_ok();
+        if let (true, RecordingOutcome::Failed(msg)) = (settled, &outcome) {
+            worker_shared.notify(msg);
+        }
+        let _ = done_tx.send(outcome);
+    });
+    spawn(task).map_err(|e| {
+        anyhow::Error::new(e).context(format!(
+            "cannot start the IQ recording writer for {}",
+            path.display()
+        ))
+    })?;
+    Ok((
         RecordingSource {
             inner,
             shared: shared.clone(),
@@ -249,7 +313,7 @@ fn start_with_sinks<S: IqSource + ?Sized>(
             shared,
             done: done_rx,
         },
-    )
+    ))
 }
 
 fn write_recording(
@@ -345,7 +409,14 @@ fn write_recording(
     }
     drop(payload);
     drop(meta);
-    if shared.cancelled.load(Ordering::Acquire) {
+    // Publication is a claim (MAN-453): only a writer that moves the state
+    // from `PENDING` publishes, so a `finish` that cancelled first has
+    // reported the truth.
+    if shared
+        .state
+        .compare_exchange(PENDING, PUBLISHING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return RecordingOutcome::Failed(format!(
             "IQ recording finalization timed out: {}; completion is unconfirmed",
             path.display()
@@ -441,10 +512,10 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         let gap = self.inner.take_discontinuity();
         self.pending_gap = gap;
         self.enqueue(gap, &buf[..n]);
-        // MAN-201: a stalled stream's `0` is not an end of input.
+        // MAN-201: a stalled stream's `0` is not an end of input. The engine
+        // closes its tracks here, so a replay must too: a zero-length `gap`
+        // record, in the existing format, has that effect.
         self.stalled = n == 0 && self.inner.take_stalled();
-        // The engine closes its tracks here, so a replay must too: a
-        // zero-length `gap` record, in the existing format, has that effect.
         if self.stalled {
             self.enqueue(Some(0), &[]);
         }
@@ -515,16 +586,48 @@ impl RecordingHandle {
         self.shared.close();
     }
 
-    /// Closes the queue and waits at most `timeout` for the writer to
-    /// publish. A timeout cancels publication if it has not begun.
-    pub fn finish(self, timeout: Duration) -> RecordingOutcome {
+    /// Closes the queue and waits at most `timeout` for the writer. A
+    /// timeout cancels publication if the writer has not begun it; if it
+    /// has, `finish` waits at most `grace` more and reports how it ended.
+    /// So `TimedOut` means the final metadata is not published and will not
+    /// be, unless publication itself outlasted `grace` (MAN-453).
+    pub fn finish(self, timeout: Duration, grace: Duration) -> RecordingOutcome {
         self.shared.close();
-        match self.done.recv_timeout(timeout) {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.shared.cancelled.store(true, Ordering::Release);
-                RecordingOutcome::TimedOut(self.path.clone())
+        if let Ok(outcome) = self.done.recv_timeout(timeout) {
+            return outcome;
+        }
+        let grace_end = Instant::now() + grace;
+        let state = &self.shared.state;
+        match state.compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return RecordingOutcome::TimedOut(self.path.clone()),
+            Err(PUBLISHING) => {
+                if let Ok(outcome) = self.done.recv_timeout(grace) {
+                    return outcome;
+                }
+                if state
+                    .compare_exchange(PUBLISHING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return RecordingOutcome::TimedOut(self.path.clone());
+                }
             }
+            Err(_) => {}
+        }
+        // Settled: the writer sends once its one warning, if any, returns.
+        // Wait for that for what is left of the grace, then take the stored
+        // outcome: a warning that takes longer can follow the report.
+        match self
+            .done
+            .recv_timeout(grace_end.saturating_duration_since(Instant::now()))
+        {
+            Ok(outcome) => outcome,
+            Err(_) => self
+                .shared
+                .outcome
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_else(|| RecordingOutcome::TimedOut(self.path.clone())),
         }
     }
 }
@@ -689,7 +792,9 @@ mod tests {
                 Ok(())
             }),
             Some(notice),
+            spawn_writer,
         )
+        .unwrap()
     }
 
     #[test]
@@ -715,7 +820,7 @@ mod tests {
         assert_eq!(rec.read(&mut buf).unwrap(), buf.len());
         release.send(()).unwrap();
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished {
                 samples, reason, ..
             } => {
@@ -751,7 +856,7 @@ mod tests {
         assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
         release.send(()).unwrap();
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished {
                 samples, reason, ..
             } => {
@@ -782,7 +887,7 @@ mod tests {
         assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
         release.send(()).unwrap();
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished { samples, .. } => assert_eq!(samples, fits as u64),
             other => panic!("{other:?}"),
         }
@@ -801,7 +906,7 @@ mod tests {
                 assert_eq!(rec.read(&mut buf).unwrap(), 5000);
             }
             drop(rec);
-            let outcome = handle.finish(Duration::from_secs(10));
+            let outcome = handle.finish(Duration::from_secs(10), Duration::ZERO);
             assert_eq!(
                 outcome,
                 RecordingOutcome::Failed(
@@ -828,10 +933,12 @@ mod tests {
             Box::new(meta),
             Box::new(|| Err(std::io::Error::other("exists"))),
             None,
-        );
+            spawn_writer,
+        )
+        .unwrap();
         drop(rec);
         assert!(matches!(
-            handle.finish(Duration::from_secs(10)),
+            handle.finish(Duration::from_secs(10), Duration::ZERO),
             RecordingOutcome::Failed(_)
         ));
     }
@@ -846,8 +953,10 @@ mod tests {
         let (rec, handle) = start(payload, meta, published.clone(), notice);
         drop(rec);
         let started = std::time::Instant::now();
+        // MAN-453: a writer that has not claimed publication does not use
+        // up the grace.
         assert_eq!(
-            handle.finish(Duration::from_millis(50)),
+            handle.finish(Duration::from_millis(50), Duration::from_secs(5)),
             RecordingOutcome::TimedOut(PathBuf::from("test.cf32"))
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -873,7 +982,7 @@ mod tests {
                 assert_eq!(rec.read(&mut buf).unwrap(), 5000);
             }
             drop(rec);
-            match handle.finish(Duration::from_secs(10)) {
+            match handle.finish(Duration::from_secs(10), Duration::ZERO) {
                 RecordingOutcome::Failed(msg) => {
                     assert!(msg.contains("flush lost"), "{msg}");
                 }
@@ -912,7 +1021,9 @@ mod tests {
                 Ok(())
             }),
             Some(notice),
-        );
+            spawn_writer,
+        )
+        .unwrap();
         // Read 1 fills the queue exactly; read 2 carries the gap and is
         // refused, so the recording ends before it.
         let mut full = vec![Complex32::new(0.0, 0.0); QUEUE_BLOCKS * RECORDING_BLOCK_FRAMES];
@@ -925,7 +1036,7 @@ mod tests {
         assert_eq!(notices.get().len(), 1, "{:?}", notices.get());
         release.send(()).unwrap();
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished {
                 samples, reason, ..
             } => {
@@ -938,6 +1049,277 @@ mod tests {
         let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
         assert!(!meta.contains("\"gap\""), "{meta}");
         assert!(meta.contains("\"backpressure\""), "{meta}");
+    }
+
+    /// A metadata sink that, when dropped (after the `End` record is
+    /// flushed and before the publication claim), says so and then holds
+    /// the writer until released.
+    struct HoldOnDrop {
+        inner: Sink,
+        dropping: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Write for HoldOnDrop {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl Drop for HoldOnDrop {
+        fn drop(&mut self) {
+            let _ = self.dropping.send(());
+            let _ = self.release.recv();
+        }
+    }
+
+    /// A `Publish` step that says it has begun, waits for `release`, then
+    /// sets `published` and returns `result`.
+    fn held_publish(
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+        published: Arc<AtomicBool>,
+        result: std::io::Result<()>,
+    ) -> Publish {
+        Box::new(move || {
+            let _ = entered.send(());
+            let _ = release.recv();
+            published.store(true, Ordering::Release);
+            result
+        })
+    }
+
+    /// Waits until the writer has dropped its `Publish` step (called or
+    /// not): the step held the only other reference to `probe`.
+    fn wait_until_dropped(probe: &Arc<AtomicBool>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(probe) > 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer kept its publication step"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// MAN-453: a writer that cannot start fails the call, removes the
+    /// payload and partial metadata the call created, and frees the
+    /// destination for the next start.
+    #[test]
+    fn a_writer_that_cannot_start_fails_the_recording_and_leaves_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capture.wav");
+        let refuse: SpawnWriter = |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        let Err(err) = start_recording_with(
+            Box::new(Endless),
+            &path,
+            std::time::UNIX_EPOCH,
+            None,
+            refuse,
+        ) else {
+            panic!("a refused writer thread still started a recording");
+        };
+        assert_eq!(
+            format!("{err:#}"),
+            format!(
+                "cannot start the IQ recording writer for {}: {}",
+                path.display(),
+                std::io::Error::from(std::io::ErrorKind::WouldBlock)
+            )
+        );
+        assert!(!path.exists());
+        assert!(!partial_metadata_path(&path).exists());
+        assert!(!metadata_path(&path).exists());
+        // The destination is free again.
+        let (rec, handle) =
+            start_recording(Box::new(Endless), &path, std::time::UNIX_EPOCH, None).unwrap();
+        drop(rec);
+        assert!(matches!(
+            handle.finish(Duration::from_secs(10), Duration::ZERO),
+            RecordingOutcome::Finished { .. }
+        ));
+        assert!(metadata_path(&path).exists());
+    }
+
+    /// MAN-453, scenario 1: all writes are done and publication is next when
+    /// the deadline passes. The timeout wins: `TimedOut` at once (no grace),
+    /// and the writer, released afterwards, never publishes or reports.
+    #[test]
+    fn a_timeout_before_publication_begins_cancels_it_for_good() {
+        let (payload, _) = sink(None, false);
+        let (meta, _) = sink(None, false);
+        let (dropping_tx, dropping) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let meta = HoldOnDrop {
+            inner: meta,
+            dropping: dropping_tx,
+            release: release_rx,
+        };
+        let published = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let header = RecordingHeader::for_source(&Endless, std::time::UNIX_EPOCH);
+        let probe = published.clone();
+        let (rec, handle) = start_with_sinks(
+            Box::new(Endless),
+            Path::new("test.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(move || {
+                probe.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Some(notice),
+            spawn_writer,
+        )
+        .unwrap();
+        drop(rec);
+        dropping.recv_timeout(Duration::from_secs(10)).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            handle.finish(Duration::from_millis(50), Duration::from_secs(5)),
+            RecordingOutcome::TimedOut(PathBuf::from("test.cf32"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        release.send(()).unwrap();
+        wait_until_dropped(&published);
+        assert!(!published.load(Ordering::Acquire));
+        // Give the writer's settle-and-report step time to run, had it not
+        // been cancelled.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(notices.get().is_empty(), "{:?}", notices.get());
+    }
+
+    /// MAN-453: the writer is already publishing when the deadline passes.
+    /// `finish` waits for it (within the grace) and reports what happened.
+    #[test]
+    fn a_timeout_during_publication_waits_for_it_and_reports_the_result() {
+        let (payload, _) = sink(None, false);
+        let (meta, _) = sink(None, false);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let published = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let header = RecordingHeader::for_source(&Endless, std::time::UNIX_EPOCH);
+        let (rec, handle) = start_with_sinks(
+            Box::new(Endless),
+            Path::new("test.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            held_publish(entered_tx, release_rx, published.clone(), Ok(())),
+            Some(notice),
+            spawn_writer,
+        )
+        .unwrap();
+        drop(rec);
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            release.send(()).unwrap();
+        });
+        match handle.finish(Duration::from_millis(20), Duration::from_secs(10)) {
+            RecordingOutcome::Finished { path, reason, .. } => {
+                assert_eq!(path, PathBuf::from("test.cf32"));
+                assert_eq!(reason, EndReason::Stopped);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(published.load(Ordering::Acquire));
+        assert!(notices.get().is_empty(), "{:?}", notices.get());
+        releaser.join().unwrap();
+    }
+
+    /// MAN-453: a publication that outlasts the grace is reported as
+    /// unconfirmed on time, and the writer stays silent afterwards.
+    #[test]
+    fn a_publication_that_outlasts_the_grace_is_reported_unconfirmed_and_stays_quiet() {
+        let (payload, _) = sink(None, false);
+        let (meta, _) = sink(None, false);
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let probe = Arc::new(AtomicBool::new(false));
+        let (notices, notice) = Notices::new();
+        let header = RecordingHeader::for_source(&Endless, std::time::UNIX_EPOCH);
+        let (rec, handle) = start_with_sinks(
+            Box::new(Endless),
+            Path::new("test.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            held_publish(
+                entered_tx,
+                release_rx,
+                probe.clone(),
+                Err(std::io::Error::other("link failed")),
+            ),
+            Some(notice),
+            spawn_writer,
+        )
+        .unwrap();
+        drop(rec);
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            handle.finish(Duration::from_millis(20), Duration::from_millis(200)),
+            RecordingOutcome::TimedOut(PathBuf::from("test.cf32"))
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        release.send(()).unwrap();
+        wait_until_dropped(&probe);
+        // Give the writer's settle-and-report step time to run, had it not
+        // been cancelled.
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(notices.get().is_empty(), "{:?}", notices.get());
+    }
+
+    /// MAN-453: a writer that settled a failure and is stuck in its warning
+    /// has still settled: `finish` reports that failure within its timeout
+    /// and grace instead of waiting for the warning to return.
+    #[test]
+    fn a_settled_failure_whose_warning_blocks_is_reported_on_time() {
+        let (payload, _) = sink(None, true);
+        let (meta, _) = sink(None, false);
+        let (warning_tx, warning) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let notice: RecordingNotice = Box::new(move |_| {
+            let _ = warning_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        });
+        let header = RecordingHeader::for_source(&Endless, std::time::UNIX_EPOCH);
+        let (mut rec, handle) = start_with_sinks(
+            Box::new(Endless),
+            Path::new("test.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(|| Ok(())),
+            Some(notice),
+            spawn_writer,
+        )
+        .unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
+        assert_eq!(rec.read(&mut buf).unwrap(), buf.len());
+        drop(rec);
+        warning.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = outcome_tx.send(handle.finish(Duration::from_millis(20), Duration::ZERO));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        assert_eq!(
+            outcome,
+            Ok(RecordingOutcome::Failed(
+                "IQ recording stopped: write failed for test.cf32: disk on fire; decoding \
+                 continues"
+                    .into()
+            ))
+        );
     }
 
     /// MAN-201: a stall closes the live engine's tracks, so it is recorded
@@ -985,7 +1367,9 @@ mod tests {
             Box::new(meta),
             Box::new(|| Ok(())),
             None,
-        );
+            spawn_writer,
+        )
+        .unwrap();
         let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
         assert_eq!(rec.read(&mut one).unwrap(), one.len());
         assert_eq!(rec.read(&mut one).unwrap(), 0);
@@ -993,7 +1377,7 @@ mod tests {
         assert!(!rec.take_stalled());
         assert_eq!(rec.read(&mut one).unwrap(), one.len());
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished { samples, .. } => {
                 assert_eq!(samples, 2 * RECORDING_BLOCK_FRAMES as u64);
             }
@@ -1027,7 +1411,9 @@ mod tests {
             Box::new(meta),
             Box::new(|| Ok(())),
             None,
-        );
+            spawn_writer,
+        )
+        .unwrap();
         let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
         let mut seen = Vec::new();
         for _ in 0..3 {
@@ -1036,7 +1422,7 @@ mod tests {
         }
         assert_eq!(seen, vec![(None, false), (None, true), (None, false)]);
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished { samples, .. } => {
                 assert_eq!(samples, 3 * RECORDING_BLOCK_FRAMES as u64);
             }

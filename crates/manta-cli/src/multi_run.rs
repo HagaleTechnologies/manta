@@ -589,6 +589,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                     Ok(reopen.open(capture, dial)?
                                         as Box<dyn manta_input::IqSource>)
                                 }),
+                                stop,
                             )
                         }
                     })()?;
