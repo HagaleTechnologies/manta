@@ -88,8 +88,37 @@ the change the `has_emitted = false` rows for `HangExpired`, `Merged` and
 ### Sweep
 
 Run on the branch with `cargo test -p manta-engine --locked --test
-regression_first_character -- --ignored --nocapture`; see the PR for the
-printed table if it is not filled in here.
+regression_first_character -- --ignored --nocapture` (15 cases × seeds 22,
+23, 24 per SNR, depth 64):
+
+| SNR (2500 Hz) | First character | Exact text |
+|---|---|---|
+| 20 dB | 45/45 | 45/45 |
+| 12 dB | 45/45 | 45/45 |
+| 8 dB | 45/45 | 45/45 |
+| 5 dB | 45/45 | 45/45 |
+| 3 dB | 45/45 | 45/45 |
+
+The plan's prototype measured the depth-0 baseline on the same grid at
+18/45, 12/45, 12/45, 11/45 and 8/45 first characters; that baseline was not
+re-run on the branch beyond the 20 dB seed-22 row above.
+
+### Held-out set
+
+`held_out_cases_exact_at_baseline_stay_exact` (ignored): texts `TEST`,
+`5NN TU`, `EE`, `R`, `DX DE N0CALL`, `73`, `QRZ`, `TNX` at 18, 28, 38 and
+45 WPM, in three scenes (15 dB at −7 kHz, 6 dB at +2.5 kHz, 10 dB at
++11 kHz; seeds 31–33), 96 cases per rate. None of these picked the depth.
+
+| Rate | Exact text, depth 0 → 64 | Exact at depth 0, wrong at 64 |
+|---|---|---|
+| 96 kS/s | 20 → 70 | 0 |
+| 48 kS/s | 25 → 71 | 0 |
+
+The 45 depth-0 exact cases are listed in the test as `BASELINE_EXACT`.
+The 51 misses left at depth 64 are `EE` (24), `R` (21) and `5NN TU` (6),
+the known limits below: `EE` and `R` are shorter than `Demod`'s init
+window, and a fast all-dit `5` is longer than the lead-in.
 
 ## Decisions
 
@@ -113,7 +142,11 @@ printed table if it is not filled in here.
   is replayed and no padding is counted as received silence.
 - **D7.** A lead-in never re-reads a hop a decoder on the same channels
   consumed (`last_fed_hop`), which covers a DORMANT wake and an eviction
-  respawn.
+  respawn. Each lead-in hop takes the channel the live feed would select
+  (`select_live_channel`, so a MAN-197 cooldown channel is skipped there
+  too). When MAN-313's unqualified-backlog trim drops the front of
+  `pending`, the lead-in is dropped with it: it is no longer contiguous
+  with the queue.
 - **D8.** One close routine, with the `has_emitted` gate after the flush.
   This is MAN-374's rejected alternative C in its safe form: MAN-19's rule
   (a `TrackClosed` only for a track that produced another event first)

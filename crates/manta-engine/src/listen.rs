@@ -1023,11 +1023,16 @@ pub fn listen_with_observers(
                     &mut on_spot,
                 );
                 report_active_tracks(0);
-                if let Some(obs) = lifecycle {
-                    obs.clear_active();
-                }
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
+                // The final close moved the close and gate counts.
+                if let Some(obs) = lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        validator.gate_records_total(),
+                    );
+                    obs.clear_active();
+                }
                 on_tracks(0);
                 return Err(e);
             }

@@ -575,6 +575,10 @@ type DecoderInputEntry = (f32, f32, Option<f32>, u64, f32, f64, bool);
 /// all 225 cases of the decision record's grid (48 missed one at 3 dB).
 pub(crate) const LEAD_IN_HOPS: usize = 64;
 
+/// One `Track::pending` entry: `(amplitude, raw_power, spectral_ref_power,
+/// sample_ts, snr_db, freq_hz)`.
+type PendingEntry = (f32, f32, Option<f32>, u64, f32, f64);
+
 /// MAN-199: one lead-in entry, `(amplitude, raw_power, sample_ts)`.
 type LeadInEntry = (f32, f32, u64);
 
@@ -593,7 +597,9 @@ pub(crate) enum NotRecorded {
 
 /// MAN-199: the history's answer for one hop index. "Not recorded" and
 /// "not yet known" are different answers, so a hop that was never captured
-/// is never confused with one that has not arrived.
+/// is never confused with one that has not arrived. Production code checks
+/// only the variant (`Track::build_lead_in`'s invariant); tests read the
+/// payloads.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) enum HopRecord<'a> {
@@ -680,7 +686,6 @@ impl HopHistory {
     }
 
     /// The record for hop `m`.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn get(&self, m: u64) -> HopRecord<'_> {
         match (self.hops.front(), self.hops.back()) {
             (Some(front), Some(back)) => {
@@ -897,7 +902,7 @@ fn publish_garbles(
 
 /// MAN-118: one rail-ratio sample per track per SPEC §5 reporting interval
 /// (1 Hz), on the hop `TrackMeta` fires on. Called after every queued hop's
-/// `push_hop`, in `drain_pool` and both `finish_decoder*` flushes, so a
+/// `push_hop`, in `drain_pool` and `Track::close`'s flush, so a
 /// boundary is sampled whichever path drains it. `None` before the rails
 /// initialize and for engines without them records nothing. Without an
 /// observer it returns before the boundary test, so those paths pay only
@@ -978,7 +983,7 @@ fn man372_diag() -> bool {
 /// input (`Track::pending`). MAN-199: it takes the queue, not the track,
 /// so the lead-in is never read and replayed pre-promotion marks never help
 /// a track qualify.
-fn queued_keyed_marks(pending: &[(f32, f32, Option<f32>, u64, f32, f64)]) -> u64 {
+fn queued_keyed_marks(pending: &[PendingEntry]) -> u64 {
     keyed_marks(&pending.iter().map(|p| p.0).collect::<Vec<f32>>())
 }
 
@@ -1428,7 +1433,7 @@ impl Track {
     /// **`snr_db` (MAN-102, merged after this branch was cut) gets the same
     /// per-entry-capture treatment, for the same reason (Codex review, PR
     /// #183).** MAN-102 added a 5th field to this entry, the raw per-hop
-    /// SNR `TrackManager::drain_pool`/`Track::finish_decoder*` use for
+    /// SNR `TrackManager::drain_pool`/`Track::close` use for
     /// peak-hold `TrackMeta` reporting. An earlier version of this branch's
     /// merge-conflict resolution paired every entry with the CALLER's
     /// current-hop `current_snr_db` at push/drain time instead of capturing
@@ -1605,19 +1610,31 @@ impl Track {
     /// MAN-199: build this track's lead-in from `history`: the last `depth`
     /// recorded hops before `m`, minus any hop a decoder on this track's
     /// channels already consumed (`last_fed_hop`, so a DORMANT wake or an
-    /// eviction respawn never re-reads input), each on the max-power owned
-    /// channel and through the crash hold. Recorded hops only: nothing
-    /// synthetic is ever replayed, and the shortfall keeps its reason.
+    /// eviction respawn never re-reads input), each on the owned channel the
+    /// live feed would select (`select_live_channel`: max power, skipping a
+    /// channel serving a MAN-197 cooldown) and through the crash hold.
+    /// Recorded hops only: nothing synthetic is ever replayed, and the
+    /// shortfall keeps its reason.
+    #[allow(clippy::too_many_arguments)]
     fn build_lead_in(
         &mut self,
         history: &HopHistory,
         last_fed_hop: &[Option<u64>],
+        channel_cooldown_until: &[u64],
+        hop_counter: u64,
         m: u64,
         depth: usize,
         n: usize,
     ) {
         self.lead_in.clear();
         self.lead_in_cut = LeadInCut::Full;
+        // `step_hop` records hop `m` only after its promotions and wakes, so
+        // the lead-in can never hold the hop it is built at (it is not yet
+        // known, or not recorded when the history is empty after a gap).
+        debug_assert!(
+            !matches!(history.get(m), HopRecord::Recorded(_)),
+            "hop {m} must not be recorded before its own lead-in is built"
+        );
         if depth == 0 {
             return;
         }
@@ -1635,7 +1652,7 @@ impl Track {
                 self.lead_in_cut = LeadInCut::AlreadyFed(fed.unwrap_or(0));
                 continue;
             }
-            let k = self.select_channel(&h.power, n);
+            let k = self.select_live_channel(&h.power, n, channel_cooldown_until, hop_counter);
             let raw_power = h.power[k];
             let (amp, raw_power) = self.hold_crash(raw_power.sqrt(), raw_power, h.hold);
             self.lead_in.push((amp, raw_power, h.sample_ts));
@@ -2805,8 +2822,8 @@ impl TrackManager {
         // way `HangExpired` (sustained `drop` for `hang_hops`) does -- it
         // can fire on a track that's still ACTIVE with a real, continuous
         // signal, just not producing decoded characters. Only
-        // `HangExpired` may use the forcing `finish_decoder`; `Silent`
-        // must go through `finish_decoder_speed_only` below, same as
+        // `HangExpired` may use the forcing flush
+        // (`CloseReason::flush`); `Silent` takes the speed-only one, same as
         // Merged/Evicted.
         let mut close_reasons: std::collections::HashMap<u32, CloseReason> =
             std::collections::HashMap::new();
@@ -2898,6 +2915,8 @@ impl TrackManager {
                     track.build_lead_in(
                         &self.history,
                         &self.last_fed_hop,
+                        &self.channel_cooldown_until,
+                        self.hop_counter,
                         hop.m,
                         self.lead_in_hops,
                         n,
@@ -2985,6 +3004,8 @@ impl TrackManager {
                     track.build_lead_in(
                         &self.history,
                         &self.last_fed_hop,
+                        &self.channel_cooldown_until,
+                        self.hop_counter,
                         hop.m,
                         self.lead_in_hops,
                         n,
@@ -3084,15 +3105,21 @@ impl TrackManager {
                         {
                             let excess = track.pending.len() - MAX_UNQUALIFIED_BACKLOG;
                             track.pending.drain(..excess);
+                            // MAN-199: the queue no longer starts at the
+                            // promotion hop, so the lead-in before it is no
+                            // longer contiguous with it.
+                            track.lead_in.clear();
+                            track.lead_in_cut = LeadInCut::NotRecorded(NotRecorded::Overwritten);
                         }
                     }
                 }
             }
         }
         // MAN-19: only report a close as `TrackClosed`-worthy if the track
-        // actually emitted a real event (`has_emitted`, or was named as a
-        // merge survivor -- MAN-174, see `merge_converged`), not merely
-        // whether it was ever promoted (`decoder.is_some()`) -- a track
+        // actually emitted a real event (`has_emitted`, which since MAN-199
+        // includes the close's own flush, or was named as a merge survivor
+        // -- MAN-174, see `merge_converged`), not merely whether it was
+        // ever promoted (`decoder.is_some()`) -- a track
         // promoted and then merged/evicted within this *same*
         // `process_hops` batch never gets a `drain_pool` pass before it's
         // removed here (that runs once, after every hop in the batch), so
@@ -3114,7 +3141,7 @@ impl TrackManager {
         // only honored at overall stream end, in `TrackManager::finish`
         // below). Draining it here and threading the events out gives
         // every closure path the same guarantee `TrackManager::finish`
-        // already had. `Track::finish_decoder` (round 6) also drains any
+        // already had. `Track::close` (round 6; MAN-199) also drains any
         // samples still queued in `pending` THIS batch first -- without
         // that, `finish()` alone would reflect only whatever the decoder
         // processed as of the end of the PREVIOUS `process_hops` batch.
@@ -3313,19 +3340,8 @@ impl TrackManager {
             }
         }
         self.recompute_ownership();
-        // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
-        // RF gap -- proof the signal actually ended. MAN-108: that includes
-        // a DORMANT track whose re-acquisition window ran out. Silent fires after 30 s
-        // of no *decoded character*, which a continuous carrier or other
-        // undecodable signal satisfies just as well as a real end-of-signal;
-        // `finish_decoder_speed_only()` above deliberately can't force such
-        // a still-open run to resolve, so the WPM it reports can still be a
-        // stale, transient pre-carrier estimate. Judging a deferred Beacon
-        // against that stale value would readmit exactly the false-positive
-        // class this PR exists to close. So Silent gets `Bookkeeping` (no
-        // survivor) like Merged/Evicted -- its pending beacons are counted
-        // and discarded, never resolved, since no genuine signal-ending
-        // observation is available for them.
+        // MAN-199: `close_track` maps each reason to its `ClosureKind`
+        // (round 10: only HangExpired is `SignalEnded`).
         let (merged_ids, merged_flush) = self.merge_converged();
         closed_with_kind.extend(merged_ids);
         closure_flush_events.extend(merged_flush);
@@ -3725,7 +3741,7 @@ impl TrackManager {
     /// reconnected after an outage), not a stream end. A transport gap is
     /// not evidence the RF signal ended -- the same transmission can still
     /// be on the air when samples resume (PR #207 review) -- so each track
-    /// closes like a Merged/Evicted one: `finish_decoder_speed_only` (no
+    /// closes like a Merged/Evicted one: `CloseFlush::SpeedOnly` (no
     /// forced decode of a truncated trailing element) and
     /// `ClosureKind::Bookkeeping` with no survivor, which keeps
     /// `manta-spot`'s `Validator` from reading the post-reconnect track as a
@@ -10251,7 +10267,15 @@ mod tests {
         tm.spawn(10);
         let id = *tm.tracks.keys().next().unwrap();
         let track = tm.tracks.get_mut(&id).unwrap();
-        track.build_lead_in(&tm.history, &tm.last_fed_hop, 20, LEAD_IN_HOPS, n);
+        track.build_lead_in(
+            &tm.history,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            20,
+            LEAD_IN_HOPS,
+            n,
+        );
         assert_eq!(track.lead_in.len(), 20);
         assert_eq!(
             track.lead_in_cut,
@@ -10279,7 +10303,15 @@ mod tests {
         tm.spawn(10);
         let id = *tm.tracks.keys().next().unwrap();
         let track = tm.tracks.get_mut(&id).unwrap();
-        track.build_lead_in(&tm.history, &tm.last_fed_hop, 40, LEAD_IN_HOPS, n);
+        track.build_lead_in(
+            &tm.history,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            40,
+            LEAD_IN_HOPS,
+            n,
+        );
         assert_eq!(track.lead_in.len(), 20);
         assert!(track.lead_in.iter().all(|&(_, _, ts)| ts >= 20));
         assert_eq!(
@@ -10301,7 +10333,15 @@ mod tests {
         tm.spawn(10);
         let id = *tm.tracks.keys().next().unwrap();
         let track = tm.tracks.get_mut(&id).unwrap();
-        track.build_lead_in(&tm.history, &tm.last_fed_hop, 100, LEAD_IN_HOPS, n);
+        track.build_lead_in(
+            &tm.history,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            100,
+            LEAD_IN_HOPS,
+            n,
+        );
         let ts: Vec<u64> = track.lead_in.iter().map(|&(_, _, ts)| ts).collect();
         assert_eq!(ts, (81..100).collect::<Vec<u64>>());
         assert_eq!(track.lead_in_cut, LeadInCut::AlreadyFed(80));
@@ -10350,7 +10390,15 @@ mod tests {
         tm.spawn(10);
         let id = *tm.tracks.keys().next().unwrap();
         let track = tm.tracks.get_mut(&id).unwrap();
-        track.build_lead_in(&tm.history, &tm.last_fed_hop, 2, LEAD_IN_HOPS, n);
+        track.build_lead_in(
+            &tm.history,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            2,
+            LEAD_IN_HOPS,
+            n,
+        );
         assert_eq!(track.lead_in, vec![(2.0, 4.0, 0), (2.0, 4.0, 1)]);
         assert_eq!(track.clean_hist.back(), Some(&(2.0, 4.0)));
     }
@@ -10400,7 +10448,15 @@ mod tests {
         track.refiner = Some(Refiner::new(100.0, 0.0));
         track.refiner_channel = Some(10);
         track.refiner_hops_since_reset = 3;
-        track.build_lead_in(&tm.history, &tm.last_fed_hop, 10, LEAD_IN_HOPS, n);
+        track.build_lead_in(
+            &tm.history,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            10,
+            LEAD_IN_HOPS,
+            n,
+        );
         assert!(track.lead_in.iter().all(|&(a, p, _)| (a, p) == (3.0, 9.0)));
         assert_eq!(track.refiner_hops_since_reset, 3);
         assert!(track.refiner_backlog.is_empty());
