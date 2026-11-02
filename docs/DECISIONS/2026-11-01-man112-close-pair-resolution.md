@@ -278,3 +278,83 @@ paragraph records the stopped attempts and directs the next phase to run
 the all-target build and close-pair goldens on the current tree first.
 The birth-centre seeding and immediate ownership refresh were introduced
 after the first stopped attempt; the late retry did not verify them.
+
+## Remediation of the interrupted implement gate
+
+The all-target build completed on 2026-11-01 in the remediation worker.
+Exit 143 in the implement receipt was a stopped process, not a compiler error.
+Runtime verification exposed two channel-selection defects in the final tree.
+
+Before a neighbor has its own track, max-power selection can read that
+neighbor's carrier. In the mid-bin 125 Hz scene this happened during startup
+and left signal 0 at CER 0.2055. Selection now rejects an outer owned channel
+when two consecutive observations exceed the phase SNR gate and its measured
+carrier is more than 0.6 channel from this track's centroid. It chooses the
+strongest remaining exclusive, non-cooling owned channel. Missing evidence
+and the existing fallback when no channel qualifies are retained. Channels
+within one channel of the centroid retain the prior selection behavior.
+The synthetic untracked-neighbor test fails without this check and passes
+with it. All eight enabled close-pair goldens pass with the check.
+
+Restored V7 also exposed a straddle override that activated too far from
+the midpoint. A centroid shift from 106.667 to 106.64 switched input from
+107 to 106. Transition sidelobes then biased phase tracking farther away
+and corrupted copy. The override now applies within 0.1 channel of the
+midpoint, rather than 0.15. The boundary regression protects the observed
+106.64 case. Both V7 engines, V9, V10 legacy and V51 pass the focused suite.
+These are deterministic fixture results, not a new claim about the full
+separation matrix or live input. The experimental frontend remains off.
+
+The class sweep found the production association call in `step_hop` and
+its decoder-input selection on the same path. Birth admission already has
+its own phase gate. No second production association caller was found.
+The full repository gate is recorded in the remediation phase receipt;
+the earlier incomplete-handover receipt above remains historical evidence.
+
+That gate failed (exit 101) in `crates/manta-engine/tests/non_cw.rs`.
+Four tests that pass at `d4f9220` fail at this branch's head, with or
+without the remediation edits:
+
+- `swept_carrier_7000_to_7040_starts_no_cw_track`: 4 promotions, needs 0.
+- `single_channel_sweep_bumps_do_not_qualify_as_short_transmissions`:
+  37 promotions, needs 0.
+- `non_cw_only_input_reports_no_keyed_cw`: the sweep decodes as CW.
+- `ssb_voice_at_14040_starts_far_fewer_cw_tracks`: 29 filter-off
+  promotions; its scene guard needs more than 50.
+
+Every other gate step passed. Toggling the spawn changes showed an
+interaction, not one cause. Without in-window split admission the
+1000 Hz/s sweep passes. Without phase-seeded birth centres the
+2000 Hz/s sweep passes. Without both, all four fail. Restoring the
+power-interpolated centroid did not fix them. Neither did feeding the
+slope classifier the max-power channel. The close-pair association is
+therefore not yet shippable: a swept carrier must stay non-qualifying.
+
+## Swept-carrier diagnosis (not landed)
+
+A later remediation round traced the three sweep failures to the keying
+evidence. Close-spaced births along a 2000 Hz/s sweep hold their phase
+centroids near birth, because the 0.6-channel outlier gate rejects a
+carrier that has moved on. The selected channel then reads the departed
+carrier's sidelobes about 25 dB above the floor for over 100 hops. Those
+hops count as key-down. They flatten the slope fit to between -50 and
+-290 Hz/s, and the short-transmission rule (D′) promotes four tracks.
+Feeding the fit the max-power channel promoted ten.
+
+Requiring each key-down hop's phase position at the selected channel to
+sit within 0.6 channel of the centre fixed both sweeps and the sweep-only
+input. The engine library tests, `close_pairs`, all eight enabled
+close-pair goldens, V7, V9, V10 and V51 passed with it. It broke MAN-402:
+`ticket_mo_at_33_wpm_decodes_word_bounded` lost its first dozen words
+(CER 0.35), and `high_speed_dah_heavy_grid_rows_decode_word_bounded`
+failed. Both pass without it, so it was reverted. A sweep fix must keep
+clean dah-heavy keying's early key-down hops.
+
+`ssb_voice_at_14040_starts_far_fewer_cw_tracks` fails its scene guard,
+not its filter check. With the filter off, the SSB scene promotes 29
+tracks in band, and the guard needs more than 50. With the filter on it
+promotes none, and no SSB track is spotted. Disabling phase-seeded birth
+centres gives 41. Also disabling the spawn phase-outlier check gives 42.
+The rest comes from the split, merge and selection rules together.
+Restoring the fragmentation would undo this ticket's intent, and changing
+the MAN-313 guard is the owner's decision.
