@@ -245,6 +245,9 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// MAN-305: the inner source's spliced losses, pending for
     /// `take_missing_samples()`.
     missing: Option<u64>,
+    /// MAN-202: the current inner source's unknown-length loss, pending for
+    /// `take_unknown_gap()`.
+    unknown_gap: bool,
     /// MAN-228: `None` when the first source counts nothing (MAN-56's
     /// "absent means not measured").
     input_health: Option<Arc<InputHealthTotals>>,
@@ -310,6 +313,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             last_ok,
             discontinuity: None,
             missing: None,
+            unknown_gap: false,
             input_health,
         }
     }
@@ -344,6 +348,9 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
         if let Some(k) = inner.take_missing_samples() {
             *self.missing.get_or_insert(0) += k;
         }
+        // MAN-202: forwarded from the current inner only; one a lost inner
+        // left pending is dropped with it, inside the reopen's outage.
+        self.unknown_gap |= inner.take_unknown_gap();
     }
 
     /// MAN-258: a stop before the source came back ends the stream with
@@ -582,6 +589,9 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                             let outage = resumed_at.duration_since(self.last_ok);
                             let gap = (outage.as_secs_f64() * self.fs).round() as u64;
                             self.discontinuity = Some(gap);
+                            // MAN-202: the outage covers any unknown
+                            // loss from before it.
+                            self.unknown_gap = false;
                             self.reopened = false;
                             crate::logging::note(&format!(
                                 "source {} reconnected after {:.1}s",
@@ -626,6 +636,10 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
 
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.missing.take()
+    }
+
+    fn take_unknown_gap(&mut self) -> bool {
+        std::mem::take(&mut self.unknown_gap)
     }
 }
 
@@ -850,8 +864,10 @@ mod tests {
         reads: usize,
         gaps: Vec<(usize, u64)>,
         missing: Vec<(usize, u64)>,
+        unknown: Vec<usize>,
         pending_gap: Option<u64>,
         pending_missing: Option<u64>,
+        pending_unknown: bool,
     }
 
     impl GapScriptedSource {
@@ -861,8 +877,10 @@ mod tests {
                 reads: 0,
                 gaps: Vec::new(),
                 missing: Vec::new(),
+                unknown: Vec::new(),
                 pending_gap: None,
                 pending_missing: None,
+                pending_unknown: false,
             }
         }
     }
@@ -883,6 +901,7 @@ mod tests {
             for &(_, k) in self.missing.iter().filter(|(at, _)| *at == i) {
                 *self.pending_missing.get_or_insert(0) += k;
             }
+            self.pending_unknown |= self.unknown.contains(&i);
             self.inner.read(buf)
         }
         fn take_discontinuity(&mut self) -> Option<u64> {
@@ -891,6 +910,64 @@ mod tests {
         fn take_missing_samples(&mut self) -> Option<u64> {
             self.pending_missing.take()
         }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.pending_unknown)
+        }
+    }
+
+    /// MAN-202: an unknown gap the inner source reports reaches `listen()`
+    /// on the read it precedes, once, beside the counted hooks.
+    #[test]
+    fn inner_unknown_gap_is_forwarded() {
+        let mut first = GapScriptedSource::new(vec![ok_chunk(8), ok_chunk(8), ok_chunk(8)]);
+        first.unknown.push(1);
+        first.missing.push((1, 40));
+        let mut src = wrapping(first);
+        let mut b = buf(8);
+        let mut reports = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(src.read(&mut b).unwrap(), 8);
+            reports.push((
+                src.take_missing_samples(),
+                src.take_discontinuity(),
+                src.take_unknown_gap(),
+            ));
+        }
+        assert_eq!(
+            reports,
+            vec![
+                (None, None, false),
+                (Some(40), None, true),
+                (None, None, false)
+            ]
+        );
+    }
+
+    /// MAN-202: an unknown gap left pending by an inner source that then
+    /// failed is dropped with it; the reopen's discontinuity covers it.
+    #[test]
+    fn a_reopen_drops_the_lost_inners_unknown_gap() {
+        let mut first = GapScriptedSource::new(vec![ok_chunk(8), err_chunk("lost")]);
+        first.unknown.push(1);
+        let mut reopened = Some(scripted(FS, CENTER, vec![ok_chunk(8)]));
+        let opener: Opener =
+            Box::new(move || Ok(Box::new(reopened.take().expect("opened once")) as SendSource));
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert!(!src.take_unknown_gap());
+        assert_eq!(src.read(&mut b).unwrap(), 8); // errors, reopens, resumes
+        assert!(src.take_discontinuity().is_some());
+        assert!(!src.take_unknown_gap(), "covered by the outage");
     }
 
     /// A `ReconnectingSource` over `first`, with no reopen scripted.

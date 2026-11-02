@@ -2058,6 +2058,12 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_missing_samples()
     }
 
+    /// MAN-202: forwarded as `take_discontinuity` is (a SoapySDR overflow
+    /// reaches `listen()` through this wrapper).
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
     /// end an outage where acquisition began.
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -4353,6 +4359,9 @@ const LISTENER_METRICS: &str = "metrics";
 /// MAN-324: the live-state listener, registered only when
 /// `[server].live_port` is set.
 const LISTENER_LIVE: &str = "live";
+/// MAN-322: the RTTY-only telnet listener, registered only when
+/// `[server].rtty_telnet_port` is set.
+const LISTENER_RTTY_TELNET: &str = "rtty_telnet";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -4644,6 +4653,28 @@ fn start_spot_server(
                 .as_ref()
                 .map(tokio::net::TcpListener::local_addr)
                 .transpose()?;
+            // MAN-322 D5: the RTTY-only telnet listener, only when
+            // `rtty_telnet_port` is set. It binds `bind_addr`, like
+            // `telnet_port`.
+            let rtty_telnet_listener = match cfg.rtty_telnet_port {
+                Some(rtty_telnet_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), rtty_telnet_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "binding the RTTY telnet server (bind_addr = {}, \
+                                 rtty_telnet_port = {})",
+                                fmt::quoted(&cfg.bind_addr),
+                                rtty_telnet_port
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            let rtty_telnet_addr = rtty_telnet_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
             // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
             // failure never produces a banner at all) but BEFORE any listener task is
@@ -4671,6 +4702,7 @@ fn start_spot_server(
                     json_addr: json_listener.local_addr()?,
                     metrics_addr: metrics_listener.local_addr()?,
                     live_addr,
+                    rtty_telnet_addr,
                     inputs: source.inputs,
                 })
             );
@@ -4685,6 +4717,9 @@ fn start_spot_server(
             if live_listener.is_some() {
                 metrics.enable_live();
                 metrics.set_listener_up(LISTENER_LIVE, true);
+            }
+            if rtty_telnet_listener.is_some() {
+                metrics.set_listener_up(LISTENER_RTTY_TELNET, true);
             }
 
             let telnet_ip_command_limiter =
@@ -4724,6 +4759,44 @@ fn start_spot_server(
                 profile.sett.segments = manta_server::sett::segments_for_inputs(source.coverage);
             }
             let profile = std::sync::Arc::new(profile);
+            // MAN-322 D5: an RTTY telnet listener speaks the CW listener's
+            // protocol and serves RTTY spots only, with its own client cap,
+            // per-IP quota and command budget (built from the same
+            // `telnet_*` keys).
+            if let Some(rtty_telnet_listener) = rtty_telnet_listener {
+                let rtty_telnet_ip_command_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::telnet::MAX_TELNET_COMMANDS,
+                        manta_server::telnet::COMMAND_RATE_WINDOW,
+                        cfg.telnet_max_commands_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(
+                    rtty_telnet_ip_command_limiter.clone(),
+                );
+                spawn_tracked_listener(
+                    LISTENER_RTTY_TELNET,
+                    metrics.clone(),
+                    manta_server::telnet::serve(
+                        rtty_telnet_listener,
+                        bus.clone(),
+                        metrics.clone(),
+                        profile.clone(),
+                        shutdown_rx.clone(),
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                            cfg.telnet_max_connections_per_ip,
+                        ),
+                        rtty_telnet_ip_command_limiter,
+                        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        cfg.line_format,
+                        manta_spot::SpotMode::Rtty,
+                    ),
+                );
+            }
             spawn_tracked_listener(
                 LISTENER_TELNET,
                 metrics.clone(),
@@ -4744,6 +4817,7 @@ fn start_spot_server(
                     telnet_ip_command_limiter,
                     manta_server::tasks::CLIENT_DRAIN_DEADLINE,
                     cfg.line_format,
+                    manta_spot::SpotMode::Cw,
                 ),
             );
             let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
@@ -11051,6 +11125,8 @@ mod tests {
                 sample_ts: 12_345,
                 rst: None,
                 qrl_query: false,
+                mode: manta_spot::SpotMode::Cw,
+                baud: None,
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
@@ -11990,6 +12066,44 @@ mod tests {
         };
         assert_eq!(src.take_missing_samples(), Some(11_900));
         assert_eq!(src.take_missing_samples(), None);
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
+    /// MAN-202: the inner source's unknown-length loss reaches `listen()`,
+    /// once, beside the counted hooks.
+    #[test]
+    fn fixed_center_freq_source_forwards_take_unknown_gap() {
+        struct UnknownProbeSource {
+            unknown: bool,
+            missing: Option<u64>,
+        }
+        impl IqSource for UnknownProbeSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
+        }
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(UnknownProbeSource {
+                unknown: true,
+                missing: Some(5),
+            }),
+            freq_hz: 14_000_000.0,
+        };
+        assert!(src.take_unknown_gap());
+        assert!(!src.take_unknown_gap());
+        assert_eq!(src.take_missing_samples(), Some(5));
         assert_eq!(src.take_discontinuity(), None);
     }
 

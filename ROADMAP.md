@@ -105,11 +105,9 @@ metrics endpoint, spot JSON Schema contributed to `dispensa`.
 
 `manta-spot` (callsign/CQ-DE validation, cty.dat/SCP cross-check,
 repetition gate, dedupe) is complete as a standalone crate -- see
-`docs/superpowers/specs/2026-07-25-m3-manta-spot-design.md` and SPEC
--decode-core.md §7.1 (V11-V15). It is now wired into `manta-engine`'s
-batch (`decode_samples`/`decode_wav`) and streaming (`listen`) pipelines,
-both emitting real `Spot`s -- see
-`docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md`.
+ARCHITECTURE.md §6 and SPEC-decode-core.md §7.1 (V11-V15). It is now
+wired into `manta-engine`'s batch (`decode_samples`/`decode_wav`) and
+streaming (`listen`) pipelines, both emitting real `Spot`s.
 `manta-server` has also landed: the telnet cluster server, the
 JSON/WebSocket stream, TOML config, the metrics endpoint, and the
 outbound RBN uplink are all shipped and tested. The uplink is tested only

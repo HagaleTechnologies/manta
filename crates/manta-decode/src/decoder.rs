@@ -110,6 +110,14 @@ const SINGLE_FLUSH_REINIT: usize = 5;
 // to the evidence front end's mark/noise levels for EdgeLegacy/Hsmm.
 const SNR_BW_CORR_DB: f32 = 14.3;
 
+/// MAN-202: the dit, in ms, the post-gap resync measures spaces in while the
+/// tracker is not ready and no mark has been seen yet: SPEC §4.1's slowest
+/// dit (8 WPM), so only a long space resynchronizes.
+const WARMUP_RESYNC_DIT_MS: f32 = 150.0;
+/// MAN-202: the shortest dit the warm-up resync unit may take, SPEC §4.1's
+/// 60 WPM clamp (`timing.rs` `DIT_CLAMP_MS`).
+const WARMUP_RESYNC_MIN_DIT_MS: f32 = 20.0;
+
 /// Per-track decode glue: demod -> timing -> beam -> events. SPEC §3–§5.
 pub struct TrackDecoder {
     readings: ReadingsBeam,
@@ -193,6 +201,21 @@ pub struct TrackDecoder {
     /// which case `TrackMeta` falls back to the M0 keying-rail estimate.
     /// MAN-102.
     snr_2500_db: Option<f32>,
+    /// MAN-202: set by `note_input_gap`. Runs are discarded, nothing learned
+    /// and nothing assembled, until a closed space of at least a character
+    /// gap resynchronizes the decoder: the first mark after an unknown gap
+    /// may be truncated mid-element.
+    after_gap: bool,
+    /// MAN-202: unknown input gaps this decoder has been told about.
+    continuity_epoch: u32,
+    /// MAN-202: the shortest mark fed to the tracker before readiness. The
+    /// tracker's dit centroid is 0 until then, so the post-gap resync
+    /// measures spaces in this instead. A complete post-gap mark lowers it
+    /// too, so a gap before the first mark can still resynchronize.
+    warmup_min_mark_ms: Option<f32>,
+    /// MAN-202: a mark has been discarded since the last gap. The first
+    /// post-gap mark may be truncated and sets no scale; later ones are whole.
+    post_gap_mark_seen: bool,
 }
 
 impl TrackDecoder {
@@ -242,6 +265,10 @@ impl TrackDecoder {
             snr_history: VecDeque::new(),
             garble_count: 0,
             snr_2500_db: None,
+            after_gap: false,
+            continuity_epoch: 0,
+            warmup_min_mark_ms: None,
+            post_gap_mark_seen: false,
         }
     }
 
@@ -278,6 +305,155 @@ impl TrackDecoder {
     /// (MAN-102 review round 2, finding 2).
     pub fn hop_count(&self) -> u64 {
         self.hop_count
+    }
+
+    /// MAN-202: how many unknown input gaps `note_input_gap` has applied to
+    /// this decoder. An internal counter for tests and diagnostics, not an
+    /// event field.
+    pub fn continuity_epoch(&self) -> u32 {
+        self.continuity_epoch
+    }
+
+    /// MAN-202: the input stream lost samples of unknown count between the
+    /// last hop pushed and the next one. Invalidates this decoder's
+    /// continuity-dependent state, so no run that spans the loss is read as
+    /// the sender's timing and no character or word is spliced across it:
+    ///
+    /// - `Demod`'s held run is debounce-confirmed before the loss, so it is
+    ///   processed as a normal run first; the open run and the fade run span
+    ///   the loss and are dropped; an init window restarts.
+    /// - The marks of the character in progress are emitted only when the
+    ///   open space had already reached a character gap before the loss;
+    ///   otherwise they are dropped. The boundary must be observed, not
+    ///   inferred from the gap.
+    /// - A word with committed characters is closed with a `WordBoundary`
+    ///   at the last pre-gap hop, as `finish` closes a trailing word.
+    /// - Warm-up `pending` runs and the flushed-gap lengths are cleared, so
+    ///   nothing replays or learns across the loss.
+    /// - Runs after the loss are discarded until a space of at least a
+    ///   character gap closes (resync).
+    /// - The speed tracker, gap classifier, sender timing, rails, noise
+    ///   tracker, SNR history and hop count are sender properties, not
+    ///   continuity, and are kept.
+    ///
+    /// `EdgeLegacy` and `Hsmm` rebuild their buffered front ends (`Evidence`,
+    /// `EdgeDemod`, and `HsmmDecoder` for `Hsmm`) from the config, forcing
+    /// nothing; `EdgeLegacy` then applies the same run-level steps, `Hsmm`
+    /// has no post-gap resync yet (MAN-202 D9).
+    pub fn note_input_gap(&mut self) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        match self.cfg.engine {
+            Engine::Legacy => {
+                if let Some(run) = self.demod.take_held() {
+                    self.on_run(run, &mut events);
+                }
+                let open_space = self
+                    .demod
+                    .open_space_hops()
+                    .zip(self.demod.open_space_start_ts());
+                self.break_run_level_state(open_space, &mut events);
+                self.demod.break_continuity();
+            }
+            Engine::EdgeLegacy => {
+                // `EdgeDemod` keeps its held run one flip behind `open`, as
+                // `Demod` does. `finish` hands back `[held?, open]` when
+                // `open` is confirmed, or `held` with a short `open` merged
+                // in: the held run is confirmed and processed; an open mark
+                // spans the loss and is dropped; an open space only dates
+                // the character boundary.
+                let open_space = self.edge.open_space();
+                let mut runs = self.edge.finish();
+                let mut boundary = None;
+                match runs.last() {
+                    Some(r) if !r.mark && open_space.is_some_and(|(_, ts)| ts == r.start_ts) => {
+                        boundary = open_space;
+                        runs.pop();
+                    }
+                    // `open` is never `None` while `held` is set, so a
+                    // trailing mark with no open space is the open mark.
+                    Some(r) if r.mark && open_space.is_none() => {
+                        runs.pop();
+                    }
+                    _ => {}
+                }
+                for run in runs {
+                    self.on_run(run, &mut events);
+                }
+                self.rebuild_evidence();
+                self.edge = EdgeDemod::new(self.cfg.demod.debounce_ms);
+                self.break_run_level_state(boundary, &mut events);
+            }
+            Engine::Hsmm => {
+                self.rebuild_evidence();
+                self.hsmm = HsmmDecoder::new(self.cfg.hsmm.clone());
+                self.continuity_epoch = self.continuity_epoch.wrapping_add(1);
+            }
+        }
+        events
+    }
+
+    /// MAN-202: a fresh `Evidence` front end. Its hop index restarts at 0, so
+    /// `snr_history`, keyed and pruned by that index, restarts with it; no
+    /// commit can reference a pre-gap hop once the front end is rebuilt.
+    fn rebuild_evidence(&mut self) {
+        self.evidence = Evidence::new(self.cfg.evidence.clone());
+        self.snr_history.clear();
+    }
+
+    /// MAN-202: the run-level steps of `note_input_gap` the `Legacy` and
+    /// `EdgeLegacy` engines share. `open_space` is the front end's open
+    /// space `(hops, start_ts)` at the loss, if one was open.
+    fn break_run_level_state(
+        &mut self,
+        open_space: Option<(u32, u64)>,
+        events: &mut Vec<DecoderEvent>,
+    ) {
+        if self.tracker.ready() && !self.cur_marks.is_empty() {
+            if let Some((hops, ts)) = open_space {
+                if self.reaches_char_gap(hops) {
+                    // The boundary was observed before the loss; its
+                    // truncated length teaches nothing.
+                    self.emit_char(ts, events);
+                }
+            }
+        }
+        self.cur_marks.clear();
+        if !self.word_flushed && self.word_chars > 0 {
+            let ts = self.last_ts;
+            self.settle_readings(ts, events);
+            events.push(DecoderEvent::word_boundary(self.track_id, ts));
+            self.word_flushed = true;
+        }
+        self.word_chars = 0;
+        self.word_decoded = 0;
+        self.flushed_gap_ms = None;
+        self.single_flush_ms = None;
+        self.pending.clear();
+        self.after_gap = true;
+        self.post_gap_mark_seen = false;
+        self.continuity_epoch = self.continuity_epoch.wrapping_add(1);
+    }
+
+    /// MAN-202: whether a space `hops` long is at least a character gap, as
+    /// `GapClassifier::classify` would say, on a scratch copy: `classify`
+    /// folds long gaps into the Farnsworth statistics, and a space cut by an
+    /// unknown gap must teach nothing.
+    /// Before readiness the tracker's centroid is 0, so the unit is the
+    /// shortest whole mark seen so far, before or after the gap
+    /// (`WARMUP_RESYNC_DIT_MS` with none).
+    fn reaches_char_gap(&self, hops: u32) -> bool {
+        let ms = hops as f32 * HOP_MS as f32;
+        let unit = if self.tracker.ready() {
+            self.gap_unit_ms()
+        } else {
+            // Clamped to SPEC §4.1's fastest dit (60 WPM): a one- or two-hop
+            // noise blip seen in warm-up must not shrink the unit so far
+            // that an element space reads as a character gap.
+            self.warmup_min_mark_ms
+                .unwrap_or(WARMUP_RESYNC_DIT_MS)
+                .max(WARMUP_RESYNC_MIN_DIT_MS)
+        };
+        self.gaps.clone().classify(ms, unit) != GapClass::InterElement
     }
 
     /// MAN-118: the `Legacy` engine's keying-rail ratio (`Demod::rail_ratio`),
@@ -795,9 +971,32 @@ impl TrackDecoder {
     }
 
     fn on_run(&mut self, run: Run, events: &mut Vec<DecoderEvent>) {
+        if self.after_gap {
+            // MAN-202: a mark after an unknown gap may be truncated
+            // mid-element; only a closed space of at least a character gap
+            // is a boundary (`reaches_char_gap`, which also covers the
+            // tracker's zero centroid before readiness).
+            if run.mark {
+                // Before readiness a whole post-gap mark may be the only
+                // timing scale there is: with none, a fast sender's spaces
+                // never reach the resync unit and the track stays silent.
+                // It updates this resync unit alone, not the tracker.
+                if self.post_gap_mark_seen && !self.tracker.ready() {
+                    let ms = run.hops as f32 * HOP_MS as f32;
+                    self.warmup_min_mark_ms =
+                        Some(self.warmup_min_mark_ms.map_or(ms, |m| m.min(ms)));
+                }
+                self.post_gap_mark_seen = true;
+            } else if self.reaches_char_gap(run.hops) {
+                self.after_gap = false;
+            }
+            return; // nothing learned, nothing assembled
+        }
         if !self.tracker.ready() {
             if run.mark {
-                self.tracker.on_mark(run.hops as f32 * HOP_MS as f32);
+                let ms = run.hops as f32 * HOP_MS as f32;
+                self.warmup_min_mark_ms = Some(self.warmup_min_mark_ms.map_or(ms, |m| m.min(ms)));
+                self.tracker.on_mark(ms);
                 self.sync_sender_regime();
             }
             self.pending.push(run);
@@ -2164,6 +2363,336 @@ mod tests {
             "finish_speed_only must never fabricate a character/word from \
              an in-progress mark, got {speed_only_events:?}"
         );
+    }
+
+    /// MAN-202: feed `env` to a fresh decoder with each `(pos, lost)` span
+    /// `env[pos..pos + lost]` removed and an unknown gap noted in its place.
+    /// As in the engine, the clock does not move over the loss: hop `i` of
+    /// what is fed is stamped `i * 256`. Returns the events, the stamp of
+    /// each gap's first post-gap hop, and the decoder.
+    fn decode_across_gaps(
+        engine: Engine,
+        env: &[f32],
+        cuts: &[(usize, usize)],
+    ) -> (Vec<DecoderEvent>, Vec<u64>, TrackDecoder) {
+        let mut dec = TrackDecoder::new(
+            1,
+            DecodeConfig {
+                engine,
+                ..Default::default()
+            },
+        );
+        let mut events = Vec::new();
+        let mut gap_ts = Vec::new();
+        let mut cuts = cuts.iter().peekable();
+        let (mut i, mut fed) = (0usize, 0u64);
+        while i < env.len() {
+            if let Some(&&(pos, lost)) = cuts.peek() {
+                if i == pos {
+                    cuts.next();
+                    events.extend(dec.note_input_gap());
+                    gap_ts.push(fed * 256);
+                    i += lost;
+                    continue;
+                }
+            }
+            events.extend(dec.push_envelope(env[i], fed * 256));
+            fed += 1;
+            i += 1;
+        }
+        events.extend(dec.finish());
+        (events, gap_ts, dec)
+    }
+
+    /// `(start, len)` of every keyed run of `env`, in hops.
+    fn mark_spans(env: &[f32]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut start = None;
+        for (i, &a) in env.iter().chain(std::iter::once(&0.0)).enumerate() {
+            match (a > 0.5, start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    spans.push((s, i - s));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        spans
+    }
+
+    fn chars(events: &[DecoderEvent]) -> Vec<(u64, Glyph)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    sample_ts, glyph, ..
+                } => Some((*sample_ts, *glyph)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn is_subsequence(text: &str, truth: &str) -> bool {
+        let mut truth = truth.chars().filter(|c| !c.is_whitespace());
+        text.chars()
+            .filter(|c| !c.is_whitespace())
+            .all(|c| truth.any(|t| t == c))
+    }
+
+    /// "PARIS PARIS" at 25 WPM: marks 0-3 are P, 4-5 A, 6-8 R.
+    const R_DIT: usize = 6;
+    const R_DAH: usize = 7;
+    const R_LAST: usize = 8;
+
+    #[test]
+    fn input_gap_mid_mark_emits_no_character_from_the_cut_run() {
+        let env = rect_envelope("PARIS PARIS", 18);
+        let spans = mark_spans(&env);
+        let (dah, _) = spans[R_DAH];
+        let (cut, lost) = (dah + 27, 40);
+        let r_end = spans[R_LAST].0 + spans[R_LAST].1;
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(cut, lost)]);
+        let text = events_to_text(&events);
+        assert!(is_subsequence(&text, "PARIS PARIS"), "{text:?}");
+        let resync_ts = (r_end - lost) as u64 * 256;
+        let cut_chars: Vec<_> = chars(&events)
+            .into_iter()
+            .filter(|&(ts, _)| ts >= gaps[0] && ts <= resync_ts)
+            .collect();
+        assert!(
+            cut_chars.is_empty(),
+            "no character may be assembled from the cut run: {cut_chars:?} in {text:?}"
+        );
+        assert!(text.ends_with("PARIS"), "decoding resumes: {text:?}");
+    }
+
+    #[test]
+    fn input_gap_after_a_completed_character_gap_keeps_that_character() {
+        // 4-dit character gaps, so the space after A is past 3 dits at the cut.
+        let env = weighted_envelope("PARIS PARIS", 18, 3.0, 4.0, 7.0);
+        let spans = mark_spans(&env);
+        let a_end = spans[5].0 + spans[5].1;
+        let reference = decode_events(Engine::Legacy, &env);
+        let a_ts = chars(&reference)[1];
+        assert_eq!(a_ts.1, Glyph::Char('A'), "{reference:?}");
+        assert_eq!(
+            a_ts.0,
+            a_end as u64 * 256,
+            "A is stamped at its space's start"
+        );
+        let (events, _, _) = decode_across_gaps(Engine::Legacy, &env, &[(a_end + 60, 80)]);
+        let got = chars(&events);
+        assert_eq!(
+            got.first().map(|c| c.1),
+            Some(Glyph::Char('P')),
+            "{events:?}"
+        );
+        assert_eq!(
+            got.get(1),
+            Some(&a_ts),
+            "A keeps its pre-gap stamp: {events:?}"
+        );
+        let text = events_to_text(&events);
+        assert!(text.starts_with("PA "), "{text:?}");
+        assert!(is_subsequence(&text, "PARIS PARIS"), "{text:?}");
+    }
+
+    #[test]
+    fn input_gap_inside_a_word_closes_it_with_a_word_boundary() {
+        let env = rect_envelope("PARIS PARIS", 18);
+        let spans = mark_spans(&env);
+        let cut = spans[R_DAH].0 + 27;
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(cut, 40)]);
+        let last_pre_gap_ts = gaps[0] - 256;
+        let boundaries: Vec<u64> = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::WordBoundary { sample_ts, .. } => Some(*sample_ts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            boundaries.first(),
+            Some(&last_pre_gap_ts),
+            "the gap closes PA at the last pre-gap hop: {events:?}"
+        );
+        let after_a = chars(&events)
+            .into_iter()
+            .skip(2)
+            .map(|(ts, _)| ts)
+            .next()
+            .expect("decoding resumes after the gap");
+        assert_eq!(
+            boundaries.iter().filter(|&&ts| ts < after_a).count(),
+            1,
+            "exactly one boundary between PA and the next character: {events:?}"
+        );
+        let text = events_to_text(&events);
+        assert!(
+            text.starts_with("PA "),
+            "post-gap characters never extend PA: {text:?}"
+        );
+    }
+
+    #[test]
+    fn input_gap_discards_runs_until_a_character_gap() {
+        let env = rect_envelope("PARIS PARIS", 18);
+        let spans = mark_spans(&env);
+        // Cut R's first dit in half and resume exactly at its dah: the
+        // post-gap runs are a whole dah and dit, which would read as `N`.
+        let (cut, lost) = (spans[R_DIT].0 + 9, 27);
+        assert_eq!(cut + lost, spans[R_DAH].0);
+        let r_end = spans[R_LAST].0 + spans[R_LAST].1;
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(cut, lost)]);
+        let resync_ts = (r_end - lost) as u64 * 256;
+        let post: Vec<_> = chars(&events)
+            .into_iter()
+            .filter(|&(ts, _)| ts >= gaps[0])
+            .collect();
+        assert!(
+            post.first()
+                .is_some_and(|&(ts, g)| ts > resync_ts && g == Glyph::Char('I')),
+            "nothing is assembled before a character gap closes: {post:?}"
+        );
+        let text = events_to_text(&events);
+        assert!(is_subsequence(&text, "PARIS PARIS"), "{text:?}");
+    }
+
+    #[test]
+    fn input_gap_does_not_teach_the_tracker_a_truncated_mark() {
+        let text = ["PARIS"; 12].join(" ");
+        let env = rect_envelope(&text, 18);
+        let dahs: Vec<usize> = mark_spans(&env)
+            .into_iter()
+            .filter(|&(_, len)| len == 54)
+            .map(|(start, _)| start)
+            .collect();
+        // Skip the first word's dahs, then halve every other dah.
+        let cuts: Vec<(usize, usize)> = dahs
+            .iter()
+            .skip(4)
+            .step_by(2)
+            .take(20)
+            .map(|&start| (start + 27, 27))
+            .collect();
+        assert_eq!(cuts.len(), 20);
+        let reference = last_wpm(&decode_events(Engine::Legacy, &env)).unwrap();
+        let (events, gaps, dec) = decode_across_gaps(Engine::Legacy, &env, &cuts);
+        assert_eq!(gaps.len(), 20);
+        assert_eq!(dec.continuity_epoch(), 20);
+        let got = last_wpm(&events).unwrap();
+        assert!(
+            (got - reference).abs() <= 1.0,
+            "{got} WPM after 20 cut dahs against {reference} WPM uncut"
+        );
+    }
+
+    #[test]
+    fn input_gap_during_warmup_replays_no_run_across_it() {
+        // 15 WPM: the demod's rails initialize on P (the first 375 hops),
+        // and the tracker is still under its 5-mark quorum while A keys.
+        let env = rect_envelope("PARIS PARIS", 30);
+        let spans = mark_spans(&env);
+        let (a_dit, _) = spans[4];
+        assert!(a_dit > 375, "the demod is running at the cut");
+        // Cut into A's dit and resume inside its element gap.
+        let (cut, lost) = (a_dit + 15, 30);
+        let a_end = spans[5].0 + spans[5].1;
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(cut, lost)]);
+        let text = events_to_text(&events);
+        assert!(is_subsequence(&text, "PARIS PARIS"), "{text:?}");
+        let got = chars(&events);
+        assert!(
+            !got.is_empty(),
+            "decoding resumes after the gap: {events:?}"
+        );
+        let resync_ts = (a_end - lost) as u64 * 256;
+        assert!(
+            got.iter().all(|&(ts, _)| ts > resync_ts && ts > gaps[0]),
+            "no warm-up run before the gap is replayed into a character: {got:?}"
+        );
+    }
+
+    #[test]
+    fn input_gap_before_the_first_mark_resyncs_on_fast_continuous_text() {
+        // 40 WPM (dit 11 hops, 29 ms): even a word gap is about 205 ms, under
+        // the 300 ms the no-marks-yet resync unit asks for, so only the
+        // complete post-gap marks can set a scale that lets the decoder out.
+        let text = ["PARIS"; 12].join(" ");
+        let env = rect_envelope(&text, 11);
+        let (events, gaps, _) = decode_across_gaps(Engine::Legacy, &env, &[(100, 10)]);
+        assert_eq!(gaps.len(), 1);
+        let decoded = events_to_text(&events);
+        assert!(is_subsequence(&decoded, &text), "{decoded:?}");
+        assert!(
+            chars(&events).len() >= text.len() / 2,
+            "a gap before the first mark must not silence the track: {decoded:?}"
+        );
+    }
+
+    #[test]
+    fn input_gap_advances_the_continuity_epoch_once_per_gap() {
+        for engine in [Engine::Legacy, Engine::EdgeLegacy, Engine::Hsmm] {
+            let env = rect_envelope("PARIS PARIS", 18);
+            let cuts = [(300, 10), (500, 3), (900, 40)];
+            let mut dec = TrackDecoder::new(
+                1,
+                DecodeConfig {
+                    engine,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(dec.continuity_epoch(), 0);
+            let (_, gaps, dec_after) = decode_across_gaps(engine, &env, &cuts);
+            assert_eq!(gaps.len(), 3);
+            assert_eq!(dec_after.continuity_epoch(), 3, "{engine:?}");
+            dec.note_input_gap();
+            assert_eq!(dec.continuity_epoch(), 1, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn input_gap_under_edge_legacy_and_hsmm_forces_nothing() {
+        let lo = 10f32.powf(-40.0 / 20.0);
+        let mut env = vec![lo; 4];
+        env.extend(rect_envelope_depth("PARIS PARIS", 18, 40.0));
+        let spans = mark_spans(&env);
+        let (dah, _) = spans[R_DAH];
+        let cut = dah + 27;
+        for engine in [Engine::EdgeLegacy, Engine::Hsmm] {
+            let mut dec = TrackDecoder::new(
+                1,
+                DecodeConfig {
+                    engine,
+                    ..Default::default()
+                },
+            );
+            let mut events = Vec::new();
+            for (i, &a) in env[..cut].iter().enumerate() {
+                events.extend(dec.push_envelope(a, i as u64 * 256));
+            }
+            let at_gap = dec.note_input_gap();
+            let forced: Vec<_> = chars(&at_gap)
+                .into_iter()
+                .filter(|&(ts, _)| ts >= dah as u64 * 256)
+                .collect();
+            assert!(
+                forced.is_empty(),
+                "{engine:?}: the gap forced a character from the open mark: {forced:?}"
+            );
+            events.extend(at_gap);
+            for (i, &a) in env[cut + 40..].iter().enumerate() {
+                events.extend(dec.push_envelope(a, (cut + i) as u64 * 256));
+            }
+            events.extend(dec.finish());
+            let text = events_to_text(&events);
+            assert!(
+                chars(&events).iter().any(|&(ts, _)| ts > cut as u64 * 256),
+                "{engine:?}: decoding resumes after the gap: {text:?}"
+            );
+            assert!(text.ends_with("PARIS"), "{engine:?}: {text:?}");
+        }
     }
 
     /// MAN-271: "AI" at ~35 WPM is 4 marks (dit-dah dit-dit); the live

@@ -6,7 +6,7 @@
 //! measured in the test. Deadlines are generous and exist only so a broken
 //! build fails cleanly instead of hanging.
 
-use std::io::{BufRead, BufReader, ErrorKind, Write as _};
+use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -334,4 +334,90 @@ fn a_looped_replay_shorter_than_the_connect_time_keeps_the_server_up_until_stopp
     {
         daemon.0.kill().unwrap();
     }
+}
+
+/// MAN-322 scenario 1, daemon side: with `rtty_telnet_port` set, `run`
+/// binds a second telnet port, names it in the banner and registers its
+/// listener, and that port never serves the replay's CW spot, live or
+/// through `sh/dx`, while the CW port does.
+#[test]
+fn the_rtty_telnet_port_serves_no_cw_spot() {
+    let dir = tempfile::tempdir().unwrap();
+    // As scenario 1 above: V1's W1AW CQ spot lands about 21 s in.
+    let (wav, _) = v1_fixture(dir.path(), 30.0);
+    let cfg = dir.path().join("rtty.toml");
+    std::fs::write(
+        &cfg,
+        "[server]\nstation_callsign = \"W5AU\"\nbind_addr = \"127.0.0.1\"\n\
+         telnet_port = 0\njson_port = 0\nmetrics_port = 0\nstatus_interval_secs = 0\n\
+         rtty_telnet_port = 0\n",
+    )
+    .unwrap();
+
+    let spawned = Instant::now();
+    let (_daemon, rx) = spawn_daemon(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        wav.as_os_str(),
+        "--source-iq".as_ref(),
+        "--realtime".as_ref(),
+        "--config".as_ref(),
+        cfg.as_os_str(),
+    ]);
+    let banner = stderr_line_until(
+        &rx,
+        spawned + Duration::from_secs(30),
+        "the listening: banner",
+        |l| l.contains("listening:"),
+    );
+    let port_of = |key: &str| -> u16 {
+        let re = regex::Regex::new(&format!(r" {key}=127\.0\.0\.1:(\d+)")).unwrap();
+        re.captures(&banner)
+            .unwrap_or_else(|| panic!("no {key}= in {banner:?}"))[1]
+            .parse()
+            .unwrap()
+    };
+    let cw_port = port_of("telnet");
+    let rtty_port = port_of("rtty_telnet");
+    assert_ne!(cw_port, rtty_port);
+
+    let deadline = spawned + Duration::from_secs(90);
+    let mut rtty = telnet_login(rtty_port, deadline);
+    read_line_until(&mut rtty, deadline, "the RTTY port's prompt", |l| {
+        l.starts_with("de W5AU-# >")
+    });
+    let mut cw = telnet_login(cw_port, deadline);
+    read_line_until(&mut cw, deadline, "a DX de spot on the CW port", |l| {
+        l.starts_with("DX de ") && l.contains(" CW ")
+    });
+
+    // The CW spot is now in history and was published live. The RTTY port
+    // answers `sh/dx` with no row, and nothing before the `sh/version`
+    // barrier is a spot line.
+    rtty.get_mut()
+        .write_all(b"sh/dx\r\nsh/version\r\n")
+        .unwrap();
+    let version = format!("manta {}", env!("CARGO_PKG_VERSION"));
+    read_line_until(&mut rtty, deadline, "the sh/version barrier", |l| {
+        assert!(
+            !l.starts_with("DX de "),
+            "the RTTY port served a CW spot: {l:?}"
+        );
+        l == version
+    });
+
+    let mut metrics = TcpStream::connect(("127.0.0.1", port_of("metrics"))).unwrap();
+    metrics
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    metrics
+        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    let mut body = String::new();
+    metrics.read_to_string(&mut body).unwrap();
+    assert!(
+        body.lines()
+            .any(|l| l == "manta_listener_up{listener=\"rtty_telnet\"} 1"),
+        "{body}"
+    );
 }

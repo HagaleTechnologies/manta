@@ -10,6 +10,8 @@ pub struct DetectorConfig {
     /// Rise threshold in dB SNR. **Deviation from SPEC §9's literal 6.0 dB
     /// default (see `impl Default`).**
     pub on_snr_db: f32,
+    /// Two dit-scale integration lengths, each in 1..=375 hops.
+    pub integrator_hops: [u16; 2],
     /// SPEC §9: off (drop) threshold in dB SNR.
     pub off_snr_db: f32,
     /// SPEC §2.3/§2.4: rise sustained this many hops (~50ms) before CANDIDATE -> ACTIVE.
@@ -122,70 +124,21 @@ impl std::str::FromStr for CrashFilter {
     }
 }
 
+/// MAN-109: the EMA rise path never goes below the 12 dB the old false-track
+/// measurements pinned, whatever `on_snr_db` the two-look path uses.
+pub const EMA_RISE_MIN_SNR_DB: f32 = 12.0;
+
 impl Default for DetectorConfig {
-    /// **`on_snr_db` deviates from SPEC §9's literal 6.0 dB**, empirically
-    /// retuned to 12.0 dB (this repo's "measure, then pin the deviation"
-    /// convention -- cf. docs/DECISIONS/2026-07-18-char-gap-threshold-fix.md
-    /// and .../2026-07-18-m2-pfb-channelizer-pins.md).
-    ///
-    /// SPEC §2.3's 6.0 dB / confirm_hops=19 pair was specified against an
-    /// implicit per-hop-independent noise model. The real channelizer output
-    /// `power[k] = |X[k]|^2` is a single complex-Gaussian magnitude-squared
-    /// per hop (SPEC §1.3): chi-squared, 2 DOF, dB-domain std ~5.57 dB raw,
-    /// and after the Gate's tau=40 ms EMA still ~1.7 dB std with a ~15-hop
-    /// autocorrelation time -- essentially confirm_hops=19 itself. So the
-    /// "19 sustained hops" window buys almost no *independent* looks at the
-    /// noise (once an EMA excursion crosses the threshold, autocorrelation
-    /// holds it there for nearly the whole window). Over V1's real
-    /// 1024-channel x 120 s render (~46 M channel-hop opportunities) the
-    /// literal 6.0 dB threshold produced 298 spurious ACTIVE tracks for a
-    /// single clean +20 dB signal.
-    ///
-    /// Raising `confirm_hops` instead was measured and rejected: CW elements
-    /// are short (a 20 WPM dit is ~22 hops), so a longer sustained-rise
-    /// window the noise must clear is also a window the *real* signal
-    /// struggles to fill -- confirm_hops in 40..150 gave both worse false-
-    /// track counts and worse decode accuracy. Raising `on_snr_db` is the
-    /// clean lever: 12.0 dB drives false tracks to 0 across all measured
-    /// noise seeds (empirical knee = 11.0 dB; +1 dB margin) while the
-    /// channelizer's ~14 dB processing gain (2500 Hz SNR -> 93.75 Hz channel
-    /// SNR) keeps even the weakest golden vector (V3, +6 dB-in-2500) ~14 dB
-    /// clear of the threshold, so it still promotes and decodes.
-    ///
-    /// **`confirm_hops` stays at SPEC §2.3/§2.4's literal 19 (~50.7ms) --
-    /// deliberately, after measuring a real problem with it and rejecting
-    /// the obvious fix.** MAN-166, 2026-09-09, investigated further in
-    /// `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`.
-    /// The above paragraph's own "20 WPM dit is ~22 hops" observation
-    /// already implies a real problem this never closed: 19 hops needs
-    /// 50.7ms of *unbroken* rise from a CANDIDATE's very first hop, and a
-    /// dit alone is shorter than that at any real contest speed above
-    /// ~20 WPM (30ms at 40 WPM, 34ms at 35 WPM, 40ms at 30 WPM) -- so on
-    /// real contest-speed CW, any word/character starting with a
-    /// dit-leading letter (E, I, S, H, 5, ...) structurally cannot promote
-    /// its own opening element, spawning a fresh CANDIDATE every dit-onset
-    /// that immediately dies `Unconfirmed`, over and over, until a
-    /// dah-leading element promotes it or the transmission ends.
-    /// Confirmed as the majority contributor to `unconfirmed` being 68.8%
-    /// of all real-recording track churn (`crates/manta-testkit`'s B2
-    /// golden vector) -- but **lowering `confirm_hops` to fix it breaks
-    /// V10** (a real, currently-passing golden vector at 15 WPM/Farnsworth
-    /// char_wpm=25): the decoder's Farnsworth gap-classifier bootstrap
-    /// (`manta_decode::timing::FARNS_MIN_COUNT`) is apparently sensitive
-    /// to *which hop* a track promotes on, and there's a hard cliff, not a
-    /// gradual tradeoff -- confirm_hops=17 reproduces the exact same
-    /// broken decode as confirm_hops=8 (CER 0.2368 either way, letter-by-
-    /// letter word-boundary corruption on the opening transmission),
-    /// confirm_hops=18 passes clean, and 18 vs 19 (48.0ms vs 50.7ms) is
-    /// too close to the original to meaningfully help any real
-    /// contest-speed dit (still needs >40 WPM headroom this doesn't give).
-    /// `track_cap` was verified independent of this (V10 passes at
-    /// `confirm_hops: 19` regardless of `track_cap`). This confirm_hops/
-    /// Farnsworth-bootstrap coupling needs a real manta-decode-level fix
-    /// (decouple the gap-classifier's bootstrap from detector promotion
-    /// timing) before `confirm_hops` can safely move -- out of scope for
-    /// this change; folded into the wider real-world decode-accuracy
-    /// investigation the same MAN-166 finding opened.
+    /// MAN-109 adds rise from two disjoint linear-power windows. Default
+    /// windows are 38 hops at 11.5 dB over the quantile floor. The old EMA
+    /// rise stays ORed in at no less than 12 dB (`EMA_RISE_MIN_SNR_DB`), so
+    /// a strong onset still rises on its first hops, and confirmation
+    /// stays 19 consecutive rise hops (SPEC §2.3/§2.4).
+    /// The old 12 dB/19-hop EMA rule suppressed the 298 noise tracks seen
+    /// at 6 dB, but its correlated looks limited weak-signal detection.
+    /// MAN-166 found V10 Farnsworth bootstrap sensitive to promotion time,
+    /// which is why the EMA path and its 19-hop confirmation are kept.
+    /// See docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md.
     ///
     /// **`track_cap` deviates from its prior 500** (ARCHITECTURE §4, not a
     /// SPEC value), raised to 1200, same MAN-166 decision doc. 500 was
@@ -239,7 +192,8 @@ impl Default for DetectorConfig {
     /// `reacquire_ms = 0` restores the old behaviour.
     fn default() -> Self {
         DetectorConfig {
-            on_snr_db: 12.0,
+            on_snr_db: 11.5,
+            integrator_hops: [38, 38],
             off_snr_db: 3.0,
             confirm_hops: 19,
             hang_hops: 1875,
@@ -334,6 +288,8 @@ pub struct CloseCounts {
     pub not_cw: u64,
     /// MAN-313: closed because a qualified track stopped keying.
     pub unkeyed: u64,
+    /// Hops spent holding leases by tracks closed NotCw or Unkeyed.
+    pub false_lease_hops: u64,
 }
 
 impl std::ops::Add for CloseCounts {
@@ -349,6 +305,7 @@ impl std::ops::Add for CloseCounts {
             rtty: self.rtty + rhs.rtty,
             not_cw: self.not_cw + rhs.not_cw,
             unkeyed: self.unkeyed + rhs.unkeyed,
+            false_lease_hops: self.false_lease_hops + rhs.false_lease_hops,
         }
     }
 }
@@ -660,6 +617,12 @@ pub(crate) struct Track {
     /// set on the decoder before that entry's `push_hop` so `TrackMeta`
     /// pairs it with the same hop's `sample_ts` (MAN-211).
     pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
+    /// MAN-202: unknown-length input gaps this track has yet to apply, as
+    /// the `sample_ts` of the first post-gap hop (`TrackManager::note_input_gap`).
+    /// The pending drains call `TrackDecoder::note_input_gap` before the
+    /// first entry stamped at or after each one, so the gap lands at the
+    /// same hop whatever the batch split or the decoder lease timing.
+    input_gaps: VecDeque<u64>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -1197,6 +1160,7 @@ impl Track {
             birth_channel,
             decoder: None,
             pending: Vec::new(),
+            input_gaps: VecDeque::new(),
             has_emitted: false,
             refiner: None,
             refiner_channel: None,
@@ -1487,22 +1451,16 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment
-        // (review round 2, finding 2: keyed to `hop_count() %
-        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-            self.snr_peak_db = self.snr_peak_db.max(snr_db);
-            decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
-            decoder.set_freq_hz(freq_hz);
-            let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                self.snr_peak_db = f32::NEG_INFINITY;
-            }
-            sample_rail_ratio_at_boundary(decoder, quality);
-            events.extend(hop_events);
-        }
+        push_pending(
+            decoder,
+            &mut self.snr_peak_db,
+            pending,
+            &mut self.input_gaps,
+            quality,
+            &mut events,
+        );
+        apply_remaining_gaps(decoder, &mut self.input_gaps, &mut events);
         events.extend(decoder.finish());
         publish_garbles(decoder, &mut self.garbles_published, quality);
         events
@@ -1530,25 +1488,42 @@ impl Track {
             return Vec::new();
         };
         let pending = std::mem::take(&mut self.pending);
-        // MAN-102: same peak-hold/reset-at-reporting-boundary pattern as
-        // `TrackManager::drain_pool` -- see that function's doc comment
-        // (review round 2, finding 2: keyed to `hop_count() %
-        // META_INTERVAL_HOPS == 0`, not to `TrackMeta` actually emitting).
         let mut events: Vec<DecoderEvent> = Vec::new();
-        for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-            self.snr_peak_db = self.snr_peak_db.max(snr_db);
-            decoder.set_snr_2500_db(self.snr_peak_db - manta_decode::SNR_BW_CORR_DB);
-            decoder.set_freq_hz(freq_hz);
-            let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-            if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                self.snr_peak_db = f32::NEG_INFINITY;
-            }
-            sample_rail_ratio_at_boundary(decoder, quality);
-            events.extend(hop_events);
-        }
+        push_pending(
+            decoder,
+            &mut self.snr_peak_db,
+            pending,
+            &mut self.input_gaps,
+            quality,
+            &mut events,
+        );
+        apply_remaining_gaps(decoder, &mut self.input_gaps, &mut events);
         events.extend(decoder.finish_speed_only());
         publish_garbles(decoder, &mut self.garbles_published, quality);
         events
+    }
+
+    /// MAN-202: an unknown-length input gap reaches this track at the hop
+    /// stamped `first_ts`. The refiner's backlog is drained into `pending`
+    /// first (MAN-194's order: those entries are pre-gap and complete),
+    /// then the refiner, the crash hold's clean history and the phase
+    /// history are reset, because their windows would span the splice. The
+    /// decoder applies the gap when its pending drain reaches `first_ts`.
+    /// A track holding no decoder and no queued entry (a DORMANT track, or a
+    /// candidate that has queued nothing) has no state spanning the gap, so
+    /// it takes no marker: otherwise the decoder it leases later would
+    /// start in the post-gap resync and drop its first word for nothing.
+    fn note_input_gap(&mut self, first_ts: u64) {
+        self.drain_refiner_into_pending();
+        if let Some(refiner) = self.refiner.as_mut() {
+            refiner.reset();
+        }
+        self.refiner_hops_since_reset = 0;
+        self.clean_hist.clear();
+        self.phase_hist.clear();
+        if self.decoder.is_some() || !self.pending.is_empty() {
+            self.input_gaps.push_back(first_ts);
+        }
     }
 
     /// MAN-108 (SPEC §2.4): HANG -> DORMANT. Flushes the decoder exactly as
@@ -1562,6 +1537,7 @@ impl Track {
         let events = self.finish_decoder(quality);
         self.decoder = None;
         self.pending.clear();
+        self.input_gaps.clear();
         self.refiner = None;
         self.refiner_channel = None;
         self.refiner_hops_since_reset = 0;
@@ -1841,6 +1817,11 @@ pub struct TrackManager {
     /// decoder's events (a `SpeedUpdate` sorts at ts 0) cannot sort after a
     /// same-batch woken decoder's under the batch's stable sort.
     dormant_flush: Vec<DecoderEvent>,
+    /// MAN-202: hops at which an unknown-length input gap applies
+    /// (`note_input_gap`), oldest first.
+    input_gap_hops: VecDeque<u64>,
+    /// MAN-202: how many unknown-length input gaps this manager has applied.
+    continuity_epoch: u64,
     /// MAN-108: DORMANT -> ACTIVE re-acquisitions so far. See
     /// `reacquisition_count`; counted in test builds only.
     #[cfg(test)]
@@ -1949,7 +1930,13 @@ impl TrackManager {
     ) -> Self {
         TrackManager {
             floor: FloorBank::new(n_channels),
-            gate: Gate::new(n_channels, detector_cfg.on_snr_db, detector_cfg.off_snr_db),
+            gate: Gate::new(
+                n_channels,
+                detector_cfg.on_snr_db,
+                detector_cfg.off_snr_db,
+                &detector_cfg.integrator_hops,
+            )
+            .with_ema_rise(detector_cfg.on_snr_db.max(EMA_RISE_MIN_SNR_DB)),
             tracks: BTreeMap::new(),
             owner_of: vec![None; n_channels],
             next_id: 1,
@@ -1993,6 +1980,8 @@ impl TrackManager {
             total_spawns: 0,
             crash: CrashDetector::new(n_channels),
             dormant_flush: Vec::new(),
+            input_gap_hops: VecDeque::new(),
+            continuity_epoch: 0,
             #[cfg(test)]
             reacquisitions: 0,
             prev_hop: None,
@@ -2651,14 +2640,22 @@ impl TrackManager {
                                       // confirmation freezes the same way -- the held `rise` is not
                                       // evidence the signal returned -- while its expiry timer keeps
                                       // aging (`Lifecycle::age_dormant`), as a HANG track's does.
+                                      // MAN-109: the two-look windows stay full through a key-up gap,
+                                      // so their rise would pull a HANG track back to ACTIVE on every
+                                      // gap hop. They confirm a CANDIDATE and wake a DORMANT track;
+                                      // ACTIVE/HANG keep the EMA rise.
+            let rise_k = match prev_state {
+                LifecycleState::Candidate | LifecycleState::Dormant => rise[k],
+                _ => self.gate.ema_rise(k, &self.floor),
+            };
             let mut event = if suppress {
                 match prev_state {
                     LifecycleState::Candidate => LifecycleEvent::None,
                     LifecycleState::Dormant => track.lifecycle.age_dormant(),
-                    _ => track.lifecycle.on_hop(rise[k], drop[k], char_emitted),
+                    _ => track.lifecycle.on_hop(rise_k, drop[k], char_emitted),
                 }
             } else {
-                track.lifecycle.on_hop(rise[k], drop[k], char_emitted)
+                track.lifecycle.on_hop(rise_k, drop[k], char_emitted)
             };
             // MAN-108 (SPEC §2.4): DORMANT entry flushes and releases the
             // decoder (the flush goes ahead of this batch's pool output);
@@ -3036,6 +3033,15 @@ impl TrackManager {
                     self.channel_cooldown_until[ch] = until;
                 }
             }
+            if matches!(
+                close_reasons.get(id),
+                Some(CloseReason::NotCw | CloseReason::Unkeyed)
+            ) {
+                if let Some(ev) = &track.keying {
+                    self.close_counts.false_lease_hops +=
+                        self.hop_counter.saturating_sub(ev.promo_hop);
+                }
+            }
             if !track.has_emitted {
                 return false;
             }
@@ -3367,6 +3373,17 @@ impl TrackManager {
             if h.m < self.preroll_hops {
                 continue;
             }
+            // MAN-202: an unknown-length input gap applies at the first hop
+            // holding a post-gap sample, before that hop's bookkeeping, so
+            // where the caller's read or batch boundaries fall cannot move it.
+            while self.input_gap_hops.front().is_some_and(|&g| h.m >= g) {
+                self.input_gap_hops.pop_front();
+                self.continuity_epoch += 1;
+                let ts = hop_to_sample_ts(h.m);
+                for t in self.tracks.values_mut() {
+                    t.note_input_gap(ts);
+                }
+            }
             let (closed, promoted, closure_flush) = self.step_hop(h, hop_to_sample_ts(h.m));
             closed_ids.extend(closed);
             promoted_events.extend(promoted);
@@ -3504,6 +3521,32 @@ impl TrackManager {
         self.close_all(true)
     }
 
+    /// MAN-202: the input lost samples of unknown count immediately before
+    /// data sample `data_pos` of this segment; `first_hop` is
+    /// [`first_hop_after_gap`]`(data_pos, hop)`, the first hop whose window
+    /// holds a post-gap sample. At that hop every track then present has
+    /// its continuity-dependent decode state invalidated
+    /// (`TrackDecoder::note_input_gap`; refiner and crash history reset).
+    /// No track closes and the sample clock does not move: the count is
+    /// unknown, so there is nothing to advance by.
+    pub fn note_input_gap(&mut self, first_hop: u64) {
+        if let Some(&back) = self.input_gap_hops.back() {
+            debug_assert!(first_hop >= back, "gap hops must not go backwards");
+            if back == first_hop {
+                return;
+            }
+        }
+        self.input_gap_hops.push_back(first_hop);
+    }
+
+    /// MAN-202: how many unknown-length input gaps this manager has applied.
+    /// Read by tests; the engine itself keys nothing off it yet (the event
+    /// epoch is a follow-up).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn continuity_epoch(&self) -> u64 {
+        self.continuity_epoch
+    }
+
     /// Shared body of `finish` (`discontinuity == false`: genuine stream
     /// end, `SignalEnded`) and `finish_for_discontinuity` (`true`).
     fn close_all(&mut self, discontinuity: bool) -> Vec<DecoderEvent> {
@@ -3525,6 +3568,15 @@ impl TrackManager {
         // parallel decode pass below sees a fully-populated `pending`.
         for track in self.tracks.values_mut() {
             track.drain_refiner_into_pending();
+        }
+        // MAN-202: a gap noted but not yet reached still applies, after
+        // every queued entry, so the flush forces nothing across it.
+        if !self.input_gap_hops.is_empty() {
+            self.continuity_epoch += self.input_gap_hops.len() as u64;
+            self.input_gap_hops.clear();
+            for track in self.tracks.values_mut() {
+                track.note_input_gap(u64::MAX);
+            }
         }
         // `finish_decoder` drains `pending` through `push_hop` before
         // calling `TrackDecoder::finish()` -- exactly what the backlog
@@ -3626,46 +3678,15 @@ impl TrackManager {
                         decoder,
                         &mut t.snr_peak_db,
                         &mut t.garbles_published,
+                        &mut t.input_gaps,
                         pending,
                     ))
                 }
             })
             .par_bridge()
-            .flat_map_iter(|(decoder, peak, garbles_published, pending)| {
+            .flat_map_iter(|(decoder, peak, garbles_published, gaps, pending)| {
                 let mut out = Vec::new();
-                for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
-                    // MAN-102: SPEC §2.3's floor-based estimate, in the
-                    // 2500 Hz reference bandwidth, held at its peak since
-                    // this track's last SPEC §5 reporting boundary (see
-                    // `snr_peak_db`'s and `pending`'s doc comments on
-                    // `Track`). The reset below is keyed to the boundary
-                    // itself (`hop_count() % META_INTERVAL_HOPS == 0`), not
-                    // to `TrackMeta` actually being emitted: before
-                    // `Demod::running()` (init/retrying, SPEC §3.2) no
-                    // `TrackMeta` fires at all, and resetting only on
-                    // emission left the peak window unbounded for however
-                    // long init took instead of one interval (review round
-                    // 2, finding 2). This still lands on the exact hop a
-                    // report fires when one does (review round 1 findings
-                    // 2/3): the boundary check is the same hop the decoder
-                    // itself gates `TrackMeta` emission on. Consumed only by
-                    // the `Legacy` engine (`TrackDecoder::tick_meta`);
-                    // `EdgeLegacy`/`Hsmm` source their own SPEC v2 §2.3
-                    // evidence-derived estimate instead, so this call is
-                    // harmless but inert for those two engines.
-                    *peak = peak.max(snr_db);
-                    decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
-                    // MAN-211: this entry's own hop's centroid, so a
-                    // `TrackMeta` this push emits pairs it with the same
-                    // hop's `sample_ts`.
-                    decoder.set_freq_hz(freq_hz);
-                    let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
-                    if decoder.hop_count() % manta_decode::META_INTERVAL_HOPS == 0 {
-                        *peak = f32::NEG_INFINITY;
-                    }
-                    sample_rail_ratio_at_boundary(decoder, quality);
-                    out.extend(hop_events);
-                }
+                push_pending(decoder, peak, pending, gaps, quality, &mut out);
                 publish_garbles(decoder, garbles_published, quality);
                 out
             })
@@ -3673,6 +3694,80 @@ impl TrackManager {
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
         events
     }
+}
+
+/// Push one track's queued `pending` entries through its decoder: the
+/// shared body of `TrackManager::drain_pool`, `Track::finish_decoder` and
+/// `Track::finish_decoder_speed_only`.
+///
+/// MAN-102: SPEC §2.3's floor-based estimate, in the 2500 Hz reference
+/// bandwidth, held at its peak since this track's last SPEC §5 reporting
+/// boundary (see `snr_peak_db`'s and `pending`'s doc comments on `Track`).
+/// The reset below is keyed to the boundary itself (`hop_count() %
+/// META_INTERVAL_HOPS == 0`), not to `TrackMeta` actually being emitted:
+/// before `Demod::running()` (init/retrying, SPEC §3.2) no `TrackMeta`
+/// fires at all, and resetting only on emission left the peak window
+/// unbounded for however long init took instead of one interval (review
+/// round 2, finding 2). This still lands on the exact hop a report fires
+/// when one does (review round 1 findings 2/3): the boundary check is the
+/// same hop the decoder itself gates `TrackMeta` emission on. Consumed only
+/// by the `Legacy` engine (`TrackDecoder::tick_meta`); `EdgeLegacy`/`Hsmm`
+/// source their own SPEC v2 §2.3 evidence-derived estimate instead, so this
+/// call is harmless but inert for those two engines. MAN-211: each entry's
+/// own hop's centroid is set first, so a `TrackMeta` the push emits pairs
+/// it with the same hop's `sample_ts`.
+///
+/// MAN-202: every gap marker in `gaps` is applied
+/// (`TrackDecoder::note_input_gap`) before the first entry stamped at or
+/// after it, so one copy of this loop applies gaps for all three callers.
+fn push_pending(
+    decoder: &mut TrackDecoder,
+    peak: &mut f32,
+    pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
+    gaps: &mut VecDeque<u64>,
+    quality: Option<&DecodeQualityObserver>,
+    out: &mut Vec<DecoderEvent>,
+) {
+    for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
+        while gaps.front().is_some_and(|&g| ts >= g) {
+            gaps.pop_front();
+            out.extend(decoder.note_input_gap());
+        }
+        *peak = peak.max(snr_db);
+        decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
+        decoder.set_freq_hz(freq_hz);
+        let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
+        if decoder
+            .hop_count()
+            .is_multiple_of(manta_decode::META_INTERVAL_HOPS)
+        {
+            *peak = f32::NEG_INFINITY;
+        }
+        sample_rail_ratio_at_boundary(decoder, quality);
+        out.extend(hop_events);
+    }
+}
+
+/// MAN-202: a track closing before its decoder reached a gap marker's hop
+/// still applies the gap, so the closing flush forces nothing from a run
+/// that spans it.
+fn apply_remaining_gaps(
+    decoder: &mut TrackDecoder,
+    gaps: &mut VecDeque<u64>,
+    out: &mut Vec<DecoderEvent>,
+) {
+    while gaps.pop_front().is_some() {
+        out.extend(decoder.note_input_gap());
+    }
+}
+
+/// MAN-202: the first hop whose window holds data sample `data_pos`. Hop `m`
+/// is computed from channelizer input `[m·hop, m·hop + filter_len)`
+/// (`Channelizer::process`), and every segment feeds `filter_len` zeros
+/// before data sample 0, so hop `m` covers data `[m·hop − filter_len,
+/// m·hop)` and the first one reaching `data_pos` is `data_pos / hop + 1`.
+pub(crate) fn first_hop_after_gap(data_pos: u64, hop: u64) -> u64 {
+    data_pos / hop + 1
 }
 
 /// SPEC §6 rule 6 resequencing key: the sample timestamp an event is
@@ -3876,6 +3971,32 @@ mod tests {
     }
 
     #[test]
+    fn pair_true_confirmation_and_dormant_wake_use_configured_count() {
+        for count in [2, 19] {
+            let cfg = DetectorConfig {
+                confirm_hops: count,
+                ..DetectorConfig::default()
+            };
+            let mut life = Lifecycle::new(&cfg);
+            for _ in 1..count - 1 {
+                assert_eq!(life.on_hop(true, false, false), LifecycleEvent::None);
+            }
+            assert_eq!(life.on_hop(true, false, false), LifecycleEvent::Promoted);
+            life.state = LifecycleState::Dormant;
+            life.confirm_count = 0;
+            for _ in 1..count {
+                assert_eq!(life.on_hop(true, false, false), LifecycleEvent::None);
+            }
+            assert_eq!(life.on_hop(true, false, false), LifecycleEvent::Reacquired);
+            let mut missed = Lifecycle::new(&cfg);
+            assert_eq!(
+                missed.on_hop(false, true, false),
+                LifecycleEvent::Closed(CloseReason::Unconfirmed)
+            );
+        }
+    }
+
+    #[test]
     fn track_ids_interleave_by_input() {
         let mut tm = id_space_manager();
         tm.set_track_id_space(crate::multi::TrackIdSpace {
@@ -3942,6 +4063,7 @@ mod tests {
             rtty: 6,
             not_cw: 7,
             unkeyed: 8,
+            false_lease_hops: 9,
         };
         let b = CloseCounts {
             unconfirmed: 10,
@@ -3952,6 +4074,7 @@ mod tests {
             rtty: 60,
             not_cw: 70,
             unkeyed: 80,
+            false_lease_hops: 90,
         };
         assert_eq!(
             a + b,
@@ -3963,7 +4086,8 @@ mod tests {
                 evicted: 55,
                 rtty: 66,
                 not_cw: 77,
-                unkeyed: 88
+                unkeyed: 88,
+                false_lease_hops: 99,
             }
         );
     }
@@ -5598,6 +5722,284 @@ mod tests {
             saw_promotion,
             "step_hop must return a TrackPromoted event at the hop it promotes a track"
         );
+    }
+
+    use manta_dsp::channelizer::Channelizer;
+    use num_complex::Complex32;
+
+    /// MAN-202: a keyed "PARIS " stream at 20 WPM on channel 10 (dit = 22
+    /// hops), one bool per hop, `len` hops long.
+    fn paris_keying(len: usize) -> Vec<bool> {
+        let code = |c: char| match c {
+            'P' => ".--.",
+            'A' => ".-",
+            'R' => ".-.",
+            'I' => "..",
+            'S' => "...",
+            _ => "",
+        };
+        let dit = 22;
+        let mut out = Vec::new();
+        while out.len() < len {
+            for w in ["PARIS"] {
+                for ch in w.chars() {
+                    for e in code(ch).chars() {
+                        let on = if e == '.' { dit } else { 3 * dit };
+                        out.extend(std::iter::repeat_n(true, on));
+                        out.extend(std::iter::repeat_n(false, dit));
+                    }
+                    out.extend(std::iter::repeat_n(false, 2 * dit));
+                }
+                out.extend(std::iter::repeat_n(false, 4 * dit));
+            }
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// MAN-202: a warmed-up 64-channel manager and the keyed hops after
+    /// warm-up, starting at hop `250 * 15`.
+    fn keyed_manager(len: usize) -> (TrackManager, Vec<HopOutput>) {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        feed_warmup(&mut tm, n);
+        let start = 250u64 * 15;
+        let hops = paris_keying(len)
+            .into_iter()
+            .enumerate()
+            .map(|(i, on)| {
+                let mut power = quiet_power(n);
+                if on {
+                    power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+                }
+                hop(start + i as u64, power)
+            })
+            .collect();
+        (tm, hops)
+    }
+
+    #[test]
+    fn first_hop_after_gap_is_the_first_hop_holding_a_post_gap_sample() {
+        let probe = Channelizer::new(96_000.0, 0.0).unwrap();
+        let (hop, filter_len) = (probe.hop() as u64, probe.filter_len());
+        for g in [0, 1, hop - 1, hop, 3 * hop + 5, 10_000] {
+            let mut ch = Channelizer::new(96_000.0, 0.0).unwrap();
+            let mut input = vec![Complex32::new(0.0, 0.0); filter_len + g as usize];
+            input.push(Complex32::new(1.0, 0.0));
+            input.extend(std::iter::repeat_n(Complex32::new(0.0, 0.0), filter_len));
+            let first = ch
+                .process(&input)
+                .into_iter()
+                .find(|h| h.power.iter().any(|&p| p > 0.0))
+                .map(|h| h.m);
+            assert_eq!(first, Some(first_hop_after_gap(g, hop)), "g = {g}");
+        }
+    }
+
+    #[test]
+    fn note_input_gap_applies_at_the_same_hop_whatever_the_batch_split() {
+        let len = 6_000;
+        let gap_at = 250u64 * 15 + 4_000;
+        let run = |split: Option<u64>| {
+            let (mut tm, hops) = keyed_manager(len);
+            tm.note_input_gap(gap_at);
+            let mut events = Vec::new();
+            let at = split.map_or(hops.len(), |s| hops.iter().position(|h| h.m == s).unwrap());
+            for batch in [&hops[..at], &hops[at..]] {
+                events.extend(tm.process_hops(batch, |m| m * 256));
+            }
+            let epoch = tm.continuity_epoch();
+            let decoders: Vec<u32> = tm
+                .tracks
+                .values()
+                .filter_map(|t| t.decoder.as_ref().map(|d| d.continuity_epoch()))
+                .collect();
+            (skeleton_of(&events), epoch, decoders)
+        };
+        let (whole, epoch, decoders) = run(None);
+        assert!(whole.iter().any(|e| e.starts_with('C')), "{whole:?}");
+        assert!(
+            !whole.iter().any(|e| e.starts_with('X')),
+            "the gap closed a track"
+        );
+        assert_eq!(epoch, 1);
+        assert_eq!(decoders, vec![1], "one track, its decoder invalidated once");
+        for split in [gap_at - 1, gap_at, gap_at + 1] {
+            assert_eq!(run(Some(split)).0, whole, "split at {split}");
+        }
+    }
+
+    /// `TrackPromoted`, `CharDecoded`, `WordBoundary` and `TrackClosed`, in
+    /// order, as `crates/manta-engine/tests/support/man202.rs` reads them.
+    fn skeleton_of(events: &[DecoderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::TrackPromoted {
+                    track_id,
+                    sample_ts,
+                    ..
+                } => Some(format!("P{track_id}@{sample_ts}")),
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph,
+                    ..
+                } => Some(format!("C{track_id}@{sample_ts}:{glyph:?}")),
+                DecoderEvent::WordBoundary {
+                    track_id,
+                    sample_ts,
+                    ..
+                } => Some(format!("W{track_id}@{sample_ts}")),
+                DecoderEvent::TrackClosed { track_id, closure } => {
+                    Some(format!("X{track_id}:{closure:?}"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_gap_pending_at_finish_is_applied_before_the_flush() {
+        // The stream ends inside a dah, with a gap noted for a hop never
+        // reached: the closing flush must not force that dah into a
+        // character, and the gap still counts.
+        let (mut tm, hops) = keyed_manager(6_000);
+        let mid_dah = hops
+            .windows(40)
+            .rposition(|w| w.iter().all(|h| h.power[10] > 1e-8))
+            .unwrap()
+            + 40;
+        let events = tm.process_hops(&hops[..mid_dah], |m| m * 256);
+        assert!(skeleton_of(&events).iter().any(|e| e.starts_with('C')));
+        let last_char_ts = events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded { sample_ts, .. } => Some(*sample_ts),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        tm.note_input_gap(u64::MAX / 512);
+        let flush = tm.finish();
+        assert_eq!(tm.continuity_epoch(), 1);
+        let dah_start_ts = hops[..mid_dah]
+            .iter()
+            .rev()
+            .take_while(|h| h.power[10] > 1e-8)
+            .last()
+            .unwrap()
+            .m
+            * 256;
+        for e in &flush {
+            if let DecoderEvent::CharDecoded { sample_ts, .. } = e {
+                assert!(
+                    *sample_ts < dah_start_ts && *sample_ts >= last_char_ts,
+                    "the flush forced a character from the dah open at the gap: {e:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_track_with_no_decoder_and_no_queue_takes_no_gap_marker() {
+        let (mut tm, hops) = keyed_manager(3_000);
+        tm.process_hops(&hops[..2_000], |m| m * 256);
+        let id = *tm.tracks.keys().next().unwrap();
+        let t = tm.tracks.get_mut(&id).unwrap();
+        t.decoder = None;
+        t.pending.clear();
+        t.note_input_gap(hops[2_000].m * 256);
+        assert!(t.input_gaps.is_empty(), "nothing spans the gap");
+    }
+
+    #[test]
+    fn input_gap_drains_the_refiners_backlog_before_resetting_it() {
+        let n = 64;
+        let mut tm = TrackManager::new(
+            n,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig {
+                refine_bw_hz: 30.0,
+                ..DecodeConfig::default()
+            },
+        );
+        let mk_hop = |m: u64, power: &Vec<f32>| {
+            let x: Vec<num_complex::Complex32> = power
+                .iter()
+                .map(|&p| num_complex::Complex32::new(p.sqrt(), 0.0))
+                .collect();
+            hop_with_x(m, x)
+        };
+        feed_warmup(&mut tm, n);
+        let mut power = quiet_power(n);
+        power[10] = 1e-9 * 10f32.powf(20.0 / 10.0);
+        let mut m = 250 * 15;
+        loop {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+            if tm
+                .tracks
+                .values()
+                .any(|t| t.state() == LifecycleState::Active)
+            {
+                break;
+            }
+        }
+        let id = *tm.tracks.keys().next().unwrap();
+        for _ in 0..(GROUP_DELAY_HOPS as u64 + 5) {
+            tm.step_hop(&mk_hop(m, &power), m);
+            m += 1;
+        }
+        let t = tm.tracks.get_mut(&id).unwrap();
+        let backlog = t.refiner_backlog.len();
+        assert!(backlog > 0, "the refiner must hold a backlog");
+        let pending_before = t.pending.len();
+        t.note_input_gap(m * 256);
+        assert_eq!(
+            t.pending.len(),
+            pending_before + backlog,
+            "backlog drained first"
+        );
+        assert!(t.refiner_backlog.is_empty());
+        assert_eq!(
+            t.refiner_hops_since_reset, 0,
+            "refiner reset after the drain"
+        );
+        assert!(t.clean_hist.is_empty() && t.phase_hist.is_empty());
+        assert_eq!(t.input_gaps.front(), Some(&(m * 256)));
+    }
+
+    #[test]
+    fn a_gap_marker_waits_in_an_unleased_tracks_queue() {
+        // A track whose decoder is not leased (MAN-313) keeps its gap
+        // markers; once leased, the gap applies before the first post-gap
+        // entry.
+        let (mut tm, hops) = keyed_manager(3_000);
+        tm.process_hops(&hops[..2_000], |m| m * 256);
+        let id = *tm.tracks.keys().next().unwrap();
+        let t = tm.tracks.get_mut(&id).unwrap();
+        let leased = t.decoder.take().expect("the keyed track decodes");
+        // A pre-gap entry still queued for the lease.
+        let before = hops[1_999].m * 256;
+        t.pending.push((1.0, 1.0, None, before, 20.0, 14_000_000.0));
+        t.note_input_gap(hops[2_000].m * 256);
+        tm.process_hops(&hops[2_000..2_500], |m| m * 256);
+        let t = tm.tracks.get_mut(&id).unwrap();
+        assert_eq!(t.input_gaps.len(), 1, "the marker waits for the lease");
+        t.decoder = Some(leased);
+        tm.process_hops(&hops[2_500..], |m| m * 256);
+        let t = &tm.tracks[&id];
+        assert!(t.input_gaps.is_empty());
+        assert_eq!(t.decoder.as_ref().unwrap().continuity_epoch(), 1);
     }
 
     #[test]
@@ -7481,6 +7883,8 @@ mod tests {
             DetectorConfig::default(),
             DecodeConfig::default(),
         );
+        // Match production startup: exclude the channelizer zero pre-roll.
+        tm.skip_preroll_hops((ch.filter_len() / ch.hop()) as u64);
         let mut all_events = Vec::new();
         for chunk in rendered.samples.chunks(4096) {
             let hops = ch.process(chunk);
@@ -8119,6 +8523,7 @@ mod tests {
         assert!(promoted.is_empty(), "{promoted:?}");
         assert_eq!(tm.close_counts().not_cw, 1);
         assert_eq!(closed_at.unwrap() - promo_hop.unwrap(), 1000);
+        assert_eq!(tm.close_counts().false_lease_hops, 1000);
         assert!(tm.confirmations() >= 1);
     }
 
@@ -9144,6 +9549,7 @@ mod tests {
     fn suppressed_crash_cannot_finish_dormant_wake_confirmation() {
         let cfg = DetectorConfig {
             hang_hops: 10,
+            confirm_hops: 19,
             non_cw_filter: false,
             rtty_filter: false,
             ..DetectorConfig::default()
@@ -9187,6 +9593,7 @@ mod tests {
     fn suppressed_crash_still_ages_the_dormant_expiry() {
         let cfg = DetectorConfig {
             hang_hops: 10,
+            confirm_hops: 19,
             non_cw_filter: false,
             reacquire_hops: 15,
             rtty_filter: false,

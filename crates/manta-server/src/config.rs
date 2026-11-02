@@ -470,6 +470,15 @@ pub struct ServerConfig {
     /// connect. Read only when `live_port` is set.
     #[serde(default = "default_live_bind_addr")]
     pub live_bind_addr: String,
+    /// MAN-322 D5: the RTTY telnet listener's port. `None` (the default,
+    /// field omitted) runs no RTTY listener. When set, a second telnet
+    /// listener binds `bind_addr` and serves RTTY spots only, with the
+    /// greeting, commands and `line_format` of `telnet_port`, which keeps
+    /// serving CW spots only. Each listener has its own connection cap and
+    /// per-IP quotas, sized by the `telnet_*` keys. Restart-only, like the
+    /// rest of `[server]`.
+    #[serde(default)]
+    pub rtty_telnet_port: Option<u16>,
     /// Overrides the telnet listener's per-source-IP connection quota
     /// (MAN-61) -- `None` (default, field omitted) uses the built-in
     /// default (16). `0` means "no per-IP cap" (only
@@ -1297,6 +1306,19 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.live_port, Some(7303));
         assert_eq!(cfg.live_bind_addr, "0.0.0.0");
+    }
+
+    #[test]
+    fn rtty_telnet_port_is_unset_by_default() {
+        let cfg: ServerConfig = toml::from_str("station_callsign = \"W3XYZ\"\n").unwrap();
+        assert_eq!(cfg.rtty_telnet_port, None);
+    }
+
+    #[test]
+    fn rtty_telnet_port_parses() {
+        let cfg: ServerConfig =
+            toml::from_str("station_callsign = \"W3XYZ\"\nrtty_telnet_port = 7304\n").unwrap();
+        assert_eq!(cfg.rtty_telnet_port, Some(7304));
     }
 
     #[test]

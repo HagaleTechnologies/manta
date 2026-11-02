@@ -124,8 +124,9 @@ logged and ignored. See
 
 ## [server]
 
-The telnet, JSON and metrics servers, and the optional live-state stream
-(`live_port`). Only `run` starts them. `doctor` reads
+The telnet, JSON and metrics servers, the optional live-state stream
+(`live_port`) and the optional RTTY telnet server (`rtty_telnet_port`). Only
+`run` starts them. `doctor` reads
 the table to check that each listener's address and port can bind right now
 and that `station_callsign` is not the example `N0CALL`. `status` reads
 `metrics_bind_addr` and `metrics_port` to find a running daemon, from the file
@@ -143,21 +144,22 @@ the config for both. The table needs `station_callsign`.
 | `operator_grid` | none; example `"FN03GW"`; unset leaves it out of the greeting | live: `run` with `[server]` | Maidenhead locator for the greeting, 4 or 6 characters. Also every JSON spot's `deGrid`, and its square's centre is `deLat`/`deLon` unless `operator_lat`/`operator_lon` are set (MAN-138). |
 | `operator_lat` | none; example `43.9375`; unset with no `operator_grid` sends `deLat` as `null` | live: `run` with `[server]` | Station latitude for JSON spots' `deLat`, decimal degrees, -90 to 90, south negative. Set with `operator_lon` or not at all; alongside `operator_grid` the point must lie inside that square, or config loading fails. See [DECISIONS/2026-10-11-man138-station-location.md](DECISIONS/2026-10-11-man138-station-location.md). |
 | `operator_lon` | none; example `-79.4583`; unset with no `operator_grid` sends `deLon` as `null` | live: `run` with `[server]` | Station longitude for JSON spots' `deLon`, decimal degrees, -180 to 180, west negative. Same pair and inside-the-grid rules as `operator_lat`. |
-| `bind_addr` | `"0.0.0.0"` | live: `run` with `[server]` | Address the telnet and JSON servers listen on; it does not move the metrics listener. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
+| `bind_addr` | `"0.0.0.0"` | live: `run` with `[server]` | Address the telnet (both, with `rtty_telnet_port`) and JSON servers listen on; it does not move the metrics listener. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `metrics_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]`, `status` and `health` | Address of `/metrics` and `/healthz`, which have no password. See [DECISIONS/2026-10-08-man132-metrics-loopback-bind.md](DECISIONS/2026-10-08-man132-metrics-loopback-bind.md). |
-| `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. |
+| `telnet_port` | `7300` | live: `run` with `[server]` | DX-cluster telnet port. Serves CW spots only (MAN-322). |
 | `json_port` | `7301` | live: `run` with `[server]` | JSON Lines and WebSocket spot stream; both share this port. |
 | `metrics_port` | `7302` | live: `run` with `[server]`, `status` and `health` | Prometheus metrics port; `manta status` and `manta health` dial it when given `--config` or `MANTA_CONFIG` and no `--addr`. |
 | `live_port` | none; example `7303`; unset runs no live-state listener | live: `run` with `[server]`; restart required | Live-state stream port; see [LIVE-STATE.md](LIVE-STATE.md). |
 | `live_bind_addr` | `"127.0.0.1"` | live: `run` with `[server]` and `live_port`; restart required | Address of the live-state listener, which has no password. The stream carries every track's decoded text; set `"0.0.0.0"` only for a dashboard on another machine, and firewall `live_port`. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
-| `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`. The uplink always sends the `"rbn"` layout. |
+| `rtty_telnet_port` | none; example `7304`; unset runs no RTTY telnet listener | live: `run` with `[server]`; restart required | RTTY DX-cluster telnet port, on `bind_addr`. Same greeting, commands and `line_format` as `telnet_port`, but it serves RTTY spots only, with speed in baud (`45 BPS`); `sh/dx CW` returns no rows here, as `sh/dx RTTY` does on `telnet_port`. Must differ from the other ports. See [MAN-322](DECISIONS/2026-11-01-man322-rtty-spot-outputs.md). |
+| `line_format` | `"rbn"` | live: `run` with `[server]` | Telnet spot-line layout, `"rbn"` or `"skimmer"`, on both telnet listeners. The uplink always sends the `"rbn"` layout. |
 | `status_interval_secs` | `60` | live: `run` with `[server]` | Seconds between one-line status reports in the log; `0` turns them off. |
 | `silent_input_warning_secs` | `600` | live: `run` with `[server]` and 2+ `[[input]]` | Seconds an input may decode no spots, while another input decodes some, before manta warns and sets `manta_input_silent{source}` to 1; `0` turns the check off; otherwise 60 to 86400. See [MAN-14](DECISIONS/2026-10-19-man14-per-receiver-hearing-visibility.md). |
 | `history_minutes` | `30` | live: `run` with `[server]`; restart required | Telnet replay retention in whole minutes, 0–1440, measured from the newest published spot's sample timestamp. Keeps at least the newest 50 spots and at most 10,000; `0` keeps only the newest 50. Loggers request `sh/dx 30m`; bare `sh/dx` returns 10 rows. See [MAN-93](DECISIONS/2026-10-11-man93-sh-dx-history-window.md). Also bounds the separate JSON resume history, with spots and grades together under the same floor and ceiling, counted in records; see [MAN-137](DECISIONS/2026-10-14-man137-json-stream-resume.md). |
-| `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
+| `telnet_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open telnet connections per client IP; `0` removes the limit. Each telnet listener counts separately. See [RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md). |
 | `json_max_connections_per_ip` | `16` | live: `run` with `[server]` | Open JSON and WebSocket connections per client IP; `0` removes the limit. The live-state listener applies the same quota, counted separately. |
 | `metrics_max_connections_per_ip` | `8` | live: `run` with `[server]` | Open metrics connections per client IP; `0` removes the limit. |
-| `telnet_max_commands_per_ip` | `30` | live: `run` with `[server]` | Telnet commands per client IP per 10 seconds; `0` removes the limit. |
+| `telnet_max_commands_per_ip` | `30` | live: `run` with `[server]` | Telnet commands per client IP per 10 seconds; `0` removes the limit. Each telnet listener counts separately. |
 | `json_max_pings_per_ip` | `10` | live: `run` with `[server]` | WebSocket pings per client IP per 60 seconds; `0` removes the limit. The live-state listener applies the same budget, counted separately. |
 | `metrics_max_requests_per_ip` | `60` | live: `run` with `[server]` | Metrics connections per client IP per 60 seconds; `0` removes the limit. |
 
@@ -632,9 +634,10 @@ milliseconds, 0 to 3600000.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
-| `on_snr_db` | `12.0` | live | SNR, dB, that starts a track; 0 to 100. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `on_snr_db` | `11.5` | live | Threshold, dB over the detection floor, that both disjoint power windows must average before rise; 0 to 100. The 40 ms EMA also rises at this threshold or 12 dB, whichever is higher. See [SPEC §9](SPEC-decode-core.md#9-configuration-keys). |
+| `integrator_hops` | `[38, 38]` | live | Two integration lengths, each 1 to 375 hops. Each length requires two full disjoint windows above `on_snr_db`; either length can produce rise. Window rise applies only where the channel's window is the largest within two channels, and only to start or wake a track. |
 | `off_snr_db` | `3.0` | live | SNR, dB, below which a track counts as silent; 0 to `on_snr_db`. |
-| `confirm_ms` | `50.0` | live | How long a signal must last before it is decoded; at most 3600000 (1 h), and must round to at least one hop. |
+| `confirm_ms` | `50.0` | live | How long rise must stay true before a candidate becomes active; at most 3600000 (1 h), and must round to at least one hop. |
 | `hang_ms` | `5000.0` | live | How long a silent track waits before it closes; at most 3600000 (1 h), and must round to at least one hop. |
 | `reacquire_ms` | `10000.0` | live | After `hang_ms`, how long a track that has decoded characters keeps its identity and frequency while its signal is gone. No decoder runs in that time. If the signal comes back, the track resumes under the same track ID with a fresh decoder. 0 to 3600000 (1 h); `0` restores the previous behaviour (close at `hang_ms`). See [SPEC §2.4](SPEC-decode-core.md#24-track-lifecycle-state-machine) and [MAN-108](DECISIONS/2026-10-17-man108-dormant-track-reacquisition.md). |
 | `gc_ms` | `30000.0` | live | A track that decodes no character for this long is closed; at most 3600000 (1 h), and must round to at least one hop. |

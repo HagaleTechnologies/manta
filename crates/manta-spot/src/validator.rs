@@ -59,26 +59,48 @@ pub enum EmissionState {
     Tentative,
 }
 
+/// The mode a spot was decoded in (MAN-322). Every spot the validator
+/// builds today is `Cw`; `Rtty` is set by the RTTY decode path the MAN-321
+/// follow-up adds. Outputs read it to pick the mode label and the speed
+/// unit (WPM for CW, baud for RTTY).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SpotMode {
+    #[default]
+    Cw,
+    Rtty,
+}
+
+impl SpotMode {
+    /// The wire label: `"CW"` or `"RTTY"`, as JSON, the telnet mode column
+    /// and the RBN uplink line spell it.
+    pub fn label(self) -> &'static str {
+        match self {
+            SpotMode::Cw => "CW",
+            SpotMode::Rtty => "RTTY",
+        }
+    }
+}
+
 /// A validated spot, ready for `manta-server` to serialize and emit.
 /// No wall-clock timestamp -- that conversion happens at the
 /// `manta-server` boundary (SPEC-decode-core.md §5), not here.
 ///
 /// Serialized only by the CLI (`decode --json`'s `spots`, `run --json`'s
-/// `{"spot": …}`); field names follow the JSON spot stream (MAN-139,
-/// docs/CLI-JSON.md). manta-server builds its own `SpotMessage` instead.
+/// `{"spot": …}`) through `SpotJson`; field names follow the JSON spot
+/// stream (MAN-139, docs/CLI-JSON.md). manta-server builds its own
+/// `SpotMessage` instead.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(into = "SpotJson")]
 pub struct Spot {
-    #[serde(rename = "dxCall")]
     pub callsign: String,
-    #[serde(rename = "frequency")]
     pub freq_hz: f64,
     /// 2500 Hz-referenced; `snr` in JSON.
-    #[serde(rename = "snr")]
     pub snr_db: f32,
+    /// CW keying speed in WPM. Outputs read it only when `mode` is
+    /// [`SpotMode::Cw`]; an RTTY spot carries its speed in `baud` (MAN-322).
     pub wpm: f32,
     pub spot_type: SpotType,
-    #[serde(rename = "decodeConfidence")]
     pub confidence: f32,
     /// `confirmed` when the pattern tier's repetition requirement is met,
     /// otherwise `tentative`. CLI JSON only (MAN-106).
@@ -94,6 +116,73 @@ pub struct Spot {
     /// Sticky for the track's life and never forwarded through a merge
     /// (MAN-272 decisions D4/D5).
     pub qrl_query: bool,
+    /// The mode this spot was decoded in (MAN-322). The validator stamps
+    /// `Cw`; the RTTY decode path sets `Rtty`.
+    pub mode: SpotMode,
+    /// RTTY symbol rate in baud (`45.45` for standard amateur RTTY), or
+    /// `None` on a CW spot (MAN-322).
+    pub baud: Option<f32>,
+}
+
+/// The CLI JSON shape of a [`Spot`] (MAN-139, docs/CLI-JSON.md): `wpm` is
+/// `null` on a non-CW spot, and `mode`/`baud` follow `qrlQuery` (MAN-322).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpotJson {
+    #[serde(rename = "dxCall")]
+    callsign: String,
+    #[serde(rename = "frequency")]
+    freq_hz: f64,
+    #[serde(rename = "snr")]
+    snr_db: f32,
+    wpm: Option<f32>,
+    spot_type: SpotType,
+    #[serde(rename = "decodeConfidence")]
+    confidence: f32,
+    emission_state: EmissionState,
+    track_id: u32,
+    sample_ts: u64,
+    rst: Option<String>,
+    qrl_query: bool,
+    mode: SpotMode,
+    baud: Option<f32>,
+}
+
+impl From<Spot> for SpotJson {
+    fn from(spot: Spot) -> Self {
+        // Exhaustive: a new `Spot` field stops this compiling until it is
+        // serialized.
+        let Spot {
+            callsign,
+            freq_hz,
+            snr_db,
+            wpm,
+            spot_type,
+            confidence,
+            emission_state,
+            track_id,
+            sample_ts,
+            rst,
+            qrl_query,
+            mode,
+            baud,
+        } = spot;
+        Self {
+            callsign,
+            freq_hz,
+            snr_db,
+            wpm: (mode == SpotMode::Cw).then_some(wpm),
+            spot_type,
+            confidence,
+            emission_state,
+            track_id,
+            sample_ts,
+            rst,
+            qrl_query,
+            mode,
+            baud,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1814,6 +1903,8 @@ impl Validator {
             sample_ts,
             rst,
             qrl_query,
+            mode: SpotMode::Cw,
+            baud: None,
         };
         self.admit(spot, reps, is_allowlisted)
     }
@@ -2159,6 +2250,8 @@ impl Validator {
                     sample_ts: pb.sample_ts,
                     rst: rst.clone(),
                     qrl_query,
+                    mode: SpotMode::Cw,
+                    baud: None,
                 };
                 self.admit(spot, reps, false)
             })
@@ -3304,6 +3397,53 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(spots[0].spot_type, SpotType::Beacon);
         assert_eq!(spots[0].rst.as_deref(), Some("599"));
         assert!(spots[0].qrl_query);
+        // MAN-322: the validator stamps every spot it builds as CW.
+        assert_eq!(spots[0].mode, SpotMode::Cw);
+        assert!(spots[0].baud.is_none());
+    }
+
+    #[test]
+    fn spot_mode_labels_and_serializes_in_capitals() {
+        assert_eq!(SpotMode::Cw.label(), "CW");
+        assert_eq!(SpotMode::Rtty.label(), "RTTY");
+        assert_eq!(serde_json::to_value(SpotMode::Rtty).unwrap(), "RTTY");
+        assert_eq!(serde_json::to_value(SpotMode::Cw).unwrap(), "CW");
+        assert_eq!(SpotMode::default(), SpotMode::Cw);
+    }
+
+    /// MAN-322 D4: CLI JSON appends `mode` and `baud` after `qrlQuery`, and
+    /// sends `wpm` as `null` on an RTTY spot.
+    #[test]
+    fn cli_json_appends_mode_and_baud_and_nulls_wpm_on_rtty() {
+        let cw = Spot {
+            callsign: "W1AW".into(),
+            freq_hz: 14_000_759.2,
+            snr_db: 29.2,
+            wpm: 19.9,
+            spot_type: SpotType::Cq,
+            confidence: 0.794,
+            emission_state: EmissionState::Confirmed,
+            track_id: 1,
+            sample_ts: 0,
+            rst: None,
+            qrl_query: false,
+            mode: SpotMode::Cw,
+            baud: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&cw).unwrap(),
+            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"emissionState":"confirmed","trackId":1,"sampleTs":0,"rst":null,"qrlQuery":false,"mode":"CW","baud":null}"#
+        );
+        let rtty = Spot {
+            wpm: 0.0,
+            mode: SpotMode::Rtty,
+            baud: Some(45.45),
+            ..cw
+        };
+        assert_eq!(
+            serde_json::to_string(&rtty).unwrap(),
+            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":null,"spotType":"cq","decodeConfidence":0.794,"emissionState":"confirmed","trackId":1,"sampleTs":0,"rst":null,"qrlQuery":false,"mode":"RTTY","baud":45.45}"#
+        );
     }
 
     #[test]
