@@ -24,14 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
 - MAN-112: frequency-anchored association keeps independently keyed close
   pairs on separate tracks. V7 returns to its specified 150 Hz spacing.
   Close-pair track identities, decoded text and spot frequencies change.
   See docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md for the
   measured separation limits and the experimental frontend verdict.
-
-=======
 - MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
   gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
   spot is still CW, so `mode` is `"CW"` and `baud` is `null` on every spot
@@ -41,7 +38,6 @@ the git history and `docs/DECISIONS/`.
   line. With that port set, `/metrics` adds
   `manta_listener_up{listener="rtty_telnet"}`. See
   docs/DECISIONS/2026-11-01-man322-rtty-spot-outputs.md.
->>>>>>> 3a6f3c9d05ec0e11b7a71247b40b8ef4c099b536
 - MAN-109: add rise from two disjoint power windows alongside the 12 dB EMA rise; keep the 19-hop confirmation and the EMA for drop and SNR.
 - MAN-106 first slice: candidates with no finite positive character
   confidence are withheld as `noEvidence`. CLI JSON spots gain

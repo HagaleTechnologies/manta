@@ -449,15 +449,21 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   Distances wrap around the FFT; exact ties go to the lower track id.
   If no exclusive channel remains, use the existing cooldown-aware maximum,
   falling back to the plain maximum only when all owned channels are cooling
-  (MAN-197). The centre snapshot is taken before driving any track.
+  (MAN-197). Before the straddle override, if a selected channel is more
+  than 1.0 channel from the centre, two consecutive complex observations
+  at least 6 dB above its floor reject it when its phase position is more
+  than 0.6 channel from the centre. Select the strongest remaining exclusive,
+  non-cooling owned channel passing that phase check; if none remains,
+  retain the previous selection. Missing phase evidence does not reject a
+  channel. The centre snapshot is taken before driving any track.
 - With a neighbor within 2.5 channels, decoder input uses
   the rounded centre when that channel is exclusive and
   not cooling; otherwise it uses the selected channel. Tracking retains the
   exclusive max-power selection (F1, MAN-112). The optional
-  refiner remains on the centroid channel. At a straddle (at least 0.35
+  refiner remains on the centroid channel. At a straddle (at least 0.40
   channel from the nearest integer), the closest neighbor within 2.5 channels
   selects the straddle channel away from that neighbor, provided it is
-  exclusive and not cooling. This selection stays fixed through keying. The experimental steered frontend
+  exclusive and not cooling. This selection ignores instantaneous neighbor strength. The experimental steered frontend
   is off by default and is available only through the Rust pipeline config.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
   both pass the ownership admission rule, a spawn decision at `k` creates one CANDIDATE at the
