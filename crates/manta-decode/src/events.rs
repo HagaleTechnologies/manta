@@ -72,6 +72,13 @@ pub enum DecoderEvent {
         /// `frequency` in JSON (MAN-139).
         #[serde(rename = "frequency")]
         freq_hz: f64,
+        /// MAN-201: the newest character this track's decoder has decoded,
+        /// released or still held back by the MAN-317 prior; `0` with none.
+        /// `sample_ts` runs ahead of held words, so a silence bound measured
+        /// from a released word alone would read a word still in hand as
+        /// silence. In-process only: no event-stream field.
+        #[serde(skip)]
+        last_char_ts: u64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,
     /// element-gap, char-gap and word-gap durations, mean and variance in
@@ -360,6 +367,7 @@ mod tests {
                     sample_ts: 102_656,
                     snr_2500_db: 22.5,
                     freq_hz: 14_012_341.5,
+                    last_char_ts: 0,
                 },
                 Some(
                     r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5}"#,

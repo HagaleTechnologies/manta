@@ -851,6 +851,10 @@ pub fn listen_with_observers(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-201: no track exists yet, so a stall has nothing to settle.
+            if src.take_stalled() {
+                continue;
+            }
             // MAN-252: a live source's wrapper reports a stop request during
             // an outage as EOF; that is the stop, not a source that ended.
             if stop.load(Ordering::Relaxed) {
@@ -977,6 +981,17 @@ pub fn listen_with_observers(
                 if let Some(obs) = lifecycle {
                     obs.clear_active();
                 }
+                // MAN-201: a call that was held for its role is decided now;
+                // nothing later will settle it. Not evidence the signal
+                // ended, so the outage teardown.
+                let finish_events = seg.tm.finish_for_discontinuity();
+                emit(
+                    finish_events,
+                    &mut validator,
+                    &mut ctx,
+                    &mut on_event,
+                    &mut on_spot,
+                );
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
                 on_tracks(0);
@@ -984,6 +999,20 @@ pub fn listen_with_observers(
             }
         };
         if n == 0 {
+            // MAN-201: a stalled stream delivers no hops, so close its
+            // tracks here (the outage teardown) and read on: their last
+            // calls settle now, not when the stream returns.
+            if src.take_stalled() {
+                let finish_events = seg.tm.finish_for_discontinuity();
+                emit(
+                    finish_events,
+                    &mut validator,
+                    &mut ctx,
+                    &mut on_event,
+                    &mut on_spot,
+                );
+                continue;
+            }
             break;
         }
         // MAN-305: a short loss the source spliced over. Advancing
@@ -1479,6 +1508,10 @@ pub(crate) fn run_input_front(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-201: as `listen_with_observers`.
+            if src.take_stalled() {
+                continue;
+            }
             // MAN-252, as `listen_with_observers`: a live source's wrapper
             // reports a stop request during an outage as EOF; that is the
             // stop, not a source that ended.
@@ -1557,6 +1590,14 @@ pub(crate) fn run_input_front(
             }
         };
         if n == 0 {
+            // MAN-201, as `listen_with_observers`.
+            if src.take_stalled() {
+                let finish_events = seg.tm.finish_for_discontinuity();
+                if !send(batch(finish_events, seg_base + seg_consumed, &seg.tm)) {
+                    return Ok(());
+                }
+                continue;
+            }
             break;
         }
         // MAN-305, as `listen_with_observers`: a spliced loss advances
@@ -1695,6 +1736,7 @@ mod tests {
             sample_ts: start_ts,
             snr_2500_db: 20.0,
             freq_hz: 14_012_340.0 + f64::from(track_id),
+            last_char_ts: 0,
         }];
         let mut ts = start_ts;
         for word in ["DE", "W1AW", "K"] {
@@ -1799,6 +1841,7 @@ mod tests {
                 sample_ts,
                 snr_2500_db: 20.0,
                 freq_hz: 14_030_000.0,
+                last_char_ts: 0,
             };
             // Live batches arrive in input order, not common-clock order.
             back.ingest(

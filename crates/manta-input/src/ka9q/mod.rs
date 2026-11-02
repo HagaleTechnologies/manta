@@ -33,6 +33,11 @@ use wire::{ChannelStatus, Encoding, SeqObservation, SeqTracker};
 /// feature-gated and must not become a dependency of this module.
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// MAN-201: how long a delivering stream may stop before `read` reports
+/// `take_stalled`: the validator's 5 s silence turn end, which a stream
+/// delivering no hops cannot reach on its own.
+const SETTLE_AFTER: Duration = Duration::from_secs(5);
+
 /// The status socket's receive timeout while `open` waits for status. The
 /// data socket is drained (one `DRAIN_BATCH` per pass) between status
 /// receives, so this bounds how long RTP queues unread in the kernel and how
@@ -376,6 +381,10 @@ pub struct Ka9qIqSource {
     recv_buf: Vec<u8>,
     last_accepted: Instant,
     stall_timeout: Duration,
+    /// MAN-201: samples have been returned since the last stall report.
+    delivering: bool,
+    /// MAN-201: pending for `take_stalled`.
+    stalled: bool,
     confirmed_live: Arc<AtomicBool>,
     counters: Arc<InputHealthCounters>,
     /// MAN-259: `open`'s runtime up to where the replayed stream starts
@@ -448,6 +457,8 @@ impl Ka9qIqSource {
             recv_buf: vec![0u8; RECV_BUF_LEN],
             last_accepted: Instant::now(),
             stall_timeout: cfg.stall_timeout,
+            delivering: false,
+            stalled: false,
             confirmed_live: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(InputHealthCounters::new()),
             acquisition_start_offset,
@@ -840,7 +851,19 @@ impl IqSource for Ka9qIqSource {
                 for (dst, src) in buf.iter_mut().zip(self.queue.drain(..n)) {
                     *dst = src;
                 }
+                self.delivering = true;
                 return Ok(n);
+            }
+            // MAN-201: stopped but within the stall bound. The engine
+            // settles each track's last call now; a channel can stay in
+            // radiod's status for as long as it likes with no RTP.
+            if self.delivering
+                && self.stall_timeout > SETTLE_AFTER
+                && self.last_accepted.elapsed() >= SETTLE_AFTER
+            {
+                self.delivering = false;
+                self.stalled = true;
+                return Ok(0);
             }
             if self.last_accepted.elapsed() >= self.stall_timeout {
                 bail!(
@@ -857,6 +880,10 @@ impl IqSource for Ka9qIqSource {
                 Err(e) => return Err(e).context("ka9q-radio: data socket"),
             }
         }
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {

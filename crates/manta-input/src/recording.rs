@@ -105,6 +105,9 @@ pub struct RecordingSource<S: ?Sized> {
     inner: Box<S>,
     shared: Arc<Shared>,
     pending_gap: Option<u64>,
+    /// MAN-201: the inner source reported a stall, pending for
+    /// `take_stalled()`.
+    stalled: bool,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -238,6 +241,7 @@ fn start_with_sinks<S: IqSource + ?Sized>(
             inner,
             shared: shared.clone(),
             pending_gap: None,
+            stalled: false,
             stop: None,
         },
         RecordingHandle {
@@ -437,7 +441,9 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         let gap = self.inner.take_discontinuity();
         self.pending_gap = gap;
         self.enqueue(gap, &buf[..n]);
-        if n == 0 {
+        // MAN-201: a stalled stream's `0` is not an end of input.
+        self.stalled = n == 0 && self.inner.take_stalled();
+        if n == 0 && !self.stalled {
             // A live source answers a stop request with EOF: that is a
             // stopped session, not an input that ended.
             let stopping = self
@@ -471,6 +477,10 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
     // so a replay runs the samples on either side of it together.
     fn take_unknown_gap(&mut self) -> bool {
         self.inner.take_unknown_gap()
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn acquisition_start_offset(&self) -> std::time::Duration {

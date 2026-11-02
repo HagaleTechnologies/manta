@@ -3470,6 +3470,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
             sample_ts: 102_656,
             snr_2500_db: 22.6,
             freq_hz: 14_012_341.5,
+            last_char_ts: 0,
         },
         DecoderEvent::TimingUpdate {
             track_id: 1,

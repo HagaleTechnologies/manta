@@ -53,6 +53,7 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
 }
 
@@ -174,6 +175,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
         sample_ts: 0,
         snr_2500_db: 0.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
     let words = ["DE", "K5ARH", "K"];
 
@@ -196,6 +198,7 @@ fn v15_dedupe_suppresses_then_allows_on_snr_jump() {
         sample_ts: 0,
         snr_2500_db: 6.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
     let allowed = run(&transmission_events(1, &words, 300_000), &mut v);
     assert!(
@@ -330,6 +333,7 @@ fn v22_exempt_spot_waits_for_track_metadata_before_emitting() {
         sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
+        last_char_ts: 0,
     });
     assert!(
         more_spots
@@ -418,6 +422,7 @@ fn v25_pending_candidate_retried_when_metadata_arrives_with_no_further_words() {
         sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
+        last_char_ts: 0,
     });
     assert!(
         spots.iter().any(|s| s.callsign == "QQ9ZZZ"),
@@ -702,6 +707,7 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         sample_ts: 0,
         snr_2500_db: 15.0,
         freq_hz: 14_020_000.0,
+        last_char_ts: 0,
     });
     // Round 7 redesign: a non-allowlisted Beacon candidate is only ever
     // captured here (has_meta's retry lets it be captured at all, having
@@ -1639,6 +1645,7 @@ fn recording_decisions_never_changes_spots() {
             sample_ts: 0,
             snr_2500_db: snr,
             freq_hz: 14_000_000.0,
+            last_char_ts: 0,
         };
         v.ingest(&meta(0.0));
         let words = ["DE", "K5ARH", "K"];

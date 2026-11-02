@@ -1078,22 +1078,34 @@ impl Validator {
                 track_id,
                 snr_2500_db,
                 freq_hz,
-                ..
+                sample_ts: meta_ts,
+                last_char_ts,
             } => {
+                let turn_silence_samples = self.turn_silence_samples;
                 let track = self.tracks.entry(*track_id).or_default();
                 let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
                 track.has_meta = true;
                 let sample_ts = track.last_sample_ts;
-                // MAN-201 D3: no silence turn end is read from `TrackMeta`.
-                // Its timestamp runs ahead of a decoder that holds words
-                // back (the MAN-317 prior): measured on V8 with
-                // `prior = "on"`, comparing it with the newest word's
-                // boundary ended a turn after every word and spotted 40 of
-                // 50 clean calls instead of 45+. A silent tail settles on
-                // the next character (`CharDecoded`, same clock as the
-                // words) or at the track's close instead.
+                // MAN-201 D3: `TURN_SILENCE_SECONDS` with no decoded
+                // character after the newest word ends its turn, which
+                // settles that word's role; decide it now. Measured from
+                // the decoder's own newest character, not the newest word
+                // released here: `meta_ts` runs ahead of a word the MAN-317
+                // prior still holds, which is no silence (V8 with
+                // `prior = "on"`).
+                let silent_tail = track.current.text.is_empty()
+                    && track.words.back_mut().is_some_and(|back| {
+                        let quiet_from = back.end_ts.max(*last_char_ts);
+                        let silent = !back.ends_turn
+                            && meta_ts.saturating_sub(quiet_from) >= turn_silence_samples;
+                        back.ends_turn |= silent;
+                        silent
+                    });
+                if silent_tail {
+                    return self.try_spot(*track_id, sample_ts, false);
+                }
                 // Retry: a candidate held back by the has_meta gate is
                 // otherwise only ever re-evaluated by a later
                 // WordBoundary, which a short transmission may never
@@ -2397,6 +2409,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_000_000.0,
+            last_char_ts: 0,
         });
     }
 
@@ -2587,6 +2600,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_010_000.0,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = Vec::new();
@@ -2751,6 +2765,46 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
         assert_eq!(spots.len(), 1);
         assert!(v.take_decisions().is_empty());
+    }
+
+    fn meta_with_chars(track_id: u32, sample_ts: u64, last_char_ts: u64) -> DecoderEvent {
+        DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_020_000.0,
+            last_char_ts,
+        }
+    }
+
+    /// MAN-201 D3: silence after the tail word ends its turn at a `TrackMeta`,
+    /// which settles the call without waiting for the track to close.
+    #[test]
+    fn a_silent_tail_settles_at_track_meta() {
+        let mut v = Validator::bundled(FS);
+        v.allowlist("K5ARH");
+        seed_meta(&mut v, 1);
+        let events = transmission_events(1, &["DE", "K5ARH"], 1_000);
+        assert!(run(&events, &mut v).is_empty(), "the tail is unsettled");
+        let end = 1_000 + 2_000;
+        let spots = v.ingest(&meta_with_chars(1, end + 480_000, end));
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// MAN-201 D3: the MAN-317 prior holds a word's characters until it
+    /// ends. A newer character in the decoder's hands is not silence, even
+    /// though nothing newer than the tail has reached the validator.
+    #[test]
+    fn a_word_the_decoder_still_holds_is_not_silence() {
+        let mut v = Validator::bundled(FS);
+        v.allowlist("K5ARH");
+        seed_meta(&mut v, 1);
+        let events = transmission_events(1, &["DE", "K5ARH"], 1_000);
+        assert!(run(&events, &mut v).is_empty());
+        let now = 1_000 + 2_000 + 480_000;
+        let spots = v.ingest(&meta_with_chars(1, now, now - 96_000));
+        assert!(spots.is_empty(), "{spots:?}");
     }
 
     #[test]
@@ -3022,6 +3076,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz,
+            last_char_ts: 0,
         });
     }
 
@@ -3837,6 +3892,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 sample_ts: 0,
                 snr_2500_db: 20.0,
                 freq_hz,
+                last_char_ts: 0,
             });
         };
 
@@ -4330,7 +4386,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
-            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket
+            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket,
+            last_char_ts: 0,
         });
         let spots = run(&transmission_events(2, &words, 100_000), &mut v);
 
@@ -4354,7 +4411,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
-            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket
+            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4383,6 +4441,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: RAW_FREQ_HZ,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4405,6 +4464,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_027_000.0,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4577,6 +4637,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 track_id,
                 snr_2500_db: 20.0,
                 freq_hz: 14_000_000.0 + (track_id as f64) * 1000.0,
+                last_char_ts: 0,
             });
             run(&transmission_events(track_id, &words, 0), &mut v);
             v.ingest(&DecoderEvent::TrackClosed {
