@@ -74,8 +74,10 @@ multi-input run. V8 is back at 48 of 50 at weights 0, 1 and 2.
 A stalled stream delivers no hops, so no `TrackMeta` arrives and a tail call
 would wait for the stream to return. `IqSource::take_stalled` reports it:
 `read` returns `Ok(0)` with the flag set, which is not an end of stream, and
-the engine closes that input's tracks with the outage teardown. ka9q reports 5
-s after a delivering stream stops. Other live sources report when
+the engine closes that input's tracks with the outage teardown. Samples after
+the stall start a fresh segment, as a discontinuity of length 0. A recording
+keeps the stall as a zero-length `gap` record, so a replay resets the same
+state. ka9q reports 5 s after a delivering stream stops. Other live sources report when
 `ReconnectingSource` loses them, at their own stall bound; MAN-489 brings them
 to 5 s. A read error closes tracks the same way.
 

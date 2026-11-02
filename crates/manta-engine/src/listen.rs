@@ -994,6 +994,7 @@ pub fn listen_with_observers(
     }
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    let mut stalled = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1044,6 +1045,7 @@ pub fn listen_with_observers(
                     &mut on_event,
                     &mut on_spot,
                 );
+                stalled = true;
                 continue;
             }
             break;
@@ -1056,7 +1058,12 @@ pub fn listen_with_observers(
         // the loss is also held at its boundary (`seg_consumed`), so the
         // hops the channelizer still buffers from before it keep their
         // time.
-        let cont = ReadContinuity::take(&mut *src);
+        let mut cont = ReadContinuity::take(&mut *src);
+        // MAN-201: samples after a stall start a fresh segment, a
+        // zero-length discontinuity, as a replay of its `gap` record does.
+        if std::mem::take(&mut stalled) {
+            cont.discontinuity.get_or_insert(0);
+        }
         if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
@@ -1634,6 +1641,7 @@ pub(crate) fn run_input_front(
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     let mut read_error = None;
+    let mut stalled = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1652,6 +1660,7 @@ pub(crate) fn run_input_front(
                 if !send(batch(finish_events, seg_base + seg_consumed, &seg.tm)) {
                     return Ok(());
                 }
+                stalled = true;
                 continue;
             }
             break;
@@ -1659,7 +1668,12 @@ pub(crate) fn run_input_front(
         // MAN-305, as `listen_with_observers`: a spliced loss advances
         // this input's clock without closing its tracks, and (MAN-423) is
         // held at its boundary, so hops already buffered keep their time.
-        let cont = ReadContinuity::take(&mut *src);
+        let mut cont = ReadContinuity::take(&mut *src);
+        // MAN-201: samples after a stall start a fresh segment, a
+        // zero-length discontinuity, as a replay of its `gap` record does.
+        if std::mem::take(&mut stalled) {
+            cont.discontinuity.get_or_insert(0);
+        }
         if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
@@ -4333,6 +4347,87 @@ mod tests {
         let got = to_common(vec![event(1_000, 900), event(1_000, 0)], clock, 1.0);
         assert_eq!(got[0], event(2_000, 1_800));
         assert_eq!(got[1], event(2_000, 0));
+    }
+
+    /// Stops at `at` samples: with `stall`, reporting a stall, otherwise
+    /// resuming behind a zero-length recorded gap.
+    struct PausingSource {
+        inner: FixedFreqSource,
+        at: usize,
+        stall: bool,
+        paused: bool,
+        stalled: bool,
+        gap: Option<u64>,
+    }
+
+    impl IqSource for PausingSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.paused && self.inner.cursor == self.at {
+                self.paused = true;
+                if self.stall {
+                    self.stalled = true;
+                    return Ok(0);
+                }
+                self.gap = Some(0);
+            }
+            let n = if self.inner.cursor < self.at {
+                (self.at - self.inner.cursor).min(buf.len())
+            } else {
+                buf.len()
+            };
+            self.inner.read(&mut buf[..n])
+        }
+        fn take_stalled(&mut self) -> bool {
+            std::mem::take(&mut self.stalled)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    /// MAN-201: a stall resets the pipeline as a replay of its zero-length
+    /// `gap` record does, so both decode the samples after it alike.
+    #[test]
+    fn a_stall_and_its_recorded_gap_produce_the_same_events() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 8.0;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let run = |stall| {
+            let src = PausingSource {
+                inner: FixedFreqSource {
+                    samples: samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                },
+                at: 400_000,
+                stall,
+                paused: false,
+                stalled: false,
+                gap: None,
+            };
+            let mut events = Vec::new();
+            listen_with_observers(
+                Box::new(src),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                ListenObservers::default(),
+                |e| events.push(e.clone()),
+                |_| {},
+                |_| {},
+            )
+            .unwrap();
+            events
+        };
+        let stalled = run(true);
+        assert!(!stalled.is_empty());
+        assert_eq!(stalled, run(false));
     }
 
     /// Delivers its samples, then fails: a dead receiver.
