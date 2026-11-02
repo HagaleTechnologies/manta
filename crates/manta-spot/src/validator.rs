@@ -2894,6 +2894,38 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(spots.is_empty(), "{spots:?}");
     }
 
+    /// MAN-201 D6: a candidate is bound to its exact word, not the newest
+    /// word sharing its text.
+    #[test]
+    fn exact_binding_evaluates_the_occurrence_not_the_newest_same_text_word() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K1ABC", "K", "K1ABC", "DE", "W1AW", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "K1ABC");
+        assert_eq!(d.len(), 1, "{log:?}");
+        assert_eq!(d[0].sample_ts, 800, "the first occurrence's boundary");
+    }
+
+    /// MAN-201 D5: the V41 shape. A held occurrence reaches the gate at its
+    /// own time, so two calls 80 s apart still confirm.
+    #[test]
+    fn held_occurrences_are_recorded_in_the_gate_at_their_own_time() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let mut spots = run(&transmission_events(1, &["DE", "K5ARH"], 0), &mut v);
+        spots.extend(run(
+            &transmission_events(1, &["DE", "K5ARH"], (80.0 * FS) as u64),
+            &mut v,
+        ));
+        spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        }));
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
     #[test]
     fn a_first_decode_is_withheld_for_repetition_then_spotted_on_the_second() {
         let mut v = recording(CTY_FIXTURE);

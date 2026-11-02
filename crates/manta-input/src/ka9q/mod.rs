@@ -381,6 +381,8 @@ pub struct Ka9qIqSource {
     recv_buf: Vec<u8>,
     last_accepted: Instant,
     stall_timeout: Duration,
+    /// MAN-201: `SETTLE_AFTER`, a field so a test need not wait it out.
+    settle_after: Duration,
     /// MAN-201: samples have been returned since the last stall report.
     delivering: bool,
     /// MAN-201: pending for `take_stalled`.
@@ -457,6 +459,7 @@ impl Ka9qIqSource {
             recv_buf: vec![0u8; RECV_BUF_LEN],
             last_accepted: Instant::now(),
             stall_timeout: cfg.stall_timeout,
+            settle_after: SETTLE_AFTER,
             delivering: false,
             stalled: false,
             confirmed_live: Arc::new(AtomicBool::new(false)),
@@ -858,8 +861,8 @@ impl IqSource for Ka9qIqSource {
             // settles each track's last call now; a channel can stay in
             // radiod's status for as long as it likes with no RTP.
             if self.delivering
-                && self.stall_timeout > SETTLE_AFTER
-                && self.last_accepted.elapsed() >= SETTLE_AFTER
+                && self.stall_timeout > self.settle_after
+                && self.last_accepted.elapsed() >= self.settle_after
             {
                 self.delivering = false;
                 self.stalled = true;
@@ -1762,6 +1765,24 @@ mod tests {
             f.send_rtp(SSRC, 6, Encoding::F32Le, &good);
             assert_eq!(read_n(&mut src, 180), good);
             assert_eq!(src.counters.malformed_packets(), 6);
+        }
+
+        /// MAN-201: a delivering stream that stops reports one stall inside
+        /// the stall bound, then still fails at the bound.
+        #[test]
+        fn a_stopped_stream_reports_a_stall_once_before_the_stall_timeout() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            src.settle_after = Duration::from_millis(200);
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            assert!(src.read(&mut buf).unwrap() > 0);
+            assert!(!src.take_stalled());
+            assert_eq!(src.read(&mut buf).unwrap(), 0);
+            assert!(src.take_stalled());
+            assert!(!src.take_stalled());
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(e.contains("stream stalled"), "{e}");
         }
 
         #[test]

@@ -4304,6 +4304,58 @@ mod tests {
         (spots, reads.load(Ordering::Relaxed))
     }
 
+    /// Delivers its samples, then fails: a dead receiver.
+    struct FailingSource(FixedFreqSource);
+
+    impl IqSource for FailingSource {
+        fn sample_rate(&self) -> f64 {
+            self.0.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.0.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            match self.0.read(buf)? {
+                0 => anyhow::bail!("receiver unplugged"),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// MAN-201: a read error closes the tracks, so a call held for its role
+    /// is decided rather than lost with the input.
+    #[test]
+    fn a_read_error_settles_the_last_call() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 4.0;
+        spec.signals[0].wpm = 40.0;
+        spec.signals[0].text = "DE W1AW".into();
+        spec.signals[0].loop_text = false;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let src = FailingSource(FixedFreqSource {
+            samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let mut spots = Vec::new();
+        let result = listen_with_observers(
+            Box::new(src),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers::default(),
+            |_| {},
+            |s| spots.push(s.callsign.clone()),
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(spots.iter().any(|c| c == "W1AW"), "{spots:?}");
+    }
+
     #[test]
     fn lists_offered_during_calibration_apply_to_the_calibration_buffer() {
         // MAN-201 (D12, a spot emitted at settle): a bare run settles only

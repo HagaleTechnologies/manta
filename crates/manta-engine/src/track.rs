@@ -7380,7 +7380,7 @@ mod tests {
             },
         ];
         let mut ts = 1_000;
-        for word in ["K5ARH", "T"] {
+        for word in ["V", "V", "V", "K5ARH"] {
             for c in word.chars() {
                 events.push(DecoderEvent::char_decoded(
                     2,

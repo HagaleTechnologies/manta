@@ -306,8 +306,16 @@ station_callsign = "N0CALL"
 
 [spot]
 
-# Callsigns always spotted, skipping the plausibility checks, for example
-# ["W1AW", "K1ABC"]. A non-empty --allowlist replaces this list.
+# Callsigns that skip the plausibility checks (grammar, country allocation,
+# repetition), for example ["W1AW", "K1ABC"]. A listed call is still not
+# spotted where the decoded exchange shows it was only called or mentioned:
+# "W1AW DE K1ABC" spots K1ABC, never W1AW. A call followed by a lone "T" (a
+# beacon ID ending in long power-step dashes) spots as BEACON only when it is
+# listed here. The 18 NCDXF/IARU beacons are:
+# ["4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O",
+#  "VR2B", "4S7B", "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA",
+#  "OA4B", "YV5B"]
+# A non-empty --allowlist replaces this list.
 #allowlist = []
 
 # File of callsigns never to spot, one per line; `#` starts a comment.
