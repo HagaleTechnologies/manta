@@ -970,8 +970,8 @@ mod tests {
                 std::mem::take(&mut self.stalled)
             }
         }
-        let (payload, _) = sink(None, false);
-        let (meta, meta_kept) = sink(None, false);
+        let (payload, _, _) = kept_sink(None, false, false);
+        let (meta, _, meta_kept) = kept_sink(None, false, false);
         let src = Stalling {
             reads: 0,
             stalled: false,
