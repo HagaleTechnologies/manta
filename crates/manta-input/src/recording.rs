@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Frames per queued block.
 pub const RECORDING_BLOCK_FRAMES: usize = 4096;
@@ -94,6 +94,9 @@ struct Shared {
     reason: AtomicU8,
     /// `PENDING`, `PUBLISHING`, `SETTLED` or `CANCELLED`.
     state: AtomicU8,
+    /// The writer's outcome, stored before it moves `state` to `SETTLED`,
+    /// so `finish` has it even while the writer's warning blocks.
+    outcome: Mutex<Option<RecordingOutcome>>,
     notified: AtomicBool,
     notice: Option<RecordingNotice>,
 }
@@ -256,6 +259,7 @@ fn start_with_sinks<S: IqSource + ?Sized>(
         queued: AtomicUsize::new(0),
         reason: AtomicU8::new(REASON_STOPPED),
         state: AtomicU8::new(PENDING),
+        outcome: Mutex::new(None),
         notified: AtomicBool::new(false),
         notice,
     });
@@ -271,6 +275,9 @@ fn start_with_sinks<S: IqSource + ?Sized>(
             publish,
             &worker_shared,
         );
+        if let Ok(mut slot) = worker_shared.outcome.lock() {
+            *slot = Some(outcome.clone());
+        }
         // Settled unless `finish` gave up first; only a settled failure is
         // reported, since a timed-out `finish` has already said "unconfirmed".
         let settled = worker_shared
@@ -574,6 +581,7 @@ impl RecordingHandle {
         if let Ok(outcome) = self.done.recv_timeout(timeout) {
             return outcome;
         }
+        let grace_end = Instant::now() + grace;
         let state = &self.shared.state;
         match state.compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => return RecordingOutcome::TimedOut(self.path.clone()),
@@ -590,11 +598,22 @@ impl RecordingHandle {
             }
             Err(_) => {}
         }
-        // Settled: the writer sends right after it settles, so this waits
-        // only for its one warning, if any.
-        self.done
-            .recv()
-            .unwrap_or_else(|_| RecordingOutcome::TimedOut(self.path.clone()))
+        // Settled: the writer sends once its one warning, if any, returns.
+        // Wait for that for what is left of the grace, then take the stored
+        // outcome: a warning that takes longer can follow the report.
+        match self
+            .done
+            .recv_timeout(grace_end.saturating_duration_since(Instant::now()))
+        {
+            Ok(outcome) => outcome,
+            Err(_) => self
+                .shared
+                .outcome
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_else(|| RecordingOutcome::TimedOut(self.path.clone())),
+        }
     }
 }
 
@@ -1017,7 +1036,6 @@ mod tests {
         assert!(meta.contains("\"backpressure\""), "{meta}");
     }
 
-<<<<<<< HEAD
     /// A metadata sink that, when dropped (after the `End` record is
     /// flushed and before the publication claim), says so and then holds
     /// the writer until released.
@@ -1241,7 +1259,54 @@ mod tests {
         // been cancelled.
         std::thread::sleep(Duration::from_millis(50));
         assert!(notices.get().is_empty(), "{:?}", notices.get());
-=======
+    }
+
+    /// MAN-453: a writer that settled a failure and is stuck in its warning
+    /// has still settled: `finish` reports that failure within its timeout
+    /// and grace instead of waiting for the warning to return.
+    #[test]
+    fn a_settled_failure_whose_warning_blocks_is_reported_on_time() {
+        let (payload, _) = sink(None, true);
+        let (meta, _) = sink(None, false);
+        let (warning_tx, warning) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let notice: RecordingNotice = Box::new(move |_| {
+            let _ = warning_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
+        });
+        let header = RecordingHeader::for_source(&Endless, std::time::UNIX_EPOCH);
+        let (mut rec, handle) = start_with_sinks(
+            Box::new(Endless),
+            Path::new("test.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(|| Ok(())),
+            Some(notice),
+            spawn_writer,
+        )
+        .unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
+        assert_eq!(rec.read(&mut buf).unwrap(), buf.len());
+        drop(rec);
+        warning.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (outcome_tx, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = outcome_tx.send(handle.finish(Duration::from_millis(20), Duration::ZERO));
+        });
+        let outcome = outcome.recv_timeout(Duration::from_secs(5));
+        release.send(()).unwrap();
+        assert_eq!(
+            outcome,
+            Ok(RecordingOutcome::Failed(
+                "IQ recording stopped: write failed for test.cf32: disk on fire; decoding \
+                 continues"
+                    .into()
+            ))
+        );
+    }
+
     /// MAN-202: an unknown gap reaches the engine on the read it precedes,
     /// once, but the recording gains no record for it.
     #[test]
@@ -1265,7 +1330,9 @@ mod tests {
             Box::new(meta),
             Box::new(|| Ok(())),
             None,
-        );
+            spawn_writer,
+        )
+        .unwrap();
         let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
         let mut seen = Vec::new();
         for _ in 0..3 {
@@ -1274,7 +1341,7 @@ mod tests {
         }
         assert_eq!(seen, vec![(None, false), (None, true), (None, false)]);
         drop(rec);
-        match handle.finish(Duration::from_secs(10)) {
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
             RecordingOutcome::Finished { samples, .. } => {
                 assert_eq!(samples, 3 * RECORDING_BLOCK_FRAMES as u64);
             }
@@ -1283,6 +1350,5 @@ mod tests {
         let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
         assert!(!meta.contains("\"gap\""), "{meta}");
         assert_eq!(meta.lines().count(), 2, "header and end only: {meta}");
->>>>>>> 3a6f3c9d05ec0e11b7a71247b40b8ef4c099b536
     }
 }

@@ -48,7 +48,12 @@ reproduced at `4581725`:
   would have added up to 32 s for 16 inputs. The writer's settle step
   (`fetch_update` to `SETTLED` unless `CANCELLED`) also decides whether it
   warns: a cancelled writer stays silent, since `finish` has already said
-  "unconfirmed". One case remains: on a filesystem where publishing blocks
+  "unconfirmed". The writer stores its outcome before it settles and
+  warns, so a settled writer whose warning callback blocks still has its
+  outcome reported within `timeout + grace`; `finish` waits for the
+  warning only for what is left of the grace, so a warning that takes
+  longer can follow the report, or be cut off when the process exits.
+  One case remains: on a filesystem where publishing blocks
   longer than the grace, a recording is reported "unconfirmed" and may
   still appear. The grace is shared and `run` finishes recordings one after
   another, so one recording's blocked publication can spend the grace of a
