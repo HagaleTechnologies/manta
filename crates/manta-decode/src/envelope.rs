@@ -274,6 +274,26 @@ impl Demod {
         }
     }
 
+    /// MAN-202: the input stream lost samples of unknown count before the next
+    /// `push`. The open run spans the loss, so it is dropped; the caller takes
+    /// `held` first (`take_held`), which is debounce-confirmed. An init window
+    /// restarts, so its replay never joins runs across the loss. Rails, A_ref
+    /// and the key decision are levels, not continuity, and are kept.
+    pub(crate) fn break_continuity(&mut self) {
+        if let Phase::Init {
+            buf,
+            hops_until_attempt,
+        } = &mut self.phase
+        {
+            buf.clear();
+            *hops_until_attempt = INIT_HOPS;
+        }
+        self.open = None;
+        self.held = None;
+        self.fade_run = 0;
+        self.fade_sum = 0.0;
+    }
+
     /// EOF flush: closes the open run and emits everything held. SPEC §3.4.
     pub fn finish(&mut self) -> Vec<Run> {
         let mut out = Vec::new();

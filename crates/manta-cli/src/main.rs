@@ -2063,6 +2063,12 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_missing_samples()
     }
 
+    /// MAN-202: forwarded as `take_discontinuity` is (a SoapySDR overflow
+    /// reaches `listen()` through this wrapper).
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
     /// end an outage where acquisition began.
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -11995,6 +12001,44 @@ mod tests {
         };
         assert_eq!(src.take_missing_samples(), Some(11_900));
         assert_eq!(src.take_missing_samples(), None);
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
+    /// MAN-202: the inner source's unknown-length loss reaches `listen()`,
+    /// once, beside the counted hooks.
+    #[test]
+    fn fixed_center_freq_source_forwards_take_unknown_gap() {
+        struct UnknownProbeSource {
+            unknown: bool,
+            missing: Option<u64>,
+        }
+        impl IqSource for UnknownProbeSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
+        }
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(UnknownProbeSource {
+                unknown: true,
+                missing: Some(5),
+            }),
+            freq_hz: 14_000_000.0,
+        };
+        assert!(src.take_unknown_gap());
+        assert!(!src.take_unknown_gap());
+        assert_eq!(src.take_missing_samples(), Some(5));
         assert_eq!(src.take_discontinuity(), None);
     }
 

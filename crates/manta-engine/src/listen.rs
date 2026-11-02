@@ -6,11 +6,11 @@
 use crate::latency::DecodeLatencyObserver;
 use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
-use crate::track::CloseCounts;
+use crate::track::{first_hop_after_gap, CloseCounts};
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::{ClosureKind, DecoderEvent};
-use manta_input::IqSource;
+use manta_input::{IqSource, ReadContinuity};
 use manta_spot::reference::ReferenceLists;
 use manta_spot::{Blocklist, NotchList, Validator};
 use num_complex::Complex32;
@@ -826,6 +826,9 @@ pub fn listen_with_observers(
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
+    // MAN-202: fill offsets of unknown-length gaps, applied once the fill
+    // is processed as the segment's first data.
+    let mut calib_gaps: Vec<u64> = Vec::new();
     let filter_len = seg.ch.filter_len() as u64;
     while filled < calib_n {
         // MAN-122 review round 7: checked before EVERY calibration read, not
@@ -862,11 +865,15 @@ pub fn listen_with_observers(
         // samples before it being pre-gap), so the hops mapped from the
         // fill before it keep their pre-loss timestamps. Nothing has been
         // processed yet, so no held loss is dropped.
-        if let Some(k) = src.take_missing_samples() {
+        let cont = ReadContinuity::take(&mut *src);
+        if let Some(k) = cont.missing_samples {
             seg_base += k;
             seg.held.record(filled as u64, k, 0, filter_len);
         }
-        if let Some(gap) = src.take_discontinuity() {
+        if let Some(gap) = cont.discontinuity {
+            // MAN-202: an unknown gap noted in the discarded fill goes
+            // with it; one on this read is subsumed by the discontinuity.
+            calib_gaps.clear();
             // A discontinuity during calibration: the pre-gap partial
             // buffer was never processed through the channelizer, so it's
             // simply discarded (not spliced) -- keep the post-gap samples
@@ -881,7 +888,15 @@ pub fn listen_with_observers(
             filled = n;
             continue;
         }
+        // MAN-202: an unknown-length gap before this read's samples, at
+        // fill offset `filled` (the fill is the segment's first data).
+        if cont.unknown_gap {
+            calib_gaps.push(filled as u64);
+        }
         filled += n;
+    }
+    for &pos in &calib_gaps {
+        seg.tm.note_input_gap(first_hop_after_gap(pos, seg.hop));
     }
     // The startup lead-in padding is processed only once the calibration
     // fill has returned, not before it: its `on_tracks` call is the first
@@ -979,12 +994,13 @@ pub fn listen_with_observers(
         // the loss is also held at its boundary (`seg_consumed`), so the
         // hops the channelizer still buffers from before it keep their
         // time.
-        if let Some(k) = src.take_missing_samples() {
+        let cont = ReadContinuity::take(&mut *src);
+        if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
             seg.held.record(seg_consumed, k, seg_consumed, filter_len);
         }
-        if let Some(gap) = src.take_discontinuity() {
+        if let Some(gap) = cont.discontinuity {
             // Not `finish()`: an outage is not an end of signal (see
             // `TrackManager::finish_for_discontinuity`). MAN-423: losses
             // still held are already in `seg_base`, so they stay on the
@@ -1041,6 +1057,13 @@ pub fn listen_with_observers(
                 &mut on_event,
                 &mut on_spot,
             );
+        } else if cont.unknown_gap {
+            // MAN-202: samples of unknown count were lost before this
+            // read's. No clock advance (there is no count) and no new
+            // segment; every track's continuity-dependent state is
+            // invalidated at the first hop holding a post-gap sample.
+            seg.tm
+                .note_input_gap(first_hop_after_gap(seg_consumed, seg.hop));
         }
         // MAN-128: steady-state chunk latency, timed from here (after the
         // read and after any outage-segment rebuild above, so a one-off
@@ -1087,8 +1110,9 @@ pub fn listen_with_observers(
         obs.observe_peak(seg.tm.active_track_count());
     }
     // MAN-258: an end of stream with an outage pending (a stop while a live
-    // source was down) is not an end of signal either.
-    let events = if src.take_discontinuity().is_some() {
+    // source was down) is not an end of signal either. MAN-202: nor is one
+    // with an unknown gap pending (both are taken: no short-circuit).
+    let events = if src.take_discontinuity().is_some() | src.take_unknown_gap() {
         seg.tm.finish_for_discontinuity()
     } else {
         seg.tm.finish()
@@ -1445,6 +1469,9 @@ pub(crate) fn run_input_front(
     let calib_n = (fs * CALIBRATION_SECONDS).round() as usize;
     let mut calib = vec![Complex32::new(0.0, 0.0); calib_n];
     let mut filled = 0;
+    // MAN-202: fill offsets of unknown-length gaps, applied once the fill
+    // is processed as the segment's first data.
+    let mut calib_gaps: Vec<u64> = Vec::new();
     let filter_len = seg.ch.filter_len() as u64;
     while filled < calib_n {
         if stop.load(Ordering::Relaxed) {
@@ -1463,18 +1490,27 @@ pub(crate) fn run_input_front(
         // MAN-305, as `listen_with_observers`: the splice stays, only the
         // clock moves -- MAN-423: at once, with the loss held at the fill
         // offset where it happened.
-        if let Some(k) = src.take_missing_samples() {
+        let cont = ReadContinuity::take(&mut *src);
+        if let Some(k) = cont.missing_samples {
             seg_base += k;
             seg.held.record(filled as u64, k, 0, filter_len);
         }
-        if let Some(gap) = src.take_discontinuity() {
+        if let Some(gap) = cont.discontinuity {
+            calib_gaps.clear();
             calib.copy_within(filled..filled + n, 0);
             seg.held = HeldLosses::default();
             seg_base += filled as u64 + gap;
             filled = n;
             continue;
         }
+        // MAN-202, as `listen_with_observers`.
+        if cont.unknown_gap {
+            calib_gaps.push(filled as u64);
+        }
         filled += n;
+    }
+    for &pos in &calib_gaps {
+        seg.tm.note_input_gap(first_hop_after_gap(pos, seg.hop));
     }
     // MAN-374: the fill goes through `process_hops` in `CHUNK_SAMPLES`
     // pieces, as `listen_with_observers` processes it, but is still sent
@@ -1526,13 +1562,14 @@ pub(crate) fn run_input_front(
         // MAN-305, as `listen_with_observers`: a spliced loss advances
         // this input's clock without closing its tracks, and (MAN-423) is
         // held at its boundary, so hops already buffered keep their time.
-        if let Some(k) = src.take_missing_samples() {
+        let cont = ReadContinuity::take(&mut *src);
+        if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
             seg.held.record(seg_consumed, k, seg_consumed, filter_len);
         }
         let mut pending = Vec::new();
-        if let Some(gap) = src.take_discontinuity() {
+        if let Some(gap) = cont.discontinuity {
             // MAN-423: held losses are already in `seg_base`.
             let finish_events = seg.tm.finish_for_discontinuity();
             pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
@@ -1559,6 +1596,10 @@ pub(crate) fn run_input_front(
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
             });
             pending.push(batch(events, seg_base, &seg.tm));
+        } else if cont.unknown_gap {
+            // MAN-202, as `listen_with_observers`.
+            seg.tm
+                .note_input_gap(first_hop_after_gap(seg_consumed, seg.hop));
         }
         let t0 = observers
             .decode_latency
@@ -1591,11 +1632,12 @@ pub(crate) fn run_input_front(
     // while a live source was down): both take the outage teardown, as
     // `listen_with_observers` does. Only a plain end of stream or a stop
     // is `SignalEnded`.
-    let events = if read_error.is_some() || src.take_discontinuity().is_some() {
-        seg.tm.finish_for_discontinuity()
-    } else {
-        seg.tm.finish()
-    };
+    let events =
+        if read_error.is_some() | src.take_discontinuity().is_some() | src.take_unknown_gap() {
+            seg.tm.finish_for_discontinuity()
+        } else {
+            seg.tm.finish()
+        };
     let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
@@ -3017,12 +3059,26 @@ mod tests {
         BASELINE.get_or_init(|| lossy_event_ts_multi(LossySource::v1_192k(&[], true)))
     }
 
+    fn overlapping_loss_cut(after_calibration: bool) -> u64 {
+        let lower = if after_calibration { 384_000 } else { 192_000 };
+        let event = baseline_event_ts()
+            .iter()
+            .copied()
+            .find(|&t| t >= lower)
+            .expect("fixture has an event in the selected segment");
+        let cut = event + 6_000;
+        assert_eq!(cut >= 384_000, after_calibration, "fixture segment");
+        cut
+    }
+
     /// MAN-423: every baseline event before `cut` is in `lossy` at its own
-    /// time, `must_keep` among them (a hop whose window straddles the cut).
-    fn assert_pre_loss_kept(baseline: &[u64], lossy: &[u64], cut: u64, must_keep: u64) {
+    /// time, including an event whose filter window straddles the cut.
+    /// Select that event from the actual baseline: detector changes may move
+    /// promotion-dependent decoder events without changing clock mapping.
+    fn assert_pre_loss_kept(baseline: &[u64], lossy: &[u64], cut: u64) {
         assert!(
-            baseline.contains(&must_keep) && must_keep < cut && must_keep + 16_384 > cut,
-            "test setup: {must_keep} must be a baseline event inside the window before {cut}"
+            baseline.iter().any(|&t| t < cut && t + 16_384 > cut),
+            "test setup: a baseline event must straddle the cut at {cut}: {baseline:?}"
         );
         for &t in baseline.iter().filter(|&&t| t < cut) {
             assert!(
@@ -3234,16 +3290,19 @@ mod tests {
     /// keeps the loss-free time (before the fix: 409,212, 11,900 late).
     #[test]
     fn missing_samples_after_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 402_240, 397_312);
+        let cut = overlapping_loss_cut(true);
+        let lossy = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
     }
 
     /// MAN-423: the multi-input front end (`run_input_front`) keeps the
     /// same pre-loss event times.
     #[test]
     fn multi_input_missing_samples_after_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, 402_240, 397_312);
+        let cut = overlapping_loss_cut(true);
+        let lossy =
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, cut);
     }
 
     /// MAN-423: read one protocol-2 datagram at a time, the same loss gives
@@ -3252,20 +3311,26 @@ mod tests {
     /// timeline, so the fix cannot rely on it.
     #[test]
     fn one_datagram_reads_keep_pre_loss_event_times() {
-        let chunked = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true));
-        let split = lossy_event_ts(LossySource::v1_192k(&[(2.095, 50)], true).one_datagram_reads());
+        let cut = overlapping_loss_cut(true);
+        let chunked = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        let split = lossy_event_ts(
+            LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true).one_datagram_reads(),
+        );
         assert_eq!(split, chunked, "event times depend on how reads were split");
-        assert_pre_loss_kept(baseline_event_ts(), &split, 402_240, 397_312);
+        assert_pre_loss_kept(baseline_event_ts(), &split, cut);
     }
 
     /// MAN-423: the multi-input twin of the one-datagram-read test.
     #[test]
     fn multi_input_one_datagram_reads_keep_pre_loss_event_times() {
-        let chunked = lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true));
-        let split =
-            lossy_event_ts_multi(LossySource::v1_192k(&[(2.095, 50)], true).one_datagram_reads());
+        let cut = overlapping_loss_cut(true);
+        let chunked =
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        let split = lossy_event_ts_multi(
+            LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true).one_datagram_reads(),
+        );
         assert_eq!(split, chunked, "event times depend on how reads were split");
-        assert_pre_loss_kept(baseline_event_ts_multi(), &split, 402_240, 397_312);
+        assert_pre_loss_kept(baseline_event_ts_multi(), &split, cut);
     }
 
     /// MAN-423: two losses inside one filter length (50 datagrams at
@@ -3273,9 +3338,13 @@ mod tests {
     /// 397,312 came out 16,660 late), and the spot stays clock-true.
     #[test]
     fn two_losses_in_one_window_keep_pre_loss_event_times() {
-        let losses = [(400_000.0 / 192_000.0, 50), (404_000.0 / 192_000.0, 20)];
+        let cut = overlapping_loss_cut(true);
+        let losses = [
+            (cut as f64 / 192_000.0, 50),
+            ((cut + 4000) as f64 / 192_000.0, 20),
+        ];
         let lossy = lossy_event_ts(LossySource::v1_192k(&losses, true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 400_000, 397_312);
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
         assert_clock_true(
             &lossy_spots(LossySource::v1_192k(&losses, true)),
             lossless_baseline_ts(),
@@ -3288,16 +3357,18 @@ mod tests {
     /// the fix: 217,212).
     #[test]
     fn missing_samples_late_in_calibration_keep_pre_loss_event_times() {
-        let lossy = lossy_event_ts(LossySource::v1_192k(&[(211_312.0 / 192_000.0, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts(), &lossy, 211_312, 205_312);
+        let cut = overlapping_loss_cut(false);
+        let lossy = lossy_event_ts(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts(), &lossy, cut);
     }
 
     /// MAN-423: the multi-input twin of the late-calibration-loss test.
     #[test]
     fn multi_input_missing_samples_late_in_calibration_keep_pre_loss_event_times() {
+        let cut = overlapping_loss_cut(false);
         let lossy =
-            lossy_event_ts_multi(LossySource::v1_192k(&[(211_312.0 / 192_000.0, 50)], true));
-        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, 211_312, 205_312);
+            lossy_event_ts_multi(LossySource::v1_192k(&[(cut as f64 / 192_000.0, 50)], true));
+        assert_pre_loss_kept(baseline_event_ts_multi(), &lossy, cut);
     }
 
     /// MAN-423: two losses in the calibration fill keep the event before
@@ -3307,13 +3378,16 @@ mod tests {
     #[test]
     fn two_calibration_losses_keep_events_before_the_first() {
         let losses = [(0.5, 50), (211_312.0 / 192_000.0, 50)];
-        assert!(
-            baseline_event_ts().contains(&13_824),
-            "test setup: {:?}",
-            baseline_event_ts()
-        );
+        let before = baseline_event_ts()
+            .iter()
+            .copied()
+            .find(|&t| t < 96_000)
+            .expect("test setup: an event before the first loss");
         let lossy = lossy_event_ts(LossySource::v1_192k(&losses, true));
-        assert!(lossy.contains(&13_824), "13,824 re-timed: {lossy:?}");
+        assert!(
+            lossy.contains(&before),
+            "pre-loss event {before} re-timed: {lossy:?}"
+        );
     }
 
     /// MAN-423: a discontinuity while a loss is still held (11,900 samples

@@ -466,6 +466,13 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         self.inner.take_missing_samples()
     }
 
+    // MAN-202: an unknown-length loss reaches the engine too, and is not
+    // recorded either: a new record type would change the recording format,
+    // so a replay runs the samples on either side of it together.
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
     fn acquisition_start_offset(&self) -> std::time::Duration {
         self.inner.acquisition_start_offset()
     }
@@ -595,12 +602,15 @@ mod tests {
     }
 
     /// Endless constant source whose read number `gap_after` (1-based) is
-    /// followed by a `missing`-sample discontinuity.
+    /// followed by a `missing`-sample discontinuity, or (MAN-202) by an
+    /// unknown-length gap when `missing` is 0 and `unknown` is set.
     struct GapOnce {
         reads: usize,
         gap_after: usize,
         missing: u64,
         pending: Option<u64>,
+        unknown: bool,
+        pending_unknown: bool,
     }
 
     impl IqSource for GapOnce {
@@ -614,12 +624,19 @@ mod tests {
             buf.fill(Complex32::new(0.25, -0.25));
             self.reads += 1;
             if self.reads == self.gap_after {
-                self.pending = Some(self.missing);
+                if self.unknown {
+                    self.pending_unknown = true;
+                } else {
+                    self.pending = Some(self.missing);
+                }
             }
             Ok(buf.len())
         }
         fn take_discontinuity(&mut self) -> Option<u64> {
             self.pending.take()
+        }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.pending_unknown)
         }
     }
 
@@ -865,6 +882,8 @@ mod tests {
             gap_after: 2,
             missing: 1000,
             pending: None,
+            unknown: false,
+            pending_unknown: false,
         };
         let header = RecordingHeader::for_source(&src, std::time::UNIX_EPOCH);
         let (mut rec, handle) = start_with_sinks(
@@ -904,5 +923,48 @@ mod tests {
         let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
         assert!(!meta.contains("\"gap\""), "{meta}");
         assert!(meta.contains("\"backpressure\""), "{meta}");
+    }
+
+    /// MAN-202: an unknown gap reaches the engine on the read it precedes,
+    /// once, but the recording gains no record for it.
+    #[test]
+    fn an_unknown_gap_reaches_the_engine_and_is_not_recorded() {
+        let (payload, _, _) = kept_sink(None, false, false);
+        let (meta, _, meta_kept) = kept_sink(None, false, false);
+        let src = GapOnce {
+            reads: 0,
+            gap_after: 2,
+            missing: 0,
+            pending: None,
+            unknown: true,
+            pending_unknown: false,
+        };
+        let header = RecordingHeader::for_source(&src, std::time::UNIX_EPOCH);
+        let (mut rec, handle) = start_with_sinks(
+            Box::new(src),
+            Path::new("unknown.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(|| Ok(())),
+            None,
+        );
+        let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(rec.read(&mut one).unwrap(), one.len());
+            seen.push((rec.take_discontinuity(), rec.take_unknown_gap()));
+        }
+        assert_eq!(seen, vec![(None, false), (None, true), (None, false)]);
+        drop(rec);
+        match handle.finish(Duration::from_secs(10)) {
+            RecordingOutcome::Finished { samples, .. } => {
+                assert_eq!(samples, 3 * RECORDING_BLOCK_FRAMES as u64);
+            }
+            other => panic!("{other:?}"),
+        }
+        let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
+        assert!(!meta.contains("\"gap\""), "{meta}");
+        assert_eq!(meta.lines().count(), 2, "header and end only: {meta}");
     }
 }

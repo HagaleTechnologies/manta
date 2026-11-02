@@ -1684,32 +1684,166 @@ mod tests {
         assert_eq!(src.gap_stats().malformed_packets, 50);
     }
 
-    #[test]
-    fn keepalive_resends_on_cadence() {
+    /// One keepalive observation (MAN-449): what the source issued, from its
+    /// own sequence counters, which a lost datagram cannot change, beside what
+    /// the fake recorded, which loopback UDP may thin. Streams are indexed by
+    /// `Stream`: general, rx-specific, tx-specific, high-priority.
+    #[derive(Debug)]
+    struct KeepaliveObservation {
+        /// Datagrams issued per stream during the one-second window.
+        window: [u32; 4],
+        /// The window's length.
+        elapsed: Duration,
+        /// Datagrams issued per stream since the open, bring-up included.
+        issued: [u32; 4],
+        /// Datagrams the fake recorded per stream since the open.
+        received: [usize; 4],
+        /// The recorded high-priority sequence numbers, in arrival order.
+        hp_seqs: Vec<u32>,
+        /// Whether every recorded high-priority datagram carried run = 1.
+        hp_run: bool,
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Keepalives {
+        /// Every issued datagram arrived, in sequence.
+        Clean,
+        /// The source behaved, but loopback lost a datagram: observe again.
+        Lossy,
+        /// The source is wrong, whatever the network did.
+        Broken(&'static str),
+    }
+
+    fn judge(o: &KeepaliveObservation) -> Keepalives {
+        let [general, rx, tx, hp] = o.window;
+        if hp < 8 || rx < 4 || tx < 4 || general < 1 {
+            return Keepalives::Broken("fewer keepalives than the cadence sends");
+        }
+        // Consecutive sends of one stream are at least its interval apart.
+        let most = |every: Duration| (o.elapsed.as_millis() / every.as_millis()) as u32 + 1;
+        if hp > most(HIGH_PRIORITY_EVERY)
+            || rx > most(RX_TX_SPECIFIC_EVERY)
+            || tx > most(RX_TX_SPECIFIC_EVERY)
+            || general > most(GENERAL_EVERY)
+        {
+            return Keepalives::Broken("more sequence numbers than the cadence allows");
+        }
+        if !o.hp_run {
+            return Keepalives::Broken("a high-priority keepalive carried run = 0");
+        }
+        if !o.hp_seqs.windows(2).all(|w| w[0] < w[1])
+            || o.hp_seqs.last().is_some_and(|&s| s >= o.issued[3])
+        {
+            return Keepalives::Broken(
+                "high-priority sequence numbers out of order or never issued",
+            );
+        }
+        if (0..4).any(|i| o.received[i] > o.issued[i] as usize) {
+            return Keepalives::Broken("more datagrams arrived than were issued");
+        }
+        if (0..4).all(|i| o.received[i] == o.issued[i] as usize) {
+            Keepalives::Clean
+        } else {
+            Keepalives::Lossy
+        }
+    }
+
+    fn observe_keepalives() -> KeepaliveObservation {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
         let _iq = fake.stream_iq(Duration::from_millis(2));
-        let before: Vec<usize> = (0..4).map(|o| fake.received(o).len()).collect();
+        let before = src.seq;
         let start = Instant::now();
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
         while start.elapsed() < Duration::from_secs(1) {
             src.read(&mut buf).unwrap();
         }
-        thread::sleep(Duration::from_millis(20));
-        let sent: Vec<usize> = (0..4)
-            .map(|o| fake.received(o).len() - before[o as usize])
-            .collect();
-        assert!(sent[3] >= 8, "high-priority {sent:?}");
-        assert!(sent[1] >= 4 && sent[2] >= 4, "rx/tx-specific {sent:?}");
-        assert!(sent[0] >= 1, "general {sent:?}");
-        // Keepalives carry run = 1 and count on from the bring-up.
+        let elapsed = start.elapsed();
+        let issued = src.seq;
+        let recorded = |o: u16| fake.received(o).len();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while (0..4).any(|o| recorded(o) < issued[usize::from(o)] as usize)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
         let hp = fake.received(3);
-        assert!(hp.iter().all(|p| p[4] == 1));
-        let seqs: Vec<u32> = hp
-            .iter()
-            .map(|p| u32::from_be_bytes([p[0], p[1], p[2], p[3]]))
-            .collect();
-        assert_eq!(seqs, (0..seqs.len() as u32).collect::<Vec<_>>());
+        KeepaliveObservation {
+            window: std::array::from_fn(|i| issued[i] - before[i]),
+            elapsed,
+            issued,
+            received: std::array::from_fn(|i| recorded(i as u16)),
+            hp_seqs: hp
+                .iter()
+                .map(|p| u32::from_be_bytes([p[0], p[1], p[2], p[3]]))
+                .collect(),
+            hp_run: hp.iter().all(|p| p[4] == 1),
+        }
+    }
+
+    #[test]
+    fn keepalive_resends_on_cadence() {
+        // Keepalives carry run = 1 and count on from the bring-up. A lost
+        // datagram does not recur on a fresh source; a skip by the source does.
+        let mut lossy = Vec::new();
+        for _ in 0..3 {
+            let o = observe_keepalives();
+            match judge(&o) {
+                Keepalives::Clean => return,
+                Keepalives::Lossy => lossy.push(o),
+                Keepalives::Broken(why) => panic!("{why}: {o:?}"),
+            }
+        }
+        panic!("every observation missed a datagram: {lossy:#?}");
+    }
+
+    /// The Windows failures of 2026-10-23..26 (each one datagram lost on
+    /// loopback) are loss; a source that skips or over-sends is broken.
+    #[test]
+    fn keepalive_judge_tells_loopback_loss_from_a_broken_source() {
+        let healthy = || KeepaliveObservation {
+            window: [1, 4, 4, 9],
+            elapsed: Duration::from_millis(1001),
+            issued: [3, 6, 6, 11],
+            received: [3, 6, 6, 11],
+            hp_seqs: (0..11).collect(),
+            hp_run: true,
+        };
+        assert_eq!(judge(&healthy()), Keepalives::Clean);
+        // High-priority seq 6 lost (2026-10-26 11:52Z).
+        let mut o = healthy();
+        o.hp_seqs.retain(|&s| s != 6);
+        o.received[3] = 10;
+        assert_eq!(judge(&o), Keepalives::Lossy);
+        // The general keepalive lost (2026-10-26 13:20Z).
+        let mut o = healthy();
+        o.received[0] = 2;
+        assert_eq!(judge(&o), Keepalives::Lossy);
+        // One rx-specific keepalive lost (2026-10-24 00:06Z).
+        let mut o = healthy();
+        o.received[1] = 5;
+        assert_eq!(judge(&o), Keepalives::Lossy);
+        // Every keepalive skips a sequence number.
+        let mut o = healthy();
+        o.window[3] = 18;
+        o.issued[3] = 20;
+        o.hp_seqs = vec![0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+        assert!(matches!(judge(&o), Keepalives::Broken(_)));
+        // Disabled, or slower than the cadence.
+        let mut o = healthy();
+        o.window[3] = 7;
+        assert!(matches!(judge(&o), Keepalives::Broken(_)));
+        // A sequence number the source never issued, or out of order.
+        let mut o = healthy();
+        o.hp_seqs[10] = 11;
+        assert!(matches!(judge(&o), Keepalives::Broken(_)));
+        let mut o = healthy();
+        o.hp_seqs.swap(3, 4);
+        assert!(matches!(judge(&o), Keepalives::Broken(_)));
+        // run = 0.
+        let mut o = healthy();
+        o.hp_run = false;
+        assert!(matches!(judge(&o), Keepalives::Broken(_)));
     }
 
     #[test]
