@@ -106,7 +106,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-97: `manta grade --paired` compares one node's spots with a
   co-located reference skimmer both ways and prints recall, the reports
   manta missed and its candidate false spots, as text or one JSON object
@@ -115,11 +114,9 @@ the git history and `docs/DECISIONS/`.
   example CW Skimmer Server's) or RBN CSVs with `--spotter`. `--reference`
   also works for the one-way table. See
   `docs/RUNBOOKS/rbn-comparison.md`.
-=======
 - MAN-202: Rust API: `IqSource::take_unknown_gap()` and
   `manta_input::ReadContinuity`; wrappers must forward the new hook. See
   docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
->>>>>>> f3d78c90694b35a05a278137f247a83f1a0212ba
 - MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
   protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
   overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
