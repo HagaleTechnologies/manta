@@ -4245,10 +4245,19 @@ mod tests {
         truncate: Option<usize>,
         offer_at: Option<u64>,
     ) -> (Vec<(String, u64)>, u64) {
+        fast_text("W1AW W1AW W1AW W1AW W1AW", wpm, truncate, offer_at)
+    }
+
+    fn fast_text(
+        text: &str,
+        wpm: f32,
+        truncate: Option<usize>,
+        offer_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
         let mut spec = manta_testkit::vectors::v1();
         spec.duration_s = 3.0;
         spec.signals[0].wpm = wpm;
-        spec.signals[0].text = "W1AW W1AW W1AW W1AW W1AW".into();
+        spec.signals[0].text = text.into();
         let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
         if let Some(n) = truncate {
             samples.truncate(n);
@@ -4297,9 +4306,14 @@ mod tests {
 
     #[test]
     fn lists_offered_during_calibration_apply_to_the_calibration_buffer() {
-        let (control, _) = fast_w1aw(72.0, None, None);
+        // MAN-201 (D12, a spot emitted at settle): a bare run settles only
+        // when another token follows it, so the turn ends keep W1AW's spot
+        // inside the calibration buffer. The leading `K` takes the first
+        // word's warm-up damage (`W1AW` decodes as `T1AW`).
+        let text = "K W1AW K W1AW K W1AW K W1AW K";
+        let (control, _) = fast_text(text, 72.0, None, None);
         assert_eq!(control, vec![("W1AW".to_string(), 1)]);
-        let (spots, _) = fast_w1aw(72.0, None, Some(1));
+        let (spots, _) = fast_text(text, 72.0, None, Some(1));
         assert!(spots.is_empty(), "got {spots:?}");
     }
 
