@@ -1520,8 +1520,11 @@ decode (MAN-28). `r` still feeds `c_call` above unchanged, so a spot of
 either kind still carries the `r=1` confidence penalty at the repetition
 count it actually resolved with. An allowlisted callsign also bypasses
 ARCHITECTURE §6 steps 1 (context parse -- tagged `SpotType::Unknown` when no
-CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, and may spot
-the instant its pattern completes, as before.
+CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, but not role:
+a listed call heard only as the station called or mentioned is not spotted.
+Every candidate is decided at settle, once another word follows its run, its
+turn ends or its track ends (MAN-201). A `BEACON` tag needs `V V V` or an
+allowlisted power-step ID.
 
 **Beacon emission timing (amended 2026-09-09, see
 `docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md`):** a
@@ -1916,11 +1919,13 @@ are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 (non-gating RST/QRL? spot annotations, MAN-272) in
-`crates/manta-spot/tests/golden_v32_v33.rs`.
+`crates/manta-spot/tests/golden_v32_v33.rs`; V53-V57 (exchange roles, MAN-201)
+in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
+`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
-| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family. Amended (MAN-201): the `<call> T` row runs with the call allowlisted |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of a common-pattern callsign within 90 s, non-beacon spot type | 1 rep never spots; the tier's requirement (2 for a common pattern) spots |
@@ -1932,20 +1937,20 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 | V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 | V21 | allowlist-independent-of-context | A stale, already-attempted context match (e.g. `CQ K5ARH`, decoded once, never spotted) sits in the window when a different, freshly-allowlisted word arrives | The allowlisted word still spots -- context-match and allowlist candidates are evaluated independently, not one-or-the-other by priority (MAN-28 Watch List) |
 | V22 | exempt-spot-waits-for-metadata | An allowlisted callsign decoded before the track's first `TrackMeta` event | No spot until real telemetry arrives; the pending candidate spots once metadata does arrive, on the next word boundary. A non-allowlisted BEACON candidate decoded before `TrackMeta` is captured once metadata arrives and spots only at `TrackClosed` (V18/V30; `power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate`) |
-| V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type |
+| V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type. Amended (MAN-201): a call's type is decided once, at settle; the word that settles it can type it, but no later word reclassifies it |
 | V24 | reclassification-reps-reuse | "DE K5ARH" decodes once (reps=1, held back by the repetition gate), then a trailing `CQ` token reclassifies the same word from `De` to `Cq` | Still 0 spots -- the reclassification reuses the word's existing rep count rather than recording a second decode |
 | V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending allowlisted candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come. A pending non-allowlisted BEACON candidate is captured at that `TrackMeta`, not spotted; it spots only at `TrackClosed` (V18/V30) |
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
-| V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
+| V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general. Amended (MAN-201): a call's type is decided once, at settle; the word that settles it can type it, but no later word reclassifies it |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
-| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note. Amended (MAN-201): the exemption needs the call on the allowlist, where it spots on the first decode; an unlisted `<call> T` does not spot (V58) |
 | V32 | rst-on-spot | A track decodes `TU 5NN` before its callsign spots; a later `339` replaces it; a report aged out of the 16-word window is still carried | The spot carries `rst = "599"`, then `"339"`; aged-out still `"599"`; no report → `null` |
 | V33 | qrl-query-flag | A track sends `QRL?` before its callsign spots; bare `QRL`; a merge loser's `QRL?`; a closed track's `QRL?` | `qrl_query` true only in the first case; a merge survivor and a new track carry neither annotation (MAN-272 D5) |
 | V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
 | V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the repetition gate (2 for its common pattern); the second message completes it |
 | V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
-| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
+| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2). Amended (MAN-201): the event sequence closes the track, which settles the last call |
 | V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 | V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
 | V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
@@ -1956,6 +1961,12 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 | V48 | unlisted-pattern-five-reps | `DE W4KTNL K` with its pattern absent, on the same track | No spot through 4; spots at 5 message-distinct repetitions |
 | V49 | minimal-level-is-flat-two | V48's unlisted pattern at `validation_level = "minimal"` | No spot at 1; spots at 2 |
 | V50 | exemptions-ignore-pattern-tier | An unlisted-pattern allowlisted call, then a `V V V <call>` beacon | Allowlisted call spots at its first decode; beacon spots at track close with confirmed plausible speed |
+| V53 | addressee-never-spotted (MAN-201) | `DE W1AW DE K1ABC K` twice; the same with no turn end, 1 s and 6.25 s apart; `W1AW W1AW DE K1ABC K1ABC K` twice | K1ABC spots `De` at its own word's boundary; W1AW never spots and no decision names it. Unterminated pairs under the 5 s bound spot neither call |
+| V54 | bare-cq-with-filler (MAN-201) | `CQ DX W1AW` once, then twice and closed | No spot, then W1AW `Cq` `confirmed` |
+| V55 | stale-cq (MAN-201) | A `CQ` many words back from a different station, then `DE K1ABC K1ABC K`; `CQ W1AW DE K1ABC` | K1ABC `De`, never `Cq`; in the second, no W1AW |
+| V56 | allowlist-skips-plausibility-not-role (MAN-201) | W1AW listed, `W1AW DE K1ABC K` and `DE K1ABC K1ABC OP W1AW K`; lone `W1AW`; K5ARH listed, `K5ARH T` | No W1AW spot; one `Unknown` at close; one `Beacon` at K5ARH's boundary |
+| V57 | decided-once-settled (MAN-201) | `DE K5ARH`, K5ARH listed, then each of: next word, `K`, `<AR>`, a character or `TrackMeta` 5 s later, `TrackClosed` of either kind | No spot while K5ARH is the newest word; one spot at its own timestamp on each. 4.35 s settles nothing; `<ERR>` retracts a word; an older held occurrence behind a newer spot is withheld `dedupe`; a settled mention stays one after its framing scrolls out |
+| V58 | beacon-evidence (MAN-201) | `K5ARH T` and similar unlisted, listed and guarded; `V V V K5ARH` | Unlisted: no spot, one `BeaconNoEvidence` per occurrence. Listed: one `Beacon`. Guarded: neither. `V V V` keeps V18's deferred path |
 
 ### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
 

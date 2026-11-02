@@ -323,6 +323,7 @@ pub fn reason_label(r: Reason) -> &'static str {
         Reason::Variant => "variant",
         Reason::Dedupe => "dedupe",
         Reason::PowerStepGuard => "powerStepGuard",
+        Reason::BeaconNoEvidence => "beaconNoEvidence",
         Reason::BeaconPending => "beaconPending",
         Reason::BeaconSpeed => "beaconSpeed",
         Reason::BeaconOverflow => "beaconOverflow",
@@ -603,6 +604,12 @@ mod tests {
                 Reason::PowerStepGuard,
                 "withheld",
                 "powerStepGuard",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::BeaconNoEvidence,
+                "withheld",
+                "beaconNoEvidence",
             ),
             (
                 Verdict::Deferred,

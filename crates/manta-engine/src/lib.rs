@@ -79,11 +79,13 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
             sample_ts,
             snr_2500_db,
             freq_hz,
+            last_char_ts,
         } => DecoderEvent::TrackMeta {
             track_id: *track_id,
             sample_ts: *sample_ts,
             snr_2500_db: *snr_2500_db,
             freq_hz: freq_hz * factor,
+            last_char_ts: *last_char_ts,
         },
         DecoderEvent::TrackPromoted {
             track_id,
@@ -548,6 +550,10 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         while !eof && filled < CHUNK_SAMPLES && carry.is_empty() {
             let n = src.read(&mut chunk[filled..])?;
             if n == 0 {
+                // MAN-201: a stall is not an end of stream.
+                if src.take_stalled() {
+                    continue;
+                }
                 eof = true;
                 break;
             }
@@ -848,6 +854,7 @@ mod tests {
                 sample_ts: 15,
                 snr_2500_db: 20.0,
                 freq_hz: 14_012_340.0,
+                last_char_ts: 0,
             },
             DecoderEvent::CharDecoded {
                 track_id: 2,

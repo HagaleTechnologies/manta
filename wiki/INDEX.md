@@ -101,3 +101,4 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 
 - [Why does detector rise use two disjoint power windows and a block floor bound?](../docs/DECISIONS/2026-10-30-man109-dit-scale-two-look-detector.md)
 - [What does the first RTTY decoder slice deliver?](../docs/DECISIONS/2026-10-30-man321-rtty-decoding.md) Diagnostic ITA2 text after recognition, with preroll and validated spots deferred.
+- [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
