@@ -359,8 +359,8 @@ directory and handed to `pkg-config`.
 | `manta gen v1`, `v2`, `vr1` on ARM under qemu versus native x86-64 | all 9 output files (WAV, JSON, manifest) byte-identical per `cmp` |
 | `manta decode v1.wav` on ARM under qemu versus native | outputs byte-identical (195 bytes, same copy, "frequency: 14012.3 kHz speed: 20 WPM spots: 1") |
 | `cargo test --release --target ...` for `manta-spot --lib` | 299 passed, 0 failed |
-| same for `manta-dsp --lib` | 275 passed, 0 failed |
-| same for `manta-decode --lib` | 154 passed, 0 failed, 1 ignored |
+| same for `manta-dsp --lib` | 154 passed, 0 failed, 1 ignored |
+| same for `manta-decode --lib` | 275 passed, 0 failed |
 | same for `manta-input --features hpsdr --lib hpsdr` | 161 passed, 0 failed, 3 ignored (includes the loopback-device and `validate_ddc_config_*` tests) |
 
 The determinism constraint in `CLAUDE.md` (file input gives byte-identical
