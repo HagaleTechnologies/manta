@@ -33,6 +33,8 @@ mod devices;
 mod doctor_checks;
 mod fmt;
 mod grade_cmd;
+mod grade_paired;
+mod grade_transcript;
 mod health_cmd;
 mod hpsdr_group;
 mod list_cache;
@@ -1263,8 +1265,11 @@ enum Command {
     /// archive) and RBN daily-dump CSVs, and grades every spot the way
     /// `[rbn_compare]` grades it live: match, disagree, elsewhere, none or
     /// unknown. Prints a per-band summary, or the grade records with
-    /// --json. Never reads MANTA_* variables: the output depends only on
-    /// the inputs and flags.
+    /// --json. --reference grades against a skimmer's saved `DX de` lines
+    /// (a co-located CW Skimmer Server) instead of RBN CSVs, and --paired
+    /// grades both ways: recall, the reports manta missed and its candidate
+    /// false spots. Never reads MANTA_* variables: the output depends only
+    /// on the inputs and flags.
     Grade {
         #[command(flatten)]
         args: grade_cmd::Args,

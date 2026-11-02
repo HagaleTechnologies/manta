@@ -115,6 +115,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-97: `manta grade --paired` compares one node's spots with a
+  co-located reference skimmer both ways and prints recall, the reports
+  manta missed and its candidate false spots, as text or one JSON object
+  (`--json`), over `--passband-khz` and an optional `--start`/`--end`. The
+  reference is a skimmer's saved `DX de` telnet output (`--reference`, for
+  example CW Skimmer Server's) or RBN CSVs with `--spotter`. `--reference`
+  also works for the one-way table. See
+  `docs/RUNBOOKS/rbn-comparison.md`.
 - MAN-202: Rust API: `IqSource::take_unknown_gap()` and
   `manta_input::ReadContinuity`; wrappers must forward the new hook. See
   docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
