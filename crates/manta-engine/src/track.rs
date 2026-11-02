@@ -1731,7 +1731,7 @@ impl Track {
         now: u64,
         n: usize,
     ) -> usize {
-        if (self.center - self.center.round()).abs() < 0.35 {
+        if (self.center - self.center.round()).abs() < 0.40 {
             return selected;
         }
         let mut nearest = 2.5;
@@ -2748,6 +2748,43 @@ impl TrackManager {
                 self.hop_counter,
                 n,
             );
+            // Before the neighbor has its own track, its stronger channel
+            // must not train this track: `k` feeds tracking (envelope, rise,
+            // SNR, phase) as well as decoder input. Reject measured carriers
+            // outside this identity's centroid gate, just as centroid
+            // updates do.
+            let phase_matches = |ch: usize| {
+                if channel_distance(ch as f64, track.center, n) <= 1.0 {
+                    return true;
+                }
+                let floor = self.floor.effective_floor_db(ch);
+                if power_db_vals[ch] - floor < FINE_FREQ_MIN_SNR_DB
+                    || prev_hop
+                        .as_ref()
+                        .is_none_or(|prev| power_db(prev.power[ch]) - floor < FINE_FREQ_MIN_SNR_DB)
+                {
+                    return true;
+                }
+                prev_hop
+                    .as_ref()
+                    .and_then(|prev| phase_lag_product(prev, hop, ch))
+                    .and_then(|z| phase_position(z, track.center))
+                    .is_none_or(|pos| (pos - track.center).abs() <= CENTROID_OUTLIER_CH)
+            };
+            let k = if phase_matches(k) {
+                k
+            } else {
+                track
+                    .owned(n)
+                    .into_iter()
+                    .filter(|&ch| {
+                        self.channel_cooldown_until[ch] <= self.hop_counter
+                            && track.channel_exclusive(ch, &centers, n)
+                            && phase_matches(ch)
+                    })
+                    .max_by(|&a, &b| hop.power[a].total_cmp(&hop.power[b]))
+                    .unwrap_or(k)
+            };
             // A stronger neighbor can contaminate one side of a straddle.
             let k = track.select_straddle_channel(
                 k,
@@ -5123,6 +5160,36 @@ mod tests {
     }
 
     #[test]
+    fn untracked_neighbor_cannot_train_a_straddling_tracks_decoder() {
+        let mut tm = TrackManager::new(
+            1024,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(108);
+        tm.tracks.get_mut(&1).unwrap().center = 107.52;
+        let spectrum = |m| {
+            let mut x = vec![num_complex::Complex32::new(0.0, 0.0); 1024];
+            for (k, pos, amp) in [(107, 107.5, 1.0), (108, 107.5, 0.9), (109, 108.833, 3.0)] {
+                x[k] = num_complex::Complex32::from_polar(
+                    amp,
+                    (std::f64::consts::FRAC_PI_2 * (pos - k as f64) * m as f64) as f32,
+                ) * odd_channel_sign_correction(m, k);
+            }
+            hop_with_x(m, x)
+        };
+        tm.prev_hop = Some(spectrum(0));
+        tm.step_hop(&spectrum(1), 1);
+        let observed_db = tm.tracks[&1].envelope.back().unwrap().1;
+        assert!(
+            observed_db.abs() < 1e-4,
+            "must read the 0 dB own carrier, not the stronger untracked neighbor: {observed_db}"
+        );
+    }
+
+    #[test]
     fn phase_centroid_rejects_an_outlier_more_than_0_6_channel_away() {
         let mut t = Track::new(1, 107, &DetectorConfig::default());
         t.update_centroid_phase(Complex64::from_polar(
@@ -5243,6 +5310,19 @@ mod tests {
         tm.tracks.get_mut(&1).unwrap().center = 10.5;
         assert!(!tm.spawn_admits(11, Some(11.07)));
     }
+    #[test]
+    fn off_midpoint_neighbor_does_not_force_the_outer_straddle_channel() {
+        let mut t = Track::new(1, 107, &DetectorConfig::default());
+        // Restored V7 is at 106.667. Small centroid noise must not switch
+        // its decoder to 106, where transition sidelobes bias phase tracking.
+        t.center = 106.64;
+        let centers = [(1, t.center), (2, 108.27)];
+        assert_eq!(
+            t.select_straddle_channel(107, &centers, &[0; 1024], 0, 1024),
+            107
+        );
+    }
+
     #[test]
     fn stronger_neighbor_does_not_choose_the_contaminated_straddle_channel() {
         let mut t = Track::new(1, 11, &DetectorConfig::default());
