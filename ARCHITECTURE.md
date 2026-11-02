@@ -413,22 +413,40 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 (not left waiting on a `WordBoundary` that a short, already-finished
 transmission may never produce again).
 
-1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
-   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
-   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
-   different callsigns, or after a sign-off such as `TU`, is ambiguous and
-   yields no candidate),
-   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
-   for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
-   token appears anywhere in the window at all (the token must be a
-   complete decoded word, not a substring glued to punctuation inside
-   one), a deliberately coarse guard against mistagging an ordinary,
-   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+1. **Exchange grammar** (`manta_spot::exchange`, MAN-201): a finite-state
+   read of the decoded window gives every callsign occurrence one role:
+   `self_id` (the sending station), `addressee`, `relayed_mention` or
+   `uncertain`. It recognizes `CQ`, `TEST` and contest fillers (an enumerated
+   set, e.g. `CQ WPX`, MAN-104), `DE`, `UP`, sign-offs, RST and serials,
+   queries, corrections and `V V V`. A `CQ` or `TEST` types a call only when
+   it leads straight into it; a bare `TEST` after a sign-off such as `TU`, or
+   between two different callsigns, is ambiguous. Only a `self_id` occurrence
+   with a spot form is a candidate, so `DE W1AW DE K1ABC K` spots K1ABC.
+
+   A turn ends at `K`, `KN`, `BK`, `AR` or `SK`, and after 5 s with no decoded
+   character; frames and mentions never cross a turn end. A call is decided
+   once it is settled: another word follows its run, its turn ends, or the
+   track ends. An input that stalls or fails closes its tracks, so it settles
+   their last calls too. A settled role is latched on its word, and a spot
+   keeps the call's own timestamp. Silence is measured from the decoder's
+   newest character, held or released, so a word the MAN-317 prior still
+   holds is not silence.
+
+   `<call> T` is the decoded shape of an NCDXF-style power-step beacon the
+   decoder can't resolve past a single trailing dash (MAN-37). A lone `T` is
+   the most common noise decode in CW, so the shape alone is not beacon
+   evidence: it is a `BEACON` candidate only for an allowlisted call, and any
+   other plausible call records `beaconNoEvidence` (MAN-201). It is also
+   suppressed whenever a bare `CQ`/`TEST`/`DE` token appears anywhere in the
+   window (a complete decoded word, not a substring glued to punctuation
+   inside one), a deliberately coarse guard. Each occurrence that guard costs
    is counted once, as `SuppressionCounts::power_step_guard` (§8); an
-   occurrence already evaluated as a Beacon before the guard appeared is
-   not a loss and is not counted). Context
-   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+   occurrence already evaluated as a Beacon before the guard appeared is not
+   a loss and is not counted. Role and context determine spot type (CQ / DE /
+   BEACON) — RBN spots carry this flag. The allowlist skips plausibility and
+   repetition, not role: a listed call heard only as the station called or
+   mentioned is not spotted. See
+   `docs/DECISIONS/2026-11-02-man201-callsign-roles.md`.
 
    **Spot annotations (MAN-272).** Each completed word is also scanned for
    an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for

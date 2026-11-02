@@ -493,6 +493,10 @@ fn calibrate_with_clock(
         let cap = remaining.min(buf.len());
         let n = src.read(&mut buf[..cap])?;
         if n == 0 {
+            // MAN-201: a stall is not an end of stream.
+            if src.take_stalled() {
+                continue;
+            }
             break;
         }
         // MAN-234: calibrate is the one raw-IQ consumer that bypasses the

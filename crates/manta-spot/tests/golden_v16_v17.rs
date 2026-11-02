@@ -59,6 +59,7 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
 }
 
@@ -106,6 +107,7 @@ fn v17_notched_frequency_never_spots() {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
+        last_char_ts: 0,
     });
     let words = ["DE", "K5ARH", "K"];
 
@@ -143,6 +145,7 @@ fn suppressed_spots_are_counted_by_reason() {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_025_050.0,
+        last_char_ts: 0,
     });
     run(&transmission_events(1, &words, 0), &mut v);
 
@@ -160,6 +163,7 @@ fn v17_frequency_outside_notch_still_spots() {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_030_000.0,
+        last_char_ts: 0,
     });
     let words = ["DE", "K5ARH", "K"];
 
