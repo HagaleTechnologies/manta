@@ -1112,7 +1112,12 @@ non-blocking send plus shared atomics and short locks between them.
   async). `manta-engine::listen` reads up to 2048 samples with
   `IqSource::read()`, runs `Channelizer::process` and
   `TrackManager::process_hops`, feeds the batch's events to the validator,
-  and reads again. Validation runs on this thread.
+  and reads again. Validation runs on this thread. With `[input]
+  spectrum_udp` set, `Segment::channelize` also folds each hop's channel
+  power into a 125-hop mean (`manta-engine::spectrum`, write-only, spots
+  unchanged) that a `manta-spectrum-<input>` thread sends to N1MM+'s
+  Spectrum Display as XML over UDP (MAN-141,
+  `docs/DECISIONS/2026-11-01-man141-n1mm-spectrum-feed.md`).
 - **Several inputs (MAN-13).** With several `[[input]]` entries
   (`manta-engine::multi`) each input's read, channelizer, track manager and
   decoder pool run on its own `manta-input-<name>` thread, that input's

@@ -719,6 +719,45 @@ fn each_input_publishes_its_own_band_sample_once_per_stream_second() {
     );
 }
 
+/// MAN-141: records every spectrum frame.
+#[derive(Default)]
+struct FrameRecorder(std::sync::Mutex<Vec<manta_engine::SpectrumFrame>>);
+
+impl manta_engine::SpectrumSink for FrameRecorder {
+    fn publish(&self, frame: manta_engine::SpectrumFrame) {
+        self.0.lock().unwrap().push(frame);
+    }
+}
+
+#[test]
+fn each_input_sends_its_own_spectrum_without_changing_spots() {
+    let sinks: Vec<Arc<FrameRecorder>> = (0..2).map(|_| Arc::default()).collect();
+    let mut specs = vec![
+        plain("20m", short_scene()),
+        plain("40m", forty_metre_scene()),
+    ];
+    for (s, sink) in specs.iter_mut().zip(&sinks) {
+        s.observers.spectrum = Some(sink.clone());
+    }
+    let with = run(specs);
+    for (sink, center) in sinks.iter().zip([14_000_000.0, 7_020_000.0]) {
+        let frames = sink.0.lock().unwrap();
+        // 30 s at 96 kS/s: 89 whole frames, each the input's own span.
+        assert_eq!(frames.len(), 89);
+        for f in frames.iter() {
+            assert_eq!(f.power_db.len(), 1024);
+            assert_eq!(f.low_hz, center - 48_000.0);
+            assert_eq!(f.high_hz, center + 48_000.0 - 93.75);
+        }
+    }
+    let without = run(vec![
+        plain("20m", short_scene()),
+        plain("40m", forty_metre_scene()),
+    ]);
+    assert!(!without.spots.is_empty());
+    assert_eq!(format!("{:?}", with.spots), format!("{:?}", without.spots));
+}
+
 /// An input that errors or panics mid-transmission still closes every track
 /// it reported (Codex, PR 313): the shared validator frees their state and
 /// the live tap publishes their closure, while the other inputs run on.

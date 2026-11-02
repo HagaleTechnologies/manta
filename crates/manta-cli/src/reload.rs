@@ -867,6 +867,23 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-141: the spectrum socket is bound once, at startup.
+    #[test]
+    fn changing_input_spectrum_udp_needs_a_restart() {
+        let body =
+            "[input]\ntype = 'hpsdr'\nhost = 'h'\nfreq_hz = 14050000.0\nrate_hz = 192000.0\n";
+        let old = table(&format!("{body}spectrum_udp = '127.0.0.1:13064'\n"));
+        let new = table(&format!("{body}spectrum_udp = '192.168.1.50:13064'\n"));
+        assert_eq!(restart_only_changes(&old, &new), vec!["input.spectrum_udp"]);
+        let named = table(&format!(
+            "{body}spectrum_udp = '127.0.0.1:13064'\nspectrum_name = 'Rig 2'\n"
+        ));
+        assert_eq!(
+            restart_only_changes(&old, &named),
+            vec!["input.spectrum_name"]
+        );
+    }
+
     #[test]
     fn changing_input_auto_attenuation_needs_a_restart() {
         let body = "[input]\ntype = 'hpsdr'\nhost = 'h'\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";

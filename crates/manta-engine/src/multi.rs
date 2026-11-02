@@ -127,6 +127,10 @@ pub struct InputObservers {
     pub bad_samples: Option<Arc<AtomicU64>>,
     /// This input's marked RTTY signals.
     pub rtty: Option<Arc<RttyObserver>>,
+    /// MAN-141: this input's spectrum tap (`ListenObservers::spectrum`,
+    /// calibrated by this input's `freq_correction_ppm`), published from
+    /// the input's own thread. `None` skips it.
+    pub spectrum: Option<Arc<dyn crate::SpectrumSink>>,
 }
 
 /// Opens one input's source on the input's own thread (`IqSource` is not
@@ -497,6 +501,7 @@ pub fn listen_inputs(
                 decode_quality: shared.decode_quality.clone(),
                 live_ids: shared.live_state.is_some(),
                 input: index,
+                spectrum: opened.observers[index].spectrum.clone(),
             },
             outbox,
         };

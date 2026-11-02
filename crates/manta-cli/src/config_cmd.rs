@@ -751,6 +751,19 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             "record_iq",
             shared.record_iq.as_ref().map(|p| p.display().to_string()),
         ),
+        // MAN-141: only when set, so every existing summary is unchanged.
+        (
+            "spectrum_udp",
+            shared.spectrum.as_ref().map(|s| s.dest.to_string()),
+        ),
+        (
+            "spectrum_name",
+            shared
+                .spectrum
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .map(crate::fmt::quoted),
+        ),
     ] {
         if let Some(v) = value {
             input.push_str(&format!(" {key}={v}"));
@@ -1239,6 +1252,30 @@ mod tests {
             line(&lines_of(&body), "input:"),
             "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
              rate_hz=192000 auto_attenuation=true"
+        );
+    }
+
+    #[test]
+    fn config_check_prints_the_spectrum_feed_only_when_set() {
+        // MAN-141: design section 1's input line.
+        let body = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.20\"\nport = 1024\n\
+                    freq_hz = 14050000.0\nrate_hz = 192000.0\n";
+        assert_eq!(
+            line(&lines_of(body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000"
+        );
+        let body = format!("{body}spectrum_udp = \"127.0.0.1:13064\"\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000 spectrum_udp=127.0.0.1:13064"
+        );
+        let body = format!("{body}spectrum_name = \"Rig 2\"\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000 spectrum_udp=127.0.0.1:13064 spectrum_name=\"Rig 2\""
         );
     }
 
@@ -2006,6 +2043,8 @@ mod tests {
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
+        ("input", "spectrum_udp"),
+        ("input", "spectrum_name"),
         ("input", "iq_format"),
         ("input", "sample_rate_hz"),
         ("spot", "blocklist_path"),
