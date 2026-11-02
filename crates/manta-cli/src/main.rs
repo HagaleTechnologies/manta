@@ -2482,7 +2482,38 @@ fn start_input_recording(
 /// adds nothing to the stop budget the service manager allows
 /// (`TimeoutStopSec=60` against the 50 s `SHUTDOWN_DRAIN_DEADLINE` plus
 /// 2 s of runtime shutdown) beyond this bound when the drain is shorter.
+/// With `RECORDING_PUBLICATION_GRACE` after it, it still ends inside that
+/// drain (MAN-453).
 const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// MAN-453: how long after `RECORDING_FINISH_TIMEOUT` a writer that has
+/// already begun publishing may take to finish. One window for every
+/// recording of the run, as the timeout is one deadline, so recording's
+/// part of a stop ends 7 s after `close_recordings`, inside the drain.
+const RECORDING_PUBLICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// MAN-453: what `finish` gets at `now` for a recording closed with
+/// `deadline`: the rest of the timeout, then the rest of the shared grace.
+fn recording_finish_budget(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> (std::time::Duration, std::time::Duration) {
+    let grace_end = deadline + RECORDING_PUBLICATION_GRACE;
+    (
+        deadline.saturating_duration_since(now),
+        grace_end.saturating_duration_since(deadline.max(now)),
+    )
+}
+
+/// MAN-453: finishes one recording with what is left of `deadline` and of
+/// the publication grace after it.
+fn finish_by(
+    handle: manta_input::RecordingHandle,
+    deadline: std::time::Instant,
+) -> manta_input::RecordingOutcome {
+    let (timeout, grace) = recording_finish_budget(deadline, std::time::Instant::now());
+    handle.finish(timeout, grace)
+}
 
 /// MAN-309: closes every recording's queue once decoding has ended, so
 /// each writer finalizes during the client drain. Returns the one deadline
@@ -2519,7 +2550,7 @@ fn finish_recording(
     deadline: std::time::Instant,
 ) -> Result<()> {
     let recorded = handle.path().to_path_buf();
-    let outcome = handle.finish(deadline.saturating_duration_since(std::time::Instant::now()));
+    let outcome = finish_by(handle, deadline);
     report_recording(&recorded, outcome)
 }
 
@@ -2530,7 +2561,7 @@ fn finish_recording(
 /// reports it; the run is failing already, so nothing is returned.
 fn discard_empty_recording(handle: manta_input::RecordingHandle, deadline: std::time::Instant) {
     let recorded = handle.path().to_path_buf();
-    match handle.finish(deadline.saturating_duration_since(std::time::Instant::now())) {
+    match finish_by(handle, deadline) {
         manta_input::RecordingOutcome::Finished { samples: 0, .. } => {
             let removed = std::fs::remove_file(manta_input::metadata_path(&recorded))
                 .and_then(|()| std::fs::remove_file(&recorded));
@@ -5798,12 +5829,14 @@ fn record_iq_ignored_note(command: &str, loaded: &config::Loaded) -> Option<Stri
 
 /// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
 /// the pacing, so one clock spans every pass. `reopen` opens each later pass.
-/// The default mode returns `first` unchanged.
+/// The default mode returns `first` unchanged. `stop` ends a pacing wait
+/// early (MAN-453).
 fn wrap_file_replay(
     first: Box<dyn IqSource>,
     mode: ReplayMode,
     label: String,
     reopen: manta_input::Reopen,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Box<dyn IqSource>> {
     let src: Box<dyn IqSource> = if mode.looped {
         Box::new(manta_input::LoopingSource::new(label, first, reopen))
@@ -5811,7 +5844,7 @@ fn wrap_file_replay(
         first
     };
     Ok(if mode.paced {
-        Box::new(manta_input::PacedSource::new(src)?)
+        Box::new(manta_input::PacedSource::new(src)?.with_stop_flag(stop))
     } else {
         src
     })
@@ -7308,7 +7341,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // filled); it processes only what it has already read and
             // returns `Ok` without reading again. A reconnect's backoff or
             // reopen in flight ends within ~100 ms (MAN-252: the reopen runs
-            // on its own thread, which a stop abandons). A read already in
+            // on its own thread, which a stop abandons). A paced replay's
+            // wait, including one through a recorded gap, ends within
+            // ~100 ms too (MAN-453). A read already in
             // flight is not interrupted: it returns with whatever the source
             // yields next, or fails after that source's own stall bound, and
             // the shutdown sequence below runs on both the `Ok` and the error
@@ -7637,6 +7672,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     Box::new(move || {
                         Ok(reopen_spec.open(capture_rate_hz, dial_freq_hz)? as Box<dyn IqSource>)
                     }),
+                    stop.clone(),
                 )?
             };
 
@@ -9797,6 +9833,33 @@ mod tests {
             "frequency/rate flags without a -hz suffix:\n{}",
             bad.join("\n")
         );
+    }
+
+    /// MAN-453: every recording waits out the rest of one 5 s deadline, then
+    /// the rest of one 2 s publication grace after it, not a grace each.
+    #[test]
+    fn recording_finish_budget_shares_one_grace_after_the_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let s = std::time::Duration::from_secs;
+        assert_eq!(
+            recording_finish_budget(deadline, deadline - s(3)),
+            (s(3), RECORDING_PUBLICATION_GRACE)
+        );
+        assert_eq!(
+            recording_finish_budget(deadline, deadline + s(1)),
+            (s(0), RECORDING_PUBLICATION_GRACE - s(1))
+        );
+        assert_eq!(
+            recording_finish_budget(deadline, deadline + s(9)),
+            (s(0), s(0))
+        );
+    }
+
+    /// MAN-453: recordings finish inside the client drain, so the grace adds
+    /// nothing to the stop budget `TimeoutStopSec=60` covers.
+    #[test]
+    fn recording_finalization_ends_inside_the_client_drain() {
+        assert!(RECORDING_FINISH_TIMEOUT + RECORDING_PUBLICATION_GRACE <= SHUTDOWN_DRAIN_DEADLINE);
     }
 
     /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
@@ -13042,9 +13105,33 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ReplayMode::default(),
             "x.wav".into(),
             Box::new(|| bail!("the default mode never reopens")),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .unwrap();
         assert_eq!(&*wrapped as *const dyn IqSource as *const (), before);
+    }
+
+    /// MAN-453: the paced wrapper gets the run's stop flag, so a stop ends
+    /// its wait.
+    #[test]
+    fn wrap_file_replay_hands_the_stop_flag_to_the_pacing() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut src = wrap_file_replay(
+            ramp(16_000, 8000.0),
+            ReplayMode::from_flags(true, false),
+            "x.wav".into(),
+            Box::new(|| bail!("not looped")),
+            stop,
+        )
+        .unwrap();
+        let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 16_000];
+        let start = std::time::Instant::now();
+        assert_eq!(src.read(&mut buf).unwrap(), 16_000);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -13056,6 +13143,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ReplayMode::from_flags(false, true),
             "x.wav".into(),
             Box::new(|| Ok(ramp(100, 1000.0))),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .unwrap();
         let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 300];
