@@ -56,7 +56,7 @@ use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
 use manta_decode::timing::TimingEstimates;
-use manta_input::{IqSource, WavIqSource};
+use manta_input::{IqSource, ReadContinuity, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 use std::sync::Arc;
@@ -554,12 +554,22 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             nonzero |= chunk[filled..filled + n]
                 .iter()
                 .any(|s| s.re != 0.0 || s.im != 0.0);
-            if let Some(missing) = src.take_discontinuity() {
+            // MAN-202: every gap report is taken here. `missing_samples` is
+            // still ignored by file decode, as before (a follow-up: make
+            // `decode_source` honour `take_missing_samples`).
+            let cont = ReadContinuity::take(src);
+            if let Some(missing) = cont.discontinuity {
                 // These samples follow the outage: they open the next
                 // segment, after this one's partial chunk.
                 carry.extend_from_slice(&chunk[filled..filled + n]);
                 gap = Some(missing);
                 break;
+            }
+            if cont.unknown_gap {
+                // MAN-202: an unknown-length loss before data sample
+                // `consumed` of this segment; see `listen`'s main loop.
+                seg.tm
+                    .note_input_gap(track::first_hop_after_gap(consumed, seg.hop));
             }
             filled += n;
             consumed += n as u64;
@@ -595,7 +605,8 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         consumed = 0;
     }
     // MAN-258: a stream that ended during an outage is not an end of signal.
-    let terminal_gap = src.take_discontinuity().is_some();
+    // MAN-202: nor one that ended with an unknown gap pending (both taken).
+    let terminal_gap = src.take_discontinuity().is_some() | src.take_unknown_gap();
     if !nonzero {
         bail!("input is digital silence");
     }

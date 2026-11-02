@@ -1724,6 +1724,28 @@ twice (MAN-259). File replay never reports a discontinuity. An end of stream
 reported with a discontinuity pending (MAN-258: a stop while the source is
 down) closes the segment the same way and starts none.
 
+A loss of *unknown* length (MAN-202: a SoapySDR driver overflow) is reported
+by `IqSource::take_unknown_gap()`. It has no count, so `sample_ts` does not
+advance (timestamps after it run early by the lost time) and no segment is
+rebuilt. Instead every track's continuity-dependent decode state is
+invalidated at the first hop whose channelizer window holds a post-gap
+sample, `first_hop_after_gap(pos, hop) = pos / hop + 1`, whatever the read
+sizes. Per track: the refiner backlog is drained, then the refiner,
+`clean_hist` and `phase_hist` are reset; the `Demod` held run is processed
+as a normal run, the open run and fade run are dropped and an init window
+restarts; the marks in progress become a character only if the open space
+had already reached a character gap before the loss; a word with committed
+characters closes with a `WordBoundary` at the last pre-gap hop; warm-up
+runs and flush-learning state are cleared; and post-gap runs are discarded
+until a space of at least a character gap closes (resync); before tracker
+readiness, whole post-gap marks set only the unit that space is measured in.
+Speed, gap
+classification, sender timing, rails, noise, track identity, the floor and
+the channelizer are kept. No track closes because of the gap. A
+discontinuity reported on the same read wins, and an unknown gap pending at
+end of stream closes the segment like a pending discontinuity. See
+docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
+
 ---
 
 ## 6. Determinism requirements

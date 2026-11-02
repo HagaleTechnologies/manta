@@ -201,6 +201,8 @@ fn sample_spot() -> Spot {
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     }
 }
 
@@ -653,6 +655,51 @@ async fn a_websocket_handshake_flooded_past_65536_bytes_is_rejected_not_buffered
     );
 }
 
+/// MAN-322 scenario "JSON consumers see the mode": an RTTY spot is
+/// emitted with `mode` "RTTY", `wpm` null and `baud` 45.45 on raw TCP and
+/// WebSocket alike; a CW spot published next keeps `mode` "CW", an integer
+/// `wpm` and `baud` null. Both carry all 30 keys.
+#[tokio::test]
+async fn an_rtty_spot_carries_mode_rtty_and_baud_not_wpm() {
+    let (addr, bus, _metrics, _shutdown_tx) = spawn_server().await;
+    let (mut tcp, _) = connect_tcp(addr).await;
+    let (mut ws, _) = connect_ws(format!("ws://{addr}"))
+        .await
+        .expect("ws connect failed");
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bus.publish(Spot {
+        callsign: "W1AW".to_string(),
+        freq_hz: 14_080_170.0,
+        snr_db: 20.0,
+        wpm: 0.0,
+        track_id: 12,
+        mode: manta_spot::SpotMode::Rtty,
+        baud: Some(45.45),
+        ..sample_spot()
+    });
+    bus.publish(sample_spot());
+
+    for (rtty, cw) in [
+        (next_tcp(&mut tcp).await, next_tcp(&mut tcp).await),
+        (next_ws(&mut ws).await, next_ws(&mut ws).await),
+    ] {
+        assert_eq!(rtty["dxCall"], "W1AW", "{rtty}");
+        assert_eq!(rtty["mode"], "RTTY", "{rtty}");
+        assert!(rtty.get("wpm").is_some_and(|w| w.is_null()), "{rtty}");
+        assert_eq!(rtty["baud"], 45.45, "{rtty}");
+        assert_eq!(rtty.as_object().unwrap().len(), 30, "{rtty}");
+
+        assert_eq!(cw["dxCall"], "JA1ABC", "{cw}");
+        assert_eq!(cw["mode"], "CW", "{cw}");
+        assert_eq!(cw["wpm"], 28, "{cw}");
+        assert!(cw.get("baud").is_some_and(|b| b.is_null()), "{cw}");
+        assert_eq!(cw.as_object().unwrap().len(), 30, "{cw}");
+    }
+
+    let _ = ws.close(None).await;
+}
+
 #[tokio::test]
 async fn tcp_and_websocket_clients_share_the_same_port() {
     // ARCHITECTURE §7 documents one shared "tcp/ws :7301" port -- prove a
@@ -689,7 +736,7 @@ async fn tcp_and_websocket_clients_share_the_same_port() {
 }
 
 /// MAN-323: an FT8 spot published with `publish_ftx` reaches a TCP client
-/// and a WebSocket client on the same port as a 29-key spot line labelled
+/// and a WebSocket client on the same port as a 30-key spot line labelled
 /// FT8. The telnet server and the uplink read `SpotBus::subscribe`, which
 /// receives nothing.
 #[tokio::test]
@@ -721,8 +768,9 @@ async fn an_ft8_spot_reaches_the_json_stream_labelled_ft8() {
         assert_eq!(value["timestamp"], 1_730_462_415);
         assert_eq!(value["seq"], 1);
         assert!(value["wpm"].is_null(), "{value}");
+        assert!(value["baud"].is_null(), "{value}");
         assert!(value["decodeConfidence"].is_null(), "{value}");
-        assert_eq!(value.as_object().unwrap().len(), 29, "{value}");
+        assert_eq!(value.as_object().unwrap().len(), 30, "{value}");
     }
     assert!(matches!(
         telnet_channel.try_recv(),

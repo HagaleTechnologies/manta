@@ -31,8 +31,8 @@ pub use notch::{FreqRange, NotchList};
 pub use pattern::{PatternTier, ValidationLevel};
 pub use support::Support;
 pub use validator::{
-    calibration_factor_from_ppm, EmissionState, InvalidCalibration, Spot, SuppressionCounts,
-    Validator,
+    calibration_factor_from_ppm, EmissionState, InvalidCalibration, Spot, SpotMode,
+    SuppressionCounts, Validator,
 };
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see

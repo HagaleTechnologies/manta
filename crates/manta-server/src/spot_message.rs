@@ -28,7 +28,7 @@
 //! is in `docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md`.
 
 use manta_spot::cty;
-use manta_spot::Spot;
+use manta_spot::{Spot, SpotMode};
 use serde::Serialize;
 
 /// Emitted for `dxDxcc`/`deDxcc` when `cty.lookup` cannot resolve the
@@ -219,7 +219,11 @@ pub struct SpotMessage {
     pub snr: Option<i32>,
     /// The reference bandwidth `snr` is quoted in. MAN-102 / D3.
     pub snr_ref_hz: u32,
+    /// CW keying speed; `null` on an RTTY spot, which carries `baud` (MAN-322).
     pub wpm: Option<i32>,
+    /// RTTY symbol rate in baud, two decimals; `null` on a CW spot.
+    /// MAN-322; agreed for spots.v1 in dispensa Q-0085.
+    pub baud: Option<f64>,
     /// The spot's track's most recent RST, three digits. MAN-272; manta-originated, not yet in dispensa.
     pub rst: Option<String>,
     /// The spot's track decoded `QRL?`. MAN-272; manta-originated, not yet in dispensa.
@@ -250,11 +254,21 @@ pub fn wire_frequency_hz(spot: &Spot) -> i64 {
     spot.freq_hz.round() as i64
 }
 
-/// A spot's JSON `wpm`: the decoder's estimate rounded to whole WPM.
+/// A spot's JSON `wpm`: the decoder's estimate rounded to whole WPM, or
+/// `None` on a non-CW spot, whose speed is `baud` (MAN-322).
 /// MAN-301: shared with the live comparator for the same reason as
 /// [`wire_frequency_hz`].
 pub fn wire_wpm(spot: &Spot) -> Option<i32> {
-    Some(spot.wpm.round() as i32)
+    (spot.mode == SpotMode::Cw).then(|| spot.wpm.round() as i32)
+}
+
+/// A spot's JSON `baud`: an RTTY spot's symbol rate rounded to two
+/// decimals (`45.45`), or `None` on a CW spot (MAN-322 D3).
+pub fn wire_baud(spot: &Spot) -> Option<f64> {
+    match spot.mode {
+        SpotMode::Cw => None,
+        SpotMode::Rtty => spot.baud.map(|b| (f64::from(b) * 100.0).round() / 100.0),
+    }
 }
 
 impl SpotMessage {
@@ -336,7 +350,7 @@ impl SpotMessage {
             ingested_at: unix_ts_secs,
             frequency: frequency_hz,
             band: crate::band::band_for_freq_hz(frequency_hz as f64).to_string(),
-            mode: "CW",
+            mode: spot.mode.label(),
             dx_call: spot.callsign.clone(),
             dx_grid: None,
             dx_lat: dx.lat,
@@ -356,6 +370,7 @@ impl SpotMessage {
             snr: Some(spot.snr_db.round() as i32),
             snr_ref_hz: SNR_REF_HZ,
             wpm: wire_wpm(spot),
+            baud: wire_baud(spot),
             rst: spot.rst.clone(),
             qrl_query: spot.qrl_query,
             decode_confidence: Some(spot.confidence),
@@ -366,11 +381,11 @@ impl SpotMessage {
     }
 
     /// MAN-323: the wire message for one FT8/FT4 `CQ` decoded from an IQ
-    /// stream. The same 29 keys as [`SpotMessage::from_spot`], with the
+    /// stream. The same 30 keys as [`SpotMessage::from_spot`], with the
     /// geography and `de*` fields resolved the same way. `timestamp` is the
     /// slot's UTC start in whole seconds, `snr` the decoder's own estimate
     /// (WSJT-X's 2500 Hz reference), `dxGrid` the grid the `CQ` carried, and
-    /// `wpm`/`rst`/`decodeConfidence`/`channelizerResolutionHz` are `null`.
+    /// `wpm`/`baud`/`rst`/`decodeConfidence`/`channelizerResolutionHz` are `null`.
     pub fn from_ftx(
         spot: &FtxSpot,
         station_call: &str,
@@ -408,6 +423,7 @@ impl SpotMessage {
             snr: Some(spot.snr_db),
             snr_ref_hz: SNR_REF_HZ,
             wpm: None,
+            baud: None,
             rst: None,
             qrl_query: false,
             decode_confidence: None,
@@ -529,6 +545,8 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             sample_ts: 12_345,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1035,6 +1053,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             "snr",
             "snrRefHz",
             "wpm",
+            "baud",
             "decodeConfidence",
             "decoderVersion",
             "channelizerResolutionHz",
@@ -1141,7 +1160,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
     }
 
     /// MAN-272: a track's latest RST and its QRL? flag reach the JSON
-    /// stream as `rst`/`qrlQuery`, between `wpm` and `decodeConfidence`.
+    /// stream as `rst`/`qrlQuery`, between `wpm`/`baud` and `decodeConfidence`.
     #[test]
     fn rst_and_qrl_reach_the_wire_under_their_contract_names() {
         let cty = cty::Table::parse(CTY_FIXTURE);
@@ -1151,7 +1170,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         let msg = SpotMessage::from_spot(&spot, "W1AW", None, &cty, "v", 0, 1, 0);
         let line = serde_json::to_string(&msg).unwrap();
         assert!(
-            line.contains(r#""wpm":28,"rst":"599","qrlQuery":true,"decodeConfidence""#),
+            line.contains(r#""wpm":28,"baud":null,"rst":"599","qrlQuery":true,"decodeConfidence""#),
             "got {line}"
         );
     }
@@ -1168,6 +1187,63 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
             "got {line}"
         );
     }
+    fn rtty_spot() -> Spot {
+        Spot {
+            freq_hz: 14_080_170.0,
+            wpm: 0.0,
+            mode: manta_spot::SpotMode::Rtty,
+            baud: Some(45.45),
+            ..sample_spot()
+        }
+    }
+
+    /// MAN-322, the ticket's JSON scenario at the message level: an RTTY
+    /// spot is labelled `RTTY` and carries baud, never WPM.
+    #[test]
+    fn an_rtty_spot_is_mode_rtty_with_baud_and_null_wpm() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&rtty_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(line.contains(r#""mode":"RTTY""#), "got {line}");
+        assert!(
+            line.contains(r#""wpm":null,"baud":45.45,"rst":null"#),
+            "got {line}"
+        );
+    }
+
+    /// MAN-322: `baud` is never omitted; a CW spot sends it as `null`,
+    /// right after `wpm`.
+    #[test]
+    fn a_cw_spot_sends_baud_null_after_wpm() {
+        let cty = cty::Table::parse(CTY_FIXTURE);
+        let msg = SpotMessage::from_spot(&sample_spot(), "W1AW", None, &cty, "v", 0, 1, 0);
+        let line = serde_json::to_string(&msg).unwrap();
+        assert!(line.contains(r#""mode":"CW""#), "got {line}");
+        assert!(line.contains(r#""wpm":28,"baud":null,"rst""#), "got {line}");
+    }
+
+    #[test]
+    fn wire_baud_rounds_to_two_decimals() {
+        assert_eq!(wire_baud(&rtty_spot()), Some(45.45));
+        let fifty = Spot {
+            baud: Some(50.0),
+            ..rtty_spot()
+        };
+        assert_eq!(wire_baud(&fifty), Some(50.0));
+        let unrounded = Spot {
+            baud: Some(45.454_544),
+            ..rtty_spot()
+        };
+        assert_eq!(wire_baud(&unrounded), Some(45.45));
+        assert_eq!(wire_baud(&sample_spot()), None);
+        // A CW spot never reports baud, and an RTTY spot never reports WPM.
+        let cw_with_baud = Spot {
+            baud: Some(45.45),
+            ..sample_spot()
+        };
+        assert_eq!(wire_baud(&cw_with_baud), None);
+        assert_eq!(wire_wpm(&rtty_spot()), None);
+    }
 
     fn w1aw_ft8() -> FtxSpot {
         FtxSpot {
@@ -1180,7 +1256,7 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         }
     }
 
-    /// MAN-323 devex 3: an FT8 spot keeps the 29 keys in their order, with
+    /// MAN-323 devex 3: an FT8 spot keeps the 30 keys in their order, with
     /// the FTx-specific values and nulls.
     #[test]
     fn an_ft8_spot_renders_as_devex_3() {
@@ -1215,7 +1291,13 @@ Japan:            25: 45: AS:  36.0: 138.0:  9.0:  JA:
         assert_eq!(json["seq"], 42);
         assert_eq!(json["qrlQuery"], false);
         assert_eq!(json["dxDxcc"], 291);
-        for key in ["wpm", "rst", "decodeConfidence", "channelizerResolutionHz"] {
+        for key in [
+            "wpm",
+            "baud",
+            "rst",
+            "decodeConfidence",
+            "channelizerResolutionHz",
+        ] {
             assert!(json[key].is_null(), "{key}: {json}");
         }
     }
