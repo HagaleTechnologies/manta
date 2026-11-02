@@ -65,8 +65,9 @@ Reading silence as `TrackMeta.sample_ts - word end` dropped V8 with the prior
 on to 40 of 50 (floor 45). `TrackMeta.sample_ts` runs ahead of a word the
 MAN-317 prior still holds, so every word looked silent. `TrackMeta` now carries
 `last_char_ts`, the decoder's newest character, held or released, and silence
-is measured from it. The field is `#[serde(skip)]`: it is in-process only and
-the event JSON is unchanged. V8 is back at 48 of 50 at weights 0, 1 and 2.
+is measured from it. It is `lastCharTs` in `decode --json` events, so a
+replayed report decides as the live run did, and is on the shared clock in a
+multi-input run. V8 is back at 48 of 50 at weights 0, 1 and 2.
 
 ### A stream that stops (Tony's decision, 2026-11-01)
 

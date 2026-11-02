@@ -76,8 +76,9 @@ pub enum DecoderEvent {
         /// released or still held back by the MAN-317 prior; `0` with none.
         /// `sample_ts` runs ahead of held words, so a silence bound measured
         /// from a released word alone would read a word still in hand as
-        /// silence. In-process only: no event-stream field.
-        #[serde(skip)]
+        /// silence. Serialized so a replayed report decides as the live run
+        /// did; `#[serde(default)]` keeps older reports readable.
+        #[serde(default)]
         last_char_ts: u64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,
@@ -370,7 +371,7 @@ mod tests {
                     last_char_ts: 0,
                 },
                 Some(
-                    r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5}"#,
+                    r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5,"lastCharTs":0}"#,
                 ),
             ),
             (timing_update(), None),

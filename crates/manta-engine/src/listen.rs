@@ -1436,11 +1436,22 @@ fn to_common(
             match &mut ev {
                 DecoderEvent::CharDecoded { sample_ts, .. }
                 | DecoderEvent::WordBoundary { sample_ts, .. }
-                | DecoderEvent::TrackMeta { sample_ts, .. }
                 | DecoderEvent::ReadingsHeld { sample_ts, .. }
                 | DecoderEvent::TimingUpdate { sample_ts, .. }
                 | DecoderEvent::TrackPromoted { sample_ts, .. } => {
                     *sample_ts = clock.to_common(*sample_ts);
+                }
+                // MAN-201: the validator compares these with word times on
+                // the shared clock. `0` means no character yet.
+                DecoderEvent::TrackMeta {
+                    sample_ts,
+                    last_char_ts,
+                    ..
+                } => {
+                    *sample_ts = clock.to_common(*sample_ts);
+                    if *last_char_ts > 0 {
+                        *last_char_ts = clock.to_common(*last_char_ts);
+                    }
                 }
                 DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackClosed { .. } => {}
             }
@@ -4302,6 +4313,26 @@ mod tests {
         // lists apply to W1AW.
         spots.retain(|(call, _)| call == "W1AW");
         (spots, reads.load(Ordering::Relaxed))
+    }
+
+    /// MAN-201: a mixed-rate session compares the character clock with word
+    /// times on the shared clock.
+    #[test]
+    fn to_common_converts_the_character_clock_with_the_sample_clock() {
+        let clock = crate::multi::SourceClock {
+            scale: 2,
+            offset: 0,
+        };
+        let event = |sample_ts, last_char_ts| DecoderEvent::TrackMeta {
+            track_id: 1,
+            sample_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0,
+            last_char_ts,
+        };
+        let got = to_common(vec![event(1_000, 900), event(1_000, 0)], clock, 1.0);
+        assert_eq!(got[0], event(2_000, 1_800));
+        assert_eq!(got[1], event(2_000, 0));
     }
 
     /// Delivers its samples, then fails: a dead receiver.

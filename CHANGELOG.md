@@ -37,7 +37,8 @@ the git history and `docs/DECISIONS/`.
   settles their last calls. A call followed by a lone `T` spots as `BEACON`
   only when it is on `[spot].allowlist`; other such decodes are withheld as
   `beaconNoEvidence`. An allowlisted call heard only as the station called
-  or mentioned is no longer spotted. See
+  or mentioned is no longer spotted. `decode --json` `TrackMeta` events gain
+  `lastCharTs`. See
   [docs/DECISIONS/2026-11-02-man201-callsign-roles.md](docs/DECISIONS/2026-11-02-man201-callsign-roles.md).
 - MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
   gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
