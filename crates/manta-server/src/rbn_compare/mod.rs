@@ -4,7 +4,9 @@
 //! published spot until its comparison window closes, then grades it
 //! ([`grade`]) and publishes a `spotGrade` record on the JSON stream and the
 //! `manta_rbn_compare_*` metrics ([`live`]). `manta grade` replays a node's
-//! spot archive through the same [`grade`] engine offline.
+//! spot archive through the same [`grade`] engine offline; its reverse pass
+//! ([`grade::grade_references`], MAN-97) grades a reference skimmer's
+//! reports against manta's spots for `manta grade --paired`.
 //!
 //! Read-only toward RBN: the feed client writes exactly one line, its login
 //! callsign, and nothing else. See

@@ -28,6 +28,9 @@ pub struct StartupInfo<'a> {
     /// MAN-324: the live-state listener's bound address, when
     /// `[server].live_port` is set.
     pub live_addr: Option<SocketAddr>,
+    /// MAN-322: the RTTY telnet listener's bound address, when
+    /// `[server].rtty_telnet_port` is set.
+    pub rtty_telnet_addr: Option<SocketAddr>,
     /// MAN-13: the `[[input]]` names, set only with two or more inputs.
     /// The banner then names them (`inputs=a,b`) instead of one source's
     /// `source=`/`sample_rate_hz=`/`dial_frequency=`; each input prints
@@ -74,6 +77,11 @@ pub fn format_startup_banner(info: &StartupInfo<'_>) -> String {
     // banner is unchanged without `live_port`.
     if let Some(live) = info.live_addr {
         line.push_str(&format!(" live={live}"));
+    }
+    // MAN-322: likewise only when the RTTY telnet listener runs; last, so
+    // every earlier field keeps its place.
+    if let Some(rtty_telnet) = info.rtty_telnet_addr {
+        line.push_str(&format!(" rtty_telnet={rtty_telnet}"));
     }
     line
 }
@@ -384,6 +392,7 @@ mod tests {
             json_addr: "0.0.0.0:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr: None,
+            rtty_telnet_addr: None,
             inputs: Some(&inputs),
         });
         assert_eq!(
@@ -414,6 +423,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr: None,
+            rtty_telnet_addr: None,
             inputs: None,
         });
         for needle in [
@@ -441,6 +451,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr,
+            rtty_telnet_addr: None,
             inputs: None,
         };
         let off = format_startup_banner(&info(None));
@@ -448,6 +459,34 @@ mod tests {
         assert!(!off.contains("live="));
         let on = format_startup_banner(&info(Some("127.0.0.1:7303".parse().unwrap())));
         assert_eq!(on, format!("{off} live=127.0.0.1:7303"));
+    }
+
+    #[test]
+    fn banner_appends_rtty_telnet_addr_only_when_enabled() {
+        let info = |live_addr, rtty_telnet_addr| StartupInfo {
+            version: "0.1.0",
+            source: "file",
+            sample_rate_hz: 96_000.0,
+            dial_freq_hz: 14_000_000.0,
+            station_callsign: "W1AW",
+            telnet_addr: "127.0.0.1:7300".parse().unwrap(),
+            json_addr: "127.0.0.1:7301".parse().unwrap(),
+            metrics_addr: "127.0.0.1:7302".parse().unwrap(),
+            live_addr,
+            rtty_telnet_addr,
+            inputs: None,
+        };
+        let off = format_startup_banner(&info(None, None));
+        assert!(!off.contains("rtty_telnet="), "{off}");
+        let rtty: SocketAddr = "127.0.0.1:7304".parse().unwrap();
+        let on = format_startup_banner(&info(None, Some(rtty)));
+        assert_eq!(on, format!("{off} rtty_telnet=127.0.0.1:7304"));
+        let live: SocketAddr = "127.0.0.1:7303".parse().unwrap();
+        let both = format_startup_banner(&info(Some(live), Some(rtty)));
+        assert_eq!(
+            both,
+            format!("{off} live=127.0.0.1:7303 rtty_telnet=127.0.0.1:7304")
+        );
     }
 
     #[test]
@@ -630,6 +669,7 @@ mod tests {
             json_addr: "127.0.0.1:7301".parse().unwrap(),
             metrics_addr: "127.0.0.1:7302".parse().unwrap(),
             live_addr: None,
+            rtty_telnet_addr: None,
             inputs: None,
         });
         assert!(banner.contains("listening:"), "{banner:?}");

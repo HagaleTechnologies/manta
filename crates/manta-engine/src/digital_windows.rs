@@ -66,6 +66,12 @@ pub(crate) fn contains(freq_hz: f64) -> bool {
     })
 }
 
+/// The dials of one table column (0 FT8, 1 FT4, 2 WSPR, 3 JS8), low band
+/// first, skipping bands without one. MAN-323 reads the FT8 and FT4 columns.
+pub(crate) fn dials(column: usize) -> impl Iterator<Item = u32> {
+    DIALS_HZ.iter().filter_map(move |row| row[column])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1194,6 +1194,8 @@ mod tests {
             sample_ts,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 

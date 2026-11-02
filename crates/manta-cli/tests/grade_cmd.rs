@@ -811,3 +811,646 @@ fn grade_names_a_missing_input_as_typed_once() {
         "stderr: {err}"
     );
 }
+
+// MAN-97: `--reference` (a skimmer's `DX de` transcript) and `--paired`
+// (recall, misses and candidate false spots), against
+// `tests/fixtures/skimsrv_pair/`: node W3XYZ-1 beside its SkimSrv W3XYZ.
+
+fn pair_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/skimsrv_pair")
+        .join(name)
+}
+
+fn read_pair_fixture(name: &str) -> String {
+    std::fs::read_to_string(pair_fixture(name)).unwrap()
+}
+
+/// `manta grade --spots <pair spots> --reference <pair transcript>` plus `extra`.
+fn reference_fixture(extra: &[&str]) -> Output {
+    manta()
+        .arg("grade")
+        .arg("--spots")
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(pair_fixture("reference-2026-10-31.txt"))
+        .args(extra)
+        .output()
+        .unwrap()
+}
+
+/// The paired fixture run: the night 00:00-06:00Z on 14000-14070 kHz.
+fn paired_fixture(extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--paired",
+        "--passband-khz",
+        "14000-14070",
+        "--start",
+        "2026-10-31T00:00:00Z",
+        "--end",
+        "2026-10-31T06:00:00Z",
+    ];
+    args.extend_from_slice(extra);
+    reference_fixture(&args)
+}
+
+fn paired_json(out: &Output) -> serde_json::Value {
+    assert_success(out);
+    let text = stdout(out);
+    assert_eq!(text.lines().count(), 1, "one JSON line:\n{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// The `grade` of the spot at `time` (Unix seconds), from `--json` lines.
+fn grade_of_call(json: &str, time: i64) -> String {
+    json.lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v["spotTime"] == time)
+        .unwrap_or_else(|| panic!("no grade at {time} in:\n{json}"))["grade"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// 2026-10-31 00:06:00Z, the fixture's W1AW spot that R1 confirms.
+const PAIR_W1AW_TIME: i64 = 1_793_405_160;
+
+#[test]
+fn grade_reference_summary_matches_expected_text() {
+    let out = reference_fixture(&[]);
+    assert_success(&out);
+    assert_lines_eq(
+        &stdout(&out),
+        &read_pair_fixture("expected-reference-summary.txt"),
+    );
+}
+
+#[test]
+fn grade_reference_counts_the_nodes_own_base_call() {
+    // The transcript's spotter is W3XYZ, the node W3XYZ-1's base call:
+    // with --rbn it would be excluded and the spot would grade none.
+    let out = reference_fixture(&["--json"]);
+    assert_success(&out);
+    assert_eq!(grade_of_call(&stdout(&out), PAIR_W1AW_TIME), "match");
+}
+
+#[test]
+fn grade_reference_accepts_a_spotter_that_is_the_nodes_own_call() {
+    let out = reference_fixture(&["--json", "--spotter", "W3XYZ"]);
+    assert_success(&out);
+    assert_eq!(grade_of_call(&stdout(&out), PAIR_W1AW_TIME), "match");
+    // A spotter the transcript never names leaves every grade without a
+    // report: the filter applies to `DX de` spotters. (K1ABC's spot at
+    // 00:41:00Z, whose window the transcript's span covers.)
+    let out = reference_fixture(&["--json", "--spotter", "K5TR"]);
+    assert_success(&out);
+    assert_eq!(grade_of_call(&stdout(&out), 1_793_407_260), "none");
+}
+
+#[test]
+fn grade_reference_bare_file_takes_its_day_from_the_name() {
+    // 2358Z then 0003Z in reference-bare-2026-10-30.txt: the second line is
+    // 2026-10-31 00:03:30Z, which confirms the spot at 00:04:00Z.
+    let out = manta()
+        .args(["grade", "--json", "--spots"])
+        .arg(pair_fixture("spots-bare-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(pair_fixture("reference-bare-2026-10-30.txt"))
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert_eq!(grade_of_call(&stdout(&out), 1_793_405_040), "match");
+}
+
+#[test]
+fn grade_reference_directory_reads_txt_and_log_files_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = read_pair_fixture("reference-2026-10-31.txt");
+    let (head, tail) = body.split_at(body.find("2026-10-31T02:00:00Z").unwrap());
+    std::fs::write(dir.path().join("reference-2026-10-31.txt"), head).unwrap();
+    std::fs::write(dir.path().join("reference-2026-10-31b.log"), tail).unwrap();
+    std::fs::write(dir.path().join("notes.md"), "DX de nothing\n").unwrap();
+    let out = manta()
+        .args(["grade", "--spots"])
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(dir.path())
+        .arg(dir.path().join("reference-2026-10-31.txt"))
+        .output()
+        .unwrap();
+    assert_success(&out);
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "reference: 8 CW reports from 2 files (1 non-CW line, 1 other line skipped), \
+             2026-10-31 00:05:00Z to 06:02:00Z\n"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn grade_needs_rbn_or_reference_and_refuses_both() {
+    let neither = manta()
+        .args(["grade", "--spots"])
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .output()
+        .unwrap();
+    assert_eq!(neither.status.code(), Some(2), "{}", stderr(&neither));
+    assert!(stderr(&neither).contains("<--rbn <PATH>...|--reference <PATH>...>"));
+    let both = reference_fixture(&["--rbn", fixture("rbn-20261011.csv").to_str().unwrap()]);
+    assert_eq!(both.status.code(), Some(2), "{}", stderr(&both));
+    assert!(
+        stderr(&both).contains("cannot be used with"),
+        "{}",
+        stderr(&both)
+    );
+}
+
+#[test]
+fn grade_reference_error_names_file_and_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let capture = dir.path().join("capture.txt");
+    std::fs::write(
+        &capture,
+        "CW Skimmer Server\n\
+         Please enter your callsign:\n\
+         DX de W3XYZ-#:  14025.0  W1AW           CW    21 dB  25 WPM  CQ      0005Z\n",
+    )
+    .unwrap();
+    let out = manta()
+        .args(["grade", "--spots"])
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(&capture)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!(
+            "{} line 3: a DX de line with no UTC stamp needs its UTC day in the file name \
+             (as reference-2026-10-31.txt)",
+            capture.display()
+        )),
+        "{}",
+        stderr(&out)
+    );
+
+    let dated = dir.path().join("reference-2026-10-31.txt");
+    std::fs::write(
+        &dated,
+        "2026-10-31T25:00:00Z DX de W3XYZ-#:  14025.0  W1AW           CW    21 dB  25 WPM  CQ      0005Z\n",
+    )
+    .unwrap();
+    let out = manta()
+        .args(["grade", "--spots"])
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(&dated)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(&format!(
+            "{} line 1: bad UTC stamp \"2026-10-31T25:00:00Z\" before DX de",
+            dated.display()
+        )),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn paired_text_matches_expected() {
+    let out = paired_fixture(&[]);
+    assert_success(&out);
+    assert_lines_eq(&stdout(&out), &read_pair_fixture("expected-paired.txt"));
+}
+
+#[test]
+fn paired_json_matches_expected() {
+    let out = paired_fixture(&["--json"]);
+    assert_success(&out);
+    assert_lines_eq(&stdout(&out), &read_pair_fixture("expected-paired.json"));
+}
+
+#[test]
+fn paired_is_byte_identical_across_runs() {
+    for extra in [&[][..], &["--json"][..]] {
+        let first = paired_fixture(extra);
+        let second = paired_fixture(extra);
+        assert_success(&first);
+        assert_success(&second);
+        assert_eq!(first.stdout, second.stdout, "run {extra:?} twice");
+    }
+}
+
+#[test]
+fn paired_counts_add_up() {
+    for extra in [&["--json"][..], &["--json", "--window-secs", "180"][..]] {
+        let v = paired_json(&paired_fixture(extra));
+        let (m, r) = (&v["mantaSpots"], &v["referenceReports"]);
+        let n = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap();
+        assert_eq!(n(r, "found") + n(r, "missed"), n(r, "counted"), "{extra:?}");
+        assert_eq!(
+            ["match", "disagree", "elsewhere", "none", "unknown"]
+                .iter()
+                .map(|k| n(m, k))
+                .sum::<u64>(),
+            n(m, "counted"),
+            "{extra:?}"
+        );
+        assert_eq!(
+            n(m, "outOfPassband") + n(m, "outOfWindow") + n(m, "counted"),
+            n(m, "loaded")
+        );
+        assert_eq!(
+            [
+                "otherSpotter",
+                "outOfPassband",
+                "outOfWindow",
+                "implausibleCall",
+                "counted"
+            ]
+            .iter()
+            .map(|k| n(r, k))
+            .sum::<u64>(),
+            n(r, "loaded")
+        );
+        assert_eq!(v["missed"].as_array().unwrap().len() as u64, n(r, "missed"));
+        assert_eq!(
+            v["candidateFalse"].as_array().unwrap().len() as u64,
+            n(m, "none") + n(m, "elsewhere")
+        );
+    }
+}
+
+#[test]
+fn paired_window_defaults_to_600_and_the_flag_wins() {
+    let out = paired_fixture(&[]);
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("\nwindow: 600 s; "),
+        "{}",
+        stdout(&out)
+    );
+    let out = paired_fixture(&["--window-secs", "180"]);
+    assert_success(&out);
+    assert!(
+        stdout(&out).contains("\nwindow: 180 s; "),
+        "{}",
+        stdout(&out)
+    );
+}
+
+#[test]
+fn paired_ignores_the_config_window_but_keeps_its_tolerances() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("node.toml");
+    std::fs::write(
+        &cfg,
+        "[server]\nstation_callsign = \"W3XYZ-1\"\n\n\
+         [rbn_compare]\nwindow_secs = 180\nfreq_tol_hz = 2000.0\n",
+    )
+    .unwrap();
+    let out = paired_fixture(&["--config", cfg.to_str().unwrap()]);
+    assert_success(&out);
+    let text = stdout(&out);
+    assert!(
+        text.contains("\nwindow: 600 s; frequency disagreement over 2000 Hz; "),
+        "{text}"
+    );
+    // K1ABC's 1.4 kHz gap is inside the file's 2000 Hz: match, not disagree.
+    assert!(
+        text.contains("confirmed: 3 manta spots the reference also reported (match 3, disagree 0)"),
+        "{text}"
+    );
+}
+
+#[test]
+fn paired_without_start_and_end_counts_everything_loaded() {
+    let out = reference_fixture(&["--paired", "--passband-khz", "14000-14070", "--json"]);
+    let v = paired_json(&out);
+    assert_eq!(v["start"], serde_json::Value::Null);
+    assert_eq!(v["end"], serde_json::Value::Null);
+    assert_eq!(v["mantaSpots"]["outOfWindow"], 0);
+    // M8 (06:30) and R9 (06:02) now count.
+    assert_eq!(v["mantaSpots"]["counted"], 7);
+    assert_eq!(v["referenceReports"]["outOfWindow"], 0);
+    assert_eq!(v["referenceReports"]["counted"], 6);
+    let text = stdout(&reference_fixture(&[
+        "--paired",
+        "--passband-khz",
+        "14000-14070",
+    ]));
+    assert!(
+        text.contains("paired: node W3XYZ-1, all times, passband 14000-14070 kHz\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn paired_needs_a_passband() {
+    let out = reference_fixture(&["--paired"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "error: the following required arguments were not provided:\n  --passband-khz <LO-HI>"
+        ),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn paired_only_flags_need_paired() {
+    for extra in [
+        &["--passband-khz", "14000-14070"][..],
+        &["--start", "2026-10-31T00:00:00Z"][..],
+        &["--end", "2026-10-31T06:00:00Z"][..],
+    ] {
+        let out = reference_fixture(extra);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", stderr(&out));
+        let err = stderr(&out);
+        assert!(
+            err.contains("required arguments were not provided:")
+                && err.lines().any(|l| l == "  --paired"),
+            "{extra:?}: {err}"
+        );
+    }
+}
+
+#[test]
+fn paired_with_rbn_needs_a_spotter() {
+    let out = grade_fixture(&["--paired", "--passband-khz", "14000-14070"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "error: --paired with --rbn needs --spotter (the co-located skimmer): against \
+             every RBN skimmer, each call heard anywhere would count as a miss"
+        ),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn paired_with_rbn_and_a_spotter_reports_recall() {
+    let args = [
+        "--paired",
+        "--spotter",
+        "K5TR",
+        "--passband-khz",
+        "7000-7300",
+        "--passband-khz",
+        "14000-14350",
+    ];
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let v = paired_json(&grade_fixture(&json_args));
+    assert_eq!(v["referenceSource"], "rbn");
+    assert_eq!(v["spotters"], serde_json::json!(["K5TR"]));
+    assert_eq!(
+        v["passbandsKhz"],
+        serde_json::json!([[7000.0, 7300.0], [14000.0, 14350.0]])
+    );
+    let (m, r) = (&v["mantaSpots"], &v["referenceReports"]);
+    let n = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap();
+    assert!(n(r, "counted") > 0, "{v}");
+    assert!(n(r, "otherSpotter") > 0, "{v}");
+    assert_eq!(n(r, "found") + n(r, "missed"), n(r, "counted"));
+    assert_eq!(
+        ["match", "disagree", "elsewhere", "none", "unknown"]
+            .iter()
+            .map(|k| n(m, k))
+            .sum::<u64>(),
+        n(m, "counted")
+    );
+    // Own calls stay excluded with --rbn, as in the one-way header.
+    let out = grade_fixture(&args);
+    assert_success(&out);
+    let text = stdout(&out);
+    assert!(text.contains("\nrbn: "), "{text}");
+    assert!(
+        text.contains("\nspotters: K5TR (excluding W3XYZ-1, W3XYZ)\n"),
+        "{text}"
+    );
+    assert!(!text.contains("own calls are not excluded"), "{text}");
+    assert!(
+        text.contains("passbands 7000-7300, 14000-14350 kHz"),
+        "{text}"
+    );
+}
+
+#[test]
+fn paired_refuses_spots_from_two_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let spots = read_pair_fixture("spots-2026-10-31.jsonl");
+    let second = spots
+        .lines()
+        .next()
+        .unwrap()
+        .replace("\"deCall\":\"W3XYZ-1\"", "\"deCall\":\"K1ABC\"")
+        .replace("W3XYZ-1:", "K1ABC:");
+    let path = dir.path().join("spots-2026-10-31.jsonl");
+    std::fs::write(&path, format!("{spots}{second}\n")).unwrap();
+    let out = manta()
+        .args([
+            "grade",
+            "--paired",
+            "--passband-khz",
+            "14000-14070",
+            "--spots",
+        ])
+        .arg(&path)
+        .arg("--reference")
+        .arg(pair_fixture("reference-2026-10-31.txt"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "error: --paired compares one node with its reference; the spots carry 2 nodes \
+             (W3XYZ-1, K1ABC): grade each node's archive apart"
+        ),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn paired_refuses_end_not_after_start() {
+    let out = reference_fixture(&[
+        "--paired",
+        "--passband-khz",
+        "14000-14070",
+        "--start",
+        "2026-10-31T06:00:00Z",
+        "--end",
+        "2026-10-31T00:00:00Z",
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains(
+            "error: --end (2026-10-31 00:00:00Z) must be after --start (2026-10-31 06:00:00Z)"
+        ),
+        "{}",
+        stderr(&out)
+    );
+    let bad = reference_fixture(&["--paired", "--passband-khz", "14070-14000"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", stderr(&bad));
+    assert!(
+        stderr(&bad).contains(
+            "error: invalid value '14070-14000' for '--passband-khz <LO-HI>': passband needs \
+             finite LO < HI in kHz, got \"14070-14000\""
+        ),
+        "{}",
+        stderr(&bad)
+    );
+}
+
+#[test]
+fn paired_ignores_manta_env_vars() {
+    let out = manta()
+        .arg("grade")
+        .arg("--spots")
+        .arg(pair_fixture("spots-2026-10-31.jsonl"))
+        .arg("--reference")
+        .arg(pair_fixture("reference-2026-10-31.txt"))
+        .args([
+            "--paired",
+            "--passband-khz",
+            "14000-14070",
+            "--start",
+            "2026-10-31T00:00:00Z",
+            "--end",
+            "2026-10-31T06:00:00Z",
+        ])
+        .env("MANTA_RBN_COMPARE_WINDOW_SECS", "30")
+        .env("MANTA_RBN_COMPARE_SPOTTERS", "[\"K5TR\"]")
+        .env("MANTA_RBN_COMPARE_FREQ_TOL_HZ", "5000")
+        .output()
+        .unwrap();
+    assert_success(&out);
+    assert_eq!(stdout(&out), read_pair_fixture("expected-paired.txt"));
+}
+
+/// Every key of a JSON line, in wire order, as `a` and `a.b` for objects
+/// and `a[].b` for arrays of objects (each array's first element names its
+/// keys). Scans the raw text: `serde_json::Value` keeps no key order.
+fn wire_key_paths(text: &str) -> Vec<String> {
+    enum Frame {
+        Obj {
+            prefix: String,
+            emit: bool,
+            key: String,
+        },
+        Arr {
+            path: String,
+            index: usize,
+            emit: bool,
+        },
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut last_string: Option<String> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                let mut s = String::new();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => s.extend(chars.next()),
+                        '"' => break,
+                        _ => s.push(c),
+                    }
+                }
+                last_string = Some(s);
+                continue;
+            }
+            ':' => {
+                if let (Some(Frame::Obj { prefix, emit, key }), Some(k)) =
+                    (stack.last_mut(), last_string.take())
+                {
+                    if *emit {
+                        out.push(format!("{prefix}{k}"));
+                    }
+                    *key = k;
+                }
+            }
+            '{' | '[' => {
+                let (path, emit) = match stack.last() {
+                    None => (String::new(), true),
+                    Some(Frame::Obj { prefix, emit, key }) => (format!("{prefix}{key}"), *emit),
+                    Some(Frame::Arr { path, index, emit }) => {
+                        (format!("{path}[]"), *emit && *index == 0)
+                    }
+                };
+                stack.push(if c == '{' {
+                    let prefix = if path.is_empty() {
+                        path
+                    } else {
+                        format!("{path}.")
+                    };
+                    Frame::Obj {
+                        prefix,
+                        emit,
+                        key: String::new(),
+                    }
+                } else {
+                    Frame::Arr {
+                        path,
+                        index: 0,
+                        emit,
+                    }
+                });
+            }
+            '}' | ']' => {
+                stack.pop();
+            }
+            ',' => {
+                if let Some(Frame::Arr { index, .. }) = stack.last_mut() {
+                    *index += 1;
+                }
+            }
+            _ => {}
+        }
+        last_string = None;
+    }
+    out
+}
+
+#[test]
+fn paired_json_keys_are_documented_in_the_runbook() {
+    let out = paired_fixture(&["--json"]);
+    assert_success(&out);
+    let line = stdout(&out);
+    let keys = wire_key_paths(&line);
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/RUNBOOKS/rbn-comparison.md"
+    );
+    let runbook = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("reading {path}: {e}"))
+        .replace("\r\n", "\n");
+    let (_, rest) = runbook
+        .split_once("\n### The paired report's JSON\n")
+        .expect("docs/RUNBOOKS/rbn-comparison.md has no `### The paired report's JSON` section");
+    let section = rest.split("\n#").next().unwrap_or(rest);
+    let rows: Vec<&str> = section
+        .lines()
+        .filter_map(|l| l.strip_prefix("- `"))
+        .filter_map(|l| l.split_once("` ("))
+        .map(|(field, _)| field)
+        .collect();
+    assert_eq!(
+        rows, keys,
+        "the runbook's paired JSON list must name every key, in wire order"
+    );
+    assert!(
+        section.contains(&format!("all {} keys", keys.len())),
+        "the section must say \"all {} keys\"",
+        keys.len()
+    );
+}
