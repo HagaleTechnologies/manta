@@ -139,6 +139,11 @@ impl IqSource for PacedSource {
         self.inner.take_missing_samples()
     }
 
+    /// MAN-202: forwarded; an unknown-length loss has no count to pace.
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
@@ -162,6 +167,9 @@ pub struct LoopingSource {
     fs: f64,
     center_freq_hz: f64,
     pending_gap: Option<u64>,
+    /// MAN-202: an unknown-length loss the ended pass left pending, carried
+    /// across the reopen like `pending_gap`.
+    pending_unknown_gap: bool,
 }
 
 impl LoopingSource {
@@ -177,6 +185,7 @@ impl LoopingSource {
             fs,
             center_freq_hz,
             pending_gap: None,
+            pending_unknown_gap: false,
         }
     }
 }
@@ -214,6 +223,8 @@ impl IqSource for LoopingSource {
         }
         // MAN-309: a gap at the end of this pass survives the reopen.
         let terminal = self.inner.take_discontinuity();
+        // MAN-202: so does an unknown-length loss.
+        self.pending_unknown_gap |= self.inner.take_unknown_gap();
         // One reopen per call, so an empty recording ends (returns 0)
         // instead of spinning.
         let next = (self.reopen)()?;
@@ -268,6 +279,11 @@ impl IqSource for LoopingSource {
     /// MAN-305: forwarded as `take_discontinuity` is.
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.inner.take_missing_samples()
+    }
+
+    /// MAN-202: forwarded, including a loss the previous pass ended in.
+    fn take_unknown_gap(&mut self) -> bool {
+        std::mem::take(&mut self.pending_unknown_gap) | self.inner.take_unknown_gap()
     }
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
@@ -653,11 +669,15 @@ mod tests {
         );
     }
 
-    /// MAN-309: scripted reads, each `(gap before it, sample count)`.
+    /// MAN-309: scripted reads, each `(gap before it, sample count)`;
+    /// MAN-202: `unknown_at` names the reads (0-based) with an unknown gap.
     struct GapSource {
         reads: std::collections::VecDeque<(Option<u64>, usize)>,
         pending: Option<u64>,
         fs: f64,
+        served: usize,
+        unknown_at: Vec<usize>,
+        pending_unknown: bool,
     }
 
     fn gap_source(reads: &[(Option<u64>, usize)], fs: f64) -> GapSource {
@@ -665,6 +685,9 @@ mod tests {
             reads: reads.iter().copied().collect(),
             pending: None,
             fs,
+            served: 0,
+            unknown_at: Vec::new(),
+            pending_unknown: false,
         }
     }
 
@@ -676,6 +699,9 @@ mod tests {
             0.0
         }
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            let i = self.served;
+            self.served += 1;
+            self.pending_unknown |= self.unknown_at.contains(&i);
             let Some((gap, n)) = self.reads.pop_front() else {
                 return Ok(0);
             };
@@ -686,6 +712,41 @@ mod tests {
         fn take_discontinuity(&mut self) -> Option<u64> {
             self.pending.take()
         }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.pending_unknown)
+        }
+    }
+
+    /// MAN-202: both wrappers hand an unknown gap to the caller on the same
+    /// outer read, once, beside the counted discontinuity; a loop pass that
+    /// ends in one carries it across the reopen.
+    #[test]
+    fn paced_and_looping_sources_forward_take_unknown_gap() {
+        let mut inner = gap_source(&[(None, 4), (Some(9), 8), (None, 2)], 1e12);
+        inner.unknown_at.push(1);
+        let mut paced = PacedSource::new(Box::new(inner)).unwrap();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let n = paced.read(&mut buf).unwrap();
+            seen.push((n, paced.take_discontinuity(), paced.take_unknown_gap()));
+        }
+        assert_eq!(
+            seen,
+            vec![(4, None, false), (8, Some(9), true), (2, None, false)]
+        );
+
+        let reopen: Reopen =
+            Box::new(|| Ok(Box::new(gap_source(&[(None, 2)], 1000.0)) as Box<dyn IqSource>));
+        let mut first = gap_source(&[(None, 2)], 1000.0);
+        first.unknown_at.push(1); // the EOF read
+        let mut looped = LoopingSource::new("rec", Box::new(first), reopen);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let n = looped.read(&mut buf).unwrap();
+            seen.push((n, looped.take_unknown_gap()));
+        }
+        assert_eq!(seen, vec![(2, false), (2, true), (2, false)]);
     }
 
     /// Every read as `(n, gap taken after it)`, through EOF.

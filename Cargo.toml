@@ -35,6 +35,16 @@ coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8
 coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-channel = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 
+# MAN-323: the FT8/FT4 cycle decoder (PAN-176), behind manta's optional `ftx`
+# feature. The contract is pancetta's docs/decoder-crate.md at the pinned commit
+# (dispensa Q-0085: a pinned git dependency on that stable surface, default
+# features only). Pin rule (decision D1 in
+# docs/DECISIONS/2026-11-01-man323-ft8-ft4-from-band-streams.md): a
+# `pancetta-ft8-v*` tag when one exists, else PR #550's merge commit, else its
+# head. This is PR #550's head (open on 2026-11-01): move it to the tag before
+# merging.
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "390d7860315d5086eb52b834605a0a7ff4b741c5" }
+
 cpal = "0.18"
 ctrlc = "3"
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }

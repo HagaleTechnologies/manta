@@ -127,7 +127,9 @@ versioned deps.
 One trait, six implementations:
 
 ```
-trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
+trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Complex32]) -> …,
+               take_discontinuity(), take_missing_samples(), take_unknown_gap(),
+               acquisition_start_offset(), health_counters(), …
 ```
 
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
@@ -254,6 +256,15 @@ short-lived `reopen-<kind>` thread, so a stop request during an outage
 abandons it and `read()` returns EOF within ~100 ms; the client drain,
 which starts only after `listen()` returns, therefore no longer waits for a
 stalled DNS lookup, connect or driver open (MAN-252).
+
+**Unknown-length gap (MAN-202).** A loss with no sample count (a SoapySDR
+driver overflow) is reported by `IqSource::take_unknown_gap()`, never as
+`take_discontinuity(Some(0))`. The engine loops take all three gap hooks
+through `manta_input::ReadContinuity::take`. An unknown gap neither moves
+the sample clock nor rebuilds the segment: `TrackManager::note_input_gap`
+invalidates each track's run-level decode state at the first hop holding
+a post-gap sample, so the character the gap cut is dropped rather than
+misread. See `docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md`.
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -1101,7 +1112,12 @@ non-blocking send plus shared atomics and short locks between them.
   async). `manta-engine::listen` reads up to 2048 samples with
   `IqSource::read()`, runs `Channelizer::process` and
   `TrackManager::process_hops`, feeds the batch's events to the validator,
-  and reads again. Validation runs on this thread.
+  and reads again. Validation runs on this thread. With `[input]
+  spectrum_udp` set, `Segment::channelize` also folds each hop's channel
+  power into a 125-hop mean (`manta-engine::spectrum`, write-only, spots
+  unchanged) that a `manta-spectrum-<input>` thread sends to N1MM+'s
+  Spectrum Display as XML over UDP (MAN-141,
+  `docs/DECISIONS/2026-11-01-man141-n1mm-spectrum-feed.md`).
 - **Several inputs (MAN-13).** With several `[[input]]` entries
   (`manta-engine::multi`) each input's read, channelizer, track manager and
   decoder pool run on its own `manta-input-<name>` thread, that input's

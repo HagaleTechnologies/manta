@@ -358,6 +358,7 @@ impl Member {
                 current: Some((generation, source)),
                 gap: None,
                 missing: None,
+                unknown_gap: false,
                 resumed: None,
             });
         }
@@ -377,6 +378,8 @@ pub(crate) struct GroupSource {
     samples: u64,
     gap: Option<u64>,
     missing: Option<u64>,
+    /// MAN-202: the current inner source's unknown-length loss.
+    unknown_gap: bool,
     resumed: Option<u64>,
 }
 impl GroupSource {
@@ -472,6 +475,8 @@ impl IqSource for GroupSource {
             // protocol-2 packet drop) advances the clock without closing
             // tracks; the wrapper contract forwards it.
             let inner_missing = source.take_missing_samples();
+            // MAN-202: an unknown-length loss is forwarded the same way.
+            let inner_unknown = source.take_unknown_gap();
             if !self.group.is_current(generation) {
                 continue;
             }
@@ -490,6 +495,7 @@ impl IqSource for GroupSource {
                     if let Some(k) = inner_missing {
                         *self.missing.get_or_insert(0) += k;
                     }
+                    self.unknown_gap |= inner_unknown;
                     self.samples += n as u64 + inner_gap.unwrap_or(0) + inner_missing.unwrap_or(0);
                     self.boundary = generation.started_at
                         + Duration::from_secs_f64(self.samples as f64 / self.metadata.rate);
@@ -504,6 +510,9 @@ impl IqSource for GroupSource {
     }
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.missing.take()
+    }
+    fn take_unknown_gap(&mut self) -> bool {
+        std::mem::take(&mut self.unknown_gap)
     }
 }
 impl Drop for GroupSource {
@@ -799,6 +808,7 @@ mod tests {
         value: f32,
         gap: Option<u64>,
         missing: Option<u64>,
+        unknown: bool,
     }
     impl IqSource for Samples {
         fn sample_rate(&self) -> f64 {
@@ -823,6 +833,9 @@ mod tests {
         }
         fn take_missing_samples(&mut self) -> Option<u64> {
             self.missing.take()
+        }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.unknown)
         }
     }
 
@@ -867,6 +880,7 @@ mod tests {
                             value: generation as f32,
                             gap: None,
                             missing: None,
+                            unknown: false,
                         }) as SendSource
                     })
                     .collect();
@@ -1085,6 +1099,7 @@ mod tests {
                         value: 0.0,
                         gap: None,
                         missing: None,
+                        unknown: false,
                     })],
                     started_at: Instant::now(),
                     retire: Box::new(move || {
@@ -1188,6 +1203,7 @@ mod tests {
                         value: 0.0,
                         gap: None,
                         missing: Some(4800),
+                        unknown: false,
                     })],
                     started_at: Instant::now(),
                     retire: Box::new(|| {}),
@@ -1210,6 +1226,46 @@ mod tests {
         assert_eq!(
             source.boundary,
             current(&group).started_at + Duration::from_secs_f64(4804.0 / 48000.0)
+        );
+    }
+
+    #[test]
+    fn inner_unknown_gap_is_forwarded_once_without_moving_the_clock() {
+        // MAN-202: an unknown-length loss has no count, so it moves neither
+        // the clock nor the gap reports; the wrapper contract forwards it.
+        let group = Group::new(
+            Box::new(|| {
+                Ok(Opened {
+                    sources: vec![Box::new(Samples {
+                        fail: Arc::new(AtomicBool::new(false)),
+                        counters: Arc::new(InputHealthCounters::new()),
+                        value: 0.0,
+                        gap: None,
+                        missing: None,
+                        unknown: true,
+                    })],
+                    started_at: Instant::now(),
+                    retire: Box::new(|| {}),
+                })
+            }),
+            Arc::new(AtomicBool::new(false)),
+            vec![Box::new(|_| {})],
+            Arc::new(Instant::now),
+        );
+        let mut source = Member {
+            group: group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert!(source.take_unknown_gap());
+        assert!(!source.take_unknown_gap());
+        assert_eq!(source.take_missing_samples(), None);
+        assert_eq!(source.take_discontinuity(), None);
+        assert_eq!(
+            source.boundary,
+            current(&group).started_at + Duration::from_secs_f64(4.0 / 48000.0)
         );
     }
     #[test]
@@ -1323,6 +1379,7 @@ mod tests {
                         value: 2.0,
                         gap: None,
                         missing: None,
+                        unknown: false,
                     }) as SendSource
                 })
                 .collect();

@@ -83,6 +83,8 @@ fn sample_spot() -> Spot {
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     }
 }
 
@@ -1372,5 +1374,66 @@ async fn a_relayed_spot_reaches_every_target() {
     harness.bus.publish_relay(spot);
     assert_eq!(read_forwarded_line(&mut r1).await, expected);
     assert_eq!(read_forwarded_line(&mut r2).await, expected);
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-322: an RTTY CQ spot at 14 080.17 kHz, 20 dB(2500), 45.45 baud.
+fn rtty_spot() -> Spot {
+    Spot {
+        callsign: "W1AW".to_string(),
+        freq_hz: 14_080_170.0,
+        snr_db: 20.0,
+        wpm: 0.0,
+        mode: manta_spot::SpotMode::Rtty,
+        baud: Some(45.45),
+        ..sample_spot()
+    }
+}
+
+/// MAN-322, the title's uplink clause (MAN-90 claim C14, unverified): a
+/// live uplink forwards an RTTY spot as an RBN-layout line labelled `RTTY`
+/// with its speed in baud.
+#[tokio::test]
+async fn an_rtty_spot_reaches_the_uplink_labelled_rtty_in_baud() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), false);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    harness.bus.publish(rtty_spot());
+
+    let line = read_forwarded_line(&mut reader).await;
+    assert_eq!(
+        line,
+        "DX de W3XYZ-#:  14080.17  W1AW           RTTY  27 dB  45 BPS  CQ      2213Z"
+    );
+    assert_eq!(line.find("RTTY  ").unwrap() + 1, 42, "line was: {line:?}");
+    assert!(line.contains("45 BPS"), "line was: {line:?}");
+    assert!(!line.contains("WPM"), "line was: {line:?}");
+    assert_eq!(harness.metrics.uplink_sent_total(), 1);
+
+    let _ = harness.shutdown_tx.send(true);
+}
+
+/// MAN-322 D7: an RTTY spot goes through the same `dry_run` gate as CW.
+#[tokio::test]
+async fn dry_run_withholds_an_rtty_spot_too() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let harness = spawn_uplink(addr.port(), true);
+
+    let (_login_line, mut reader, _wr) = mock_rbn_accept_and_login(&listener).await;
+    harness.bus.publish(rtty_spot());
+
+    let mut line = String::new();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut line)).await;
+    assert!(
+        result.is_err(),
+        "dry-run must not transmit the RTTY spot line, got: {line:?}"
+    );
+    assert_eq!(harness.metrics.uplink_sent_total(), 0);
+    assert_eq!(harness.metrics.uplink_suppressed_total(), 1);
+
     let _ = harness.shutdown_tx.send(true);
 }

@@ -11,13 +11,15 @@ sources:
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
   - crates/manta-input/src/lib.rs (IqSource::acquisition_start_offset)
+  - crates/manta-input/src/lib.rs (IqSource::take_unknown_gap, ReadContinuity)
+  - docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md
   - docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md
   - docs/DECISIONS/2026-10-16-man252-cancellable-source-reopen.md
   - docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md
   - crates/manta-cli/src/hpsdr_group.rs
 verified:
-  commit: cdf8487
-  date: 2026-10-19
+  commit: d144e36
+  date: 2026-11-01
 links:
   - determinism
 ---
@@ -43,6 +45,14 @@ Every driver starts acquiring inside its open call and returns what it buffered 
 reports `IqSource::acquisition_start_offset()` and every wrapper between it and
 `ReconnectingSource` (`DecimatingSource`, `FixedCenterFreqSource`) must forward it; anchoring at
 the opener's return counts those samples twice and stamps every later spot late.
+Gotcha (MAN-202): there are three gap reports, not two. An outage of known length is
+`take_discontinuity()` (close tracks, rebuild the segment, advance the clock); a known-length loss
+the source spliced over is `take_missing_samples()` (advance the clock only); a loss of unknown
+length, such as a SoapySDR overflow, is `take_unknown_gap()` (no clock move, no rebuild: each
+track's run-level decode state is invalidated at the gap hop). Never report an unknown loss as
+`take_discontinuity(Some(0))`: the zero is a fabricated count that wrappers sum, and a rebuild
+measured far worse than invalidation. Engine loops read all three through
+`manta_input::ReadContinuity::take`, and every wrapper must forward all three.
 
 ## Symptom
 

@@ -473,6 +473,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let input_counters: Arc<Mutex<Vec<Option<Arc<InputHealthTotals>>>>> =
         Arc::new(Mutex::new(vec![None; n]));
 
+    // MAN-141: each feed's socket is bound before any source opens; its
+    // sender starts once the input's span is known (after `open_inputs`).
+    let mut spectrum_bound = Vec::with_capacity(n);
+    for input in m.inputs {
+        spectrum_bound.push(match &input.spectrum {
+            Some(out) => Some(crate::spectrum_feed::bind(&input.name, out)?),
+            None => None,
+        });
+    }
+    let spectrum_late: Vec<Option<Arc<crate::spectrum_feed::LateSink>>> = spectrum_bound
+        .iter()
+        .map(|b| b.as_ref().map(|_| Arc::default()))
+        .collect();
     let grouped =
         crate::hpsdr_group::prepare(m.hpsdr_allocations, m.inputs, stop.clone(), |index| {
             input_health_sink(
@@ -518,6 +531,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     static_crashes: Some(crashes[index].clone()),
                     bad_samples: Some(bad),
                     rtty: Some(rtty_observers[index].clone()),
+                    spectrum: spectrum_late[index]
+                        .clone()
+                        .map(|late| late as Arc<dyn manta_engine::SpectrumSink>),
                     ..Default::default()
                 },
                 open: Box::new(move || {
@@ -872,6 +888,30 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .iter()
         .map(|&fs| crate::RttyLogState::new(fs))
         .collect();
+    // MAN-141: start each feed from its opened input's span, before the
+    // engine produces its first frame.
+    let mut spectrum_threads = Vec::new();
+    for (index, bound) in spectrum_bound.into_iter().enumerate() {
+        let (Some(feed), Some(late)) = (bound, spectrum_late[index].as_ref()) else {
+            continue;
+        };
+        let input = &opened.inputs()[index];
+        let started = crate::spectrum_feed::open(
+            feed,
+            input.sample_rate_hz,
+            input.center_freq_hz,
+            input.rf_passband_hz,
+            m.inputs[index].freq_correction_ppm,
+            server.as_ref().map(|(_, server)| server.metrics.as_ref()),
+        )?;
+        if let Some((sink, thread)) = started {
+            late.set(sink);
+            spectrum_threads.push(thread);
+        }
+    }
+    // Only the engine's observers hold the feeds now, so each sender thread
+    // ends when `listen_inputs` drops them.
+    drop(spectrum_late);
     let stop_ready = stop.clone();
     let stop_end = stop.clone();
     let mut hearing = HearingCounters::new(n);
@@ -1002,6 +1042,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // deadline (one failing does not stop the others).
     let handles = take_recordings(&recordings);
     let recording_deadline = crate::close_recordings(&handles);
+    for thread in spectrum_threads {
+        let _ = thread.join();
+    }
     if print_text {
         for line in text.finish() {
             if logging::is_json() {
@@ -1056,6 +1099,8 @@ mod tests {
             sample_ts: 0,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1250,6 +1295,7 @@ mod tests {
             dial_freq_hz: None,
             capture_rate_hz: None,
             record_iq: None,
+            spectrum: None,
             spawn_band_hz: None,
         }];
         let err = check_rf_references(&inputs).unwrap_err().to_string();
