@@ -6,12 +6,8 @@
 use crate::latency::DecodeLatencyObserver;
 use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
-<<<<<<< HEAD
 use crate::spectrum::{SpectrumAccumulator, SpectrumFeed, SpectrumSink};
-use crate::track::CloseCounts;
-=======
 use crate::track::{first_hop_after_gap, CloseCounts};
->>>>>>> 9a619ee59075dd89f69b8408847f6dd4d5cfa835
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::events::{ClosureKind, DecoderEvent};

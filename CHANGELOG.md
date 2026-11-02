@@ -115,7 +115,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -126,7 +125,6 @@ the git history and `docs/DECISIONS/`.
   are unchanged. Tested against a fake N1MM+ listener; a real N1MM+ render
   is still to be checked. See
   [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md).
-=======
 - MAN-97: `manta grade --paired` compares one node's spots with a
   co-located reference skimmer both ways and prints recall, the reports
   manta missed and its candidate false spots, as text or one JSON object
@@ -138,7 +136,6 @@ the git history and `docs/DECISIONS/`.
 - MAN-202: Rust API: `IqSource::take_unknown_gap()` and
   `manta_input::ReadContinuity`; wrappers must forward the new hook. See
   docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
->>>>>>> 9a619ee59075dd89f69b8408847f6dd4d5cfa835
 - MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
   protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
   overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
