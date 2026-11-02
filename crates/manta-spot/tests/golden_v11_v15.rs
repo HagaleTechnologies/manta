@@ -90,6 +90,10 @@ fn v11_context_parse_sets_spot_type() {
     ];
     for (words, expected_type) in cases {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        // MAN-201 D8: a `<call> T` is a beacon only for a listed call.
+        if words.last() == Some(&"T") {
+            v.allowlist("K5ARH");
+        }
         seed_meta(&mut v, 1);
         let mut spots = run(&transmission_events(1, words, 0), &mut v);
         spots.extend(run(&transmission_events(1, words, 100_000), &mut v));
@@ -577,23 +581,24 @@ fn v29_provenance_bound_to_exact_word_occurrence_across_repetitions() {
 #[test]
 fn v30_power_step_beacon_pattern_exempt_from_repetition_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
     let words = ["K5ARH", "T"];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
-    assert!(
-        spots.is_empty(),
-        "a non-allowlisted Beacon candidate must never spot before TrackClosed \
-         (round 7 redesign), got {spots:?}"
-    );
-    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert_eq!(
         spots.len(),
         1,
-        "a power-step BEACON-tagged spot must emit on the first decode -- no \
-         repetition needed, just the track's true close"
+        "a listed power-step BEACON spot emits on the first decode, got {spots:?}"
     );
     assert_eq!(spots[0].callsign, "K5ARH");
     assert_eq!(spots[0].spot_type, SpotType::Beacon);
+
+    // MAN-201 D8: the same shape from an unlisted call is not evidence.
+    let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    seed_meta(&mut v, 1);
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
+    assert!(spots.is_empty(), "got {spots:?}");
 }
 
 /// MAN-37 (Codex review rounds 3-6): after three consecutive rounds of
@@ -695,6 +700,8 @@ fn a_stale_unresolved_cq_several_words_earlier_still_suppresses_a_later_beacon()
 #[test]
 fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("W1AW");
+    v.allowlist("K5ARH");
     let words = ["W1AW", "T", "K5ARH", "T"];
     let none_yet = run(&transmission_events(1, &words, 0), &mut v);
     assert!(
@@ -709,21 +716,12 @@ fn power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_ga
         freq_hz: 14_020_000.0,
         last_char_ts: 0,
     });
-    // Round 7 redesign: a non-allowlisted Beacon candidate is only ever
-    // captured here (has_meta's retry lets it be captured at all, having
-    // never been attempted before), not emitted -- both occurrences only
-    // spot once the track truly closes.
-    assert!(
-        spots.is_empty(),
-        "a non-allowlisted Beacon candidate must never spot before TrackClosed, got {spots:?}"
-    );
-
-    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
+    // MAN-201 D8: listed calls, so both are evaluated at the first meta.
     assert!(
         spots
             .iter()
             .any(|s| s.callsign == "W1AW" && s.spot_type == SpotType::Beacon),
-        "W1AW must spot as Beacon once the track closes, got {spots:?}"
+        "W1AW must spot as Beacon once metadata arrives, got {spots:?}"
     );
     assert!(
         spots
@@ -913,6 +911,7 @@ fn power_step_beacon_with_unmapped_exact_range_is_discarded_not_resolved_by_text
 #[test]
 fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("W1AW");
     seed_meta(&mut v, 1);
     let words = ["DE/NOISE", "W1AW", "T"];
     let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -940,6 +939,7 @@ fn a_glued_cq_de_substring_does_not_suppress_a_power_step_beacon() {
 #[test]
 fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
     // "DX" (not a bare "CQ K5ARH") is deliberate: it's the round-1
     // motivating case (see any_bare_cq_anywhere_suppresses_the_power_step_
@@ -986,12 +986,16 @@ fn power_step_guard_suppressions_are_counted_once_per_occurrence() {
 #[test]
 fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
     let spots = run(&transmission_events(1, &["CQ", "K5ARH", "T"], 0), &mut v);
+    // MAN-201 D8: only a listed call has a beacon candidacy to lose, and a
+    // listed call skips the repetition gate, so its `Cq` read spots.
     assert!(
-        spots.is_empty(),
-        "nothing can spot here -- Cq fails the repetition gate and the \
-         repetition-exempt Beacon candidate is guard-suppressed, got {spots:?}"
+        spots
+            .iter()
+            .all(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Cq),
+        "the Beacon candidate is guard-suppressed, got {spots:?}"
     );
     assert_eq!(
         v.suppression_counts().power_step_guard,
@@ -1024,14 +1028,15 @@ fn a_previously_attempted_but_unspotted_word_still_counts_its_suppression() {
 #[test]
 fn a_spotted_word_still_counts_its_guard_suppression_once() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
     let words = ["CQ", "K5ARH", "K5ARH", "T"];
-    run(&transmission_events(1, &words, 0), &mut v);
+    let mut spots = run(&transmission_events(1, &words, 0), &mut v);
     // MAN-201 (D5): the trailing `K` settles the second CQ's K5ARH.
-    let spots = run(
+    spots.extend(run(
         &transmission_events(1, &["CQ", "K5ARH", "K"], 200_000),
         &mut v,
-    );
+    ));
     assert!(
         spots
             .iter()
@@ -1050,6 +1055,7 @@ fn a_spotted_word_still_counts_its_guard_suppression_once() {
 #[test]
 fn an_unsuppressed_power_step_beacon_counts_nothing() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
     let mut spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
     // A non-allowlisted Beacon candidate is never emitted before
@@ -1071,37 +1077,25 @@ fn an_unsuppressed_power_step_beacon_counts_nothing() {
 #[test]
 fn a_beacon_processed_before_the_guard_appeared_counts_no_suppression() {
     let mut v = Validator::new(FS, CTY_FIXTURE, None);
+    v.allowlist("K5ARH");
     seed_meta(&mut v, 1);
+    // MAN-201 D8: a listed call's beacon candidacy is evaluated at once.
     let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
-    // Round 7 redesign: a non-allowlisted Beacon candidate is captured
-    // (setting word.last_spot_type = Some(Beacon), exactly the state the
-    // guard's own already_processed check looks for below), not emitted,
-    // until TrackClosed -- so this is empty here, not the eventual spot.
-    assert!(
-        spots.is_empty(),
-        "must be captured, not yet resolved, got {spots:?}"
-    );
-
-    // A bare CQ now enters the rolling window while "K5ARH T" is still in
-    // it, so the guard fires and re-burns the already-captured occurrence.
-    run(&transmission_events(1, &["CQ", "DX"], 100_000), &mut v);
-    assert_eq!(
-        v.suppression_counts().power_step_guard,
-        0,
-        "the beacon was already captured before the guard appeared, so the \
-         guard suppressed nothing"
-    );
-
-    // The captured candidate must still resolve at the track's true
-    // close -- the later guard re-burn (which only marks
-    // power_step_suppressed, never touches pending_beacons) must not
-    // have destroyed it.
-    let spots = close_track(&mut v, 1, ClosureKind::SignalEnded);
     assert!(
         spots
             .iter()
             .any(|s| s.callsign == "K5ARH" && s.spot_type == SpotType::Beacon),
-        "the captured beacon must still resolve at true close, got {spots:?}"
+        "got {spots:?}"
+    );
+
+    // A bare CQ now enters the rolling window while "K5ARH T" is still in
+    // it, so the guard fires and re-burns the already-processed occurrence.
+    run(&transmission_events(1, &["CQ", "DX"], 100_000), &mut v);
+    assert_eq!(
+        v.suppression_counts().power_step_guard,
+        0,
+        "the beacon was already processed before the guard appeared, so the \
+         guard suppressed nothing"
     );
 }
 

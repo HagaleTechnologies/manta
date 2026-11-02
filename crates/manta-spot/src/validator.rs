@@ -236,6 +236,9 @@ struct Word {
     /// occurrence is a property of the guard alone, so it needs its own
     /// per-occurrence bit.
     power_step_suppressed: bool,
+    /// MAN-201: this word's `<call> T` occurrence has recorded its
+    /// `BeaconNoEvidence` decision; each occurrence counts once.
+    beacon_no_evidence_recorded: bool,
     /// MAN-201: the `WordBoundary` `sample_ts` this word completed at. A
     /// settled occurrence is evaluated -- repetition gate, dedupe, decision
     /// and spot -- at this time, not at the event that settled it (D5).
@@ -468,6 +471,12 @@ pub struct SuppressionCounts {
     /// guard destroyed no beacon candidacy there (Codex review on PR #90,
     /// round 10). See `burn_suppressed_power_step_candidate`.
     pub power_step_guard: u64,
+    /// `<call> T` occurrences of a plausible, allocated call that is not on
+    /// the allowlist (MAN-201): a trailing `T` alone is not beacon evidence.
+    /// Counted once per occurrence. The two power-step counts partition the
+    /// shape: `beacon_no_evidence` for an unguarded, unlisted call,
+    /// `power_step_guard` for an allowlisted, guarded one.
+    pub beacon_no_evidence: u64,
     /// Spots withheld by MAN-100's cross-candidate variant arbitration: a
     /// confusable, better-supported rival existed on the same track in the
     /// same window. See `support::SupportLedger`.
@@ -1387,6 +1396,11 @@ impl Validator {
                 else {
                     continue;
                 };
+                // MAN-201 D8: a trailing `T` alone is not beacon evidence;
+                // `record_beacon_no_evidence` explains the unlisted call.
+                if !self.allowlist.contains(&candidate) {
+                    continue;
+                }
                 // MAN-201: a call the exchange shows was only called or
                 // mentioned is never that station's beacon ID.
                 if matches!(
@@ -1491,6 +1505,9 @@ impl Validator {
                     .iter()
                     .find(|(start, end, _)| *start == call_range.start && *end == call_range.end)
                     .map(|(_, _, seq)| *seq)?;
+                // MAN-201 D8: only an allowlisted call has a beacon
+                // candidacy for the guard to burn.
+                self.allowlist.contains(&call).then_some(())?;
                 Some((call, involved_max_seq, exact_seq))
             })
             .collect()
@@ -1582,6 +1599,75 @@ impl Validator {
         }
     }
 
+    /// MAN-201 D8: records one `BeaconNoEvidence` decision per unguarded
+    /// `<call> T` occurrence of a plausible, allocated, unlisted call. A
+    /// call the exchange shows was only called or mentioned has no beacon
+    /// question to explain.
+    fn record_beacon_no_evidence(&mut self, track_id: u32) {
+        let Some(track) = self.tracks.get(&track_id) else {
+            return;
+        };
+        let mut joined = String::new();
+        let mut word_spans = Vec::with_capacity(track.words.len());
+        for word in &track.words {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            let start = joined.len();
+            joined.push_str(&word.text);
+            word_spans.push((start, joined.len()));
+        }
+        let guarded = context::power_step_framing_is_unresolved(&joined);
+        let mut found = Vec::new();
+        for (call, _, r) in context::power_step_candidates(&joined) {
+            let Some(index) = word_spans
+                .iter()
+                .position(|&(start, end)| start == r.start && end == r.end)
+            else {
+                continue;
+            };
+            let word = &track.words[index];
+            if guarded && !self.allowlist.contains(&call) {
+                found.push((call, word.seq, word.end_ts));
+                continue;
+            }
+            if word.beacon_no_evidence_recorded
+                || self.allowlist.contains(&call)
+                || matches!(word.role, Some((Role::Addressee | Role::RelayedMention, _)))
+                || !grammar::is_plausible(&call)
+                || !self.cty.is_allocated(&call)
+            {
+                continue;
+            }
+            found.push((call, word.seq, word.end_ts));
+        }
+        for (call, seq, end_ts) in found {
+            let Some(track) = self.tracks.get_mut(&track_id) else {
+                return;
+            };
+            let freq_hz = track.freq_hz * self.freq_calibration;
+            if let Some(word) = track.words.iter_mut().find(|w| w.seq == seq) {
+                word.beacon_no_evidence_recorded = true;
+            }
+            // A guarded occurrence stays explained by its CQ/DE framing,
+            // also once that framing ages out of the window.
+            if guarded {
+                continue;
+            }
+            self.suppression_counts.beacon_no_evidence += 1;
+            self.decide(|| {
+                Decision::withheld(
+                    track_id,
+                    end_ts,
+                    &call,
+                    freq_hz,
+                    SpotType::Beacon,
+                    Reason::BeaconNoEvidence,
+                )
+            });
+        }
+    }
+
     /// Decides every settled candidate on `track_id`, each at its own
     /// word's `end_ts` (MAN-201 D5); `complete` settles the window's last
     /// call (the track is closing). `sample_ts` is the triggering event's
@@ -1618,6 +1704,7 @@ impl Validator {
                 },
             )
             .collect();
+        self.record_beacon_no_evidence(track_id);
         for (call, involved_max_seq, exact_seq) in suppressed {
             // Identity resolved via exact_seq, not text -- see burn's own docs.
             self.burn_suppressed_power_step_candidate(
@@ -2990,7 +3077,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut ts = 0u64;
         for i in 0..(MAX_PENDING_BEACONS + 1) {
             let call = format!("K5AA{}", (b'A' + i as u8) as char);
-            run(&transmission_events(1, &[call.as_str(), "T"], ts), &mut v);
+            run(
+                &transmission_events(1, &["V", "V", "V", call.as_str(), "K"], ts),
+                &mut v,
+            );
             ts += 1_000_000;
         }
         let log = v.take_decisions();
@@ -3005,6 +3095,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn a_power_step_guard_withhold_is_recorded() {
         let mut v = recording(CTY_FIXTURE);
+        v.allowlist("K5ARH");
         let words = ["CQ", "DX", "FILLER1", "FILLER2", "FILLER3", "K5ARH", "T"];
         run(&transmission_events(1, &words, 0), &mut v);
         assert_eq!(v.suppression_counts().power_step_guard, 1);
@@ -3228,7 +3319,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         // "K5ARH T" parses as SpotType::Beacon (context::parse) -- exempt
         // from the repetition gate, so one occurrence would otherwise spot.
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots.is_empty(),
@@ -3264,7 +3355,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 46.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
 
@@ -3373,7 +3464,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
@@ -3395,7 +3489,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
         v.ingest(&DecoderEvent::SpeedUpdate {
@@ -3418,7 +3515,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3439,7 +3539,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty(), "should be captured, not yet resolved");
         let spots = run(&transmission_events(1, &["QRL?", "5NN"], 10_000), &mut v);
         assert!(spots.is_empty(), "got {spots:?}");
@@ -3509,7 +3612,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(
             &[],
@@ -3606,7 +3712,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH", "K"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
         assert_eq!(v.suppression_counts().blocklist, 1);
@@ -3631,7 +3737,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3647,7 +3756,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_beacon_rejected_for_unconfirmed_wpm_is_counted() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3668,7 +3780,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 2,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(2, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(2, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         for (track_id, survivor) in [(1, 3), (2, 1)] {
             let spots = v.ingest(&DecoderEvent::TrackClosed {
@@ -3705,14 +3820,17 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         seed_meta(&mut v, 2);
-        let spots = run(&transmission_events(1, &["K5AAZ", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5AAZ", "K"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let mut expected = Vec::new();
         for i in 0..MAX_PENDING_BEACONS {
             let call = format!("K5AA{}", (b'A' + i as u8) as char);
             let start = 10_000_000 + i as u64 * 1_000_000;
             let spots = run(
-                &transmission_events(2, &[call.as_str(), "T"], start),
+                &transmission_events(2, &["V", "V", "V", call.as_str(), "K"], start),
                 &mut v,
             );
             assert!(spots.is_empty());
@@ -3754,8 +3872,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             wpm: 22.0,
         });
         // MAN-201 (D5): the capture is stamped at "K5ARH"'s own word
-        // boundary, 500 samples after its first character.
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], t - 500), &mut v);
+        // boundary, 1 100 samples after the first `V`.
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], t - 1_100),
+            &mut v,
+        );
         assert!(spots.is_empty());
         assert_eq!(
             v.tracks[&1]
@@ -3795,7 +3916,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             // 26 distinct, grammar/cty-valid callsigns (K-prefixed, ending
             // in a letter): K5AAA, K5AAB, K5AAC, ...
             let call = format!("K5AA{}", (b'A' + (i % 26) as u8) as char);
-            let words = [call.as_str(), "T"];
+            let words = ["V", "V", "V", call.as_str()];
             let spots = run(&transmission_events(1, &words, ts), &mut v);
             assert!(spots.is_empty(), "must only ever capture, not spot yet");
             ts += 1_000_000;
@@ -3832,7 +3953,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // timestamp, on 14_000_000.0 Hz (seed_meta's fixture value), but
         // does not close yet.
         seed_meta(&mut v, 1);
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 1_000), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -3898,7 +4019,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         // bucket(14_012_549) == 46_708, bucket(14_012_551) == 46_709.
         meta(&mut v, 1, 14_012_549.0);
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 1_000), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 1_000),
+            &mut v,
+        );
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
         meta(&mut v, 2, 14_012_551.0);
@@ -3947,7 +4071,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -4144,7 +4268,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn duplicate_tracks_capturing_the_same_beacon_do_not_self_confirm_through_a_shared_survivor() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
 
         seed_meta(&mut v, 1);
         let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4221,7 +4345,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -4276,7 +4400,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots.is_empty(),
@@ -4307,7 +4431,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH", "K"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots

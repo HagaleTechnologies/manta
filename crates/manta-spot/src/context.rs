@@ -177,7 +177,12 @@ pub fn parse(text: &str) -> Vec<ContextMatch> {
             let spot_type = o.frame.and_then(exchange::Frame::spot_type)?;
             let first = ranges[o.span.start].start;
             let last = ranges[o.span.end - 1].end;
-            Some((o.call, spot_type, first..last, Some(ranges[o.index].clone())))
+            Some((
+                o.call,
+                spot_type,
+                first..last,
+                Some(ranges[o.index].clone()),
+            ))
         })
         .collect();
     if !power_step_framing_is_unresolved(text) {
