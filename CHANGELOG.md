@@ -115,6 +115,16 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
+  power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
+  "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
+  a second, each the mean of 125 channelizer hops over the passband in
+  93.75 Hz bins. `spectrum_name` sets the source name N1MM+ lists (default
+  `manta <input name>`). `manta run` only; with `[server]`, `/metrics` gains
+  `manta_spectrum_datagrams_total` and `manta_spectrum_dropped_total`. Spots
+  are unchanged. Tested against a fake N1MM+ listener; a real N1MM+ render
+  is still to be checked. See
+  [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md).
 - MAN-97: `manta grade --paired` compares one node's spots with a
   co-located reference skimmer both ways and prints recall, the reports
   manta missed and its candidate false spots, as text or one JSON object

@@ -28,6 +28,8 @@ Then:
 - [GUIDES/iq-recording.md](GUIDES/iq-recording.md): recording a session's
   IQ with `run --record-iq`, replaying it, and reading headerless cf32/ci16
   files (MAN-309).
+- [GUIDES/n1mm-spectrum.md](GUIDES/n1mm-spectrum.md): sending a receiver's
+  spectrum to N1MM+'s Spectrum Display, as CW Skimmer does (MAN-141).
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed

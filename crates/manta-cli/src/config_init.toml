@@ -288,6 +288,14 @@
 # overwritten, so a restart needs a new name. No default: no recording.
 #record_iq = "captures/session.cf32"
 
+# `manta run` only: send this input's spectrum to N1MM+'s Spectrum Display
+# (N1MM+ listens on UDP 13064), about 3 times a second, as CW Skimmer's
+# "Send Spectrum via UDP" does. Needs a real RF frequency. No default:
+# send nothing.
+#spectrum_udp = "127.0.0.1:13064"
+# The source name N1MM+ lists for this feed. No default: "manta <name>".
+#spectrum_name = "manta 20m"
+
 
 # --- Spot filters ------------------------------------------------------------
 
