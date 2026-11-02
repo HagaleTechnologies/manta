@@ -24,6 +24,15 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
+  gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
+  spot is still CW, so `mode` is `"CW"` and `baud` is `null` on every spot
+  today. RTTY spots, once the engine produces them, reach telnet only
+  through the new opt-in `[server].rtty_telnet_port` (`telnet_port` stays
+  CW-only), and carry `RTTY` and `<baud> BPS` on the telnet and uplink
+  line. With that port set, `/metrics` adds
+  `manta_listener_up{listener="rtty_telnet"}`. See
+  docs/DECISIONS/2026-11-01-man322-rtty-spot-outputs.md.
 - MAN-109: add rise from two disjoint power windows alongside the 12 dB EMA rise; keep the 19-hop confirmation and the EMA for drop and SNR.
 - MAN-106 first slice: candidates with no finite positive character
   confidence are withheld as `noEvidence`. CLI JSON spots gain

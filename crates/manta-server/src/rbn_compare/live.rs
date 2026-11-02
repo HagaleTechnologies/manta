@@ -10,6 +10,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use manta_spot::SpotMode;
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -162,6 +163,11 @@ async fn run_spots(
             _ = shutdown.changed() => {}
             received = rx.recv() => match received {
                 Ok(bus_spot) => {
+                    // MAN-322 D8: RBN's reference feed is CW-only, so a
+                    // non-CW spot is neither graded nor counted ungraded.
+                    if bus_spot.spot.mode != SpotMode::Cw {
+                        continue;
+                    }
                     let input = GradeInput::from_bus_spot(&bus_spot.spot, &bus, &station_callsign);
                     let (outcome, pending) = {
                         let mut g = lock(&grader);
