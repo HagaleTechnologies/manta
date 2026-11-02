@@ -25,7 +25,8 @@ Other commands' `--json` (`bench`, `check`, `calibrate`, `devices`,
 - A concept that the JSON spot stream or the live-state stream
   ([LIVE-STATE.md](LIVE-STATE.md)) also carries uses the stream's name:
   `frequency`, `snr`, `wpm`, `dxCall`, `decodeConfidence`, `trackId`,
-  `spotType`, `closure`, `survivorTrackId`, `rst` and `qrlQuery`.
+  `spotType`, `closure`, `survivorTrackId`, `rst`, `qrlQuery`, `mode` and
+  `baud`.
 - Any other quantity ends in a short unit suffix, as the streams' `loHz`
   and `windowS` do: `centerFreqHz`, `sampleRateHz`, `markHz`, `ditMs`,
   `durationS`.
@@ -74,7 +75,7 @@ With several `[[input]]` entries the records are the same.
 
 ```json
 {"event":"TrackClosed","trackId":1,"closure":"signalEnded","survivorTrackId":null}
-{"spot":{"dxCall":"W1AW","frequency":14012341.017764632,"snr":20.995895,"wpm":19.565216,"spotType":"cq","decodeConfidence":0.55182433,"emissionState":"confirmed","trackId":1,"sampleTs":2006272,"rst":null,"qrlQuery":false}}
+{"spot":{"dxCall":"W1AW","frequency":14012341.017764632,"snr":20.995895,"wpm":19.565216,"spotType":"cq","decodeConfidence":0.55182433,"emissionState":"confirmed","trackId":1,"sampleTs":2006272,"rst":null,"qrlQuery":false,"mode":"CW","baud":null}}
 ```
 
 ## Events
@@ -179,7 +180,7 @@ object of a `run --json` spot line.
 | `dxCall` | string | never | The decoded callsign, as validated. |
 | `frequency` | number | never | Spot frequency in Hz. Absolute only when the source has an RF reference. |
 | `snr` | number | never | SNR in dB, 2500 Hz reference. |
-| `wpm` | number | never | Keying speed in words per minute. |
+| `wpm` | number or null | on an RTTY spot | CW keying speed in words per minute. `null` on an RTTY spot, which carries `baud` instead. |
 | `spotType` | string | never | `cq`, `de`, `beacon` or `unknown`: the context the call was decoded in, with the same labels as LIVE-STATE's `candidateDecision`. |
 | `decodeConfidence` | number | never | Callsign confidence from 0 to 1 (SPEC §4.6), as the stream's `decodeConfidence`. |
 | `emissionState` | string | never | `confirmed` or `tentative` (MAN-106): whether the pattern tier's repetition requirement was met. A spot that would be `abstained` (no acoustic evidence) is never emitted. CLI JSON only; the `:7301` stream does not send it. |
@@ -187,6 +188,8 @@ object of a `run --json` spot line.
 | `sampleTs` | integer | never | Input sample counter at the decode that produced the spot. |
 | `rst` | string or null | when none decoded | The track's latest RST report as three digits (`5NN` reads as `"599"`). `null` when the track decoded none. |
 | `qrlQuery` | boolean | never | `true` when the track decoded `QRL?` before the spot. |
+| `mode` | string | never | `"CW"` or `"RTTY"`: the mode the spot was decoded in (MAN-322). Every spot is `"CW"` until the RTTY decode path emits spots. |
+| `baud` | number or null | unless RTTY | RTTY symbol rate in baud, for example `45.45`. `null` on a CW spot. |
 
 ## `timing`
 

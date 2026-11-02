@@ -124,6 +124,7 @@ class VerifierTestsGateTests(unittest.TestCase):
 
 
 COPPA_GIT = "https://github.com/HagaleTechnologies/coppa.git"
+PANCETTA_GIT = "https://github.com/HagaleTechnologies/pancetta.git"
 # MAN-318: CDLA-Permissive-2.0 is webpki-roots' (Mozilla's CA list, as data).
 PERMISSIVE = {"0BSD", "Apache-2.0", "Apache-2.0 WITH LLVM-exception", "BSD-2-Clause", "BSD-3-Clause",
               "BSL-1.0", "CDLA-Permissive-2.0", "ISC", "MIT", "Unicode-3.0", "Unlicense", "Zlib"}
@@ -185,11 +186,11 @@ class DenyPolicyTests(unittest.TestCase):
         for lic in allow:
             self.assertNotRegex(lic, r"GPL|MPL|EUPL|CDDL|SSPL|CC-BY-SA")
 
-    def test_sources_are_crates_io_and_coppa_only(self):
+    def test_sources_are_crates_io_coppa_and_pancetta(self):
         src = self.cfg["sources"]
         self.assertEqual(src["unknown-registry"], "deny")
         self.assertEqual(src["unknown-git"], "deny")
-        self.assertEqual(src["allow-git"], [COPPA_GIT])
+        self.assertEqual(src["allow-git"], [COPPA_GIT, PANCETTA_GIT])
 
     def test_wildcards_denied_except_workspace_paths(self):
         self.assertEqual(self.cfg["bans"]["wildcards"], "deny")

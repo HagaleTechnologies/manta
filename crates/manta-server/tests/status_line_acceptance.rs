@@ -82,6 +82,8 @@ async fn the_periodic_status_line_reports_tracks_spot_rate_clients_and_uplink_st
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     };
     for _ in 0..5 {
         metrics.record_spot(&spot);

@@ -22,6 +22,8 @@ manta-decode = { workspace = true }
 manta-dsp = { workspace = true }
 manta-input = { workspace = true }
 manta-spot = { workspace = true }
+# MAN-323: the FT8/FT4 decoder, only with the `ftx` feature.
+pancetta-ft8 = { workspace = true, optional = true }
 
 # Windows has no libc::rusage/getrusage (POSIX-only) -- peak_rss_bytes()
 # in soak.rs (shared with soak_metrics.rs) needs a native equivalent there
@@ -35,6 +37,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 
+[features]
+# MAN-323: FT8/FT4 decoding through pancetta-ft8 (C ft8_lib; Linux and macOS).
+ftx = ["dep:pancetta-ft8"]
+
 [dev-dependencies]
 coppa-audio = { workspace = true }
 coppa-channel = { workspace = true }
@@ -42,6 +48,7 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 manta-testkit = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 toml = { workspace = true }
 
 [[bench]]

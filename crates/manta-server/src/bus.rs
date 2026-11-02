@@ -12,6 +12,9 @@
 //! [`SpotBus::subscribe_json`], which carries every spot plus, with
 //! `[rbn_compare]` enabled, each `spotGrade` record in publish order. With
 //! no grades published the JSON channel carries exactly the spots.
+//! FT8/FT4 spots decoded from the IQ streams (MAN-323,
+//! [`SpotBus::publish_ftx`]) are JSON-only records too: they share the
+//! stream's `seq` and resume history and never reach telnet or the uplink.
 //!
 //! A fourth channel carries relayed spots (MAN-320) to the RBN uplink only:
 //! [`SpotBus::publish_relay`] / [`SpotBus::subscribe_relay`]. Telnet, the
@@ -19,7 +22,8 @@
 //! program's spots never appear on manta's own outputs.
 
 use crate::relay::RelaySpot;
-use manta_spot::Spot;
+use crate::spot_message::FtxSpot;
+use manta_spot::{Spot, SpotMode};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -93,6 +97,13 @@ pub enum JsonItem {
         seq: u64,
         line: Arc<str>,
     },
+    /// MAN-323: one FT8/FT4 spot, rendered as a 29-key spot line. JSON
+    /// stream only; `rendered` works as for [`JsonItem::Spot`].
+    Ftx {
+        seq: u64,
+        spot: FtxSpot,
+        rendered: Arc<OnceLock<Arc<str>>>,
+    },
     /// MAN-324: one serialized live-state record, sent verbatim. Only ever
     /// on the live channel, never on the spot stream's.
     Live(Arc<str>),
@@ -113,8 +124,12 @@ pub enum JsonItem {
 /// eviction pressure here is inherently rare (real callsign cardinality
 /// sits far under capacity; sustained floods are the exception, not the
 /// steady state).
+///
+/// Keyed on `(callsign, mode)` (MAN-322 D9): each telnet listener serves
+/// one mode, so `set dx filter unique` counts a call's occurrences in that
+/// listener's own mode.
 struct OccurrenceTracker {
-    counts: HashMap<String, (u32, u64)>,
+    counts: HashMap<(String, SpotMode), (u32, u64)>,
     next_touch: u64,
 }
 
@@ -126,11 +141,13 @@ impl OccurrenceTracker {
         }
     }
 
-    /// Records one occurrence of `callsign` and returns its new count.
-    fn touch(&mut self, callsign: &str) -> u32 {
+    /// Records one occurrence of `callsign` in `mode` and returns its new
+    /// count.
+    fn touch(&mut self, callsign: &str, mode: SpotMode) -> u32 {
         self.next_touch += 1;
         let touch = self.next_touch;
-        if let Some(entry) = self.counts.get_mut(callsign) {
+        let key = (callsign.to_string(), mode);
+        if let Some(entry) = self.counts.get_mut(&key) {
             entry.0 += 1;
             entry.1 = touch;
             return entry.0;
@@ -145,7 +162,7 @@ impl OccurrenceTracker {
                 self.counts.remove(&lru_key);
             }
         }
-        self.counts.insert(callsign.to_string(), (1, touch));
+        self.counts.insert(key, (1, touch));
         1
     }
 }
@@ -154,7 +171,7 @@ impl JsonItem {
     /// Per-session stream position; live-state records have none.
     pub fn seq(&self) -> Option<u64> {
         match self {
-            Self::Spot { seq, .. } | Self::Grade { seq, .. } => Some(*seq),
+            Self::Spot { seq, .. } | Self::Grade { seq, .. } | Self::Ftx { seq, .. } => Some(*seq),
             Self::Live(_) => None,
         }
     }
@@ -338,7 +355,7 @@ impl SpotBus {
                 .occurrence_counts
                 .lock()
                 .expect("occurrence_counts lock poisoned");
-            counts.touch(&spot.callsign)
+            counts.touch(&spot.callsign, spot.mode)
         };
         let bus_spot = BusSpot {
             spot,
@@ -404,6 +421,38 @@ impl SpotBus {
         );
         let _ = self.json_tx.send(item);
         n
+    }
+
+    /// MAN-323: publishes one FT8/FT4 spot to JSON-stream subscribers only,
+    /// with the next `seq` and a place in the resume history. Telnet, the
+    /// uplink and `recent()` never see it. The record ages by its slot's
+    /// start time. Returns ceiling evictions, as `publish_grade` does.
+    pub fn publish_ftx(&self, spot: FtxSpot) -> usize {
+        let heard_ts = self.sample_ts_for_unix_ms(spot.slot_start_ms);
+        let mut stream = self.stream.lock().expect("stream lock poisoned");
+        stream.last_seq += 1;
+        let item = JsonItem::Ftx {
+            seq: stream.last_seq,
+            spot,
+            rendered: Arc::default(),
+        };
+        let n = stream.records.push(
+            StreamRecord {
+                heard_ts,
+                item: item.clone(),
+            },
+            self.window_samples,
+        );
+        let _ = self.json_tx.send(item);
+        n
+    }
+
+    /// The inverse of [`SpotBus::unix_ts_for`] for a Unix-millisecond
+    /// instant: samples since `epoch`, 0 for an instant before it.
+    fn sample_ts_for_unix_ms(&self, unix_ms: i64) -> u64 {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_millis(unix_ms.max(0) as u64);
+        let elapsed = at.duration_since(self.epoch).unwrap_or(Duration::ZERO);
+        (elapsed.as_secs_f64() * self.sample_rate_hz).round() as u64
     }
 
     /// Subscribe and snapshot under the publication lock, so every live
@@ -491,7 +540,8 @@ impl SpotBus {
         self.relay_tx.subscribe()
     }
 
-    /// Spots and grades in publish order: the JSON/WebSocket stream.
+    /// Spots (CW and, MAN-323, FT8/FT4) and grades in publish order: the
+    /// JSON/WebSocket stream.
     pub fn subscribe_json(&self) -> broadcast::Receiver<JsonItem> {
         self.json_tx.subscribe()
     }
@@ -682,6 +732,93 @@ mod tests {
             .all(|item| matches!(item, JsonItem::Spot { .. })));
     }
 
+    fn ftx_spot(slot_start_ms: i64) -> FtxSpot {
+        FtxSpot {
+            mode: crate::spot_message::FtxMode::Ft8,
+            callsign: "W1AW".to_string(),
+            grid: Some("FN31".to_string()),
+            freq_hz: 14_075_234.0,
+            snr_db: -10,
+            slot_start_ms,
+        }
+    }
+
+    /// MAN-323: an FTx spot is a JSON-only record.
+    #[tokio::test]
+    async fn ftx_spots_reach_the_json_channel_only() {
+        let bus = live_bus();
+        let mut json = bus.subscribe_json();
+        let mut spots = bus.subscribe();
+        let mut relay = bus.subscribe_relay();
+        assert_eq!(bus.publish_ftx(ftx_spot(15_000)), 0);
+        match json.recv().await.unwrap() {
+            JsonItem::Ftx { seq, spot, .. } => {
+                assert_eq!(seq, 1);
+                assert_eq!(spot, ftx_spot(15_000));
+            }
+            other => panic!("expected an FTx record, got {other:?}"),
+        }
+        assert!(matches!(
+            spots.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            relay.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(bus.recent(usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn ftx_spots_share_the_seq_and_resume_history_with_cw_spots() {
+        let bus = live_bus();
+        bus.publish(sample_spot(0));
+        bus.publish_ftx(ftx_spot(15_000));
+        bus.publish(sample_spot(1));
+        let r = bus.json_resume(Some(&bus.session_id()), Some(1), 3);
+        assert_eq!(r.outcome, ResumeOutcome::Resumed);
+        let seqs: Vec<u64> = r.records.iter().filter_map(JsonItem::seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+        assert!(matches!(&r.records[0], JsonItem::Ftx { spot, .. } if spot.callsign == "W1AW"));
+        assert!(matches!(&r.records[1], JsonItem::Spot { .. }));
+    }
+
+    /// The record's heard time is its slot start, so it ages out of the
+    /// one-minute window like a CW spot heard at that instant.
+    #[test]
+    fn ftx_history_ages_by_slot_time() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
+        bus.publish_ftx(ftx_spot(0));
+        assert_eq!(
+            bus.stream
+                .lock()
+                .unwrap()
+                .records
+                .entries
+                .back()
+                .unwrap()
+                .heard_ts,
+            0
+        );
+        for ts in 120..120 + MIN_HISTORY_SPOTS as u64 {
+            bus.publish(sample_spot(ts));
+        }
+        let r = bus.json_resume(None, Some(0), u64::MAX);
+        assert!(r
+            .records
+            .iter()
+            .all(|item| matches!(item, JsonItem::Spot { .. })));
+        assert_eq!(r.records.len(), MIN_HISTORY_SPOTS);
+    }
+
+    #[test]
+    fn an_ftx_slot_before_the_epoch_is_heard_at_zero() {
+        let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH + Duration::from_secs(60), 0);
+        assert_eq!(bus.sample_ts_for_unix_ms(15_000), 0);
+        assert_eq!(bus.sample_ts_for_unix_ms(-5), 0);
+        assert_eq!(bus.sample_ts_for_unix_ms(75_000), 15);
+    }
+
     #[test]
     fn sh_dx_history_never_holds_grades_and_keeps_fifty_spots() {
         let bus = SpotBus::new(1.0, SystemTime::UNIX_EPOCH, 0).with_history_minutes(1);
@@ -775,6 +912,8 @@ mod tests {
             sample_ts,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -869,6 +1008,7 @@ mod tests {
             seen.push(match rx.recv().await.unwrap() {
                 JsonItem::Spot { spot: s, .. } => format!("spot:{}", s.spot.sample_ts),
                 JsonItem::Grade { line, .. } => format!("grade:{line}"),
+                JsonItem::Ftx { spot, .. } => format!("ftx:{}", spot.callsign),
                 JsonItem::Live(line) => format!("live:{line}"),
             });
         }
@@ -920,6 +1060,7 @@ mod tests {
                 JsonItem::Grade { line, .. } | JsonItem::Live(line) => {
                     panic!("unexpected line {line}")
                 }
+                JsonItem::Ftx { spot, .. } => panic!("unexpected FTx spot {spot:?}"),
             };
             assert_eq!(a.spot, b.spot);
             assert_eq!(a.occurrence_count, b.occurrence_count);
@@ -1008,6 +1149,45 @@ mod tests {
         assert_eq!(rx.recv().await.unwrap().occurrence_count, 2);
     }
 
+    fn cw(callsign: &str) -> (String, SpotMode) {
+        (callsign.to_string(), SpotMode::Cw)
+    }
+
+    /// MAN-322 D9: a call's CW and RTTY occurrences are counted apart, on
+    /// the tracker and on the spots the bus publishes.
+    #[tokio::test]
+    async fn occurrence_counts_are_kept_per_mode() {
+        let mut tracker = OccurrenceTracker::new();
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 2);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Rtty), 1);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Cw), 3);
+        assert_eq!(tracker.touch("W1AW", SpotMode::Rtty), 2);
+
+        let bus = SpotBus::new(96_000.0, SystemTime::now(), 0);
+        let mut rx = bus.subscribe();
+        let rtty = Spot {
+            mode: SpotMode::Rtty,
+            baud: Some(45.45),
+            ..sample_spot(0)
+        };
+        bus.publish(sample_spot(0));
+        bus.publish(sample_spot(1));
+        bus.publish(rtty);
+        let counts: Vec<(SpotMode, u32)> = [
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+            rx.recv().await.unwrap(),
+        ]
+        .iter()
+        .map(|b| (b.spot.mode, b.occurrence_count))
+        .collect();
+        assert_eq!(
+            counts,
+            [(SpotMode::Cw, 1), (SpotMode::Cw, 2), (SpotMode::Rtty, 1)]
+        );
+    }
+
     #[test]
     fn occurrence_tracker_stays_bounded_under_an_unbounded_sequence_of_distinct_callsigns() {
         // MAN-62's core scenario: a source able to inject fabricated CW
@@ -1015,7 +1195,7 @@ mod tests {
         // not grow this map without bound.
         let mut tracker = OccurrenceTracker::new();
         for i in 0..(MAX_OCCURRENCE_ENTRIES + 5_000) {
-            tracker.touch(&format!("SYNTH{i}"));
+            tracker.touch(&format!("SYNTH{i}"), SpotMode::Cw);
         }
         assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
     }
@@ -1024,20 +1204,20 @@ mod tests {
     fn occurrence_tracker_evicts_the_least_recently_touched_entry_first() {
         let mut tracker = OccurrenceTracker::new();
         for i in 0..MAX_OCCURRENCE_ENTRIES {
-            tracker.touch(&format!("FILL{i}"));
+            tracker.touch(&format!("FILL{i}"), SpotMode::Cw);
         }
-        assert_eq!(tracker.counts.get("FILL0").unwrap().0, 1);
+        assert_eq!(tracker.counts.get(&cw("FILL0")).unwrap().0, 1);
 
         // One more distinct callsign past capacity must evict the
         // longest-untouched entry (FILL0, touched first and never since),
         // not some other arbitrary one.
-        tracker.touch("NEWCOMER");
+        tracker.touch("NEWCOMER", SpotMode::Cw);
         assert_eq!(tracker.counts.len(), MAX_OCCURRENCE_ENTRIES);
         assert!(
-            !tracker.counts.contains_key("FILL0"),
+            !tracker.counts.contains_key(&cw("FILL0")),
             "the least-recently-touched entry must be evicted first"
         );
-        assert!(tracker.counts.contains_key("NEWCOMER"));
+        assert!(tracker.counts.contains_key(&cw("NEWCOMER")));
     }
 
     #[test]
@@ -1048,29 +1228,29 @@ mod tests {
         // technical notes called out as needing a real design decision:
         // LRU-on-touch (not FIFO-by-insertion) is what makes it hold.
         let mut tracker = OccurrenceTracker::new();
-        tracker.touch("REAL_STATION"); // inserted first -- FIFO would evict it first
+        tracker.touch("REAL_STATION", SpotMode::Cw); // inserted first -- FIFO would evict it first
 
         for i in 0..MAX_OCCURRENCE_ENTRIES {
-            tracker.touch(&format!("FLOOD{i}"));
+            tracker.touch(&format!("FLOOD{i}"), SpotMode::Cw);
             if i % 100 == 0 {
-                tracker.touch("REAL_STATION"); // stays fresh throughout
+                tracker.touch("REAL_STATION", SpotMode::Cw); // stays fresh throughout
             }
         }
 
         assert!(
-            tracker.counts.contains_key("REAL_STATION"),
+            tracker.counts.contains_key(&cw("REAL_STATION")),
             "a repeatedly-touched real callsign must survive sustained flood eviction pressure"
         );
-        assert!(tracker.counts.get("REAL_STATION").unwrap().0 > 1);
+        assert!(tracker.counts.get(&cw("REAL_STATION")).unwrap().0 > 1);
     }
 
     #[test]
     fn occurrence_tracker_counts_correctly_alongside_bounded_eviction() {
         let mut tracker = OccurrenceTracker::new();
-        assert_eq!(tracker.touch("K5ARH"), 1);
-        assert_eq!(tracker.touch("K5ARH"), 2);
-        assert_eq!(tracker.touch("JA1ABC"), 1);
-        assert_eq!(tracker.touch("K5ARH"), 3);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 2);
+        assert_eq!(tracker.touch("JA1ABC", SpotMode::Cw), 1);
+        assert_eq!(tracker.touch("K5ARH", SpotMode::Cw), 3);
     }
 
     #[test]

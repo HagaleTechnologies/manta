@@ -185,8 +185,10 @@ it had and starts again with its sample clock moved on by the outage
 (MAN-73). The recording keeps a `gap` record at that point, and
 `run --source` replays it the same way: the outage is not spliced out and
 not filled with zeros. A loss the input reports without a sample count
-(for example a SoapySDR overflow) reaches neither the engine nor the
-recording as a gap. A loss the input splices over and counts instead
+(for example a SoapySDR overflow, `take_unknown_gap`, MAN-202) reaches the
+live engine, which drops the character the loss cut instead of decoding
+through it, but not the recording: a replay runs the samples on either
+side of it together. A loss the input splices over and counts instead
 (MAN-305: HPSDR protocol 2's lost datagrams, `take_missing_samples`)
 moves the live engine's clock on without closing tracks, but the
 recording does not carry it: a replay runs the spliced samples together,

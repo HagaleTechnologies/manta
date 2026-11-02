@@ -9,6 +9,8 @@ pub fn wpm_opt(value: Option<f32>) -> String {
 
 /// MAN-272: ` rst=<RST>` and ` QRL?` follow `conf=` only when the spot's
 /// track decoded them, so an unannotated spot prints the same line as before.
+/// MAN-322: an RTTY spot quotes its speed as `<baud> BPS RTTY` where a CW
+/// spot quotes `<wpm> WPM`; a CW line is unchanged.
 pub fn spot_line(spot: &manta_spot::Spot) -> String {
     let rst = spot
         .rst
@@ -16,13 +18,22 @@ pub fn spot_line(spot: &manta_spot::Spot) -> String {
         .map(|r| format!(" rst={r}"))
         .unwrap_or_default();
     let qrl = if spot.qrl_query { " QRL?" } else { "" };
+    let speed = match spot.mode {
+        manta_spot::SpotMode::Cw => wpm(spot.wpm),
+        manta_spot::SpotMode::Rtty => {
+            let baud = spot
+                .baud
+                .map(|b| format!("{}", b.round()))
+                .unwrap_or_else(|| "unknown".into());
+            format!("{baud} BPS RTTY")
+        }
+    };
     format!(
-        "SPOT: {} ({}) {} {} {} conf={}{rst}{qrl}",
+        "SPOT: {} ({}) {} {} {speed} conf={}{rst}{qrl}",
         spot.callsign,
         spot.spot_type,
         khz(spot.freq_hz),
         db(spot.snr_db),
-        wpm(spot.wpm),
         confidence(spot.confidence)
     )
 }
@@ -217,6 +228,8 @@ mod tests {
             sample_ts: 0,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         };
         assert_eq!(
             spot_line(&spot),
@@ -234,7 +247,7 @@ mod tests {
         // MAN-139: the JSON spot stream's names, in declaration order.
         assert_eq!(
             serde_json::to_string(&annotated).unwrap(),
-            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"emissionState":"confirmed","trackId":1,"sampleTs":0,"rst":"599","qrlQuery":true}"#
+            r#"{"dxCall":"W1AW","frequency":14000759.2,"snr":29.2,"wpm":19.9,"spotType":"cq","decodeConfidence":0.794,"emissionState":"confirmed","trackId":1,"sampleTs":0,"rst":"599","qrlQuery":true,"mode":"CW","baud":null}"#
         );
         // The live-state `spotType` and `/metrics` `type` labels.
         for (value, human, json) in [
@@ -248,6 +261,43 @@ mod tests {
         }
         assert_eq!(wpm_opt(None), "unknown");
         assert_eq!(wpm_opt(Some(17.647_058)), "18 WPM");
+    }
+
+    /// MAN-322: an RTTY spot quotes baud and names the mode where a CW spot
+    /// quotes WPM; its CLI JSON sends `wpm` as `null`.
+    #[test]
+    fn an_rtty_spot_line_quotes_baud_and_names_the_mode() {
+        let rtty = Spot {
+            callsign: "W1AW".into(),
+            freq_hz: 14_080_170.0,
+            snr_db: 20.0,
+            wpm: 0.0,
+            confidence: 0.71,
+            emission_state: manta_spot::EmissionState::Confirmed,
+            spot_type: SpotType::Cq,
+            track_id: 12,
+            sample_ts: 2_737_440,
+            rst: None,
+            qrl_query: false,
+            mode: manta_spot::SpotMode::Rtty,
+            baud: Some(45.45),
+        };
+        assert_eq!(
+            spot_line(&rtty),
+            "SPOT: W1AW (CQ) 14080.2 kHz 20 dB 45 BPS RTTY conf=0.71"
+        );
+        let no_baud = Spot {
+            baud: None,
+            ..rtty.clone()
+        };
+        assert_eq!(
+            spot_line(&no_baud),
+            "SPOT: W1AW (CQ) 14080.2 kHz 20 dB unknown BPS RTTY conf=0.71"
+        );
+        assert_eq!(
+            spot_json(&rtty),
+            r#"{"spot":{"dxCall":"W1AW","frequency":14080170.0,"snr":20.0,"wpm":null,"spotType":"cq","decodeConfidence":0.71,"emissionState":"confirmed","trackId":12,"sampleTs":2737440,"rst":null,"qrlQuery":false,"mode":"RTTY","baud":45.45}}"#
+        );
     }
 
     /// MAN-139: `run --json`'s spot line is the spot as `decode --json`
@@ -266,6 +316,8 @@ mod tests {
             sample_ts: 2_006_272,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         };
         let line = spot_json(&spot);
         assert_eq!(

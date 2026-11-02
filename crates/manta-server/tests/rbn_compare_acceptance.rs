@@ -159,6 +159,8 @@ fn fixture_spots() -> Vec<(i64, Spot)> {
                 sample_ts: parts[3].parse().unwrap(),
                 rst: None,
                 qrl_query: false,
+                mode: manta_spot::SpotMode::Cw,
+                baud: None,
             };
             (v["timestamp"].as_i64().unwrap(), spot)
         })
@@ -647,6 +649,46 @@ async fn scenario_4_elsewhere() {
         SCENARIO_4_ELSEWHERE,
     )
     .await;
+}
+
+/// MAN-322 D8: RBN's reference feed is CW-only, so an RTTY spot on the bus
+/// is skipped before grading: no `spotGrade`, and not counted ungraded.
+#[tokio::test]
+async fn an_rtty_spot_is_neither_graded_nor_counted_ungraded() {
+    let (t, cw) = scenario_spot(0);
+    let rtty = Spot {
+        freq_hz: 14_080_170.0,
+        wpm: 0.0,
+        track_id: 99,
+        mode: manta_spot::SpotMode::Rtty,
+        baud: Some(45.45),
+        ..cw.clone()
+    };
+    let rtty_id = manta_server::spot_message::spot_id(STATION_CALL, NONCE, &rtty);
+    let cw_id = manta_server::spot_message::spot_id(STATION_CALL, NONCE, &cw);
+    let mut h = Harness::start(&[], t - 400).await;
+    h.send(&warm_up(t - 300)).await;
+    // The RTTY spot is never queued, so publish it straight to the bus; the
+    // CW spot behind it is queued only after the comparator has read it.
+    h.set_clock(t);
+    h.bus.publish(rtty);
+    h.publish(t, cw).await;
+    h.set_clock(t + 179);
+    h.send(&warm_up(t + 181)).await;
+
+    let grades = h.wait_grades(1, Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    let grades_after = h.grade_lines();
+    assert_eq!(grades_after.len(), 1, "{grades_after:?}");
+    assert_eq!(grades, grades_after);
+    let grade: serde_json::Value = serde_json::from_str(&grades[0]).unwrap();
+    assert_eq!(grade["spotId"].as_str(), Some(cw_id.as_str()));
+    assert_ne!(grade["spotId"].as_str(), Some(rtty_id.as_str()));
+    // Both spots reached the stream; only the CW one was graded.
+    assert_eq!(h.spot_lines(), 2);
+    assert_eq!(h.metric("manta_rbn_compare_ungraded_total"), Some(0.0));
+    assert_eq!(h.metric("manta_rbn_compare_pending"), Some(0.0));
+    h.stop().await;
 }
 
 #[tokio::test]

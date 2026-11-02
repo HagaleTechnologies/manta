@@ -33,6 +33,8 @@ mod devices;
 mod doctor_checks;
 mod fmt;
 mod grade_cmd;
+mod grade_paired;
+mod grade_transcript;
 mod health_cmd;
 mod hpsdr_group;
 mod list_cache;
@@ -47,6 +49,7 @@ mod relay_socket;
 mod reload;
 mod silent;
 mod source_check;
+mod spectrum_feed;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -1263,8 +1266,11 @@ enum Command {
     /// archive) and RBN daily-dump CSVs, and grades every spot the way
     /// `[rbn_compare]` grades it live: match, disagree, elsewhere, none or
     /// unknown. Prints a per-band summary, or the grade records with
-    /// --json. Never reads MANTA_* variables: the output depends only on
-    /// the inputs and flags.
+    /// --json. --reference grades against a skimmer's saved `DX de` lines
+    /// (a co-located CW Skimmer Server) instead of RBN CSVs, and --paired
+    /// grades both ways: recall, the reports manta missed and its candidate
+    /// false spots. Never reads MANTA_* variables: the output depends only
+    /// on the inputs and flags.
     Grade {
         #[command(flatten)]
         args: grade_cmd::Args,
@@ -2056,6 +2062,12 @@ impl IqSource for FixedCenterFreqSource {
     /// MAN-305: forwarded as `take_discontinuity` is.
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.inner.take_missing_samples()
+    }
+
+    /// MAN-202: forwarded as `take_discontinuity` is (a SoapySDR overflow
+    /// reaches `listen()` through this wrapper).
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
     }
 
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
@@ -4384,6 +4396,9 @@ const LISTENER_METRICS: &str = "metrics";
 /// MAN-324: the live-state listener, registered only when
 /// `[server].live_port` is set.
 const LISTENER_LIVE: &str = "live";
+/// MAN-322: the RTTY-only telnet listener, registered only when
+/// `[server].rtty_telnet_port` is set.
+const LISTENER_RTTY_TELNET: &str = "rtty_telnet";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -4675,6 +4690,28 @@ fn start_spot_server(
                 .as_ref()
                 .map(tokio::net::TcpListener::local_addr)
                 .transpose()?;
+            // MAN-322 D5: the RTTY-only telnet listener, only when
+            // `rtty_telnet_port` is set. It binds `bind_addr`, like
+            // `telnet_port`.
+            let rtty_telnet_listener = match cfg.rtty_telnet_port {
+                Some(rtty_telnet_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), rtty_telnet_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "binding the RTTY telnet server (bind_addr = {}, \
+                                 rtty_telnet_port = {})",
+                                fmt::quoted(&cfg.bind_addr),
+                                rtty_telnet_port
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            let rtty_telnet_addr = rtty_telnet_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
             // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
             // failure never produces a banner at all) but BEFORE any listener task is
@@ -4702,6 +4739,7 @@ fn start_spot_server(
                     json_addr: json_listener.local_addr()?,
                     metrics_addr: metrics_listener.local_addr()?,
                     live_addr,
+                    rtty_telnet_addr,
                     inputs: source.inputs,
                 })
             );
@@ -4716,6 +4754,9 @@ fn start_spot_server(
             if live_listener.is_some() {
                 metrics.enable_live();
                 metrics.set_listener_up(LISTENER_LIVE, true);
+            }
+            if rtty_telnet_listener.is_some() {
+                metrics.set_listener_up(LISTENER_RTTY_TELNET, true);
             }
 
             let telnet_ip_command_limiter =
@@ -4755,6 +4796,44 @@ fn start_spot_server(
                 profile.sett.segments = manta_server::sett::segments_for_inputs(source.coverage);
             }
             let profile = std::sync::Arc::new(profile);
+            // MAN-322 D5: an RTTY telnet listener speaks the CW listener's
+            // protocol and serves RTTY spots only, with its own client cap,
+            // per-IP quota and command budget (built from the same
+            // `telnet_*` keys).
+            if let Some(rtty_telnet_listener) = rtty_telnet_listener {
+                let rtty_telnet_ip_command_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::telnet::MAX_TELNET_COMMANDS,
+                        manta_server::telnet::COMMAND_RATE_WINDOW,
+                        cfg.telnet_max_commands_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(
+                    rtty_telnet_ip_command_limiter.clone(),
+                );
+                spawn_tracked_listener(
+                    LISTENER_RTTY_TELNET,
+                    metrics.clone(),
+                    manta_server::telnet::serve(
+                        rtty_telnet_listener,
+                        bus.clone(),
+                        metrics.clone(),
+                        profile.clone(),
+                        shutdown_rx.clone(),
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                            cfg.telnet_max_connections_per_ip,
+                        ),
+                        rtty_telnet_ip_command_limiter,
+                        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        cfg.line_format,
+                        manta_spot::SpotMode::Rtty,
+                    ),
+                );
+            }
             spawn_tracked_listener(
                 LISTENER_TELNET,
                 metrics.clone(),
@@ -4775,6 +4854,7 @@ fn start_spot_server(
                     telnet_ip_command_limiter,
                     manta_server::tasks::CLIENT_DRAIN_DEADLINE,
                     cfg.line_format,
+                    manta_spot::SpotMode::Cw,
                 ),
             );
             let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
@@ -5353,6 +5433,8 @@ struct ResolvedInput {
     capture_rate_hz: Option<f64>,
     /// MAN-309: `run` records this input's IQ here (`record_iq`).
     record_iq: Option<PathBuf>,
+    /// MAN-141: `run` sends this input's spectrum here (`spectrum_udp`).
+    spectrum: Option<config::SpectrumOut>,
     /// MAN-310: this stream's share of a split band plan.
     spawn_band_hz: Option<(f64, f64)>,
 }
@@ -5551,6 +5633,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
                     record_iq: n.input.shared.record_iq.clone(),
+                    spectrum: n.input.shared.spectrum.clone(),
                     spawn_band_hz: n.spawn_band_hz,
                 })
             })
@@ -5772,6 +5855,25 @@ fn wrap_file_replay(
 /// offset. Shared with `manta doctor`'s `config` check (MAN-126).
 fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) -> bool {
     has_server && !rf_aware && dial_freq_hz.is_none()
+}
+
+/// MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's sidecar by
+/// opening it and maps any open error to "no RF frequency". For a file
+/// that exists, that error (an unsupported sample rate, a malformed
+/// header) is the real problem, so a dial guard calls this first to
+/// report it rather than ask for a dial frequency that would not help.
+fn report_iq_open_error(spec: &LiveSourceSpec, dial_freq_hz: Option<f64>) -> Result<()> {
+    if let LiveSourceSpec::File {
+        path,
+        source_iq: true,
+        raw,
+    } = spec
+    {
+        if path.exists() {
+            open_iq_source_file(path, *raw, dial_freq_hz)?;
+        }
+    }
+    Ok(())
 }
 
 /// How `manta doctor` names the configured receiver. Never includes the
@@ -7053,6 +7155,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 Some(_) => None,
                 None => loaded.input.shared.record_iq.clone(),
             });
+            // MAN-141: `input.spectrum_udp`, dropped with the rest of the
+            // file's input when a source flag replaced it.
+            let spectrum_out = match resolved.replaced_file_source {
+                Some(_) => None,
+                None => loaded.input.shared.spectrum.clone(),
+            };
             // An existing --source is an existing destination too.
             if let Some(path) = &record_iq {
                 check_record_destination(path)?;
@@ -7151,22 +7259,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
             if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
-                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
-                // sidecar by opening it and maps any open error to "no RF
-                // frequency". For a file that exists, that error (an
-                // unsupported sample rate, a malformed header) is the real
-                // problem, so report it rather than asking for a dial
-                // frequency that would not help.
-                if let LiveSourceSpec::File {
-                    path,
-                    source_iq: true,
-                    raw,
-                } = spec
-                {
-                    if path.exists() {
-                        open_iq_source_file(path, *raw, dial_freq_hz)?;
-                    }
-                }
+                report_iq_open_error(spec, dial_freq_hz)?;
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -7175,6 +7268,22 @@ fn run_command() -> Result<std::process::ExitCode> {
                      MANTA_INPUT_CENTER_FREQ_HZ, or input.center_freq_hz"
                 );
             }
+            // MAN-141: a spectrum feed needs a real RF frequency too, with
+            // or without [server], and its socket is bound before any
+            // source I/O (as `[[wsjtx_relay]]` sockets are).
+            if spectrum_out.is_some() && needs_dial_freq(true, has_rf_aware_source, dial_freq_hz) {
+                report_iq_open_error(spec, dial_freq_hz)?;
+                bail!(spectrum_feed::NEEDS_RF_MESSAGE);
+            }
+            // The input's name: its `name` key, else its type (MAN-13).
+            let spectrum_input = loaded
+                .inputs
+                .first()
+                .map_or(source_name, |n| n.name.as_str());
+            let spectrum_bound = spectrum_out
+                .as_ref()
+                .map(|out| spectrum_feed::bind(spectrum_input, out))
+                .transpose()?;
             if config_path.is_some() && loaded.server.is_none() {
                 logging::note(&format!(
                     "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
@@ -7719,6 +7828,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
             let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
+            // MAN-141: the feed's span comes from the opened source, the
+            // same numbers the engine's tap uses.
+            let (spectrum_sink, spectrum_thread) = match spectrum_bound {
+                Some(feed) => spectrum_feed::open(
+                    feed,
+                    src.sample_rate(),
+                    src.center_freq_hz(),
+                    src.rf_passband_hz(),
+                    resolved.freq_correction_ppm,
+                    spot_server.as_ref().map(|server| server.metrics.as_ref()),
+                )?
+                .unzip(),
+                None => (None, None),
+            };
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -7747,6 +7870,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }),
                     detector_confirmations: None,
                     track_lifecycle: None,
+                    spectrum: spectrum_sink,
                 },
                 |ev| {
                     if json {
@@ -7884,6 +8008,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-309: the source is gone, so the queue is closed; the
             // writer finalizes during the drain and is collected after it.
             let recording_deadline = close_recordings(recording.as_slice());
+            // MAN-141: the engine dropped its sink, so the sender thread has
+            // sent what was queued and ends.
+            if let Some(thread) = spectrum_thread {
+                let _ = thread.join();
+            }
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -8122,6 +8251,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
                 errln!("{note}");
             }
+            if let Some(note) = spectrum_feed::ignored_note("soak", &loaded) {
+                errln!("{note}");
+            }
             if let Some(note) = record_iq_ignored_note("soak", &loaded) {
                 errln!("{note}");
             }
@@ -8322,6 +8454,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
+                errln!("{note}");
+            }
+            if let Some(note) = spectrum_feed::ignored_note("doctor", &loaded) {
                 errln!("{note}");
             }
             if let Some(note) = record_iq_ignored_note("doctor", &loaded) {
@@ -10632,6 +10767,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spectrum_needs_an_rf_reference_like_a_server_does() {
+        // MAN-141: `run`'s feed guard is MAN-34's rule with a server
+        // assumed: plain audio without a dial is refused, with one is not.
+        let audio = LiveSourceSpec::AudioDevice(None);
+        assert!(needs_dial_freq(true, audio.is_rf_aware(), None));
+        assert!(!needs_dial_freq(
+            true,
+            audio.is_rf_aware(),
+            Some(14_000_000.0)
+        ));
+        assert!(spectrum_feed::NEEDS_RF_MESSAGE.contains("set input.center_freq_hz"));
+    }
+
+    #[test]
+    fn soak_and_doctor_say_they_ignore_spectrum_udp() {
+        let loaded = loaded_from("[input]\ntype = \"audio\"\nspectrum_udp = \"127.0.0.1:13064\"\n");
+        let note = spectrum_feed::ignored_note("soak", &loaded).unwrap();
+        assert!(
+            note.starts_with(
+                "note: soak does not send spectrum; ignoring input.spectrum_udp from "
+            ),
+            "{note}"
+        );
+        assert_eq!(
+            spectrum_feed::ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
+            None
+        );
+    }
+
     /// MAN-309: a manta IQ recording pair in `dir`, `gap` its one gap.
     fn native_pair(dir: &Path, name: &str, start_secs: i64, gap: u64) -> PathBuf {
         use manta_input::recording_format::MetadataRecord;
@@ -11114,6 +11279,8 @@ mod tests {
                 sample_ts: 12_345,
                 rst: None,
                 qrl_query: false,
+                mode: manta_spot::SpotMode::Cw,
+                baud: None,
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
@@ -12053,6 +12220,44 @@ mod tests {
         };
         assert_eq!(src.take_missing_samples(), Some(11_900));
         assert_eq!(src.take_missing_samples(), None);
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
+    /// MAN-202: the inner source's unknown-length loss reaches `listen()`,
+    /// once, beside the counted hooks.
+    #[test]
+    fn fixed_center_freq_source_forwards_take_unknown_gap() {
+        struct UnknownProbeSource {
+            unknown: bool,
+            missing: Option<u64>,
+        }
+        impl IqSource for UnknownProbeSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
+        }
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(UnknownProbeSource {
+                unknown: true,
+                missing: Some(5),
+            }),
+            freq_hz: 14_000_000.0,
+        };
+        assert!(src.take_unknown_gap());
+        assert!(!src.take_unknown_gap());
+        assert_eq!(src.take_missing_samples(), Some(5));
         assert_eq!(src.take_discontinuity(), None);
     }
 

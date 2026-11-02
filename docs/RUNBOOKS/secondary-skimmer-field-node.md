@@ -34,7 +34,9 @@ The evidence files, all on the node:
 
 The tools are [`scripts/field-node.py`](../../scripts/field-node.py) and
 [`scripts/shadow-compare.py`](../../scripts/shadow-compare.py). For what `/healthz` and each
-`/metrics` family mean, see [node-health.md](node-health.md).
+`/metrics` family mean, see [node-health.md](node-health.md). For a nightly report against the
+primary's own telnet output (recall, misses and candidate false spots), see
+[Paired report against a co-located skimmer](rbn-comparison.md#paired-report-against-a-co-located-skimmer-man-97).
 
 With `[rbn_compare]` enabled, the JSON Lines port also carries one grade line per spot,
 marked `"kind":"spotGrade"`. `record-spots` writes those to the `grades-*.jsonl` files and
