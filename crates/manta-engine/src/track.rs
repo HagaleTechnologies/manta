@@ -974,6 +974,14 @@ fn man372_diag() -> bool {
     *DIAG.get_or_init(|| std::env::var("MANTA_MAN372_DIAG").is_ok())
 }
 
+/// MAN-271 (SPEC §2.8 D′): keyed marks in a track's queued post-promotion
+/// input (`Track::pending`). MAN-199: it takes the queue, not the track,
+/// so the lead-in is never read and replayed pre-promotion marks never help
+/// a track qualify.
+fn queued_keyed_marks(pending: &[(f32, f32, Option<f32>, u64, f32, f64)]) -> u64 {
+    keyed_marks(&pending.iter().map(|p| p.0).collect::<Vec<f32>>())
+}
+
 /// MAN-271 (SPEC §2.8 D′): count the debounced key-down runs ("keyed
 /// marks") in a track's queued decoder input, with Demod-style relative
 /// rails: nearest-rank Q90/Q10 quantiles over a copy (Q10 floored at
@@ -3182,7 +3190,7 @@ impl TrackManager {
                     // unqualified track; everywhere else it stays 0, so
                     // the quantile selection never runs.
                     let marks = if state == LifecycleState::Hang && ev.dropped_since_eval {
-                        keyed_marks(&track.pending.iter().map(|p| p.0).collect::<Vec<f32>>())
+                        queued_keyed_marks(&track.pending)
                     } else {
                         0
                     };
@@ -3748,6 +3756,13 @@ impl TrackManager {
             }
         }
         self.input_gap_hops.push_back(first_hop);
+    }
+
+    /// MAN-199: replay `depth` recorded hops at each lease instead of
+    /// `LEAD_IN_HOPS` (at most the history's capacity).
+    #[cfg(test)]
+    fn set_lead_in_hops(&mut self, depth: usize) {
+        self.lead_in_hops = depth;
     }
 
     /// MAN-202: how many unknown-length input gaps this manager has applied.
@@ -10366,5 +10381,170 @@ mod tests {
             })
             .collect();
         assert_eq!(order, vec![(2, false), (1, true), (1, false)]);
+    }
+
+    /// MAN-199: the lead-in is built from recorded power, never through the
+    /// refiner: it neither feeds nor resets the refiner's delay line.
+    #[test]
+    fn lead_in_bypasses_the_refiner() {
+        let n = 64;
+        let mut tm = TrackManager::new(n, 96_000.0, 14_000_000.0, cfg(), DecodeConfig::default());
+        let mut keyed = quiet_power(n);
+        keyed[10] = 9.0;
+        for m in 0..10u64 {
+            tm.history.record(m, m, &keyed, false);
+        }
+        tm.spawn(10);
+        let id = *tm.tracks.keys().next().unwrap();
+        let track = tm.tracks.get_mut(&id).unwrap();
+        track.refiner = Some(Refiner::new(100.0, 0.0));
+        track.refiner_channel = Some(10);
+        track.refiner_hops_since_reset = 3;
+        track.build_lead_in(&tm.history, &tm.last_fed_hop, 10, LEAD_IN_HOPS, n);
+        assert!(track.lead_in.iter().all(|&(a, p, _)| (a, p) == (3.0, 9.0)));
+        assert_eq!(track.refiner_hops_since_reset, 3);
+        assert!(track.refiner_backlog.is_empty());
+        assert_eq!(track.refiner_channel, Some(10));
+    }
+
+    /// MAN-199: the lead-in does not move the SPEC §5 report cadence: the
+    /// same keyed scene through a manager with and without it reports
+    /// `TrackMeta` at the same timestamps.
+    #[test]
+    fn lead_in_does_not_move_track_meta() {
+        use manta_dsp::channelizer::Channelizer;
+        use manta_testkit::scene::{render_scene, SignalSpec};
+        let fs = 96_000.0;
+        let center_freq_hz = 14_000_000.0;
+        let sig = SignalSpec {
+            dit_units: 1.0,
+            element_gap_units: 1.0,
+            text: "CQ CQ DE W1AW W1AW K".into(),
+            loop_text: true,
+            wpm: 20.0,
+            offset_hz: 12_340.0,
+            snr_2500_db: 20.0,
+            jitter: None,
+            qsb: None,
+            watterson: None,
+            char_wpm: None,
+            weight: 3.0,
+            char_gap_units: 3.0,
+            word_gap_units: 7.0,
+            rise_ms: 5.0,
+        };
+        let (samples, _) =
+            render_scene(std::slice::from_ref(&sig), fs, 8.0, Some(0x4D41_4E31_3939)).unwrap();
+        let metas = |depth: usize| -> Vec<u64> {
+            let mut ch = Channelizer::new(fs, center_freq_hz).unwrap();
+            let hop_samples = ch.hop() as u64;
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                fs,
+                center_freq_hz,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
+            tm.set_lead_in_hops(depth);
+            let hops = ch.process(&samples);
+            let mut events = tm.process_hops(&hops, |m| m * hop_samples);
+            events.extend(tm.finish());
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::TrackMeta { sample_ts, .. } => Some(*sample_ts),
+                    _ => None,
+                })
+                .collect()
+        };
+        let with = metas(LEAD_IN_HOPS);
+        assert!(!with.is_empty(), "the scene reports TrackMeta");
+        assert_eq!(with, metas(0));
+    }
+
+    /// MAN-199: a woken DORMANT track's lead-in for a wake `gap` quiet hops
+    /// after the first transmission: (DORMANT entry hop, wake hop, lead-in
+    /// timestamps, cut). The wake part is stepped hop by hop so the lead-in
+    /// can be read before a drain consumes it.
+    fn man199_wake(gap: u64) -> (u64, u64, Vec<u64>, LeadInCut) {
+        let mut tm = rq_mgr(DetectorConfig::default().reacquire_hops);
+        let first = rq_feed(&mut tm, &rq_keyed(RQ_TEXT, RQ_DIT, 10), 16, |_, _| {});
+        let id = rq_promoted_ids(&first)[0];
+        let mut dormant_at = None;
+        let wake: Vec<Vec<f32>> = rq_quiet(gap)
+            .into_iter()
+            .chain(rq_keyed(RQ_TEXT, RQ_DIT, 10))
+            .collect();
+        for p in wake {
+            let m = tm.hop_counter;
+            tm.step_hop(&hop(m, p), m);
+            let t = &tm.tracks[&id];
+            if dormant_at.is_none() && t.state() == LifecycleState::Dormant {
+                dormant_at = Some(m);
+            }
+            if tm.reacquisition_count() == 1 {
+                let ts = t.lead_in.iter().map(|&(_, _, ts)| ts).collect();
+                return (dormant_at.unwrap(), m, ts, t.lead_in_cut);
+            }
+        }
+        panic!("the second transmission must wake track {id}");
+    }
+
+    /// MAN-199: a woken DORMANT track replays only hops after its released
+    /// decoder's last input; a wake long after DORMANT entry gets the full
+    /// depth.
+    #[test]
+    fn a_woken_dormant_track_replays_only_hops_after_its_release() {
+        let hang = DetectorConfig::default().hang_hops;
+        // `rq_keyed` ends in its own quiet tail, so DORMANT entry comes
+        // before `gap` ends: this gap resumes keying soon after entry.
+        let (dormant, wake, ts, cut) = man199_wake(hang - 130);
+        assert!(
+            wake - dormant < LEAD_IN_HOPS as u64,
+            "quick wake: {dormant}..{wake}"
+        );
+        assert_eq!(ts, (dormant..wake).collect::<Vec<u64>>());
+        assert_eq!(cut, LeadInCut::AlreadyFed(dormant - 1));
+
+        let (dormant, wake, ts, cut) = man199_wake(hang + 200);
+        assert!(wake - dormant >= LEAD_IN_HOPS as u64);
+        assert_eq!(ts, (wake - LEAD_IN_HOPS as u64..wake).collect::<Vec<u64>>());
+        assert_eq!(cut, LeadInCut::Full);
+    }
+
+    /// MAN-199: MAN-313 qualification's D′ count reads only the queued
+    /// post-promotion input, never the lead-in: keyed marks replayed from
+    /// before promotion cannot make a single bump qualify.
+    #[test]
+    fn qualification_does_not_count_lead_in_marks() {
+        let mut track = Track::new(1, 10, &cfg());
+        let mut keyed = Vec::new();
+        for _ in 0..4 {
+            keyed.extend(std::iter::repeat_n(10.0_f32, 12));
+            keyed.extend(std::iter::repeat_n(1.0_f32, 12));
+        }
+        track.lead_in = keyed
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| (a, a * a, i as u64))
+            .collect();
+        // One smooth bump over the floor: a swept carrier's shape.
+        track.pending = (0..120u64)
+            .map(|i| {
+                let x = (i as f32 - 60.0) / 20.0;
+                let a = 1.0 + 9.0 * (-x * x).exp();
+                (a, a * a, None, 1000 + i, 20.0, 14_000_000.0)
+            })
+            .collect();
+        assert_eq!(queued_keyed_marks(&track.pending), 1);
+        let all: Vec<f32> = keyed
+            .iter()
+            .copied()
+            .chain(track.pending.iter().map(|p| p.0))
+            .collect();
+        assert!(
+            keyed_marks(&all) >= 4,
+            "fixture: the lead-in holds keyed marks"
+        );
     }
 }
