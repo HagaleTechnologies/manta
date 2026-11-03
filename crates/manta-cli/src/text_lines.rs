@@ -175,6 +175,7 @@ mod tests {
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz,
+            last_char_ts: 0,
         }
     }
 

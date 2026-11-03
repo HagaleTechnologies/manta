@@ -1,6 +1,10 @@
 {
   "generated_at": "2026-10-30T15:36:30Z",
+<<<<<<< HEAD
   "head_commit": "efa79c4",
+=======
+  "head_commit": "3a6f3c9",
+>>>>>>> 33340f544a9e256cdc37f9bd98e3506ec0e954bb
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -326,7 +330,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5ca169108ae1274e462ef60bd00032eb7c4e0bcfdf6b7b262f9185b03a8d9e60",
+      "hash": "sha256:c0d7bfe7b5d6e52b6524c883db2f95ceb083ab35717990d946606a1fa10ea2b2",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -344,12 +348,13 @@
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
         "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
-        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
+        "docs/DECISIONS/2026-11-02-man201-callsign-roles.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "799379d",
-      "verified_date": "2026-10-16",
+      "verified_commit": "3a6f3c9",
+      "verified_date": "2026-11-02",
       "visibility": "public"
     },
     {

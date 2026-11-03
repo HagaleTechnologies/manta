@@ -33,6 +33,11 @@ use wire::{ChannelStatus, Encoding, SeqObservation, SeqTracker};
 /// feature-gated and must not become a dependency of this module.
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// MAN-201: how long a delivering stream may stop before `read` reports
+/// `take_stalled`: the validator's 5 s silence turn end, which a stream
+/// delivering no hops cannot reach on its own.
+const SETTLE_AFTER: Duration = Duration::from_secs(5);
+
 /// The status socket's receive timeout while `open` waits for status. The
 /// data socket is drained (one `DRAIN_BATCH` per pass) between status
 /// receives, so this bounds how long RTP queues unread in the kernel and how
@@ -379,6 +384,12 @@ pub struct Ka9qIqSource {
     recv_buf: Vec<u8>,
     last_accepted: Instant,
     stall_timeout: Duration,
+    /// MAN-201: `SETTLE_AFTER`, a field so a test need not wait it out.
+    settle_after: Duration,
+    /// MAN-201: samples have been returned since the last stall report.
+    delivering: bool,
+    /// MAN-201: pending for `take_stalled`.
+    stalled: bool,
     confirmed_live: Arc<AtomicBool>,
     counters: Arc<InputHealthCounters>,
     /// MAN-259: `open`'s runtime up to where the replayed stream starts
@@ -454,6 +465,9 @@ impl Ka9qIqSource {
             recv_buf: vec![0u8; RECV_BUF_LEN],
             last_accepted: Instant::now(),
             stall_timeout: cfg.stall_timeout,
+            settle_after: SETTLE_AFTER,
+            delivering: false,
+            stalled: false,
             confirmed_live: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(InputHealthCounters::new()),
             acquisition_start_offset,
@@ -889,7 +903,19 @@ impl IqSource for Ka9qIqSource {
                 for (dst, src) in buf.iter_mut().zip(self.queue.drain(..n)) {
                     *dst = src;
                 }
+                self.delivering = true;
                 return Ok(n);
+            }
+            // MAN-201: stopped but within the stall bound. The engine
+            // settles each track's last call now; a channel can stay in
+            // radiod's status for as long as it likes with no RTP.
+            if self.delivering
+                && self.stall_timeout > self.settle_after
+                && self.last_accepted.elapsed() >= self.settle_after
+            {
+                self.delivering = false;
+                self.stalled = true;
+                return Ok(0);
             }
             if self.last_accepted.elapsed() >= self.stall_timeout {
                 bail!(
@@ -906,6 +932,10 @@ impl IqSource for Ka9qIqSource {
                 Err(e) => return Err(e).context("ka9q-radio: data socket"),
             }
         }
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -1965,6 +1995,24 @@ mod tests {
             f.send_rtp(SSRC, 6, Encoding::F32Le, &good);
             assert_eq!(read_n(&mut src, 180), good);
             assert_eq!(src.counters.malformed_packets(), 6);
+        }
+
+        /// MAN-201: a delivering stream that stops reports one stall inside
+        /// the stall bound, then still fails at the bound.
+        #[test]
+        fn a_stopped_stream_reports_a_stall_once_before_the_stall_timeout() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            src.settle_after = Duration::from_millis(200);
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            assert!(src.read(&mut buf).unwrap() > 0);
+            assert!(!src.take_stalled());
+            assert_eq!(src.read(&mut buf).unwrap(), 0);
+            assert!(src.take_stalled());
+            assert!(!src.take_stalled());
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(e.contains("stream stalled"), "{e}");
         }
 
         #[test]

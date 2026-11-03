@@ -359,6 +359,11 @@ impl IqSource for SampleBoundedSource {
         self.inner.take_unknown_gap()
     }
 
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
+    }
+
     /// MAN-273: forwarded with `trusted_band_hz`.
     fn analytic_guard_hz(&self) -> f64 {
         self.inner.analytic_guard_hz()
