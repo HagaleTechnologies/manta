@@ -2060,6 +2060,8 @@ as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 | §5 events | `manta-decode::events` |
 | §7 vectors | `manta-testkit::vectors` |
 | §7.2 static-crash vectors | `manta-testkit::crash` |
+| §7 independent generator cross-check | `manta-testkit::baseband`, `::measure`, `::crosscheck` |
+| §7 failure minimizer, synthetic repros | `manta-testkit::scenespec`, `::minimize`, `::repro` |
 
 ## 9. Configuration keys
 
