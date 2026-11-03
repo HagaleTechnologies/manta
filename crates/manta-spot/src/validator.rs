@@ -1982,11 +1982,11 @@ impl Validator {
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
                 self.decide(|| withheld(Reason::Grammar));
-                return self.try_fused(&fused_site, None);
+                return self.try_fused_other(&fused_site, &candidate);
             }
             if !self.cty.is_allocated(&candidate) {
                 self.decide(|| withheld(Reason::Cty));
-                return self.try_fused(&fused_site, None);
+                return self.try_fused_other(&fused_site, &candidate);
             }
         }
 
@@ -2178,6 +2178,15 @@ impl Validator {
             return None;
         }
         Some(fused)
+    }
+
+    /// MAN-200 D10: the fused path after a `Grammar` or `Cty` withhold. A
+    /// winner that is the candidate's own text would fail that same check
+    /// and decide this word a second time, so only a different winner is
+    /// tried.
+    fn try_fused_other(&mut self, site: &FusedSite, candidate: &str) -> Option<Spot> {
+        let fused = self.fused_winner(site).filter(|f| f.call != candidate)?;
+        self.try_fused(site, Some(fused))
     }
 
     /// MAN-200 D8/D11: decides a fused winner through the same checks as
@@ -2946,6 +2955,33 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // offered again.
         run(&transmission_events(1, &["QSL"], 50_000), &mut v);
         assert_eq!(v.lattice_counts().unwrap().added, added);
+    }
+
+    /// MAN-200 D10: repeated exact copies of a call the exact path withholds
+    /// for `Grammar` or `Cty` make the lattice confirm the candidate's own
+    /// text, which fails the same check again. The fused path must not
+    /// decide that call a second time for the same word.
+    #[test]
+    fn a_grammar_or_cty_withhold_is_decided_once_per_word() {
+        for (call, reason) in [("Q1AW", Reason::Cty), ("W1AW/X", Reason::Grammar)] {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            for i in 0..5u64 {
+                run(
+                    &transmission_events(1, &["CQ", call, "K"], i * 100_000),
+                    &mut v,
+                );
+            }
+            let log = v.take_decisions();
+            let decided = decisions_for(&log, call);
+            assert_eq!(decided.len(), 5, "{call}: {decided:?}");
+            let mut words: Vec<_> = decided.iter().map(|d| (d.track_id, d.sample_ts)).collect();
+            words.dedup();
+            assert_eq!(words.len(), 5, "{call}: a word decided twice: {decided:?}");
+            assert!(
+                decided.iter().all(|d| d.reason == Some(reason)),
+                "{decided:?}"
+            );
+        }
     }
 
     #[test]
