@@ -323,6 +323,7 @@ pub fn reason_label(r: Reason) -> &'static str {
         Reason::Variant => "variant",
         Reason::Dedupe => "dedupe",
         Reason::PowerStepGuard => "powerStepGuard",
+        Reason::BeaconNoEvidence => "beaconNoEvidence",
         Reason::BeaconPending => "beaconPending",
         Reason::BeaconSpeed => "beaconSpeed",
         Reason::BeaconOverflow => "beaconOverflow",
@@ -564,6 +565,8 @@ mod tests {
             sample_ts: 0,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         };
         let mut spotted = decision(Verdict::Spotted, None);
         spotted.spot = Some(spot);
@@ -601,6 +604,12 @@ mod tests {
                 Reason::PowerStepGuard,
                 "withheld",
                 "powerStepGuard",
+            ),
+            (
+                Verdict::Withheld,
+                Reason::BeaconNoEvidence,
+                "withheld",
+                "beaconNoEvidence",
             ),
             (
                 Verdict::Deferred,

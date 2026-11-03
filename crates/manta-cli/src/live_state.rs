@@ -185,6 +185,8 @@ mod tests {
             sample_ts: 2_006_272,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 

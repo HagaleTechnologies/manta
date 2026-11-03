@@ -31,16 +31,24 @@ const NON_CALLSIGN_TOKENS: &[&str] = &[
     "5NN", "4NN", "3NN", "599", "TEST", "TU", "QRZ", "AGN", "K", "KN",
 ];
 
+/// True if `word`'s base (the part before any `/`) is one of the
+/// `NON_CALLSIGN_TOKENS` CW conventions, by the same exact,
+/// ASCII-case-insensitive match `is_plausible` applies first. The exchange
+/// grammar uses it so a convention is never a callsign occurrence (MAN-201).
+pub(crate) fn is_convention(word: &str) -> bool {
+    let base = word.split_once('/').map_or(word, |(b, _)| b);
+    NON_CALLSIGN_TOKENS
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(base))
+}
+
 /// True if `call` has the rough shape of an amateur-radio callsign.
 pub fn is_plausible(call: &str) -> bool {
     let (base, portable) = match call.split_once('/') {
         Some((b, p)) => (b, Some(p)),
         None => (call, None),
     };
-    if NON_CALLSIGN_TOKENS
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(base))
-    {
+    if is_convention(base) {
         return false;
     }
     if let Some(p) = portable {

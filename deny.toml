@@ -45,5 +45,10 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# The pinned coppa revision in the workspace Cargo.toml.
-allow-git = ["https://github.com/HagaleTechnologies/coppa.git"]
+# The pinned coppa revision in the workspace Cargo.toml, and pancetta-ft8 (MAN-323,
+# behind the optional `ftx` feature). pancetta-ft8 also fetches the kgoba/ft8_lib git
+# submodule at build time, which cargo-deny does not see.
+allow-git = [
+    "https://github.com/HagaleTechnologies/coppa.git",
+    "https://github.com/HagaleTechnologies/pancetta.git",
+]

@@ -41,6 +41,9 @@ pub enum Reason {
     Dedupe,
     /// A power-step CQ/DE framing candidate burned by the MAN-105 guard.
     PowerStepGuard,
+    /// A `<call> T` whose call is not on the allowlist. A trailing `T` alone
+    /// is not beacon evidence (MAN-201).
+    BeaconNoEvidence,
     /// A beacon candidate deferred to its track's end.
     BeaconPending,
     /// A deferred beacon rejected at track end: speed unconfirmed or

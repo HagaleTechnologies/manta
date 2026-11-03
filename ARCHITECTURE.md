@@ -127,7 +127,9 @@ versioned deps.
 One trait, six implementations:
 
 ```
-trait IqSource: sample_rate(), center_freq(), read(&mut [Complex32]) -> …
+trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Complex32]) -> …,
+               take_discontinuity(), take_missing_samples(), take_unknown_gap(),
+               acquisition_start_offset(), health_counters(), …
 ```
 
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
@@ -254,6 +256,15 @@ short-lived `reopen-<kind>` thread, so a stop request during an outage
 abandons it and `read()` returns EOF within ~100 ms; the client drain,
 which starts only after `listen()` returns, therefore no longer waits for a
 stalled DNS lookup, connect or driver open (MAN-252).
+
+**Unknown-length gap (MAN-202).** A loss with no sample count (a SoapySDR
+driver overflow) is reported by `IqSource::take_unknown_gap()`, never as
+`take_discontinuity(Some(0))`. The engine loops take all three gap hooks
+through `manta_input::ReadContinuity::take`. An unknown gap neither moves
+the sample clock nor rebuilds the segment: `TrackManager::note_input_gap`
+invalidates each track's run-level decode state at the first hop holding
+a post-gap sample, so the character the gap cut is dropped rather than
+misread. See `docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md`.
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -402,22 +413,40 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 (not left waiting on a `WordBoundary` that a short, already-finished
 transmission may never produce again).
 
-1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
-   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
-   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
-   different callsigns, or after a sign-off such as `TU`, is ambiguous and
-   yields no candidate),
-   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
-   for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
-   token appears anywhere in the window at all (the token must be a
-   complete decoded word, not a substring glued to punctuation inside
-   one), a deliberately coarse guard against mistagging an ordinary,
-   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+1. **Exchange grammar** (`manta_spot::exchange`, MAN-201): a finite-state
+   read of the decoded window gives every callsign occurrence one role:
+   `self_id` (the sending station), `addressee`, `relayed_mention` or
+   `uncertain`. It recognizes `CQ`, `TEST` and contest fillers (an enumerated
+   set, e.g. `CQ WPX`, MAN-104), `DE`, `UP`, sign-offs, RST and serials,
+   queries, corrections and `V V V`. A `CQ` or `TEST` types a call only when
+   it leads straight into it; a bare `TEST` after a sign-off such as `TU`, or
+   between two different callsigns, is ambiguous. Only a `self_id` occurrence
+   with a spot form is a candidate, so `DE W1AW DE K1ABC K` spots K1ABC.
+
+   A turn ends at `K`, `KN`, `BK`, `AR` or `SK`, and after 5 s with no decoded
+   character; frames and mentions never cross a turn end. A call is decided
+   once it is settled: another word follows its run, its turn ends, or the
+   track ends. An input that stalls or fails closes its tracks, so it settles
+   their last calls too. A settled role is latched on its word, and a spot
+   keeps the call's own timestamp. Silence is measured from the decoder's
+   newest character, held or released, so a word the MAN-317 prior still
+   holds is not silence.
+
+   `<call> T` is the decoded shape of an NCDXF-style power-step beacon the
+   decoder can't resolve past a single trailing dash (MAN-37). A lone `T` is
+   the most common noise decode in CW, so the shape alone is not beacon
+   evidence: it is a `BEACON` candidate only for an allowlisted call, and any
+   other plausible call records `beaconNoEvidence` (MAN-201). It is also
+   suppressed whenever a bare `CQ`/`TEST`/`DE` token appears anywhere in the
+   window (a complete decoded word, not a substring glued to punctuation
+   inside one), a deliberately coarse guard. Each occurrence that guard costs
    is counted once, as `SuppressionCounts::power_step_guard` (§8); an
-   occurrence already evaluated as a Beacon before the guard appeared is
-   not a loss and is not counted). Context
-   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+   occurrence already evaluated as a Beacon before the guard appeared is not
+   a loss and is not counted. Role and context determine spot type (CQ / DE /
+   BEACON) — RBN spots carry this flag. The allowlist skips plausibility and
+   repetition, not role: a listed call heard only as the station called or
+   mentioned is not spotted. See
+   `docs/DECISIONS/2026-11-02-man201-callsign-roles.md`.
 
    **Spot annotations (MAN-272).** Each completed word is also scanned for
    an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for
@@ -1101,7 +1130,12 @@ non-blocking send plus shared atomics and short locks between them.
   async). `manta-engine::listen` reads up to 2048 samples with
   `IqSource::read()`, runs `Channelizer::process` and
   `TrackManager::process_hops`, feeds the batch's events to the validator,
-  and reads again. Validation runs on this thread.
+  and reads again. Validation runs on this thread. With `[input]
+  spectrum_udp` set, `Segment::channelize` also folds each hop's channel
+  power into a 125-hop mean (`manta-engine::spectrum`, write-only, spots
+  unchanged) that a `manta-spectrum-<input>` thread sends to N1MM+'s
+  Spectrum Display as XML over UDP (MAN-141,
+  `docs/DECISIONS/2026-11-01-man141-n1mm-spectrum-feed.md`).
 - **Several inputs (MAN-13).** With several `[[input]]` entries
   (`manta-engine::multi`) each input's read, channelizer, track manager and
   decoder pool run on its own `manta-input-<name>` thread, that input's

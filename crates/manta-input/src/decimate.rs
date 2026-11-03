@@ -56,6 +56,10 @@ pub struct DecimatingSource {
     /// is lost behind a buffered `pending`.
     gap: GapScaler,
     missing: GapScaler,
+    /// MAN-202: the inner source's unknown-length losses, ORed across the
+    /// inner reads behind one outer read and held for the outer
+    /// `take_unknown_gap()`.
+    unknown_gap: bool,
 }
 
 /// MAN-305: one gap hook's pending report at the output rate. Each inner
@@ -102,6 +106,7 @@ impl DecimatingSource {
             factor: factor as u64,
             gap: GapScaler::default(),
             missing: GapScaler::default(),
+            unknown_gap: false,
         })
     }
 
@@ -227,6 +232,10 @@ impl IqSource for DecimatingSource {
             self.gap.add(gap, self.factor);
             self.missing
                 .add(self.inner.take_missing_samples(), self.factor);
+            // MAN-202: no count to scale, and no filter reset: the engine
+            // invalidates its tracks' timing at the gap, which covers the
+            // decimator's short straddle (it lands after the gap position).
+            self.unknown_gap |= self.inner.take_unknown_gap();
             if gap.is_some() {
                 // An outage is not spliced: no pre-gap sample may leak
                 // into post-gap output through the filter history.
@@ -257,6 +266,16 @@ impl IqSource for DecimatingSource {
     /// MAN-305: the inner source's spliced loss, scaled to the output rate.
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.missing.pending.take()
+    }
+
+    /// MAN-202: the inner source's unknown-length loss, forwarded once.
+    fn take_unknown_gap(&mut self) -> bool {
+        std::mem::take(&mut self.unknown_gap)
+    }
+
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
     }
 
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
@@ -922,8 +941,10 @@ mod tests {
         reads: usize,
         gaps: Vec<(usize, u64)>,
         missing: Vec<(usize, u64)>,
+        unknown: Vec<usize>,
         pending_gap: Option<u64>,
         pending_missing: Option<u64>,
+        pending_unknown: bool,
     }
 
     impl GapReportingSource {
@@ -935,8 +956,10 @@ mod tests {
                 reads: 0,
                 gaps: Vec::new(),
                 missing: Vec::new(),
+                unknown: Vec::new(),
                 pending_gap: None,
                 pending_missing: None,
+                pending_unknown: false,
             }
         }
     }
@@ -957,6 +980,7 @@ mod tests {
             for &(_, k) in self.missing.iter().filter(|(at, _)| *at == i) {
                 *self.pending_missing.get_or_insert(0) += k;
             }
+            self.pending_unknown |= self.unknown.contains(&i);
             let n = buf
                 .len()
                 .min(self.chunk)
@@ -970,6 +994,9 @@ mod tests {
         }
         fn take_missing_samples(&mut self) -> Option<u64> {
             self.pending_missing.take()
+        }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.pending_unknown)
         }
     }
 
@@ -1078,5 +1105,61 @@ mod tests {
             scaled.iter().map(|&k| (k, k)).collect::<Vec<_>>(),
             "each hook carries its own remainder"
         );
+    }
+
+    /// MAN-202: an inner unknown gap reaches the caller once, with the outer
+    /// read that returns the post-gap samples, beside both counted hooks;
+    /// several inner reports behind one outer read OR together; and the
+    /// filter history is kept (the output is the uninterrupted decimation),
+    /// while a discontinuity still resets it.
+    #[test]
+    fn decimating_source_forwards_take_unknown_gap_without_a_filter_reset() {
+        let samples = tone(2_000.0, 4_000, 192_000.0);
+        let mut inner = GapReportingSource::new(samples.clone(), 1_000);
+        inner.unknown.push(2);
+        inner.missing.push((2, 400));
+        let mut src = DecimatingSource::new(Box::new(inner), 96_000.0).unwrap();
+        let mut out = Vec::new();
+        let mut reports = Vec::new();
+        let mut buf = vec![Complex32::new(0.0, 0.0); 500];
+        loop {
+            let n = src.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            reports.push((
+                src.take_discontinuity(),
+                src.take_missing_samples(),
+                src.take_unknown_gap(),
+            ));
+        }
+        assert_eq!(
+            reports,
+            vec![
+                (None, None, false),
+                (None, None, false),
+                (None, Some(200), true),
+                (None, None, false)
+            ]
+        );
+        assert!(!src.take_unknown_gap());
+        let whole = manta_dsp::decimate::Decimator::new(192_000.0, 2)
+            .unwrap()
+            .process(&samples);
+        assert_bit_identical(&out, &whole);
+
+        // One-sample inner reads: at factor 2 only every other inner read
+        // yields output, so inner reads 1 and 2 both sit behind the second
+        // outer read, and their two reports OR into one.
+        let mut inner = GapReportingSource::new(samples, 1);
+        inner.unknown.extend([1, 2]);
+        let mut src = DecimatingSource::new(Box::new(inner), 96_000.0).unwrap();
+        let mut flags = Vec::new();
+        for _ in 0..4 {
+            assert!(src.read(&mut buf).unwrap() > 0);
+            flags.push(src.take_unknown_gap());
+        }
+        assert_eq!(flags, vec![false, true, false, false]);
     }
 }

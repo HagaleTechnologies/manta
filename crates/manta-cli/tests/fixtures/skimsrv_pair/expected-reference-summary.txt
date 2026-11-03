@@ -1,0 +1,10 @@
+spots: 8 from 1 file (0 grade records skipped, 0 torn lines)
+reference: 8 CW reports from 1 file (1 non-CW line, 1 other line skipped), 2026-10-31 00:05:00Z to 06:02:00Z
+spotters: all
+own calls are not excluded from a --reference transcript
+window: 180 s; frequency disagreement over 500 Hz; speed disagreement over 3 WPM and 20% of RBN's median
+
+band   spots  match  disagree  elsewhere  none  unknown  median offset
+20m        7      2         1          0     2        2  +100 Hz (3)
+40m        1      0         0          1     0        0  n/a
+total      8      2         1          1     2        2

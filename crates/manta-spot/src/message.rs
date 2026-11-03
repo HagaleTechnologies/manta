@@ -29,7 +29,19 @@ use std::sync::LazyLock;
 /// the substitution to `N` keeps `A`/`U`/`V`/`E` cut letters from turning
 /// callsign fragments into spurious reports.
 static RST_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b([1-5])([1-9N])([1-9N])\b").unwrap());
+    LazyLock::new(|| Regex::new(&format!(r"(?i)\b({RST_R})({RST_ST})({RST_ST})\b")).unwrap());
+
+/// The R digit of an RST (1-5). Shared by `RST_RE` and `RST_WORD_RE`.
+const RST_R: &str = "[1-5]";
+/// The S and T digits of an RST (1-9, or the `N` cut for 9). Shared by
+/// `RST_RE` and `RST_WORD_RE`.
+const RST_ST: &str = "[1-9N]";
+
+/// A whole decoded word that is an RST, under `RST_RE`'s digit rules: the
+/// exchange grammar classifies one word at a time and must not read the
+/// `5NN` inside `HA5NN` as a report (MAN-201).
+static RST_WORD_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(&format!(r"(?i)^{RST_R}{RST_ST}{RST_ST}$")).unwrap());
 
 /// The QRL *query*. The trailing `?` IS required (Codex review on MAN-33's
 /// PR #159):
@@ -68,6 +80,13 @@ pub fn parse_rst(text: &str) -> Option<String> {
             .map(|i| uncut(caps[i].chars().next().unwrap()))
             .collect()
     })
+}
+
+/// True if the whole of `word` is an RST (`5NN`, `599`, `339`), under the same
+/// digit rules as `parse_rst`. `exchange` uses it to tell a report after a
+/// call (`<call> 5NN`, the call is the addressee) from a call (MAN-201).
+pub fn is_rst_word(word: &str) -> bool {
+    RST_WORD_RE.is_match(word)
 }
 
 /// True if `text` contains a QRL query token: the literal `QRL?`, with the
@@ -132,6 +151,16 @@ mod tests {
         assert_eq!(parse_rst("5NN 199").as_deref(), Some("199"));
         // The common form is unaffected: a serial with a 0 is not RST-shaped.
         assert_eq!(parse_rst("599 001").as_deref(), Some("599"));
+    }
+
+    #[test]
+    fn is_rst_word_matches_only_a_whole_word_report() {
+        for word in ["5NN", "599", "339", "5nn"] {
+            assert!(is_rst_word(word), "word was {word:?}");
+        }
+        for word in ["HA5NN", "5NN/", "0599", "5NNN", "069", "K5ARH", ""] {
+            assert!(!is_rst_word(word), "word was {word:?}");
+        }
     }
 
     #[test]
