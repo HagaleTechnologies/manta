@@ -13,7 +13,7 @@ use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_dsp::cancel::{
     classify, estimate_strong, residual_check, second_carrier_evidence, subtract, Hypothesis,
-    ResidualCheck, SecondCarrierEvidence, MAX_CARRIER_STEP_HZ, MIN_ELEMENTS,
+    ResidualCheck, SecondCarrierEvidence, MAX_CARRIER_STEP_HZ, MIN_ELEMENTS, MIN_OFFSET_HZ,
 };
 use manta_spot::{Spot, SpotMode};
 use num_complex::Complex32;
@@ -32,8 +32,10 @@ pub struct CancelOptions {
     /// whose estimate is stable and whose residual check is clean is
     /// subtracted (measurement only).
     pub evidence_gate: bool,
-    /// Test-and-measurement override of every candidate's carrier hint
-    /// (offset from the centre, Hz); `None` takes it from the spot.
+    /// Test-and-measurement override of the first candidate's carrier hint
+    /// (offset from the centre, Hz); `None` takes it from the spot. Later
+    /// candidates always take theirs from their spot, so an override cannot
+    /// point several candidates at one carrier.
     pub carrier_hint_override_hz: Option<f64>,
 }
 
@@ -102,6 +104,9 @@ pub enum SkipReason {
     UnstableCarrier,
     Hypothesis,
     DirtyResidual,
+    /// The refined carrier lies within `MIN_OFFSET_HZ` of a candidate
+    /// already subtracted: the same station spotted on a second track.
+    DuplicateCarrier,
 }
 
 /// Offline experiment; not part of any public output. The residual decode.
@@ -177,14 +182,15 @@ fn carrier_hint(spot_freq_hz: f64, calibration_factor: f64, center_freq_hz: f64)
 
 /// D7: admit each residual spot (in order) that lies within
 /// `ADMIT_RADIUS_HZ` of a subtracted candidate's evidence frequency, is not
-/// that candidate's call and is not among the original spots' calls.
+/// that candidate's call and is not among the original spots' calls. A
+/// call is recovered once, from its first admitted spot.
 /// `candidates` pairs each report with its evidence frequency (calibrated).
 fn admit(
     residual: &[Spot],
     original: &[Spot],
     candidates: &[(&CandidateReport, Option<f64>)],
 ) -> (Vec<RecoveredIdentity>, Vec<RejectedIdentity>) {
-    let mut recovered = Vec::new();
+    let mut recovered: Vec<RecoveredIdentity> = Vec::new();
     let mut rejected = Vec::new();
     for s in residual {
         let near = candidates.iter().find(|(c, f)| {
@@ -204,6 +210,7 @@ fn admit(
             Some(_) if original.iter().any(|o| o.callsign == s.callsign) => {
                 rejected.push(reject(RejectReason::DuplicateOfOriginal))
             }
+            Some(_) if recovered.iter().any(|r| r.callsign == s.callsign) => {}
             Some((c, _)) => recovered.push(RecoveredIdentity {
                 callsign: s.callsign.clone(),
                 freq_hz: s.freq_hz,
@@ -232,9 +239,13 @@ pub fn decode_with_cancellation(
     let factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)?;
     let mut candidates = Vec::new();
     let mut residual: Option<Vec<Complex32>> = None;
-    for c in select_candidates(&original.spots, opts.max_candidates) {
+    for (i, c) in select_candidates(&original.spots, opts.max_candidates)
+        .into_iter()
+        .enumerate()
+    {
         let hint = opts
             .carrier_hint_override_hz
+            .filter(|_| i == 0)
             .unwrap_or_else(|| carrier_hint(c.freq_hz, factor, center_freq_hz));
         let est = estimate_strong(iq, fs, hint);
         let mut report = CandidateReport {
@@ -253,6 +264,11 @@ pub fn decode_with_cancellation(
             Some(SkipReason::TooFewElements)
         } else if est.carrier_step_hz.abs() > MAX_CARRIER_STEP_HZ {
             Some(SkipReason::UnstableCarrier)
+        } else if candidates.iter().any(|p: &CandidateReport| {
+            p.outcome == CandidateOutcome::Subtracted
+                && (p.carrier_hz - est.carrier_hz).abs() < MIN_OFFSET_HZ
+        }) {
+            Some(SkipReason::DuplicateCarrier)
         } else {
             let evidence = second_carrier_evidence(iq, fs, &est);
             let hypothesis = classify(&evidence);
@@ -380,6 +396,20 @@ mod tests {
                 RejectReason::OutsideNeighbourhood
             ]
         );
+    }
+
+    #[test]
+    fn admit_recovers_a_call_once() {
+        let c = candidate("W1AW", CandidateOutcome::Subtracted);
+        let near = [(&c, c.evidence_freq_hz(CENTER))];
+        let residual = [
+            spot("K5ARH", NEIGH, 10.0, 1),
+            spot("K5ARH", NEIGH + 1.0, 11.0, 2),
+        ];
+        let (rec, rej) = admit(&residual, &[], &near);
+        assert_eq!(rec.len(), 1, "{rec:?}");
+        assert_eq!(rec[0].track_id, 1);
+        assert!(rej.is_empty());
     }
 
     #[test]

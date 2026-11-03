@@ -109,6 +109,10 @@ pub struct StrongEstimate {
     /// Refined carrier minus the hint.
     pub carrier_step_hz: f64,
     pub fits: Vec<ElementFit>,
+    /// Every element `find_elements` found at the refined carrier, fitted
+    /// or not. An element too short to fit is not subtracted, but its
+    /// blocks are still kept out of the key-up gaps.
+    pub elements: Vec<KeyedElement>,
 }
 
 /// What a subtraction of the estimate would leave in the strong station's
@@ -358,12 +362,13 @@ pub fn estimate_strong(iq: &[Complex32], fs: f64, carrier_hint_hz: f64) -> Stron
     let fits = fit_elements(iq, fs, carrier_hint_hz, &els);
     let step = mean_slope_hz(&fits, fs);
     let carrier_hz = carrier_hint_hz + step;
-    let els = find_elements(iq, fs, carrier_hz);
-    let fits = fit_elements(iq, fs, carrier_hz, &els);
+    let elements = find_elements(iq, fs, carrier_hz);
+    let fits = fit_elements(iq, fs, carrier_hz, &elements);
     StrongEstimate {
         carrier_hz,
         carrier_step_hz: step,
         fits,
+        elements,
     }
 }
 
@@ -407,15 +412,17 @@ enum BlockClass {
 
 /// Class of each `len`-sample block by its centre: edge within `EDGE_ZONE_S` of
 /// an edge, interior more than `2·RISE_S` inside an element, gap more than
-/// `3·RISE_S` from every element; blocks within `RIM_S` of either end are
-/// `Other`. The one definition both measurements share.
+/// `3·RISE_S` from every element (fitted or only found); blocks within
+/// `RIM_S` of either end are `Other`. The one definition both measurements
+/// share.
 fn classify_blocks(
     blocks: usize,
     len: usize,
     fs: f64,
     n: usize,
-    fits: &[ElementFit],
+    est: &StrongEstimate,
 ) -> Vec<BlockClass> {
+    let fits = &est.fits;
     let r = RISE_S * fs;
     let centre = |b: usize| (b * len) as f64 + (len as f64 - 1.0) / 2.0;
     let mut class = vec![BlockClass::Gap; blocks];
@@ -426,8 +433,8 @@ fn classify_blocks(
         let b = (((hi - (len as f64 - 1.0) / 2.0) / len as f64).floor() + 1.0).max(0.0) as usize;
         (a.min(blocks), b.min(blocks))
     };
-    for f in fits {
-        let (a, b) = range(f.element.start - 3.0 * r, f.element.end + 3.0 * r);
+    for el in fits.iter().map(|f| &f.element).chain(&est.elements) {
+        let (a, b) = range(el.start - 3.0 * r, el.end + 3.0 * r);
         for c in &mut class[a..b.max(a)] {
             *c = BlockClass::Other;
         }
@@ -482,7 +489,7 @@ pub fn residual_check(iq: &[Complex32], fs: f64, est: &StrongEstimate) -> Residu
             z[k / len] -= synth_baseband(f, fs, k) / len as f64;
         }
     }
-    let class = classify_blocks(blocks, len, fs, iq.len(), &est.fits);
+    let class = classify_blocks(blocks, len, fs, iq.len(), est);
     let (mut edge, mut interior, mut gap) = (Vec::new(), Vec::new(), Vec::new());
     for (zb, c) in z.iter().zip(&class) {
         let p = zb.norm_sqr();
@@ -514,7 +521,7 @@ pub fn second_carrier_evidence(
 ) -> SecondCarrierEvidence {
     let (len, _) = edge_window(fs);
     let z = block_means(iq, fs, est.carrier_hz, len);
-    let class = classify_blocks(z.len(), len, fs, iq.len(), &est.fits);
+    let class = classify_blocks(z.len(), len, fs, iq.len(), est);
     let gap_idx: Vec<usize> = (0..z.len())
         .filter(|&b| class[b] == BlockClass::Gap)
         .collect();
@@ -544,7 +551,7 @@ pub fn second_carrier_evidence(
         .count();
     let mut acc = Complex64::new(0.0, 0.0);
     let mut mag = 0.0;
-    let mut pairs = 0usize;
+    let mut pair_blocks: Vec<usize> = Vec::new();
     for w in gap_idx.windows(2) {
         let (a, b) = (w[0], w[1]);
         if b == a + 1
@@ -554,10 +561,39 @@ pub fn second_carrier_evidence(
             let p = z[b] * z[a].conj();
             acc += p;
             mag += p.norm();
-            pairs += 1;
+            if pair_blocks.last() != Some(&a) {
+                pair_blocks.push(a);
+            }
+            pair_blocks.push(b);
         }
     }
-    let offset_hz = (pairs > 0).then(|| acc.arg() * (fs / len as f64) / TAU);
+    // The lag-1 phase is ambiguous modulo the block rate (fs / len): of the
+    // offset and its two neighbouring aliases, keep the one whose derotated
+    // pair blocks hold the most power (the boxcar passes the true one best).
+    let offset_hz = (!pair_blocks.is_empty()).then(|| {
+        let rate = fs / len as f64;
+        let f0 = acc.arg() * rate / TAU;
+        let power = |f: f64| -> f64 {
+            pair_blocks
+                .iter()
+                .map(|&b| {
+                    let mut acc = Complex64::new(0.0, 0.0);
+                    for k in b * len..(b + 1) * len {
+                        acc += derotated(iq, fs, est.carrier_hz + f, k);
+                    }
+                    (acc / len as f64).norm_sqr()
+                })
+                .sum()
+        };
+        let mut best = (f0, power(f0));
+        for f in [f0 - rate, f0 + rate] {
+            let p = power(f);
+            if p > best.1 {
+                best = (f, p);
+            }
+        }
+        best.0
+    });
     SecondCarrierEvidence {
         gap_blocks: gap_idx.len(),
         hot_fraction: if gap_idx.is_empty() {
@@ -853,6 +889,7 @@ mod tests {
             carrier_hz: A_HZ,
             carrier_step_hz: 0.0,
             fits,
+            elements: Vec::new(),
         };
         let mut r = x.clone();
         subtract(&mut r, FS, &est);
@@ -899,6 +936,7 @@ mod tests {
         let est = StrongEstimate {
             carrier_hz: wrong,
             carrier_step_hz: 0.0,
+            elements: Vec::new(),
             fits: fits
                 .into_iter()
                 .map(|mut f| {
@@ -978,6 +1016,35 @@ mod tests {
             }
             assert!(ev.coherence >= 0.9, "{off}: {ev:?}");
         }
+    }
+
+    #[test]
+    fn a_neighbour_beyond_the_block_rate_is_not_aliased_into_range() {
+        // 260 Hz: the lag-1 phase alone reads it as 260 - 375 = -115 Hz.
+        let (x, _) = pair_scene(260.0, 204);
+        let est = estimate_strong(&x, FS, A_HZ + 0.3);
+        let ev = second_carrier_evidence(&x, FS, &est);
+        let off = ev.offset_hz.expect("hot pairs");
+        assert!((off - 260.0).abs() <= 5.0, "{ev:?}");
+        assert!(
+            !matches!(classify(&ev), Hypothesis::TwoSignalCw { .. }),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn a_found_but_unfitted_element_is_not_a_gap() {
+        let strong = keying(0.3, 0.048, 40, 1);
+        let n = ((end_of(&strong) + 0.4) * FS) as usize;
+        let mut x = keyed_tone(FS, n, A_HZ, &strong, amp_for_snr(30.0, FS), 0.3);
+        add(&mut x, &awgn(n, 1.0, 204));
+        let est = estimate_strong(&x, FS, A_HZ + 0.3);
+        // Drop every other fit, as if those elements were too short to fit.
+        let mut thin = est.clone();
+        thin.fits = est.fits.iter().copied().step_by(2).collect();
+        let ev = second_carrier_evidence(&x, FS, &thin);
+        assert!(ev.hot_fraction < 0.10, "{ev:?}");
+        assert_eq!(classify(&ev), Hypothesis::OneSignal);
     }
 
     #[test]

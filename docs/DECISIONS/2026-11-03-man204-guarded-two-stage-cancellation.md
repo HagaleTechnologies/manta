@@ -43,6 +43,11 @@ uplink calls it.
   `h > 0.75`; `TwoSignalCw { offset_hz }` if `0.15 ≤ h ≤ 0.75`, coherence
   ≥ 0.8 and 10 ≤ |Δf| ≤ 150 Hz; `Unresolved` otherwise. Only `TwoSignalCw`
   is subtracted while `CancelOptions::evidence_gate` is on (the default).
+  The lag-1 phase is ambiguous modulo the block rate (375 Hz at 96 kS/s), so
+  the offset is the one of `Δf` and `Δf ± 375 Hz` whose derotated hot blocks
+  hold the most power: a neighbour 260 Hz away reads +257.8 Hz, not -115 Hz.
+  Every element the edge finder found, fitted or not, is kept out of the gap
+  blocks, so a strong element too short to fit cannot read as a neighbour.
 - **D6. Residual check before subtraction, relative to the neighbour.**
   Computed blockwise from the fits, without building the residual. The
   neighbour level is the 90th percentile of gap-block residual power. A
@@ -54,14 +59,19 @@ uplink calls it.
   subtracted candidate's evidence frequency (`carrier + Δf`), with a call that
   is not the candidate's and not among the original spots. Otherwise it is
   `rejected` as `OutsideNeighbourhood`, `DuplicateOfStrong` or
-  `DuplicateOfOriginal`.
+  `DuplicateOfOriginal`. A call is recovered once, from its first admitted
+  spot.
 - **D8. A typed `NoSignal` error.** `decode_source`'s three "no signal found"
   bails return `manta_engine::NoSignal`, whose `Display` text is the old
   message byte for byte. The experiment downcasts it, so an empty residual is
   an empty branch and every other error propagates.
 - **D9. Bounded work.** Candidates are the original CW spots grouped by track,
-  ordered by best SNR descending then track id, capped at 8. All `Clean`
-  subtractions go into one residual copy, decoded once.
+  ordered by best SNR descending then track id, capped at 8. A candidate
+  whose refined carrier lies within 10 Hz of one already subtracted is
+  skipped (`DuplicateCarrier`): the same station spotted on two tracks is
+  subtracted once. `CancelOptions::carrier_hint_override_hz` applies to the
+  first candidate only. All `Clean` subtractions go into one residual copy,
+  decoded once.
 - **D10. Acceptance floor.** At least 7 of B's 9 calls on seeds 204, 2 and 3.
   The baseline is 0, so the research doc's relative-recall metric is
   undefined in the reference cell.
@@ -109,9 +119,9 @@ interior threshold. Two measurements moved them:
   decoded 2, 0 and 0 of B's 9 calls. Rule A (every row that loses B is
   `Dirty`) needs a threshold under -8.4 dB. Every row that kept 8 or 9 calls
   read -13.4 dB or lower. -10 dB sits between them with about 1.6 dB of
-  margin to the bad side and 3.4 dB to the good side. The sweep printed its
-  verdicts at -4 dB; at -10 dB the 3 % gain rows become `Dirty` and no other
-  verdict changes, because every other `Clean` row reads -13.4 dB or lower.
+  margin to the bad side and 3.4 dB to the good side. A second sweep run at
+  the final thresholds printed the 3 % gain rows `Dirty` and changed no other
+  verdict.
 
 Rule B (rows with 8 or more calls and no stray spot should be `Clean`) loses
 two kinds of row, accepted because a false accept costs more: a 0.33 ms
@@ -127,7 +137,8 @@ noise are rendered separately by `manta_testkit::scene::render_scene` and
 summed in a fixed order. Recall counts B's calls in the decoded text of every
 track. `PipelineConfig::default()` (the `legacy` engine). Reproduce with
 `cargo test -p manta-engine --test man204_cancellation_sweep --locked -- --ignored --nocapture`
-(4 min 14 s on 32 cores in the dev profile).
+(3 to 4 minutes on 32 cores in the dev profile). The tables below are from
+the run at the final constants.
 
 ### Acceptance (`crates/manta-engine/tests/man204_cancellation.rs`, CI-gated)
 
@@ -179,7 +190,7 @@ Every cell with a candidate classified `TwoSignalCw` with the offset within
 to -8.8 dB, interior -14.2 to -15.8 dB). Every recovered identity was
 `K5ARH`, within 3.6 Hz of B's true frequency except one cell (on-bin, 10 dB,
 +40 Hz: 10.3 Hz, inside the 15 Hz admission radius). The on-bin 20 dB +30 Hz
-cell recovered `K5ARH` twice, from two residual spots. No cell recovered or
+cell's residual spotted `K5ARH` twice; `recovered` lists it once. No cell recovered or
 rejected any other call. The refined carrier error was at most 0.06 Hz.
 
 The research doc's metric over its predeclared stratum (A on-bin or
@@ -227,15 +238,31 @@ the strong station's own remainder, which D7 would reject as
 `DuplicateOfStrong` or `DuplicateOfOriginal` even if a subtraction got that
 far.
 
+### Plan-phase prototype measurements (at `212fa51`, before this code)
+
+The plan measured a scratch prototype on the same geometry. Its tables 1 to
+7, condensed:
+
+| table | measurement | result |
+|---|---|---|
+| 1 | baseline, carrier hint from the original `W1AW` spot | original 0 of 9 B calls on seeds 204, 2, 3; hint error +0.33 Hz; residual 9 of 9; A alone: nothing |
+| 2 | one slope-refinement pass | a +3 Hz hint lands within 0.01 Hz; B 9 of 9; A alone with +3 Hz: no garbage track |
+| 3 | edges from raw IQ vs the channelizer | edge sd 0.224 vs 0.377 ms on-bin, 0.224 vs 4.174 ms mid-channel; mid-channel B 9 of 9 vs 0; an alternation pass gains 0.01 ms and no recall |
+| 4 | strata with refinement | -40, +60, +80 Hz and 10 or 30 dB apart: 9 of 9 |
+| 5 | a noise-relative ±10 ms residual check | catches a 3 Hz carrier error (+14 to +19 dB) and mid-channel channel edges, but misses a 1.33 ms edge shift (+3.1 dB) that grows a garbage track; superseded |
+| 6 | gap occupancy in the original buffer | one signal 5.9 to 6.6 % hot; keyed neighbour 23.8 to 45.7 %, offset within 0.4 Hz, coherence 0.86 to 0.99; steady carrier 86.7 to 100 % |
+| 7 | neighbour-relative check, forced subtractions | cells that kept B read -6.5 dB or lower (edge) and -7.8 dB or lower (interior); cells that lost B -3.8 dB or higher (edge) or -1.0 dB (interior) |
+
 ### Unit evidence (`crates/manta-dsp/src/cancel.rs`)
 
-Nineteen unit tests on synthetic tones pin the estimator: edges within
+Twenty-one unit tests on synthetic tones pin the estimator: edges within
 0.02 ms of the truth noiseless at 48, 96 and 192 kS/s and at any channel
 alignment, edge rms at most 0.30 ms beside a 20 dB weaker neighbour, a 3 Hz
 hint refined to within 0.1 Hz, a clean tone subtracted to -40 dB or lower
 (also over the last second of 60 s at +45 kHz, the f32-phase regression), the
-check's verdicts on carrier, shift, jitter and rim cases, and the classifier's
-boundaries.
+check's verdicts on carrier, shift, jitter and rim cases, the classifier's
+boundaries, a 260 Hz neighbour that must not alias into range, and found but
+unfitted elements that must not read as gaps.
 
 ## Determinism
 

@@ -91,7 +91,7 @@ fn decode(scene: &[Complex32], opts: &CancelOptions) -> CancellationReport {
 }
 
 #[test]
-#[ignore = "MAN-204 measurement sweep (4 min 14 s on 32 cores, dev profile); run before handover"]
+#[ignore = "MAN-204 measurement sweep (about 4 min on 32 cores, dev profile); run before handover"]
 fn man204_cancellation_sweep() {
     // 1. Strata, seed 204.
     let mut cells = Vec::new();
@@ -250,6 +250,7 @@ fn degrade(scene: &[Complex32], hint: f64, d: Degradation) -> StrongEstimate {
             carrier_hz: carrier,
             carrier_step_hz: 0.0,
             fits,
+            elements: Vec::new(),
         };
     }
     let mut est = estimate_strong(scene, FS, hint);
