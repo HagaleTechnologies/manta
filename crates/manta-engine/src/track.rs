@@ -3103,6 +3103,7 @@ impl TrackManager {
         // trusted band, in both the k and k+1 slots -- the same-hop
         // adjacent-rise arbitration must not route around the veto.
         // MAN-273: likewise the analytic front end's DC/Nyquist guard.
+        self.trace_spawn_vetoes(&rise, past_warmup, suppress, &hop.power, sample_ts);
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
@@ -3271,6 +3272,57 @@ impl TrackManager {
                 sample_ts,
             });
         }
+    }
+
+    /// MAN-198: the trace's spawn-veto census. For each rising channel the
+    /// spawn scan below refuses, the condition it fails: source masks
+    /// first, then the scan's own order. Reads state only, and only with a
+    /// trace; a rise that passes every condition is the scan's to spawn.
+    fn trace_spawn_vetoes(
+        &self,
+        rise: &[bool],
+        past_warmup: bool,
+        suppress: bool,
+        power: &[f32],
+        sample_ts: u64,
+    ) {
+        use crate::funnel::SpawnVeto as V;
+        let Some(trace) = &self.funnel else {
+            return;
+        };
+        let n = self.n_channels();
+        let fs = self.channel_spacing_hz * n as f64;
+        let second = (sample_ts as f64 / fs) as u64;
+        let refused = (0..n).filter(|&k| rise[k]).filter_map(|k| {
+            let veto = if self.trusted_vetoes_spawn(k) {
+                V::TrustedBand
+            } else if self.guard_vetoes_spawn(k) {
+                V::AnalyticGuard
+            } else if self.digital_vetoes_spawn(k) {
+                V::DigitalWindow
+            } else if self.mirror_vetoes_spawn(k, power) {
+                V::MirrorImage
+            } else if !past_warmup {
+                V::Warmup
+            } else if suppress {
+                V::StaticCrash
+            } else if self.owner_of[k].is_some() {
+                V::OwnedByTrack
+            } else if self.spawn_window_cooling_down(k) {
+                V::CoolingDown
+            } else if !self.is_local_peak(k) {
+                V::NotLocalPeak
+            } else if self.rtty_vetoes_spawn(k) {
+                V::Rtty
+            } else if self.comod_vetoes_spawn(k) {
+                V::CoModulated
+            } else {
+                return None;
+            };
+            let f = self.center_freq_hz + wrapped_channel_offset(k, n) * self.channel_spacing_hz;
+            Some((second, (f * 100.0).round() as i64, veto))
+        });
+        trace.vetoes(refused);
     }
 
     /// Counts one close and, MAN-198, traces it when a trace is set.

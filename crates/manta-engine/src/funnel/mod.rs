@@ -17,7 +17,7 @@ mod trace;
 pub use attribute::{
     attribute, summarize, Births, CloseTally, DecisionFact, Evidence, Geometry, Opportunity,
     Record, RecordSpot, SpotFact, Stage, StageCounts, Summary, Tolerances, TrackFacts, TrackTally,
-    TruthLayer, TRACK_TEXT_CHARS,
+    TruthLayer, VetoFact, TRACK_TEXT_CHARS,
 };
 pub use collect::{run_funnel, FunnelReport};
-pub use trace::{FunnelTrace, TraceLog, TrackCloseReason, TrackTraceRecord};
+pub use trace::{FunnelTrace, SpawnVeto, TraceLog, TrackCloseReason, TrackTraceRecord, VetoKey};

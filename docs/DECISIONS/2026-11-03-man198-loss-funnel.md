@@ -24,8 +24,8 @@ opportunity is never counted twice.
 
 | Stage (`lostAt`) | Evidence that it passed | Failure `detail` |
 |---|---|---|
-| `inputCoverage` | the acoustic window [first - W/2, last + W/2] overlaps the recording, and the frequency is inside the RF passband less half a channel | `outsideRecording`, `outsidePassband` |
-| `detectableEnergy` | a candidate track was born within `trackTolHz` plus half a channel and was alive in the acoustic window | `noCandidate` |
+| `inputCoverage` | the acoustic window [first - W/2, last + W/2] overlaps the recording, the frequency is inside the RF passband less half a channel, and not every rise near it was refused by a source mask | `outsideRecording`, `outsidePassband`, `sourceMask:<trustedBand\|analyticGuard\|digitalWindow\|mirrorImage>` |
+| `detectableEnergy` | a candidate track was born within `trackTolHz` plus half a channel and was alive in the acoustic window | `noRise`, `refusedRise:<warmup\|staticCrash\|ownedByTrack\|coolingDown\|notLocalPeak\|rtty\|coModulated>` |
 | `admittedTrack` | one of those candidates leased a decoder (`TrackPromoted`) | `closed:<closeReason>` or `openAtEnd`, for the most advanced candidate (confirmed first, then the latest) |
 | `usableTiming` | a leased candidate's speed came within max(3 WPM, 20%) of the RBN speed, or RBN gave none and the track has any estimate | `noSpeedUpdate`, `speedOff` |
 | `textContainsCall` | a leased track within `spotTolHz` and the spot window decoded the call as a whole word, or held it as a reading | `substringOnly`, `noCall` |
@@ -65,6 +65,18 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
   default) records nothing; every close still goes through the same
   `close_counts`. A test pins that events and spots are equal with and
   without the trace.
+- D5a. The spawn-veto census. With a trace set, each hop, before its spawn
+  scan, the tracker records for every rising channel the scan will refuse
+  the condition it fails, counted per (stream second, channel). Source masks
+  are tested first: a channel inside the input's trusted band, analytic
+  guard, digital window or mirror image can never spawn, whatever else
+  holds. The scan itself is untouched. A truth frequency with no candidate
+  is charged to `inputCoverage` (`sourceMask:<veto>`) when every refused
+  rise near it in the window was a source mask and no later stage has
+  evidence; otherwise to `detectableEnergy`, as `refusedRise:<veto>` (the
+  most-counted detector veto, ties to the first in the order above) or
+  `noRise`. A refused rise stays at `detectableEnergy`, not
+  `admittedTrack`: no track opened, which is Gherkin scenario 1.
 - D6. The `Reason` labels moved into `manta_spot::Reason::label`;
   `manta_server::live_state::reason_label` delegates, so the live-state wire
   is unchanged.
@@ -82,8 +94,9 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
 - "A truth opportunity lost at detection": `attribute.rs`
   `gherkin_no_track_opened_is_detectable_energy`, and end to end
   `crates/manta-engine/tests/loss_funnel.rs`
-  `funnel_charges_one_stage_per_opportunity_on_v1` (OH2XYZ: no candidate,
-  nothing counted past `detectableEnergy`).
+  `funnel_charges_one_stage_per_opportunity_on_v1` (OH2XYZ: `noRise`,
+  nothing counted past `detectableEnergy`); `source_mask_is_input_coverage`
+  pins the analytic-guard case.
 - "A truth opportunity decoded correctly counts as a full pass":
   `attribute.rs` `gherkin_validated_spot_is_delivered`, and end to end the
   same `loss_funnel.rs` test (W1AW on vector V1).
@@ -93,7 +106,6 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
 
 ## Follow-ups
 
-- The spawn-veto census (`refusedRise:<veto>` and `sourceMask:<veto>` details).
 - The validator role log (`role:<addressee|...>` details at `selfIdRecognized`).
 - The oracle-bypass experiments (known frequency, transitions, timing,
   transcript), always segregated as `oracleAssisted` lines after the

@@ -13,6 +13,8 @@ struct VecSource {
     cursor: usize,
     fs: f64,
     center_freq_hz: f64,
+    /// MAN-273: an analytic front end's DC/Nyquist spawn guard; 0 is none.
+    guard_hz: f64,
 }
 
 impl manta_input::IqSource for VecSource {
@@ -21,6 +23,9 @@ impl manta_input::IqSource for VecSource {
     }
     fn center_freq_hz(&self) -> f64 {
         self.center_freq_hz
+    }
+    fn analytic_guard_hz(&self) -> f64 {
+        self.guard_hz
     }
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         let n = buf.len().min(self.samples.len() - self.cursor);
@@ -47,6 +52,14 @@ fn op(call: &str, freq_hz: f64, t: f64) -> Opportunity {
 fn v1_funnel(ops: &[Opportunity]) -> FunnelReport {
     let mut spec = manta_testkit::vectors::v1();
     spec.duration_s = 45.0;
+    funnel_on(spec, 0.0, ops)
+}
+
+fn funnel_on(
+    spec: manta_testkit::vectors::VectorSpec,
+    guard_hz: f64,
+    ops: &[Opportunity],
+) -> FunnelReport {
     let rendered = manta_testkit::vectors::render(&spec).unwrap();
     let duration_s = rendered.samples.len() as f64 / spec.fs;
     let src = Box::new(VecSource {
@@ -54,6 +67,7 @@ fn v1_funnel(ops: &[Opportunity]) -> FunnelReport {
         cursor: 0,
         fs: spec.fs,
         center_freq_hz: spec.center_freq_hz,
+        guard_hz,
     });
     run_funnel(
         src,
@@ -90,7 +104,7 @@ fn funnel_charges_one_stage_per_opportunity_on_v1() {
     let oh2 = by_call("OH2XYZ");
     assert_eq!(oh2.reached, Some(Stage::InputCoverage), "{oh2:?}");
     assert_eq!(oh2.lost_at, Some(Stage::DetectableEnergy));
-    assert_eq!(oh2.detail.as_deref(), Some("noCandidate"));
+    assert_eq!(oh2.detail.as_deref(), Some("noRise"));
     assert_eq!(oh2.tracks.candidates, 0);
     assert!(oh2.spots.is_empty() && oh2.decisions.is_empty());
 
@@ -134,4 +148,19 @@ fn funnel_is_deterministic() {
     ];
     let first = v1_funnel(&ops);
     assert_eq!(v1_funnel(&ops), first);
+}
+
+/// A station inside the source's own spawn mask is an input-coverage loss,
+/// not a detection loss: the analytic guard refused every rise near it.
+#[test]
+fn source_mask_is_input_coverage() {
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 45.0;
+    spec.signals[0].offset_hz = 0.0;
+    let report = funnel_on(spec, 600.0, &[op("W1AW", 14_000_000.0, 25.0)]);
+    let r = &report.records[0];
+    assert_eq!(r.reached, None, "{r:?}");
+    assert_eq!(r.lost_at, Some(Stage::InputCoverage));
+    assert_eq!(r.detail.as_deref(), Some("sourceMask:analyticGuard"));
+    assert_eq!(r.tracks.candidates, 0);
 }

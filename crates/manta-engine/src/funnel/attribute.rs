@@ -2,7 +2,7 @@
 //! evidence one production pass left, and the one earliest failed stage
 //! each opportunity is charged to. No I/O and no decoding.
 
-use super::trace::TrackCloseReason;
+use super::trace::{SpawnVeto, TrackCloseReason};
 use manta_spot::Reason;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -179,12 +179,39 @@ pub struct SpotFact {
     pub spot_type: String,
 }
 
+/// Rises refused on one channel in one stream second, for one reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VetoFact {
+    /// The start of the stream second the rises fell in.
+    pub t_s: f64,
+    /// The channel centre, calibrated.
+    pub freq_hz: f64,
+    pub veto: SpawnVeto,
+    pub count: u32,
+}
+
 /// Everything the production pass left for the funnel to read.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Evidence {
     pub tracks: Vec<TrackFacts>,
     pub decisions: Vec<DecisionFact>,
     pub spots: Vec<SpotFact>,
+    /// The spawn-veto census: rises that started no candidate track.
+    pub vetoes: Vec<VetoFact>,
+}
+
+/// The most-counted veto among `facts` that `keep` admits; ties go to the
+/// first in `SpawnVeto` order, so the choice is deterministic.
+fn top_veto(facts: &[&VetoFact], keep: impl Fn(SpawnVeto) -> bool) -> Option<SpawnVeto> {
+    let mut counts: BTreeMap<SpawnVeto, u64> = BTreeMap::new();
+    for v in facts.iter().filter(|v| keep(v.veto)) {
+        *counts.entry(v.veto).or_insert(0) += u64::from(v.count);
+    }
+    counts
+        .into_iter()
+        .rev()
+        .max_by_key(|&(_, n)| n)
+        .map(|(veto, _)| veto)
 }
 
 /// Per-opportunity track counts: candidate births, confirmations and
@@ -344,6 +371,14 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
                 && overlaps(t.born_s, t.end_s, window_s)
         })
         .collect();
+    // Rises near the frequency, inside the window, that spawned nothing.
+    let vetoes: Vec<&VetoFact> = ev
+        .vetoes
+        .iter()
+        .filter(|v| {
+            (v.freq_hz - f).abs() <= track_tol && v.t_s + 1.0 > window_s[0] && v.t_s <= window_s[1]
+        })
+        .collect();
     let leased: Vec<&TrackFacts> = candidates.iter().copied().filter(|t| t.leased).collect();
     rec.tracks = TrackTally {
         candidates: candidates.len(),
@@ -458,11 +493,25 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
         .rev()
         .find(|s| evidence[*s as usize])
         .unwrap_or(Stage::InputCoverage);
+    // Stage 1, source masks: nothing later passed and every rise near the
+    // frequency was refused by the input's own mask.
+    if reached == Stage::InputCoverage
+        && !vetoes.is_empty()
+        && vetoes.iter().all(|v| v.veto.is_source_mask())
+    {
+        let mask =
+            top_veto(&vetoes, SpawnVeto::is_source_mask).expect("non-empty, all source masks");
+        rec.detail = Some(format!("sourceMask:{}", mask.label()));
+        return rec;
+    }
     rec.reached = Some(reached);
     rec.lost_at = reached.next();
     rec.detail = rec.lost_at.map(|stage| match stage {
         Stage::InputCoverage => unreachable!("input coverage passed above"),
-        Stage::DetectableEnergy => "noCandidate".to_string(),
+        Stage::DetectableEnergy => match top_veto(&vetoes, |v| !v.is_source_mask()) {
+            Some(v) => format!("refusedRise:{}", v.label()),
+            None => "noRise".to_string(),
+        },
         Stage::AdmittedTrack => {
             // The most advanced candidate: confirmed first, then the latest.
             let best = candidates
@@ -749,6 +798,73 @@ mod tests {
         (r.lost_at, r.detail.as_deref())
     }
 
+    fn veto(freq_hz: f64, t_s: f64, veto: SpawnVeto, count: u32) -> VetoFact {
+        VetoFact {
+            t_s,
+            freq_hz,
+            veto,
+            count,
+        }
+    }
+
+    #[test]
+    fn refused_rise_names_the_most_counted_detector_veto() {
+        let ev = Evidence {
+            vetoes: vec![
+                veto(F + 50.0, 20.0, SpawnVeto::CoolingDown, 5),
+                veto(F, 21.0, SpawnVeto::NotLocalPeak, 2),
+                // A source mask alongside: the detector still refused rises.
+                veto(F, 22.0, SpawnVeto::AnalyticGuard, 9),
+                // Outside the track tolerance and outside the window.
+                veto(F + 1000.0, 20.0, SpawnVeto::OwnedByTrack, 50),
+                veto(F, 200.0, SpawnVeto::Rtty, 50),
+            ],
+            ..Default::default()
+        };
+        let r = run(&op("W1AW", F, 30.0), &ev);
+        assert_eq!(r.reached, Some(Stage::InputCoverage));
+        assert_eq!(
+            lost(&r),
+            (
+                Some(Stage::DetectableEnergy),
+                Some("refusedRise:coolingDown")
+            )
+        );
+    }
+
+    #[test]
+    fn source_mask_only_is_input_coverage() {
+        let ev = Evidence {
+            vetoes: vec![
+                veto(F, 20.0, SpawnVeto::AnalyticGuard, 7),
+                veto(F + 90.0, 21.0, SpawnVeto::MirrorImage, 3),
+            ],
+            ..Default::default()
+        };
+        let r = run(&op("W1AW", F, 30.0), &ev);
+        assert_eq!(r.reached, None);
+        assert_eq!(
+            lost(&r),
+            (Some(Stage::InputCoverage), Some("sourceMask:analyticGuard"))
+        );
+        let s = summarize(&[r], Births::default(), CloseTally::default());
+        assert_eq!(s.lost_at.input_coverage, 1);
+        assert_eq!(s.lost_at.detectable_energy, 0);
+    }
+
+    #[test]
+    fn source_mask_does_not_hide_later_evidence() {
+        // A spot for the call outweighs a masked rise near it.
+        let ev = Evidence {
+            spots: vec![spot("W1AW", F + 400.0)],
+            vetoes: vec![veto(F, 20.0, SpawnVeto::TrustedBand, 4)],
+            ..Default::default()
+        };
+        let r = run(&op("W1AW", F, 30.0), &ev);
+        assert_eq!(r.reached, Some(Stage::Delivered));
+        assert_eq!(r.lost_at, None);
+    }
+
     #[test]
     fn gherkin_no_track_opened_is_detectable_energy() {
         // Later-stage-looking facts for another call on another frequency.
@@ -760,13 +876,11 @@ mod tests {
             tracks: vec![t],
             decisions: vec![d],
             spots: vec![spot("K1ABC", 14_010_000.0)],
+            ..Default::default()
         };
         let r = run(&op("W1AW", F, 30.0), &ev);
         assert_eq!(r.reached, Some(Stage::InputCoverage));
-        assert_eq!(
-            lost(&r),
-            (Some(Stage::DetectableEnergy), Some("noCandidate"))
-        );
+        assert_eq!(lost(&r), (Some(Stage::DetectableEnergy), Some("noRise")));
         assert_eq!(r.tracks, TrackTally::default());
         let s = summarize(&[r], Births::default(), CloseTally::default());
         assert_eq!(s.lost_at.detectable_energy, 1);
@@ -787,6 +901,7 @@ mod tests {
             tracks: vec![t],
             decisions: vec![decision("W1AW", None, 2)],
             spots: vec![spot("W1AW", F)],
+            ..Default::default()
         };
         let r = run(&op("W1AW", F, 30.0), &ev);
         assert_eq!(r.reached, Some(Stage::Delivered));
@@ -912,6 +1027,7 @@ mod tests {
                 tracks: vec![t.clone()],
                 decisions: vec![d],
                 spots: vec![],
+                ..Default::default()
             };
             let r = run(&op("JA1ZZZ", F, 30.0), &ev);
             (r.lost_at, r.detail)
@@ -1009,6 +1125,7 @@ mod tests {
             tracks: vec![t],
             decisions: vec![decision("K1ABC", None, 2)],
             spots: vec![spot("K1ABC", F)],
+            ..Default::default()
         };
         let a = run(&op("K1ABC", F, 30.0), &ev);
         let b = run(&op("W1XYZ", F, 30.0), &ev);
@@ -1047,6 +1164,7 @@ mod tests {
             tracks: vec![t],
             decisions: vec![decision("W1AW", None, 2)],
             spots: vec![spot("W1AW", F)],
+            ..Default::default()
         };
         let records: Vec<Record> = [
             op("W1AW", F, 30.0),

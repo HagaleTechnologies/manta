@@ -1978,6 +1978,13 @@ mod tests {
             .records
             .iter()
             .any(|r| matches!(r, crate::funnel::TrackTraceRecord::Confirmed { .. })));
+        // The census sees the strong station's own channels rise while its
+        // track owns them; no source mask applies to a complex-IQ file.
+        assert!(log
+            .vetoes
+            .keys()
+            .any(|(_, _, v)| *v == crate::funnel::SpawnVeto::OwnedByTrack));
+        assert!(log.vetoes.keys().all(|(_, _, v)| !v.is_source_mask()));
     }
 
     #[test]

@@ -146,7 +146,7 @@ fn funnel_writes_one_stage_per_episode_and_leaves_the_oracle_unchanged() {
         assert_eq!(rec(i)["kind"], "lossFunnel");
     }
     assert_eq!(rec(1)["lostAt"], "detectableEnergy");
-    assert_eq!(rec(1)["detail"], "noCandidate");
+    assert_eq!(rec(1)["detail"], "noRise");
     assert_eq!(rec(1)["tracks"]["candidates"], 0);
     assert_eq!(rec(2)["lostAt"], "inputCoverage");
     assert_eq!(rec(2)["detail"], "outsidePassband");

@@ -3,7 +3,7 @@
 
 use super::attribute::{
     attribute, summarize, Births, CloseTally, DecisionFact, Evidence, Geometry, Opportunity,
-    Record, SpotFact, Summary, Tolerances, TrackFacts,
+    Record, SpotFact, Summary, Tolerances, TrackFacts, VetoFact,
 };
 use super::trace::{FunnelTrace, TraceLog, TrackTraceRecord};
 use crate::live::{LiveRecord, LiveStateSink};
@@ -142,7 +142,8 @@ fn evidence(
     let mut births = Births::default();
     let mut closes = CloseTally::default();
     let mut tracks: BTreeMap<u32, TrackFacts> = BTreeMap::new();
-    for r in trace.records {
+    let TraceLog { records, vetoes } = trace;
+    for r in records {
         match r {
             TrackTraceRecord::Spawned {
                 track_id,
@@ -231,6 +232,15 @@ fn evidence(
             tracks: tracks.into_values().collect(),
             decisions,
             spots,
+            vetoes: vetoes
+                .into_iter()
+                .map(|((second, centi_hz, veto), count)| VetoFact {
+                    t_s: second as f64,
+                    freq_hz: centi_hz as f64 / 100.0 * factor,
+                    veto,
+                    count,
+                })
+                .collect(),
         },
         births,
         closes,
