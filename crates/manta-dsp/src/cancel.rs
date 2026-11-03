@@ -49,10 +49,13 @@ pub const EDGE_PERCENTILE: f64 = 0.98;
 /// -2.2 to -2.4 dB at a 0.33 ms shift and +3.5 dB or more at 0.67 ms.
 pub const CLEAN_EDGE_OVER_NEIGHBOUR_DB: f64 = -7.0;
 /// The residual check accepts when the median interior block, over the
-/// neighbour level, is at most this. Plan table 7: good cells -7.8 dB or
-/// lower; a 3 Hz carrier error -1.0 dB. This module's synthetic pair reads
-/// -18.3 to -18.8 dB clean.
-pub const CLEAN_INTERIOR_OVER_NEIGHBOUR_DB: f64 = -4.0;
+/// neighbour level, is at most this. Plan table 7 put good cells at -7.8 dB
+/// or lower and a 3 Hz carrier error at -1.0 dB, and proposed -4 dB. The
+/// MAN-204 sweep's degraded reconstructions (seeds 204, 2, 3) broke that
+/// under rule A: a 3 % gain error read -8.3 to -8.4 dB and lost B (2, 0
+/// and 0 of 9 calls), while every row that kept 8 or 9 calls read -13.4 dB
+/// or lower (a 1 % gain error; -15.2 to -15.4 dB undegraded).
+pub const CLEAN_INTERIOR_OVER_NEIGHBOUR_DB: f64 = -10.0;
 /// Percentile of gap-block residual power taken as the neighbour level. A
 /// `TwoSignalCw` candidate has at least 15 % hot gap blocks, so it lands on
 /// the neighbour's key-down blocks (plan table 7).
