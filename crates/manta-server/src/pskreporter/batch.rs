@@ -46,7 +46,8 @@ pub enum Offer {
     /// Not reported.
     Dropped(PskDrop),
     /// Admitted, and the datagram it could not fit into is due now; the
-    /// spot starts the next one.
+    /// spot starts the next one, after any pending reports that did not
+    /// fit beside templates that came due after they were offered.
     Full(Datagram),
 }
 
@@ -177,8 +178,10 @@ impl Batcher {
         }
     }
 
-    /// The datagram due at a flush, or `None` with nothing pending. Also
-    /// prunes the gate of entries older than [`REPORT_GATE_SECS`].
+    /// The next datagram due at a flush, or `None` with nothing pending.
+    /// Reports that do not fit beside templates that came due after they
+    /// were offered stay pending, so call it until `None`. Also prunes the
+    /// gate of entries older than [`REPORT_GATE_SECS`].
     pub fn flush(&mut self, now: Instant, export_time: u32) -> Option<Datagram> {
         if self.latest_ts != i64::MIN {
             self.prune(self.latest_ts);
@@ -196,8 +199,19 @@ impl Batcher {
             return None;
         }
         let templates = self.templates_due(now);
-        let reports = std::mem::take(&mut self.pending);
-        self.pending_len = 0;
+        // Offers sized the pending reports for the templates due then; if
+        // they came due since (the hourly resend), the reports that do not
+        // fit beside them stay pending for the next datagram.
+        let mut fit = self.pending.len();
+        let mut fit_len = self.pending_len;
+        while fit > 1
+            && ipfix::datagram_len(&self.receiver, templates, fit_len) > MAX_DATAGRAM_BYTES
+        {
+            fit -= 1;
+            fit_len -= ipfix::report_len(&self.pending[fit]);
+        }
+        let reports: Vec<Report> = self.pending.drain(..fit).collect();
+        self.pending_len -= fit_len;
         let bytes = ipfix::datagram(
             &Header {
                 export_time,
@@ -379,6 +393,51 @@ mod tests {
         assert!(d.bytes.len() + 22 > MAX_DATAGRAM_BYTES);
         // The overflowing report starts the next batch.
         assert_eq!(b.pending(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn templates_due_at_a_flush_never_take_a_datagram_past_1400_bytes() {
+        let mut b = batcher();
+        let start = Instant::now();
+        for i in 0..TEMPLATED_STARTUP_DATAGRAMS {
+            b.offer(
+                &spot(&format!("W{i}AA"), 14_012_340.0, SpotType::Cq),
+                T,
+                start,
+                0,
+            );
+            assert!(b.flush(start, 0).expect("a datagram").templates);
+        }
+        // Offered just before the hourly templates come due, so sized
+        // without them: 61 reports fit only without the templates.
+        let offered_at = start + TEMPLATE_INTERVAL - Duration::from_secs(10);
+        assert!(!b.templates_due(offered_at));
+        for i in 0..61 {
+            assert_eq!(
+                b.offer(
+                    &spot(&format!("K{i:02}ABC"), 14_012_340.0, SpotType::Cq),
+                    T + 3590,
+                    offered_at,
+                    0,
+                ),
+                Offer::Admitted
+            );
+        }
+        assert!(ipfix::datagram_len(&receiver(), true, 61 * 22) > MAX_DATAGRAM_BYTES);
+        let flush_at = start + TEMPLATE_INTERVAL;
+        let first = b.flush(flush_at, 0).expect("a datagram");
+        assert!(first.templates && templated(&first));
+        assert!(
+            first.bytes.len() <= MAX_DATAGRAM_BYTES,
+            "{}",
+            first.bytes.len()
+        );
+        // What did not fit beside the templates is the next datagram.
+        let rest = b.flush(flush_at, 0).expect("the rest");
+        assert!(!rest.templates && !templated(&rest));
+        assert!(rest.bytes.len() <= MAX_DATAGRAM_BYTES);
+        assert_eq!(first.reports + rest.reports, 61);
+        assert_eq!(b.flush(flush_at, 0), None);
     }
 
     #[tokio::test(start_paused = true)]

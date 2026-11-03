@@ -229,7 +229,7 @@ pub async fn run(
             }
             _ = tokio::time::sleep_until(next_flush) => {
                 next_flush += FLUSH_INTERVAL;
-                if let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
+                while let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
                     deliver(&mut batcher, &mut sender, d).await;
                 }
             }
@@ -248,7 +248,7 @@ pub async fn run(
             Err(TryRecvError::Empty | TryRecvError::Closed) => break,
         }
     }
-    if let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
+    while let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
         deliver(&mut batcher, &mut sender, d).await;
     }
 }
