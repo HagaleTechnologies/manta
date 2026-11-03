@@ -227,14 +227,14 @@ pub fn mix(contributions: &[&[Complex32]], n: usize, noise_seed: Option<u64>) ->
 }
 
 /// `acc += contribution`, sample by sample (the order `mix` sums in).
-fn accumulate(acc: &mut [Complex32], contribution: &[Complex32]) {
+pub(crate) fn accumulate(acc: &mut [Complex32], contribution: &[Complex32]) {
     for (out, a) in acc.iter_mut().zip(contribution.iter()) {
         *out += a;
     }
 }
 
 /// Noise, then `MASTER_SCALE`: the tail of `mix`.
-fn finish(acc: &mut [Complex32], noise_seed: Option<u64>) {
+pub(crate) fn finish(acc: &mut [Complex32], noise_seed: Option<u64>) {
     if let Some(seed) = noise_seed {
         add_unit_awgn(acc, seed);
     }

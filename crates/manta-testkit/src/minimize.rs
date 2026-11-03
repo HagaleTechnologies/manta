@@ -12,11 +12,12 @@
 //! characters, keep at least one), impairments (per signal: drop jitter,
 //! QSB, Watterson, Farnsworth, then reset timing to standard). Rounds repeat
 //! until one accepts nothing or the probe budget is spent. Each signal's
-//! unscaled contribution is cached and mixed with `scene::mix`, which
-//! `render_scene` itself uses, so the probe sees exactly the bytes
-//! `SceneSpec::render` produces.
+//! unscaled contribution is cached, up to [`CACHE_BYTES`], and summed in
+//! signal order with the arithmetic `scene::mix` and `render_scene` share;
+//! a contribution past the cap is added and dropped in turn. The probe
+//! sees exactly the bytes `SceneSpec::render` produces.
 
-use crate::scene::{mix, render_signal};
+use crate::scene::{accumulate, finish, render_signal};
 use crate::scenespec::{SceneSignal, SceneSpec};
 use anyhow::{bail, Result};
 use num_complex::Complex32;
@@ -96,6 +97,8 @@ type Contribution = (Vec<Complex32>, String);
 struct Runner<'p, P> {
     probe: &'p mut P,
     cache: HashMap<(String, u64), Contribution>,
+    /// Most bytes `cache` may hold: `CACHE_BYTES` outside tests.
+    cache_bytes: usize,
     target: Signature,
     probes: usize,
     budget: usize,
@@ -110,7 +113,10 @@ where
         scene.validate()?;
         let n = (scene.duration_s * scene.fs).round() as usize;
         // Keep only this duration's contributions, and at most
-        // CACHE_BYTES of them; a signal past the cap is rendered per probe.
+        // `cache_bytes` of them. A signal past the cap is rendered per
+        // probe, added and dropped before the next, so a probe holds at
+        // most one uncached contribution. Signal order and `mix`'s
+        // arithmetic are kept, so the bytes match `SceneSpec::render`.
         let d = scene.duration_s.to_bits();
         self.cache.retain(|k, _| k.1 == d);
         let mut cached_bytes: usize = self
@@ -118,33 +124,23 @@ where
             .values()
             .map(|c| c.0.len() * std::mem::size_of::<Complex32>())
             .sum();
-        let mut fresh: Vec<Vec<Complex32>> = Vec::new();
-        let mut slots: Vec<Result<(String, u64), usize>> = Vec::with_capacity(scene.signals.len());
+        let mut acc = vec![Complex32::new(0.0, 0.0); n];
         for sig in &scene.signals {
             let key = (serde_json::to_string(sig)?, d);
-            if self.cache.contains_key(&key) {
-                slots.push(Ok(key));
+            if let Some(c) = self.cache.get(&key) {
+                accumulate(&mut acc, &c.0);
                 continue;
             }
             let c = render_signal(&sig.signal_spec(), scene.fs, scene.duration_s)?;
+            accumulate(&mut acc, &c.0);
             let bytes = c.0.len() * std::mem::size_of::<Complex32>();
-            if cached_bytes + bytes <= CACHE_BYTES {
+            if cached_bytes + bytes <= self.cache_bytes {
                 cached_bytes += bytes;
-                self.cache.insert(key.clone(), c);
-                slots.push(Ok(key));
-            } else {
-                slots.push(Err(fresh.len()));
-                fresh.push(c.0);
+                self.cache.insert(key, c);
             }
         }
-        let parts: Vec<&[Complex32]> = slots
-            .iter()
-            .map(|s| match s {
-                Ok(k) => self.cache[k].0.as_slice(),
-                Err(i) => fresh[*i].as_slice(),
-            })
-            .collect();
-        Ok(mix(&parts, n, scene.noise_seed))
+        finish(&mut acc, scene.noise_seed);
+        Ok(acc)
     }
 
     fn exhausted(&self) -> bool {
@@ -228,6 +224,7 @@ pub fn minimize(
     let mut r = Runner {
         probe: &mut probe,
         cache: HashMap::new(),
+        cache_bytes: CACHE_BYTES,
         target: Vec::new(),
         probes: 0,
         budget: budget.max_probes.max(1),
@@ -573,6 +570,105 @@ mod tests {
         })
         .unwrap();
         assert!(checked > 5);
+    }
+
+    /// Live heap bytes on the calling thread, for the memory test below.
+    /// Other threads are not counted, so parallel tests do not disturb it.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static ON: Cell<bool> = const { Cell::new(false) };
+            static LIVE: Cell<isize> = const { Cell::new(0) };
+            static PEAK: Cell<isize> = const { Cell::new(0) };
+        }
+
+        pub struct Tracking;
+
+        fn note(delta: isize) {
+            if ON.with(Cell::get) {
+                let live = LIVE.with(|l| {
+                    l.set(l.get() + delta);
+                    l.get()
+                });
+                PEAK.with(|p| p.set(p.get().max(live)));
+            }
+        }
+
+        // SAFETY: every call forwards to `System` unchanged; `note` only
+        // updates const-initialized thread-locals, which do not allocate.
+        unsafe impl GlobalAlloc for Tracking {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc(layout) };
+                if !p.is_null() {
+                    note(layout.size() as isize);
+                }
+                p
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                let p = unsafe { System.alloc_zeroed(layout) };
+                if !p.is_null() {
+                    note(layout.size() as isize);
+                }
+                p
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) };
+                note(-(layout.size() as isize));
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                let p = unsafe { System.realloc(ptr, layout, new_size) };
+                if !p.is_null() {
+                    note(new_size as isize - layout.size() as isize);
+                }
+                p
+            }
+        }
+
+        /// Run `f`; return its result and the most bytes this thread held
+        /// live at once above where it started.
+        pub fn peak_during<R>(f: impl FnOnce() -> R) -> (R, usize) {
+            LIVE.with(|l| l.set(0));
+            PEAK.with(|p| p.set(0));
+            ON.with(|o| o.set(true));
+            let r = f();
+            ON.with(|o| o.set(false));
+            (r, PEAK.with(Cell::get).max(0) as usize)
+        }
+    }
+
+    #[global_allocator]
+    static HEAP: heap::Tracking = heap::Tracking;
+
+    #[test]
+    fn render_holds_one_uncached_contribution_at_a_time() {
+        // Ten direct-route signals and no cache room: each contribution
+        // must be added and dropped before the next is rendered.
+        let mut s = scene();
+        s.fs = 48_000.0;
+        s.duration_s = 2.0;
+        s.signals = (0..10)
+            .map(|i| sig(&format!("s{i}"), -4500.0 + 1000.0 * i as f64))
+            .collect();
+        let mut probe = |_: &SceneSpec, _: &[Complex32]| -> Option<Signature> { None };
+        let mut r = Runner {
+            probe: &mut probe,
+            cache: HashMap::new(),
+            cache_bytes: 0,
+            target: Vec::new(),
+            probes: 0,
+            budget: 1,
+            steps: Vec::new(),
+        };
+        let (samples, peak) = heap::peak_during(|| r.render(&s).unwrap());
+        assert!(r.cache.is_empty());
+        assert_eq!(samples, s.render().unwrap().0);
+        let one = 96_000 * std::mem::size_of::<Complex32>();
+        assert!(
+            peak < 4 * one,
+            "a 10-signal probe held {peak} bytes; one contribution is {one}"
+        );
     }
 
     #[test]

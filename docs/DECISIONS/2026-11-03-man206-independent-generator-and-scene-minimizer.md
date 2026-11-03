@@ -69,7 +69,7 @@ failing scene before debugging it.
 | D8 | Scene floats serialize as Rust shortest round-trip strings. | A plain JSON number changed 44 of 381 shipped values' bits (research R8). |
 | D9 | A step is accepted only when the probe returns exactly the original signature; decode errors map to `decode-error`. | One failure per repro; shrinking can turn one failure into another. |
 | D10 | Pass order per round: duration (halve, floor 2 s), signals (ddmin, keep ≥ 1), text (ddmin over words, then characters), impairments (drop jitter, QSB, Watterson, Farnsworth, then standard timing). Rounds repeat until one accepts nothing or the budget (default 200 probes) is spent. | Decode cost scales with duration, so shortening first makes later probes cheaper. |
-| D11 | Contributions are cached by (signal JSON, duration) and mixed with `scene::mix`, which `render_scene` uses. | `probe_sees_the_bytes_scenespec_render_produces` asserts the probe sees `SceneSpec::render`'s exact bytes. |
+| D11 | Contributions are cached by (signal JSON, duration), up to 1 GiB, and summed in signal order with the arithmetic `scene::mix` and `render_scene` share. A contribution past the cap is added and dropped before the next is rendered. | `probe_sees_the_bytes_scenespec_render_produces` asserts the probe sees `SceneSpec::render`'s exact bytes. `render_holds_one_uncached_contribution_at_a_time` asserts a 10-signal direct-route probe with no cache room holds under four contributions' bytes. |
 | D12 | A repro is JSON (schema, origin, name, `found_in`, generator revision, `expect`, probe, signature, per-target digests, scene) under `crates/manta-engine/tests/repros/`, replayed in required CI. `expect: "fails"` passes while the failure is present and fails once fixed. | A fix cannot slip by without updating the repro. |
 | D13 | Digests are FNV-1a over f32 bits keyed `"{ARCH}-{OS}"`; replay checks the running target's entry when present. | coppa's FFT is SIMD-dispatched. |
 | D14 | The lint rejects files other than `*.json` and `README.md`, JSON over 8 KiB, unknown fields, and `name`/`found_in` containing `.wav`, `.cf32`, `.ci16`, `audio-corpus`, or a file name or sha256 from `audio-corpus/manifest.json` (embedded with `include_str!`). | "Never real recorded IQ" is a CI check. |
@@ -148,7 +148,9 @@ removed the ghost in both runs.
 Review fixes made in this change: `render_scene` adds and drops each
 signal's contribution in turn (holding all 50 V8w contributions at 120 s
 would need about 4.6 GB); the minimizer keeps only the current duration's
-contributions, capped at 1 GiB; `render_signal_with_route` errors on QSB
+contributions, capped at 1 GiB, and adds and drops each one past the cap in
+turn, so a probe holds at most one uncached contribution;
+`render_signal_with_route` errors on QSB
 with a fade (the real route never applied it, so the generators would
 silently disagree); `SceneSpec::validate` bounds `fs` and `duration_s`; the
 lint covers `probe` and every signal label and text; the independent
