@@ -1363,6 +1363,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "scp_sha256",
                 "pattern_path",
                 "validation_level",
+                "repetition_fusion",
             ],
         ),
     ];

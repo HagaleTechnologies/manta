@@ -169,6 +169,11 @@ pub struct PipelineConfig {
     pub patterns: Option<Arc<manta_spot::pattern::Table>>,
     /// Repetition thresholds by callsign-pattern rarity.
     pub validation_level: manta_spot::ValidationLevel,
+    /// MAN-200: let damaged copies of one station's self-ID count toward
+    /// its repetition requirement (`[spot] repetition_fusion`, default
+    /// off). See `manta_spot::lattice` and
+    /// docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md.
+    pub repetition_fusion: bool,
 }
 
 impl PipelineConfig {
@@ -201,7 +206,8 @@ impl PipelineConfig {
                 .with_blocklist(self.blocklist.clone())
                 .with_notch(self.notch.clone())
                 .with_patterns(self.pattern_table())
-                .with_validation_level(self.validation_level);
+                .with_validation_level(self.validation_level)
+                .with_repetition_fusion(self.repetition_fusion);
         for call in &self.allowlist {
             validator.allowlist(call);
         }
@@ -222,6 +228,7 @@ impl Default for PipelineConfig {
             scp: None,
             patterns: None,
             validation_level: manta_spot::ValidationLevel::default(),
+            repetition_fusion: false,
         }
     }
 }
@@ -760,6 +767,19 @@ pub(crate) fn json_keys_in_order(json: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipeline_config_passes_repetition_fusion_to_the_validator() {
+        let off = PipelineConfig::default().validator(96_000.0).unwrap();
+        assert!(off.lattice_counts().is_none());
+        let on = PipelineConfig {
+            repetition_fusion: true,
+            ..Default::default()
+        }
+        .validator(96_000.0)
+        .unwrap();
+        assert!(on.lattice_counts().is_some());
+    }
     /// The QQ9ZZZ fixture `cli.rs`'s allowlist test uses: V1, 30 s, an
     /// unallocated-prefix call.
     fn qq9zzz_spec() -> manta_testkit::vectors::VectorSpec {

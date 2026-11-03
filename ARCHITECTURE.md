@@ -502,7 +502,14 @@ transmission may never produce again).
    satisfy the gate; without the time-gap half, a short ID (e.g.
    "DE `<CALL>`") puts even two genuinely separate transmissions only 2
    words apart, which a word-gap-only rule cannot tell apart from one
-   message's double utterance.
+   message's double utterance. A decode whose sample span overlaps one the gate already
+   counted for that call (a replay, a second track on one signal) adds no
+   repetition (MAN-200). With `[spot] repetition_fusion` on (default off),
+   damaged copies of one station's CQ/DE/UP self-ID are aligned character
+   by character and can together confirm the call a clear per-position
+   majority reads, from as many separate messages as its tier needs
+   (`crates/manta-spot/src/lattice.rs`,
+   `docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md`).
 4b. **Cross-candidate variant arbitration** (MAN-100): before a candidate
    spots, it's checked against every other decoded, spottable-shaped word
    (one that itself passes steps 1's grammar/cty check) observed on the same

@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-200: a decode whose samples overlap a decode the repetition gate
+  already counted, such as a replay or a second track on the same signal,
+  no longer counts as another repetition, even when it arrives a whole
+  message later on the same track.
 - MAN-201: manta now reads each decoded callsign as the sending station,
   the station called, a station mentioned, or uncertain, and spots only a
   sending station. `DE W1AW DE K1ABC K` spots K1ABC, not W1AW. A `CQ` types
@@ -131,6 +135,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
+  copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
+  `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
+  records gain `confirmation` (`exactRepeat`, `fused` or `null`). With the
+  key off, decoder output is unchanged.
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times

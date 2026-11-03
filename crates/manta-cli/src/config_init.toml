@@ -378,6 +378,15 @@
 # exempt either way. Changes need a restart.
 #validation_level = "normal"
 
+# Let damaged copies of one station's CQ, DE or UP self-ID count toward its
+# repetition requirement. The copies are lined up character by character;
+# a call is confirmed when every character has a clear majority of copies
+# from enough separate messages (2, 3 or 5 by pattern, as validation_level
+# sets). Copies of the same samples count once, and no character is used
+# that no copy read. Off by default until recorded and live RBN regression
+# gates pass. Changes need a restart.
+#repetition_fusion = false
+
 # Callsign-pattern list used in place of the copy built into manta (derived
 # from MASTER.SCP). One pattern per line, a leading + marks a common one, `#`
 # starts a comment: "+K5@@@". Relative to this file's directory. Unset: the

@@ -5,11 +5,12 @@ use crate::blocklist::Blocklist;
 use crate::confidence;
 use crate::context::{self, SpotType};
 use crate::cty;
-use crate::decision::{CandidateSupport, Decision, Reason, Rival};
+use crate::decision::{CandidateSupport, Confirmation, Decision, Reason, Rival};
 use crate::dedupe::{Dedupe, DedupeOutcome};
 use crate::exchange::{self, ExchangeWord, Frame, Role};
 use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
 use crate::grammar;
+use crate::lattice::{self, EvidenceLattice, LatticeCounts};
 use crate::lookup::{CallsignLookup, Existence, LookupStatus};
 use crate::message;
 use crate::notch::NotchList;
@@ -189,6 +190,11 @@ impl From<Spot> for SpotJson {
 struct Word {
     text: String,
     confidences: Vec<f32>,
+    /// MAN-200: each character's alternatives, parallel to `confidences`.
+    alternatives: Vec<Vec<(char, f32)>>,
+    /// MAN-200 D2: the first character's `sample_ts`; with `end_ts`, the
+    /// word's sample span.
+    start_ts: u64,
     /// Assigned from `TrackState::next_word_seq` when this word is pushed
     /// to `TrackState::words` -- a per-track, strictly-increasing "age"
     /// used to tell a genuinely new supporting word apart from an older
@@ -285,6 +291,8 @@ type Candidate = (String, SpotType, u64, Option<u64>, u64);
 struct PendingBeacon {
     candidate: String,
     sample_ts: u64,
+    /// MAN-200 D2: the captured word's first character's `sample_ts`.
+    start_ts: u64,
     freq_hz: f64,
     snr_db: f32,
     char_confidences: Vec<f32>,
@@ -580,12 +588,24 @@ pub struct Validator {
     /// MAN-318: spots held until their base call's lookup settles, keyed by
     /// that base call, in hold order.
     held: BTreeMap<String, Vec<HeldSpot>>,
+    /// MAN-200: the opt-in evidence lattice (`with_repetition_fusion`).
+    /// `None`, the default, allocates nothing.
+    lattice: Option<EvidenceLattice>,
+    fs: f64,
 }
 
 /// MAN-318: a spot waiting for its callsign lookup.
 struct HeldSpot {
     spot: Spot,
     reps: u32,
+    /// MAN-200 D12: how the spot met its repetition requirement.
+    confirmation: Confirmation,
+}
+
+/// MAN-200 D12: the marker a spotted decision carries -- only a confirmed
+/// spot met its repetition requirement.
+fn confirmation_of(spot: &Spot, how: Confirmation) -> Option<Confirmation> {
+    (spot.emission_state == EmissionState::Confirmed).then_some(how)
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -635,7 +655,25 @@ impl Validator {
             input_count: 1,
             lookup: None,
             held: BTreeMap::new(),
+            lattice: None,
+            fs,
         }
+    }
+
+    /// MAN-200: turn repetition-evidence fusion on (`[spot]
+    /// repetition_fusion`). On, damaged copies of one station's CQ/DE
+    /// self-ID that the exact path did not confirm are combined by
+    /// `lattice::EvidenceLattice`; a confirmed winner passes the usual
+    /// checks and spots with `Confirmation::Fused`. Off (the default)
+    /// changes nothing and allocates nothing.
+    pub fn with_repetition_fusion(mut self, on: bool) -> Self {
+        self.lattice = on.then(|| EvidenceLattice::new(self.fs));
+        self
+    }
+
+    /// MAN-200: the lattice's counters, `None` when fusion is off.
+    pub fn lattice_counts(&self) -> Option<LatticeCounts> {
+        self.lattice.as_ref().map(EvidenceLattice::counts)
     }
 
     /// MAN-318: asks `lookup` whether each would-be spot's call exists, as
@@ -648,11 +686,19 @@ impl Validator {
     /// allowlisted, a call the lookup does not list is withheld, and one it
     /// has not answered yet is held until `poll_lookups`/`finish_lookups`.
     /// Dedupe has already stored the spot either way.
-    fn admit(&mut self, spot: Spot, reps: u32, allowlisted: bool) -> Option<Spot> {
+    fn admit(
+        &mut self,
+        spot: Spot,
+        reps: u32,
+        allowlisted: bool,
+        confirmation: Confirmation,
+    ) -> Option<Spot> {
         let lookup = match &self.lookup {
             Some(l) if !allowlisted => l.clone(),
             _ => {
-                self.decide(|| Decision::spotted(&spot, reps));
+                self.decide(|| {
+                    Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
+                });
                 return Some(spot);
             }
         };
@@ -663,15 +709,18 @@ impl Validator {
                 None
             }
             LookupStatus::Known(Existence::Exists | Existence::Unknown) => {
-                self.decide(|| Decision::spotted(&spot, reps));
+                self.decide(|| {
+                    Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
+                });
                 Some(spot)
             }
             LookupStatus::Pending => {
                 self.decide(|| lookup_decision(&spot, Reason::LookupPending, reps));
-                self.held
-                    .entry(key)
-                    .or_default()
-                    .push(HeldSpot { spot, reps });
+                self.held.entry(key).or_default().push(HeldSpot {
+                    spot,
+                    reps,
+                    confirmation,
+                });
                 None
             }
         }
@@ -716,7 +765,12 @@ impl Validator {
             let Some(held) = self.held.remove(&key) else {
                 continue;
             };
-            for HeldSpot { spot, reps } in held {
+            for HeldSpot {
+                spot,
+                reps,
+                confirmation,
+            } in held
+            {
                 if let Some(reason) = self.held_operator_suppressed(&spot) {
                     self.decide(|| lookup_decision(&spot, reason, reps));
                 } else if existence == Existence::NotFound
@@ -724,7 +778,9 @@ impl Validator {
                 {
                     self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
                 } else {
-                    self.decide(|| Decision::spotted(&spot, reps));
+                    self.decide(|| {
+                        Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
+                    });
                     spots.push(spot);
                 }
             }
@@ -860,6 +916,9 @@ impl Validator {
     fn maybe_sweep(&mut self) {
         if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
             self.gate.sweep(self.now_ts);
+            if let Some(lattice) = self.lattice.as_mut() {
+                lattice.sweep(self.now_ts);
+            }
             // `merged_into` bounded the same way, on the same cadence, as
             // a memory-bound backstop for a root that lives past this
             // window without ever closing (its own `SignalEnded` retires
@@ -979,7 +1038,7 @@ impl Validator {
                 glyph,
                 confidence,
                 sample_ts,
-                ..
+                alternatives,
             } => {
                 self.advance_clock(*sample_ts);
                 let turn_silence_samples = self.turn_silence_samples;
@@ -997,8 +1056,20 @@ impl Validator {
                                 }
                             }
                         }
+                        if buffer_empty {
+                            track.current.start_ts = *sample_ts;
+                        }
                         track.current.text.push(c.to_ascii_uppercase());
                         track.current.confidences.push(*confidence);
+                        track.current.alternatives.push(
+                            alternatives
+                                .iter()
+                                .filter_map(|(g, a)| match g {
+                                    Glyph::Char(c) => Some((c.to_ascii_uppercase(), *a)),
+                                    Glyph::Prosign(_) => None,
+                                })
+                                .collect(),
+                        );
                     }
                     Glyph::Prosign(Prosign::Err) => {
                         // SPEC §4.4: operator-error prosign discards the
@@ -1031,7 +1102,7 @@ impl Validator {
             } => {
                 self.advance_clock(*sample_ts);
                 let track = self.tracks.entry(*track_id).or_default();
-                let mut newly_completed: Option<(String, u64, f32)> = None;
+                let mut newly_completed: Option<(String, u64, u64, f32)> = None;
                 if !track.current.text.is_empty() {
                     let mut word = std::mem::take(&mut track.current);
                     // MAN-272: scan the word that just completed, so "most
@@ -1047,6 +1118,7 @@ impl Validator {
                     newly_completed = Some((
                         word.text.clone(),
                         word.seq,
+                        word.start_ts.min(*sample_ts),
                         confidence::geo_mean(&word.confidences),
                     ));
                     track.words.push_back(word);
@@ -1062,9 +1134,15 @@ impl Validator {
                 // `evaluate_candidate` runs for a non-allowlisted
                 // candidate below, so the ledger's population is never
                 // wider than what could plausibly spot.
-                if let Some((text, seq, geo)) = newly_completed {
+                if let Some((text, seq, start_ts, geo)) = newly_completed {
                     if grammar::is_plausible(&text) && self.cty.is_allocated(&text) {
-                        self.ledger.observe(*track_id, &text, seq, *sample_ts, geo);
+                        self.ledger.observe_span(
+                            *track_id,
+                            &text,
+                            seq,
+                            (start_ts, *sample_ts),
+                            geo,
+                        );
                     }
                 }
                 self.try_spot(*track_id, *sample_ts, false)
@@ -1756,7 +1834,7 @@ impl Validator {
             )
         };
 
-        let (char_confidences, reclassifying, resolved_word_seq) = {
+        let fused_ctx = {
             let track = self.tracks.get_mut(&track_id)?;
             // Named patterns resolve by text, always to the NEWEST word
             // sharing it (MAN-28 round 13, V29 -- a repeated "DE K5ARH ...
@@ -1809,7 +1887,71 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(spot_type);
             word.classified_max_seq = involved_max_seq;
-            (word.confidences.clone(), reclassifying, word.seq)
+            let fusion_copy = (self.lattice.is_some() && !reclassifying).then(|| lattice::Copy {
+                text: word.text.clone(),
+                chars: word
+                    .text
+                    .chars()
+                    .zip(&word.confidences)
+                    .zip(
+                        word.alternatives
+                            .iter()
+                            .chain(std::iter::repeat(&Vec::new())),
+                    )
+                    .map(|((glyph, &confidence), alts)| lattice::CharEvidence {
+                        glyph,
+                        confidence,
+                        alternatives: alts.clone(),
+                    })
+                    .collect(),
+                span: (word.start_ts.min(sample_ts), sample_ts),
+                track_id,
+                word_seq: word.seq,
+                freq_hz,
+            });
+            (
+                word.confidences.clone(),
+                reclassifying,
+                word.seq,
+                word.start_ts.min(sample_ts),
+                fusion_copy,
+            )
+        };
+        let (char_confidences, reclassifying, resolved_word_seq, start_ts, fusion_copy) = fused_ctx;
+        // MAN-200 D10: a first evaluation of a non-allowlisted CQ/DE self-ID
+        // enters the lattice before the operator and plausibility checks,
+        // because a damaged copy is often implausible.
+        let episode = match (fusion_copy, self.lattice.is_some()) {
+            (Some(copy), true)
+                if matches!(spot_type, SpotType::Cq | SpotType::De)
+                    && !self.allowlist.contains(&candidate)
+                    && copy.chars.len() >= lattice::MIN_COPY_CHARS =>
+            {
+                let input = self.input_of(track_id);
+                let tracks = &self.tracks;
+                let merged = &self.merged_into;
+                let outcome = self.lattice.as_mut().map(|l| {
+                    l.add(input, copy, |tid| {
+                        tracks.contains_key(&tid) || merged.contains_key(&tid)
+                    })
+                });
+                match outcome {
+                    Some(lattice::AddOutcome::Added(k) | lattice::AddOutcome::Duplicate(k)) => {
+                        Some(k)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let fused_site = FusedSite {
+            track_id,
+            sample_ts,
+            spot_type,
+            freq_hz,
+            snr_db,
+            wpm,
+            episode,
         };
 
         // Operator suppression overrides (MAN-31) -- orthogonal to, and
@@ -1840,11 +1982,11 @@ impl Validator {
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
                 self.decide(|| withheld(Reason::Grammar));
-                return None;
+                return self.try_fused(&fused_site, None);
             }
             if !self.cty.is_allocated(&candidate) {
                 self.decide(|| withheld(Reason::Cty));
-                return None;
+                return self.try_fused(&fused_site, None);
             }
         }
 
@@ -1872,11 +2014,11 @@ impl Validator {
             // identity continues on a survivor, so `self.merged_into`
             // (round 3) still counts it as active. See
             // `gate::message_distinct_indices`'s doc.
-            self.gate.record(
+            self.gate.record_span(
                 track_id,
                 freq_hz,
                 &candidate,
-                sample_ts,
+                (start_ts, sample_ts),
                 resolved_word_seq,
                 |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
             ) as u32
@@ -1920,8 +2062,14 @@ impl Validator {
         // dispatch above).
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
         {
-            self.decide(|| withheld(Reason::Repetition).with_reps(reps));
-            return None;
+            // MAN-200 D10: a fused winner that is this candidate's own text
+            // replaces its `Repetition` decision; any other winner is
+            // decided after it.
+            let fused = self.fused_winner(&fused_site);
+            if fused.as_ref().is_none_or(|f| f.call != candidate) {
+                self.decide(|| withheld(Reason::Repetition).with_reps(reps));
+            }
+            return self.try_fused(&fused_site, fused);
         }
 
         // MAN-100 step 4b: cross-candidate arbitration. Allowlisted calls
@@ -2005,7 +2153,135 @@ impl Validator {
             mode: SpotMode::Cw,
             baud: None,
         };
-        self.admit(spot, reps, is_allowlisted)
+        self.admit(spot, reps, is_allowlisted, Confirmation::ExactRepeat)
+    }
+
+    /// MAN-200 D8/D9: the episode's confirmed winner, if every position is
+    /// decided, the winner's pattern tier has its separate messages, and no
+    /// disagreeing copy already spotted on this channel.
+    fn fused_winner(&self, site: &FusedSite) -> Option<lattice::Fused> {
+        let lattice = self.lattice.as_ref()?;
+        let key = site.episode?;
+        let lattice::Verdict::Confirmed(fused) = lattice.evaluate(key, site.sample_ts, 1) else {
+            return None;
+        };
+        let required = self.level.required_reps(self.patterns.tier(&fused.call));
+        if fused.reps < required {
+            return None;
+        }
+        let input = self.input_of(site.track_id);
+        if fused.disagreeing.iter().any(|text| {
+            self.dedupe
+                .last_sample_ts(text, site.freq_hz, input)
+                .is_some()
+        }) {
+            return None;
+        }
+        Some(fused)
+    }
+
+    /// MAN-200 D8/D11: decides a fused winner through the same checks as
+    /// any candidate, then admits it as `Confirmation::Fused`. `fused` is
+    /// the already-evaluated winner, or `None` to evaluate it here. A
+    /// refused fusion records nothing.
+    fn try_fused(&mut self, site: &FusedSite, fused: Option<lattice::Fused>) -> Option<Spot> {
+        let fused = match fused {
+            Some(f) => f,
+            None => self.fused_winner(site)?,
+        };
+        let call = fused.call.clone();
+        let reps = fused.reps;
+        let (track_id, sample_ts, freq_hz, spot_type) =
+            (site.track_id, site.sample_ts, site.freq_hz, site.spot_type);
+        let withheld = |reason: Reason| {
+            Decision::withheld(track_id, sample_ts, &call, freq_hz, spot_type, reason)
+                .with_reps(reps)
+        };
+        if self.blocklist.contains(&call) {
+            self.suppression_counts.blocklist += 1;
+            self.decide(|| withheld(Reason::Blocklist));
+            return None;
+        }
+        if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
+            self.decide(|| withheld(Reason::Notch));
+            return None;
+        }
+        let is_allowlisted = self.allowlist.contains(&call);
+        if !is_allowlisted {
+            if !grammar::is_plausible(&call) {
+                self.decide(|| withheld(Reason::Grammar));
+                return None;
+            }
+            if !self.cty.is_allocated(&call) {
+                self.decide(|| withheld(Reason::Cty));
+                return None;
+            }
+        }
+        if !confidence::has_acoustic_evidence(&fused.char_confidences) {
+            self.decide(|| withheld(Reason::NoEvidence));
+            return None;
+        }
+        let mut confidence = confidence::c_call(&fused.char_confidences, reps);
+        if let Some(scp) = &self.scp {
+            confidence = confidence::apply_scp_boost(confidence, scp.contains(&call));
+        }
+        // Variant arbitration, ignoring rivals that are this episode's own
+        // copies: they are the damage the fusion already outvoted.
+        let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&call));
+        let rival = if !is_allowlisted && !scp_exempt {
+            self.ledger
+                .better_supported_rival(track_id, &call, sample_ts)
+                .filter(|(rival, _)| !fused.disagreeing.contains(rival))
+        } else {
+            None
+        };
+        if let Some((rival_call, rival_support)) = rival {
+            self.suppression_counts.variant += 1;
+            self.decide(|| {
+                let mut d = withheld(Reason::Variant);
+                d.rival = Some(Rival {
+                    call: rival_call,
+                    support: rival_support,
+                });
+                d
+            });
+            return None;
+        }
+        let input = self.input_of(track_id);
+        if self
+            .dedupe
+            .last_sample_ts(&call, freq_hz, input)
+            .is_some_and(|last| sample_ts < last)
+        {
+            self.decide(|| withheld(Reason::Dedupe));
+            return None;
+        }
+        let outcome = self
+            .dedupe
+            .assess(&call, freq_hz, site.snr_db, spot_type, sample_ts, input);
+        if outcome != DedupeOutcome::Emit {
+            self.count_cross_input_dedupe(outcome, input);
+            self.decide(|| withheld(Reason::Dedupe));
+            return None;
+        }
+        let (rst, qrl_query) = self.track_annotations(track_id);
+        let spot = Spot {
+            callsign: call,
+            freq_hz,
+            snr_db: site.snr_db,
+            wpm: site.wpm,
+            spot_type,
+            confidence,
+            emission_state: EmissionState::Confirmed,
+            track_id,
+            sample_ts,
+            rst,
+            qrl_query,
+            mode: SpotMode::Cw,
+            baud: None,
+        };
+        self.admit(spot, reps, is_allowlisted, Confirmation::Fused)
     }
 
     /// Captures a non-allowlisted Beacon candidate once every permanent,
@@ -2031,7 +2307,7 @@ impl Validator {
         // PR #154, round 3): checking blocklist/notch before this guard
         // would re-count a permanently-suppressed candidate every time an
         // unrelated later word re-triggers a scan that finds it again.
-        let (char_confidences, word_seq) = {
+        let (char_confidences, word_seq, start_ts) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = if let Some(seq) = exact_seq {
                 track.words.iter_mut().find(|w| w.seq == seq)?
@@ -2052,7 +2328,11 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(SpotType::Beacon);
             word.classified_max_seq = involved_max_seq;
-            (word.confidences.clone(), word.seq)
+            (
+                word.confidences.clone(),
+                word.seq,
+                word.start_ts.min(sample_ts),
+            )
         };
 
         // Operator suppression overrides (MAN-31), same boundary as the
@@ -2097,6 +2377,7 @@ impl Validator {
             PendingBeacon {
                 candidate,
                 sample_ts,
+                start_ts,
                 freq_hz,
                 snr_db,
                 char_confidences,
@@ -2264,11 +2545,11 @@ impl Validator {
                 // rapid-same-track exemption -- letting one real
                 // over-the-air occurrence, captured by two overlapping
                 // duplicate-spawn tracks, reach reps >= 2 on its own.
-                let reps = self.gate.record(
+                let reps = self.gate.record_span(
                     pb.origin_track_id,
                     pb.freq_hz,
                     &pb.candidate,
-                    pb.sample_ts,
+                    (pb.start_ts, pb.sample_ts),
                     pb.word_seq,
                     |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
                 ) as u32;
@@ -2352,10 +2633,22 @@ impl Validator {
                     mode: SpotMode::Cw,
                     baud: None,
                 };
-                self.admit(spot, reps, false)
+                self.admit(spot, reps, false, Confirmation::ExactRepeat)
             })
             .collect()
     }
+}
+
+/// MAN-200: where a fused spot would be emitted -- the triggering copy's
+/// track, time, frequency, SNR, speed and spot type (D11) -- and its episode.
+struct FusedSite {
+    track_id: u32,
+    sample_ts: u64,
+    spot_type: SpotType,
+    freq_hz: f64,
+    snr_db: f32,
+    wpm: f32,
+    episode: Option<lattice::EpisodeKey>,
 }
 
 /// Inserts `pb` at its `sample_ts` position (after any equal ones, so
@@ -2603,6 +2896,106 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(d.reps.is_some());
         assert!(d.spot.is_none());
         assert_eq!(lookup.asked(), ["K5ARH"]);
+    }
+
+    /// MAN-200: V60's two damaged copies, `W1AV` and `W1AQ`, whose fourth
+    /// character lists `W` as an alternative.
+    fn complementary_copies() -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        for (call, start) in [("W1AV", 0u64), ("W1AQ", 100_000)] {
+            let mut ts = start;
+            for word in ["CQ", call, "K"] {
+                for (i, c) in word.chars().enumerate() {
+                    let damaged = word == call && i == 3;
+                    events.push(DecoderEvent::CharDecoded {
+                        track_id: 1,
+                        sample_ts: ts,
+                        glyph: Glyph::Char(c),
+                        confidence: if damaged { 0.45 } else { 0.95 },
+                        alternatives: if damaged {
+                            vec![(Glyph::Char('W'), 0.40)]
+                        } else {
+                            Vec::new()
+                        },
+                    });
+                    ts += 100;
+                }
+                events.push(DecoderEvent::word_boundary(1, ts));
+                ts += 100;
+            }
+        }
+        events
+    }
+
+    #[test]
+    fn fusion_is_off_by_default_and_allocates_nothing() {
+        let mut v = recording(CTY_FIXTURE);
+        assert!(run(&complementary_copies(), &mut v).is_empty());
+        assert!(v.lattice.is_none());
+        assert_eq!(v.lattice_counts(), None);
+    }
+
+    #[test]
+    fn a_reclassification_never_adds_a_copy() {
+        let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let added = v.lattice_counts().unwrap().added;
+        assert_eq!(added, 1);
+        // A later word re-scans the window; the settled K5ARH word is not
+        // offered again.
+        run(&transmission_events(1, &["QSL"], 50_000), &mut v);
+        assert_eq!(v.lattice_counts().unwrap().added, added);
+    }
+
+    #[test]
+    fn a_fused_spot_held_for_lookup_keeps_its_marker() {
+        let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+        let lookup = Arc::new(ScriptedLookup::default());
+        v.set_callsign_lookup(lookup.clone());
+        assert!(run(&complementary_copies(), &mut v).is_empty());
+        let held = v.take_decisions();
+        assert_eq!(
+            held.last().map(|d| (d.call.as_str(), d.reason)),
+            Some(("W1AW", Some(Reason::LookupPending)))
+        );
+        lookup.settle("W1AW", Existence::Exists);
+        let released = v.poll_lookups();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].callsign, "W1AW");
+        let d = v.take_decisions().pop().expect("released decision");
+        assert_eq!(d.verdict, Verdict::Spotted);
+        assert_eq!(d.confirmation, Some(Confirmation::Fused));
+    }
+
+    #[test]
+    fn alternatives_follow_their_characters() {
+        let mut v = recording(CTY_FIXTURE);
+        let ch = |ts: u64, c: char, alts: Vec<(Glyph, f32)>| DecoderEvent::CharDecoded {
+            track_id: 1,
+            sample_ts: ts,
+            glyph: Glyph::Char(c),
+            confidence: 0.9,
+            alternatives: alts,
+        };
+        v.ingest(&ch(10, 'x', vec![(Glyph::Char('y'), 0.3)]));
+        v.ingest(&ch(20, 'Q', vec![(Glyph::Prosign(Prosign::Ar), 0.3)]));
+        v.ingest(&DecoderEvent::char_decoded(
+            1,
+            30,
+            Glyph::Prosign(Prosign::Err),
+            1.0,
+        ));
+        let current = &v.tracks[&1].current;
+        assert!(current.text.is_empty() && current.alternatives.is_empty());
+        v.ingest(&ch(
+            40,
+            'w',
+            vec![(Glyph::Char('v'), 0.3), (Glyph::Prosign(Prosign::Ar), 0.2)],
+        ));
+        let current = &v.tracks[&1].current;
+        assert_eq!(current.alternatives, vec![vec![('V', 0.3)]]);
+        assert_eq!(current.start_ts, 40);
     }
 
     #[test]

@@ -17,6 +17,9 @@ use std::collections::BTreeMap;
 /// One observed decode of a plausible-shaped word on a track.
 struct Obs {
     word_seq: u64,
+    /// MAN-200 D2: the word's first character's `sample_ts`; with
+    /// `sample_ts` (its boundary) the decode's sample span.
+    start_ts: u64,
     sample_ts: u64,
     /// Geometric mean of the word's per-character confidences (the same
     /// quantity `confidence::c_call` computes before its repetition
@@ -73,12 +76,54 @@ impl SupportLedger {
         sample_ts: u64,
         geo_conf: f32,
     ) {
-        let entry = self.seen.entry((track_id, text.to_string())).or_default();
-        entry.push(Obs {
+        self.observe_inner(
+            track_id,
+            text,
             word_seq,
-            sample_ts,
+            (sample_ts, sample_ts),
+            false,
             geo_conf,
-        });
+        );
+    }
+
+    /// `observe` for a word whose sample span `(start, end)` is known
+    /// (MAN-200 D2). An observation whose span overlaps one already held
+    /// for the same `(track_id, text)` decodes the same samples again (a
+    /// replay) and adds no support.
+    pub fn observe_span(
+        &mut self,
+        track_id: u32,
+        text: &str,
+        word_seq: u64,
+        span: (u64, u64),
+        geo_conf: f32,
+    ) {
+        self.observe_inner(track_id, text, word_seq, span, true, geo_conf);
+    }
+
+    fn observe_inner(
+        &mut self,
+        track_id: u32,
+        text: &str,
+        word_seq: u64,
+        span: (u64, u64),
+        check_overlap: bool,
+        geo_conf: f32,
+    ) {
+        let (start_ts, sample_ts) = (span.0.min(span.1), span.1);
+        let entry = self.seen.entry((track_id, text.to_string())).or_default();
+        let replay = check_overlap
+            && entry
+                .iter()
+                .any(|o| crate::gate::overlaps((o.start_ts, o.sample_ts), (start_ts, sample_ts)));
+        if !replay {
+            entry.push(Obs {
+                word_seq,
+                start_ts,
+                sample_ts,
+                geo_conf,
+            });
+        }
         let cutoff = sample_ts.saturating_sub(self.window_samples);
         entry.retain(|o| o.sample_ts >= cutoff);
         self.evict_aged_out(track_id, cutoff);
@@ -308,6 +353,16 @@ impl SupportLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_overlapping_same_track_observation_adds_no_support() {
+        let mut ledger = SupportLedger::new(96_000.0);
+        ledger.observe_span(1, "W1AW", 1, (100, 400), 0.9);
+        ledger.observe_span(1, "W1AW", 4, (150, 420), 0.5);
+        let support = ledger.support(1, "W1AW", 420);
+        assert_eq!(support.reps, 1);
+        assert!((support.conf_sum - 0.9).abs() < 1e-6, "{support:?}");
+    }
 
     const FS: f64 = 96_000.0;
 
