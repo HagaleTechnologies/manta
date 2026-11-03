@@ -444,6 +444,7 @@ mod tests {
     /// 2026-11-03T20:07:01Z, the design spot's time.
     const SPOT_UNIX: i64 = 1_793_650_021;
     const EPOCH_UNIX: u64 = 1_793_650_000;
+    const WAIT: Duration = Duration::from_secs(5);
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()
@@ -676,6 +677,12 @@ mod tests {
     }
 
     /// Every datagram that arrives before 200 ms of silence.
+    ///
+    /// MAN-478: the tests that check what the fake logger reads run in
+    /// real time. On a paused clock the 200 ms could auto-advance before
+    /// kqueue reported a datagram already sent, and macOS then read no
+    /// datagrams at all. They pause the clock only across a 15 s
+    /// [`PULSE`] wait, when nothing reads the socket.
     async fn drain(logger: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 2048];
@@ -699,7 +706,15 @@ mod tests {
         pairs.iter().map(|(k, id)| (*k, id.to_string())).collect()
     }
 
-    #[tokio::test(start_paused = true)]
+    /// One [`PULSE`] on a paused clock; what it sends waits in the
+    /// logger's buffer for the next [`drain`].
+    async fn wait_a_pulse() {
+        tokio::time::pause();
+        tokio::time::sleep(PULSE).await;
+        tokio::time::resume();
+    }
+
+    #[tokio::test]
     async fn a_first_spot_on_a_band_sends_heartbeat_status_then_decode() {
         let h = start(false).await;
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));
@@ -725,7 +740,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_spot_on_the_same_khz_sends_only_a_decode() {
         let h = start(false).await;
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));
@@ -735,7 +750,7 @@ mod tests {
         assert_eq!(summary(&got), ids(&[(2, "manta-20m")]));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_spot_on_another_khz_sends_a_status_first() {
         let h = start(false).await;
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));
@@ -749,7 +764,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn two_bands_use_two_ids() {
         let h = start(false).await;
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));
@@ -768,14 +783,14 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn every_15_s_each_id_gets_a_heartbeat_and_a_status() {
         let h = start(false).await;
         assert!(drain(&h.logger).await.is_empty(), "no Id, no heartbeat");
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));
         publish(&h, spot("K5ARH", 7_024_000.0, SpotType::Cq));
         assert_eq!(drain(&h.logger).await.len(), 6);
-        tokio::time::sleep(PULSE).await;
+        wait_a_pulse().await;
         let got = drain(&h.logger).await;
         assert_eq!(
             summary(&got),
@@ -786,11 +801,11 @@ mod tests {
                 (1, "manta-40m"),
             ])
         );
-        tokio::time::sleep(PULSE).await;
+        wait_a_pulse().await;
         assert_eq!(drain(&h.logger).await.len(), 4, "and again 15 s later");
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn shutdown_sends_queued_spots_then_a_close_per_id() {
         let h = start(true).await;
         // Queued before the worker first runs; shutdown is already set.
@@ -822,7 +837,7 @@ mod tests {
         assert_eq!(h.stats.spots(), 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn only_types_0_1_2_and_6_are_ever_sent() {
         let h = start(false).await;
         let mut all = Vec::new();
@@ -835,7 +850,7 @@ mod tests {
             publish(&h, spot(call, f, t));
             all.extend(drain(&h.logger).await);
         }
-        tokio::time::sleep(PULSE).await;
+        wait_a_pulse().await;
         all.extend(drain(&h.logger).await);
         h.shutdown.send(true).unwrap();
         h.task.await.unwrap();
@@ -845,7 +860,7 @@ mod tests {
         assert!(all.iter().all(|d| kind(d) != 5 && kind(d) != 12));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_relay_ignores_this_output() {
         use crate::metrics::{DropReason, Metrics, RelayKind};
         use crate::relay::wsjtx::{self, WsjtxRelay};
@@ -882,7 +897,13 @@ mod tests {
             occurrence_count: 1,
         })
         .unwrap();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::timeout(WAIT, async {
+            while relay_stats.dropped_total(DropReason::OwnOutput) < 3 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the relay hears all three datagrams");
         assert_eq!(stats.datagrams(), 3);
         assert_eq!(relay_stats.dropped_total(DropReason::OwnOutput), 3);
         assert!(
@@ -895,7 +916,7 @@ mod tests {
         relay.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_counters_match_what_was_sent() {
         let h = start(false).await;
         publish(&h, spot("W1AW", 14_012_340.0, SpotType::Cq));

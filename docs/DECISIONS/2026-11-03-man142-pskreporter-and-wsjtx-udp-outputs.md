@@ -120,11 +120,14 @@ The tests:
 - `crates/manta-server/src/wsjtx_output.rs`: the 54-byte `Heartbeat` and
   65-byte `Decode` above, every message read back by the relay's own parser,
   the 114-byte `Status`, band, dial and offset mapping, message text, low
-  confidence and the time of day. Worker tests on a paused clock against a
-  loopback fake logger cover the message order, a `Status` only when the kHz
-  changes, one `Id` per band, the 15 s heartbeat, `Close` at shutdown, only
-  types 0, 1, 2 and 6, lag and send-error counting, and the relay ignoring
-  this output.
+  confidence and the time of day. Worker tests against a loopback fake
+  logger cover the message order, a `Status` only when the kHz changes, one
+  `Id` per band, the 15 s heartbeat, `Close` at shutdown, only types 0, 1, 2
+  and 6, lag and send-error counting, and the relay ignoring this output.
+  Those that check what the logger reads run in real time and pause the
+  clock only across the 15 s wait, when nothing reads the socket: on a
+  paused clock macOS could time out before it delivered a datagram
+  (MAN-478).
 - `crates/manta-server/src/relay/wsjtx.rs`:
   `mantas_own_output_is_counted_and_never_marks_the_relay_up`,
   `a_real_wsjtx_instance_still_marks_the_relay_up` and
