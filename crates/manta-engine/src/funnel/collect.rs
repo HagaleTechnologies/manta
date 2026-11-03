@@ -48,7 +48,15 @@ pub(super) struct EventTrack {
     meta_freq_hz: Option<f64>,
     pub(super) speeds: Vec<(u64, f32)>,
     pub(super) text: String,
-    pub(super) readings: Vec<String>,
+    /// (first character, last character, word), in decode order.
+    pub(super) words: Vec<(u64, u64, String)>,
+    /// (first holding, last holding, word): one entry per run of
+    /// consecutive `ReadingsHeld` events that held the word, with no
+    /// character committed and no word boundary between them.
+    pub(super) readings: Vec<(u64, u64, String)>,
+    /// `readings` indices the latest `ReadingsHeld` event held, cleared
+    /// when a run ends.
+    held: Vec<usize>,
 }
 
 fn event_track(e: &DecoderEvent) -> (u32, Option<u64>) {
@@ -95,19 +103,64 @@ pub(super) fn observe(tracks: &mut BTreeMap<u32, EventTrack>, e: &DecoderEvent) 
     if let Some(ts) = ts {
         t.last_ts = t.last_ts.max(ts);
     }
+    // A held reading lives within one word: a committed character or a
+    // word boundary ends every run, so a later holding starts a new one
+    // however long the unambiguous text between them.
+    if matches!(
+        e,
+        DecoderEvent::CharDecoded { .. } | DecoderEvent::WordBoundary { .. }
+    ) {
+        t.held.clear();
+    }
     match e {
-        DecoderEvent::CharDecoded { glyph, .. } => {
+        DecoderEvent::CharDecoded {
+            glyph, sample_ts, ..
+        } => {
             if let Some(c) = glyph.text_char() {
+                let starts_word = t.text.is_empty() || t.text.ends_with(' ');
                 t.text.push(c);
+                match t.words.last_mut() {
+                    Some((first, last, word)) if !starts_word => {
+                        *first = (*first).min(*sample_ts);
+                        *last = (*last).max(*sample_ts);
+                        word.push(c);
+                    }
+                    _ => t.words.push((*sample_ts, *sample_ts, c.to_string())),
+                }
             }
         }
         DecoderEvent::WordBoundary { .. } if !t.text.is_empty() && !t.text.ends_with(' ') => {
             t.text.push(' ');
         }
-        DecoderEvent::ReadingsHeld { readings, .. } => {
+        DecoderEvent::ReadingsHeld {
+            readings,
+            sample_ts,
+            ..
+        } => {
+            // A word the previous event also held extends that run; any
+            // other word starts a new one, so each run keeps its own time.
+            let previous = std::mem::take(&mut t.held);
             for (word, _) in readings {
-                if !t.readings.contains(word) {
-                    t.readings.push(word.clone());
+                let run = t
+                    .held
+                    .iter()
+                    .chain(&previous)
+                    .copied()
+                    .find(|&i| t.readings[i].2 == *word);
+                let i = match run {
+                    Some(i) => {
+                        let (first, last, _) = &mut t.readings[i];
+                        *first = (*first).min(*sample_ts);
+                        *last = (*last).max(*sample_ts);
+                        i
+                    }
+                    None => {
+                        t.readings.push((*sample_ts, *sample_ts, word.clone()));
+                        t.readings.len() - 1
+                    }
+                };
+                if !t.held.contains(&i) {
+                    t.held.push(i);
                 }
             }
         }
@@ -117,6 +170,17 @@ pub(super) fn observe(tracks: &mut BTreeMap<u32, EventTrack>, e: &DecoderEvent) 
         DecoderEvent::TrackPromoted { freq_hz, .. } => t.promoted_freq_hz = Some(*freq_hz),
         _ => {}
     }
+}
+
+/// `(first, last, word)` spans in seconds.
+pub(super) fn timed(
+    spans: Vec<(u64, u64, String)>,
+    secs: impl Fn(u64) -> f64,
+) -> Vec<(f64, f64, String)> {
+    spans
+        .into_iter()
+        .map(|(first, last, word)| (secs(first), secs(last), word))
+        .collect()
 }
 
 pub(super) fn spot_type_label(t: SpotType) -> &'static str {
@@ -165,6 +229,7 @@ fn evidence(
                         close: None,
                         speeds: Vec::new(),
                         text: String::new(),
+                        words: Vec::new(),
                         readings: Vec::new(),
                     },
                 );
@@ -202,7 +267,8 @@ fn evidence(
         }
         t.speeds = e.speeds.iter().map(|&(ts, w)| (secs(ts), w)).collect();
         t.text = e.text.trim().to_string();
-        t.readings = e.readings;
+        t.words = timed(e.words, secs);
+        t.readings = timed(e.readings, secs);
     }
     closes.open_at_end = tracks.values().filter(|t| t.close.is_none()).count();
     let decisions = decisions
@@ -317,4 +383,56 @@ pub fn run_funnel(
         records,
         summary,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use manta_decode::tree::Glyph;
+
+    #[test]
+    fn observe_times_each_word_and_each_run_of_held_readings() {
+        let ch = |ts, c| DecoderEvent::char_decoded(1, ts, Glyph::Char(c), 1.0);
+        let held = |ts, words: &[&str]| DecoderEvent::ReadingsHeld {
+            track_id: 1,
+            sample_ts: ts,
+            readings: words.iter().map(|w| (w.to_string(), 0.0)).collect(),
+            settled: false,
+        };
+        let mut tracks = BTreeMap::new();
+        // Prior-on order: snapshots while a word is held, then the settled
+        // characters, then the boundary.
+        for e in [
+            held(10, &["W", "M"]),
+            held(20, &["W1", "M1"]),
+            // Held again in the next event: the same run, held to 25.
+            held(25, &["W1", "W1"]),
+            ch(10, 'W'),
+            ch(20, '1'),
+            DecoderEvent::word_boundary(1, 30),
+            DecoderEvent::word_boundary(1, 35),
+            ch(40, 'K'),
+            ch(400, 'K'),
+            DecoderEvent::word_boundary(1, 410),
+            // Held again only after committed text: a new run with its
+            // own time, not one spanning 20 to 500.
+            held(500, &["W1"]),
+        ] {
+            observe(&mut tracks, &e);
+        }
+        let t = &tracks[&1];
+        assert_eq!(t.text, "W1 KK ");
+        let span = |a, b, w: &str| (a, b, w.to_string());
+        assert_eq!(t.words, vec![span(10, 20, "W1"), span(40, 400, "KK")]);
+        assert_eq!(
+            t.readings,
+            vec![
+                span(10, 10, "W"),
+                span(10, 10, "M"),
+                span(20, 25, "W1"),
+                span(20, 20, "M1"),
+                span(500, 500, "W1"),
+            ]
+        );
+    }
 }

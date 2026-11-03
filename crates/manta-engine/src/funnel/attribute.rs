@@ -151,8 +151,13 @@ pub struct TrackFacts {
     pub speeds: Vec<(f64, f32)>,
     /// One space per word boundary.
     pub text: String,
-    /// Words the decoder held as acoustically viable readings.
-    pub readings: Vec<String>,
+    /// (first character s, last character s, word): each decoded word,
+    /// in decode order.
+    pub words: Vec<(f64, f64, String)>,
+    /// (first holding s, last holding s, word): words the decoder held as
+    /// acoustically viable readings, one entry per run of consecutive
+    /// holdings.
+    pub readings: Vec<(f64, f64, String)>,
 }
 
 /// One validator decision, calibrated.
@@ -307,10 +312,6 @@ fn speed_ok(est: f32, truth: f32) -> bool {
     (est - truth).abs() <= (0.2 * truth).max(3.0)
 }
 
-fn has_word(text: &str, call: &str) -> bool {
-    text.split_whitespace().any(|w| w == call)
-}
-
 fn overlaps(born_s: f64, end_s: Option<f64>, w: [f64; 2]) -> bool {
     born_s <= w[1] && end_s.unwrap_or(f64::INFINITY) >= w[0]
 }
@@ -431,9 +432,18 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
                 && overlaps(t.born_s, t.end_s, spot_window_s)
         })
         .collect();
-    let call_track = near_tracks
-        .iter()
-        .find(|t| has_word(&t.text, call) || t.readings.iter().any(|r| r == call));
+    // Only a word decoded, or a reading held, inside the spot window counts:
+    // a long-lived track's text from outside it says nothing about this
+    // opportunity.
+    let in_spot_window =
+        |w: &&(f64, f64, String)| w.0 <= spot_window_s[1] && w.1 >= spot_window_s[0];
+    let call_track = near_tracks.iter().find(|t| {
+        t.words
+            .iter()
+            .chain(&t.readings)
+            .filter(in_spot_window)
+            .any(|(_, _, w)| w == call)
+    });
     let text_ok = call_track.is_some();
     let shown = call_track.or(leased.first()).or(near_tracks.first());
     rec.track_text = shown.map(|t| t.text.chars().take(TRACK_TEXT_CHARS).collect());
@@ -537,10 +547,14 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
             }
         }
         Stage::TextContainsCall => {
-            if near_tracks
-                .iter()
-                .any(|t| t.text.replace(' ', "").contains(call))
-            {
+            if near_tracks.iter().any(|t| {
+                t.words
+                    .iter()
+                    .filter(in_spot_window)
+                    .map(|(_, _, w)| w.as_str())
+                    .collect::<String>()
+                    .contains(call)
+            }) {
                 "substringOnly".to_string()
             } else {
                 "noCall".to_string()
@@ -766,8 +780,18 @@ mod tests {
             close: None,
             speeds: vec![(20.0, 20.0)],
             text: String::new(),
+            words: Vec::new(),
             readings: Vec::new(),
         }
+    }
+
+    /// Sets `t`'s text, every word decoded at `at` seconds.
+    fn says(t: &mut TrackFacts, text: &str, at: f64) {
+        t.text = text.into();
+        t.words = text
+            .split_whitespace()
+            .map(|w| (at, at, w.to_string()))
+            .collect();
     }
 
     fn decision(call: &str, reason: Option<Reason>, reps: u32) -> DecisionFact {
@@ -871,7 +895,7 @@ mod tests {
     fn gherkin_no_track_opened_is_detectable_energy() {
         // Later-stage-looking facts for another call on another frequency.
         let mut t = track(1, 14_010_000.0);
-        t.text = "CQ DE K1ABC K".into();
+        says(&mut t, "CQ DE K1ABC K", 30.0);
         let mut d = decision("K1ABC", None, 2);
         d.freq_hz = 14_010_000.0;
         let ev = Evidence {
@@ -898,7 +922,7 @@ mod tests {
     #[test]
     fn gherkin_validated_spot_is_delivered() {
         let mut t = track(1, F);
-        t.text = "CQ DE W1AW W1AW K".into();
+        says(&mut t, "CQ DE W1AW W1AW K", 30.0);
         let ev = Evidence {
             tracks: vec![t],
             decisions: vec![decision("W1AW", None, 2)],
@@ -996,7 +1020,7 @@ mod tests {
     #[test]
     fn text_details_and_held_readings() {
         let mut t = track(1, F);
-        t.text = "CQ DE G4X YZ K".into();
+        says(&mut t, "CQ DE G4X YZ K", 30.0);
         let ev = Evidence {
             tracks: vec![t.clone()],
             ..Default::default()
@@ -1006,7 +1030,7 @@ mod tests {
             lost(&r),
             (Some(Stage::TextContainsCall), Some("substringOnly"))
         );
-        t.readings = vec!["G4XYZ".into()];
+        t.readings = vec![(30.0, 30.0, "G4XYZ".into())];
         let r = run(
             &op("G4XYZ", F, 30.0),
             &Evidence {
@@ -1021,9 +1045,68 @@ mod tests {
     }
 
     #[test]
+    fn call_decoded_outside_the_spot_window_is_not_text_evidence() {
+        // Codex review, PR #493: a track alive 0-600 s that decodes W1AW
+        // only at 500 s says nothing about a W1AW opportunity at 100 s,
+        // whose spot window is [10, 190] s.
+        let geo = Geometry {
+            duration_s: 600.0,
+            ..geo()
+        };
+        let at_100 =
+            |ev: &Evidence| attribute(&op("W1AW", F, 100.0), ev, &geo, &Tolerances::default());
+        let mut t = track(1, F);
+        t.born_s = 0.0;
+        t.end_s = Some(600.0);
+        t.speeds = vec![(100.0, 20.0)];
+        says(&mut t, "CQ DE W1 AW K W1AW K", 500.0);
+        t.readings = vec![(500.0, 500.0, "W1AW".into())];
+        let ev = Evidence {
+            tracks: vec![t.clone()],
+            ..Default::default()
+        };
+        let r = at_100(&ev);
+        assert_eq!(r.reached, Some(Stage::UsableTiming));
+        assert_eq!(lost(&r), (Some(Stage::TextContainsCall), Some("noCall")));
+
+        // The same call held as a reading inside the window passes.
+        let mut held = t.clone();
+        held.readings.push((150.0, 151.0, "W1AW".into()));
+        let r = at_100(&Evidence {
+            tracks: vec![held],
+            ..Default::default()
+        });
+        assert_eq!(
+            lost(&r),
+            (Some(Stage::SelfIdRecognized), Some("noDecision"))
+        );
+
+        // A word spanning the window's edge counts; split words in the
+        // window are only a substring.
+        let mut edge = t.clone();
+        edge.words.push((185.0, 195.0, "W1AW".into()));
+        let r = at_100(&Evidence {
+            tracks: vec![edge],
+            ..Default::default()
+        });
+        assert_eq!(r.lost_at, Some(Stage::SelfIdRecognized));
+        let mut split = t;
+        split.words.push((120.0, 121.0, "W1".into()));
+        split.words.push((122.0, 123.0, "AW".into()));
+        let r = at_100(&Evidence {
+            tracks: vec![split],
+            ..Default::default()
+        });
+        assert_eq!(
+            lost(&r),
+            (Some(Stage::TextContainsCall), Some("substringOnly"))
+        );
+    }
+
+    #[test]
     fn decision_reasons_place_the_loss() {
         let mut t = track(1, F);
-        t.text = "CQ DE JA1ZZZ K".into();
+        says(&mut t, "CQ DE JA1ZZZ K", 30.0);
         let at = |d: DecisionFact| {
             let ev = Evidence {
                 tracks: vec![t.clone()],
@@ -1124,7 +1207,7 @@ mod tests {
     #[test]
     fn one_track_serves_both_calls_of_a_qso() {
         let mut t = track(1, F);
-        t.text = "W1XYZ DE K1ABC K".into();
+        says(&mut t, "W1XYZ DE K1ABC K", 30.0);
         let ev = Evidence {
             tracks: vec![t],
             decisions: vec![decision("K1ABC", None, 2)],
@@ -1163,7 +1246,7 @@ mod tests {
     #[test]
     fn summary_is_consistent() {
         let mut t = track(1, F);
-        t.text = "CQ DE W1AW K".into();
+        says(&mut t, "CQ DE W1AW K", 30.0);
         let ev = Evidence {
             tracks: vec![t],
             decisions: vec![decision("W1AW", None, 2)],

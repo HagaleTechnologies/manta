@@ -28,7 +28,7 @@ opportunity is never counted twice.
 | `detectableEnergy` | a candidate track was born within `trackTolHz` plus half a channel and was alive in the acoustic window | `noRise`, `refusedRise:<warmup\|staticCrash\|ownedByTrack\|coolingDown\|notLocalPeak\|rtty\|coModulated>` |
 | `admittedTrack` | one of those candidates leased a decoder (`TrackPromoted`) | `closed:<closeReason>` or `openAtEnd`, for the most advanced candidate (confirmed first, then the latest) |
 | `usableTiming` | a leased candidate's speed came within max(3 WPM, 20%) of the RBN speed, or RBN gave none and the track has any estimate | `noSpeedUpdate`, `speedOff` |
-| `textContainsCall` | a leased track within `spotTolHz` and the spot window decoded the call as a whole word, or held it as a reading | `substringOnly`, `noCall` |
+| `textContainsCall` | a leased track within `spotTolHz` decoded the call as a whole word, or held it as a reading, inside the spot window (the word's first-to-last character, or the reading's run of consecutive holdings, overlaps it; text from elsewhere in the track's life does not count) | `substringOnly` (the words decoded in the spot window, spaces removed, contain the call), `noCall` |
 | `selfIdRecognized` | a validator decision for the call that grammar, cty, the power-step guard and the beacon-evidence check did not reject | `rejected:<reason>`, `noDecision` |
 | `sufficientEvidence` | a decision that cleared the repetition, variant, zero-evidence and beacon gates | `<reason> <reps>/<required>` |
 | `emitted` | a spot for the call within the spot tolerances, or a `dedupe` withhold | `policy:blocklist`, `policy:notch`, `lookupPending`, `lookupNotFound`, `notEmitted` |

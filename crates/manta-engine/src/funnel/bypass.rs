@@ -9,7 +9,7 @@ use super::attribute::{
     attribute, DecisionFact, Evidence, Geometry, Opportunity, Record, SpotFact, Stage, Tolerances,
     TrackFacts,
 };
-use super::collect::{observe, spot_type_label, EventTrack};
+use super::collect::{observe, spot_type_label, timed, EventTrack};
 use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::decoder::TrackDecoder;
@@ -248,7 +248,8 @@ fn known_frequency_evidence(
         close: None,
         speeds: t.speeds.iter().map(|&(ts, w)| (secs(ts), w)).collect(),
         text: t.text.trim().to_string(),
-        readings: t.readings,
+        words: timed(t.words, secs),
+        readings: timed(t.readings, secs),
     };
     Ok(Evidence {
         tracks: vec![track],
