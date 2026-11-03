@@ -190,14 +190,30 @@ struct Stream {
     /// samples are never sent.
     skip: Option<(u32, u32)>,
     looping: bool,
+    /// The first socket manta streams from gets only this many datagrams,
+    /// then silence, so manta stalls and reconnects from a new one.
+    first_connection_datagrams: Option<u32>,
     /// Streaming waits for this too: set once manta is reading, as the
     /// ka9q acceptance test waits for the ready line, so a startup backlog
     /// cannot overflow the socket buffer.
     go: Arc<AtomicBool>,
 }
 
+/// Where the fake streams: manta's IQ socket as its run commands say.
+#[derive(Default)]
+struct Peer {
+    /// The latest run = 1 sender, cleared by that sender's run = 0.
+    current: Option<SocketAddr>,
+    /// Counts run = 1 senders, 1 for the first: a socket that starts
+    /// streaming again after its run = 0 counts anew, so a reconnect that
+    /// reuses the dead socket's port still gets a fresh pass.
+    connection: u32,
+}
+
 /// A loopback protocol-2 radio: discovery on `base`, bring-up on
-/// `base..=base+3`, DDC0 IQ from `base+11`.
+/// `base..=base+3`, DDC0 IQ from `base+11`. It streams to the latest
+/// socket that sent run = 1, as a radio does, so it follows manta across
+/// a reconnect; a new socket gets a fresh pass from block 0.
 struct FakeP2Radio {
     base: u16,
     stop: Arc<AtomicBool>,
@@ -214,7 +230,7 @@ impl FakeP2Radio {
     fn start_on(ip: [u8; 4], stream: Stream, done: mpsc::Sender<()>) -> Self {
         let (base, cmd, iq) = Self::bind(ip);
         let stop = Arc::new(AtomicBool::new(false));
-        let run_from: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let peer = Arc::new(Mutex::new(Peer::default()));
         let mut threads = Vec::new();
 
         // `base`: answer every discovery request (each reopen asks again).
@@ -234,9 +250,10 @@ impl FakeP2Radio {
             }
         }));
 
-        // `base+3`: remember where run = 1 came from (manta's IQ socket).
+        // `base+3`: follow run = 1 to manta's latest IQ socket, and stop on
+        // that socket's run = 0 (a late one from a dead socket is ignored).
         let high_priority = cmd[3].try_clone().unwrap();
-        let (s, r) = (stop.clone(), run_from.clone());
+        let (s, p) = (stop.clone(), peer.clone());
         threads.push(thread::spawn(move || {
             high_priority
                 .set_read_timeout(Some(Duration::from_millis(10)))
@@ -244,32 +261,45 @@ impl FakeP2Radio {
             let mut buf = vec![0u8; 65536];
             while !s.load(Ordering::SeqCst) {
                 if let Ok((n, from)) = high_priority.recv_from(&mut buf) {
-                    if n == HIGH_PRIORITY_LEN && buf[4] & 1 == 1 {
-                        *r.lock().unwrap() = Some(from);
+                    if n == HIGH_PRIORITY_LEN {
+                        let mut p = p.lock().unwrap();
+                        if buf[4] & 1 == 1 {
+                            if p.current != Some(from) {
+                                p.current = Some(from);
+                                p.connection += 1;
+                            }
+                        } else if p.current == Some(from) {
+                            p.current = None;
+                        }
                     }
                 }
             }
         }));
 
-        // `base+11`: stream once run = 1 has been seen, paced by the clock.
+        // `base+11`: stream to the current run = 1 sender, paced by the
+        // clock. A new sender starts a fresh pass from block 0; a finished
+        // or cut pass is not resent to the same socket.
         let s = stop.clone();
         threads.push(thread::spawn(move || {
-            let to = loop {
-                if s.load(Ordering::SeqCst) {
-                    return;
-                }
-                if let Some(to) = *run_from.lock().unwrap() {
-                    if stream.go.load(Ordering::SeqCst) {
-                        break to;
-                    }
-                }
-                thread::sleep(Duration::from_millis(5));
-            };
             let blocks = stream.samples.len().div_ceil(PER_DATAGRAM);
             let per_block = Duration::from_secs_f64(PER_DATAGRAM as f64 / (RATE * stream.speed));
-            let t0 = Instant::now();
-            let mut seq = 0u32;
+            let (mut streaming_to, mut t0, mut seq) = (None, Instant::now(), 0u32);
+            let mut finished: Option<u32> = None;
             while !s.load(Ordering::SeqCst) {
+                let target = {
+                    let p = peer.lock().unwrap();
+                    p.current
+                        .map(|to| (to, p.connection))
+                        .filter(|&(_, c)| stream.go.load(Ordering::SeqCst) && finished != Some(c))
+                };
+                let Some((to, connection)) = target else {
+                    streaming_to = None;
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                if streaming_to != Some(connection) {
+                    (streaming_to, t0, seq) = (Some(connection), Instant::now(), 0);
+                }
                 let due = t0 + per_block * seq;
                 let now = Instant::now();
                 if now < due {
@@ -277,8 +307,13 @@ impl FakeP2Radio {
                     continue;
                 }
                 let block = seq as usize;
-                if !stream.looping && block >= blocks {
-                    break;
+                let cut = connection == 1 && stream.first_connection_datagrams == Some(seq);
+                if cut || (!stream.looping && block >= blocks) {
+                    (finished, streaming_to) = (Some(connection), None);
+                    if !cut {
+                        let _ = done.send(());
+                    }
+                    continue;
                 }
                 let block = block % blocks;
                 let skipped = stream
@@ -291,7 +326,6 @@ impl FakeP2Radio {
                 }
                 seq = seq.wrapping_add(1);
             }
-            let _ = done.send(());
         }));
 
         // `base+1` and `base+2` stay bound (in `cmd`, moved into this
@@ -352,15 +386,36 @@ struct LiveRun {
     stderr: String,
 }
 
+impl LiveRun {
+    fn explain(&self) -> String {
+        explain(&self.stderr, &self.metrics)
+    }
+}
+
+/// What a failing live-run assertion prints: how often manta lost and
+/// regained the source, then its stderr and a `/metrics` body.
+fn explain(stderr: &str, metrics: &str) -> String {
+    let lost = stderr.lines().filter(|l| l.contains(" lost: ")).count();
+    let reconnected = stderr
+        .lines()
+        .filter(|l| l.contains(" reconnected after "))
+        .count();
+    format!(
+        "source lost {lost} time(s), reconnected {reconnected} time(s)\nstderr:\n{stderr}\nmetrics:\n{metrics}"
+    )
+}
+
 /// Run `manta run --hpsdr-host 127.0.0.1 --hpsdr-port <base> ... --json`
 /// (no `--hpsdr-protocol`) against a fake streaming `samples` at 2x,
-/// skipping `skip`. Returns every spot, a `/metrics` scrape taken once
-/// the stream has ended and `ready(metrics)` holds (or 10 s passed), and
-/// stderr.
+/// skipping `skip` and cutting the first connection after
+/// `first_connection_datagrams`. Returns every spot, a `/metrics` scrape
+/// taken once the stream has ended and `ready(metrics)` holds (or 10 s
+/// passed), and stderr.
 fn live_run(
     dir: &Path,
     samples: Arc<Vec<Complex32>>,
     skip: Option<(u32, u32)>,
+    first_connection_datagrams: Option<u32>,
     ready: impl Fn(&str) -> bool,
 ) -> LiveRun {
     let (done_tx, done_rx) = mpsc::channel();
@@ -371,6 +426,7 @@ fn live_run(
             speed: 2.0,
             skip,
             looping: false,
+            first_connection_datagrams,
             go: go.clone(),
         },
         done_tx,
@@ -428,21 +484,22 @@ fn live_run(
         }
     });
     let stderr_now = || err_lines.lock().unwrap().join("\n");
+    let explain_now = || {
+        explain(
+            &stderr_now(),
+            &scrape_metrics(metrics_port).unwrap_or_default(),
+        )
+    };
     ready_rx
         .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_else(|_| {
-            panic!(
-                "manta never printed {READY_MARKER:?}; stderr:\n{}",
-                stderr_now()
-            )
-        });
+        .unwrap_or_else(|_| panic!("manta never printed {READY_MARKER:?}; {}", explain_now()));
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("no spot within 60 s; stderr:\n{}", stderr_now()));
+        .unwrap_or_else(|_| panic!("no spot within 60 s; {}", explain_now()));
     done_rx
         .recv_timeout(Duration::from_secs(60))
-        .expect("the fake finished streaming");
+        .unwrap_or_else(|_| panic!("the fake never finished streaming; {}", explain_now()));
     // Let the last datagrams and a metrics tick land.
     let deadline = Instant::now() + Duration::from_secs(10);
     let metrics = loop {
@@ -463,21 +520,33 @@ fn live_run(
     }
 }
 
-fn assert_same_spot(live: &Spot, file: &Spot) {
+/// The run published exactly one spot, the file replay's `W1AW`, at its
+/// frequency and `sample_ts`. Every message carries `run.explain()`.
+fn assert_same_spot(run: &LiveRun, file: &Spot) {
     assert_eq!(file.0, "W1AW");
-    assert_eq!(live.0, file.0);
+    assert_eq!(
+        run.spots.len(),
+        1,
+        "spots: {:?}; {}",
+        run.spots,
+        run.explain()
+    );
+    let live = &run.spots[0];
+    assert_eq!(live.0, file.0, "{}", run.explain());
     assert!(
         (live.1 - file.1).abs() <= FREQ_TOLERANCE_HZ,
-        "protocol-2 spot at {} Hz, file replay at {} Hz",
+        "protocol-2 spot at {} Hz, file replay at {} Hz; {}",
         live.1,
-        file.1
+        file.1,
+        run.explain()
     );
     let off = live.2 as i64 - file.2 as i64;
     assert!(
         off.abs() <= SAMPLE_TS_TOLERANCE,
-        "protocol-2 spot at sample_ts {}, file replay at {} ({off:+})",
+        "protocol-2 spot at sample_ts {}, file replay at {} ({off:+}); {}",
         live.2,
-        file.2
+        file.2,
+        run.explain()
     );
 }
 
@@ -496,7 +565,7 @@ fn protocol2_radio_at_192k_spots_w1aw_like_the_file_replay() {
     let file = file_replay_spot(&wav);
     let samples = Arc::new(wav_samples(&wav));
     let health = r#"manta_source_health{source="hpsdr"}"#;
-    let run = live_run(dir.path(), samples, None, |m| {
+    let run = live_run(dir.path(), samples, None, None, |m| {
         metric_value(m, health) == Some(1)
     });
 
@@ -506,15 +575,14 @@ fn protocol2_radio_at_192k_spots_w1aw_like_the_file_replay() {
              firmware 21); connecting with protocol 2"
         ),
         "{}",
-        run.stderr
+        run.explain()
     );
-    assert_eq!(run.spots.len(), 1, "spots: {:?}", run.spots);
-    assert_same_spot(&run.spots[0], &file);
+    assert_same_spot(&run, &file);
     assert_eq!(
         metric_value(&run.metrics, health),
         Some(1),
         "{}",
-        run.metrics
+        run.explain()
     );
     // Exposed for the radio. Not pinned at 0: a CI kernel can drop
     // datagrams for real (this container dropped 10-213 at startup), and
@@ -526,7 +594,7 @@ fn protocol2_radio_at_192k_spots_w1aw_like_the_file_replay() {
         )
         .is_some(),
         "{}",
-        run.metrics
+        run.explain()
     );
 }
 
@@ -551,22 +619,95 @@ fn fifty_lost_datagrams_are_counted_and_keep_the_spot_clock_true() {
     let first = (3.0 * RATE / PER_DATAGRAM as f64) as u32;
     let dropped = r#"manta_input_dropped_packets_total{source="hpsdr"}"#;
     let gaps = r#"manta_input_gaps_detected_total{source="hpsdr"}"#;
-    let run = live_run(dir.path(), samples, Some((first, 50)), |m| {
+    let run = live_run(dir.path(), samples, Some((first, 50)), None, |m| {
         metric_value(m, dropped).unwrap_or(0) >= 50 && metric_value(m, gaps).unwrap_or(0) >= 1
     });
 
     assert!(
         metric_value(&run.metrics, dropped).unwrap_or(0) >= 50,
         "{}",
-        run.metrics
+        run.explain()
     );
     assert!(
         metric_value(&run.metrics, gaps).unwrap_or(0) >= 1,
         "{}",
-        run.metrics
+        run.explain()
     );
-    assert_eq!(run.spots.len(), 1, "spots: {:?}", run.spots);
-    assert_same_spot(&run.spots[0], &file);
+    assert_same_spot(&run, &file);
+}
+
+/// The first connection gets this many datagrams before the fake cuts it:
+/// 1 s of content at 192 kS/s (192,000 / 238, rounded up), so manta's
+/// first connection is productive and its stall reads as a disconnect.
+const FIRST_CONNECTION_DATAGRAMS: u32 = 807;
+
+/// Gherkin (MAN-459):
+///   Given a protocol-2 acceptance test whose manta stalls and reconnects on a new local port
+///   When the reconnected manta sends its run command
+///   Then the fake radio streams IQ to the new port
+///   And the test spots W1AW within its deadline
+///
+/// The spot clock moves by the cut pass's samples plus the outage manta
+/// reports (MAN-73), within the note's 0.1 s rounding.
+#[test]
+fn the_fake_radio_follows_manta_across_a_reconnect() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = v1_fixture(dir.path());
+    let file = file_replay_spot(&wav);
+    let samples = Arc::new(wav_samples(&wav));
+    let health = r#"manta_source_health{source="hpsdr"}"#;
+    let run = live_run(
+        dir.path(),
+        samples,
+        None,
+        Some(FIRST_CONNECTION_DATAGRAMS),
+        |m| metric_value(m, health) == Some(1),
+    );
+
+    for want in ["stalled: no IQ datagram for 10 s", "reconnecting in 1s"] {
+        assert!(
+            run.stderr.contains(want),
+            "missing {want:?}; {}",
+            run.explain()
+        );
+    }
+    let outage_s: f64 = run
+        .stderr
+        .lines()
+        .find_map(|l| {
+            l.split_once("source hpsdr reconnected after ")
+                .map(|(_, t)| t)
+        })
+        .and_then(|t| t.trim().strip_suffix('s'))
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("no reconnect note found; {}", run.explain()));
+    assert_eq!(
+        run.spots.len(),
+        1,
+        "spots: {:?}; {}",
+        run.spots,
+        run.explain()
+    );
+    let live = &run.spots[0];
+    assert_eq!(live.0, "W1AW", "{}", run.explain());
+    assert!(
+        (live.1 - file.1).abs() <= FREQ_TOLERANCE_HZ,
+        "protocol-2 spot at {} Hz, file replay at {} Hz; {}",
+        live.1,
+        file.1,
+        run.explain()
+    );
+    let cut = FIRST_CONNECTION_DATAGRAMS as f64 * PER_DATAGRAM as f64;
+    let shift = live.2 as f64 - file.2 as f64;
+    let off = shift - cut - outage_s * RATE;
+    assert!(
+        off.abs() <= 0.05 * RATE + SAMPLE_TS_TOLERANCE as f64,
+        "protocol-2 spot at sample_ts {}, file replay at {}: shift {shift:+} is {off:+} from \
+         {cut} cut samples plus a {outage_s} s outage; {}",
+        live.2,
+        file.2,
+        run.explain()
+    );
 }
 
 #[test]
@@ -582,6 +723,7 @@ fn check_reports_a_protocol2_radio() {
             speed: 1.0,
             skip: None,
             looping: true,
+            first_connection_datagrams: None,
             go: Arc::new(AtomicBool::new(true)),
         },
         done_tx,
@@ -632,6 +774,7 @@ fn check_discovers_a_protocol2_radio_without_an_address() {
             speed: 1.0,
             skip: None,
             looping: true,
+            first_connection_datagrams: None,
             go: Arc::new(AtomicBool::new(true)),
         },
         done_tx,
@@ -679,6 +822,7 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
                     speed: 2.0,
                     skip: None,
                     looping: true,
+                    first_connection_datagrams: None,
                     go: go.clone(),
                 },
                 done_tx.clone(),
@@ -730,8 +874,15 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("no spot within 60 s; stderr:\n{}", stderr_now()));
-    assert_eq!(spot.0, "W1AW");
+        .unwrap_or_else(|_| {
+            panic!(
+                "no spot within 60 s; {}",
+                explain(
+                    &stderr_now(),
+                    &scrape_metrics(metrics_port).unwrap_or_default()
+                )
+            )
+        });
     let healthy = |m: &str| {
         ["a", "b"].iter().all(|name| {
             metric_value(m, &format!("manta_source_health{{source=\"{name}\"}}")) == Some(1)
@@ -745,8 +896,9 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
         }
         thread::sleep(Duration::from_millis(200));
     };
-    assert!(healthy(&metrics), "{metrics}");
     let stderr = stderr_now();
+    assert_eq!(spot.0, "W1AW", "{}", explain(&stderr, &metrics));
+    assert!(healthy(&metrics), "{}", explain(&stderr, &metrics));
     for radio in &radios {
         assert!(
             stderr.contains(&format!(
@@ -754,7 +906,8 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
                  Orion II",
                 radio.base
             )),
-            "{stderr}"
+            "{}",
+            explain(&stderr, &metrics)
         );
     }
 }

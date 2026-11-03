@@ -90,12 +90,21 @@ This line was captured from `manta run --config` replaying the output of
 `null`:
 
 ```json
-{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"rst":null,"qrlQuery":false,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null,"seq":1}
+{"id":"W1AW:12534119743695398054:1:2006272:W1AW","source":"skimmer","timestamp":1700000020,"ingestedAt":1700000020,"frequency":14012362,"band":"20m","mode":"CW","dxCall":"W1AW","dxGrid":null,"dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W1AW","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":21,"snrRefHz":2500,"wpm":20,"baud":null,"rst":null,"qrlQuery":false,"decodeConfidence":0.5541629,"decoderVersion":"manta-0.1.0+d3bfa7c0c47a","channelizerResolutionHz":null,"seq":1}
+```
+
+An FT8 spot (MAN-323) has the same shape. This line is what
+`SpotMessage::from_ftx` renders for W1AW's `CQ W1AW FN31` heard at
+14075.234 kHz, -10 dB, in the slot starting 1730462415, with
+`station_callsign` `W3XYZ` and no station location configured:
+
+```json
+{"id":"W3XYZ:1730462400123456789:FT8:1730462415:W1AW","source":"skimmer","timestamp":1730462415,"ingestedAt":1730462415,"frequency":14075234,"band":"20m","mode":"FT8","dxCall":"W1AW","dxGrid":"FN31","dxLat":37.6,"dxLon":-91.87,"dxDxcc":291,"dxContinent":"NA","dxCqZone":5,"deCall":"W3XYZ","deGrid":null,"deLat":null,"deLon":null,"deDxcc":291,"deContinent":"NA","snr":-10,"snrRefHz":2500,"wpm":null,"baud":null,"rst":null,"qrlQuery":false,"decodeConfidence":null,"decoderVersion":"manta-0.1.0+d144e36b1789","channelizerResolutionHz":null,"seq":42}
 ```
 
 ## Fields
 
-Every spot object carries all 29 keys, in this order. Keys are never omitted; a
+Every spot object carries all 30 keys, in this order. Keys are never omitted; a
 missing value is JSON `null`. In the "Null?" column, "never" means the field
 cannot be `null`, "always" means manta sends `null` on every spot today, and
 "not today" means the field's type allows `null` but manta always fills it.
@@ -113,17 +122,24 @@ was met. Both states publish. This field is absent from the :7301 stream.
 Candidates with no finite positive character confidence never emit a spot;
 their live-state decision has reason `noEvidence` (MAN-106).
 
+FT8 and FT4 spots (MAN-323) use the same 30 keys in the same order, with
+`mode` `"FT8"` or `"FT4"`. The rows below say where their values differ from
+a CW spot's. They go to this stream only: telnet, the RBN uplink and CLI
+`--json` never carry them. No input produces them yet: the
+`[input].digital_modes` key that turns the decoder on is still to land under
+MAN-323.
+
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|
-| `id` | string | never | Unique key for this spot. Built today as `station_callsign:session_nonce:track_id:sample_ts:dxCall`, with `station_callsign` uppercased, including any RBN `-N` SSID. `session_nonce` is a hash of the file's contents when replaying a recording, so replaying the same recording again gives the same ids; for live input it is the session start time in nanoseconds. Treat `id` as an opaque key: do not parse it, because the composition may change. |
+| `id` | string | never | Unique key for this spot. FT8/FT4: `station_callsign:session_nonce:MODE:slot_start:dxCall`, with `slot_start` the slot's UTC start in Unix seconds. CW: built today as `station_callsign:session_nonce:track_id:sample_ts:dxCall`, with `station_callsign` uppercased, including any RBN `-N` SSID. `session_nonce` is a hash of the file's contents when replaying a recording, so replaying the same recording again gives the same ids; for live input it is the session start time in nanoseconds. Treat `id` as an opaque key: do not parse it, because the composition may change. |
 | `source` | string | never | Always `"skimmer"`. |
-| `timestamp` | integer | never | When the spot was heard, in Unix seconds (UTC, whole seconds). It is the session start time plus the spot's offset into the stream. For a replayed file the start time is the file's modification time, or `[input].replay_epoch` when set. |
+| `timestamp` | integer | never | When the spot was heard, in Unix seconds (UTC, whole seconds). It is the session start time plus the spot's offset into the stream. For a replayed file the start time is the file's modification time, or `[input].replay_epoch` when set. FT8/FT4: the UTC start of the slot the message was decoded in, rounded down (an FT4 slot starting at :07.5 reads :07). |
 | `ingestedAt` | integer | never | Unix seconds. manta sends the same value as `timestamp`; cqdx overwrites it with its own receipt time. |
-| `frequency` | integer | never | Spot frequency in Hz, rounded to the nearest Hz. It is an absolute RF frequency only when the source has an RF reference (MAN-34). |
+| `frequency` | integer | never | Spot frequency in Hz, rounded to the nearest Hz. It is an absolute RF frequency only when the source has an RF reference (MAN-34). FT8/FT4: the mode's dial frequency plus the decoder's audio offset. |
 | `band` | string | never | Amateur band label derived from the rounded `frequency`: `2200m`, `630m`, `160m`, `80m`, `60m`, `40m`, `30m`, `20m`, `17m`, `15m`, `12m`, `10m` or `6m`. `"unknown"` outside those allocations. Band edges are inclusive. |
-| `mode` | string | never | Always `"CW"`. |
+| `mode` | string | never | `"CW"`, `"RTTY"`, `"FT8"` or `"FT4"`: the mode the spot was decoded in. |
 | `dxCall` | string | never | The decoded callsign, as validated. It may carry a `/` designator such as `/P` or `/MM`. |
-| `dxGrid` | null | always | Maidenhead locator. Reserved by the contract; manta does not fill it. |
+| `dxGrid` | string or null | unless an FT8/FT4 `CQ` carried a grid | The 4-character Maidenhead locator from an FT8/FT4 `CQ` message (`"FN31"`). Always `null` on CW spots. |
 | `dxLat` | number or null | when unresolved | Latitude in degrees, north positive, of the `cty.dat` entry the call resolves to (an entity reference point, not the station's position). `null` when the call does not resolve, or carries `/MM` or `/AM`. |
 | `dxLon` | number or null | when unresolved | Longitude in degrees, east positive (manta flips `cty.dat`'s west-positive sign). `null` in the same cases as `dxLat`. |
 | `dxDxcc` | integer | never | ADIF DXCC entity number, for example `291` for the United States. `-1` (`UNKNOWN_DXCC`) when the call does not resolve. `0` (ADIF "not in any DXCC entity") when the call carries `/MM` or `/AM` after its first segment (MAN-136). |
@@ -135,12 +151,13 @@ their live-state decision has reason `noEvidence` (MAN-106).
 | `deLon` | number or null | when unconfigured | Longitude in degrees, east positive: `[server].operator_lon`, or the centre of `operator_grid`'s square. `null` in the same cases as `deLat`. |
 | `deDxcc` | integer | never | As `dxDxcc`, for the reporting station's callsign: `-1` when it does not resolve, `0` for `/MM` or `/AM`. |
 | `deContinent` | string | never | As `dxContinent`, for the reporting station's callsign. |
-| `snr` | integer | not today | Signal-to-noise ratio in dB, rounded, referenced to a 2500 Hz noise bandwidth (see `snrRefHz`). Telnet and the RBN uplink quote the same spot in 500 Hz, about 7 dB higher (MAN-102, decision D3). |
+| `snr` | integer | not today | Signal-to-noise ratio in dB, rounded, referenced to a 2500 Hz noise bandwidth (see `snrRefHz`). FT8/FT4: the decoder's own estimate, on WSJT-X's 2500 Hz reference. Telnet and the RBN uplink quote the same spot in 500 Hz, about 7 dB higher (MAN-102, decision D3). |
 | `snrRefHz` | integer | never | The reference bandwidth `snr` is quoted in, in Hz. Always `2500`. Not yet in the dispensa contract. |
-| `wpm` | integer | not today | Keying speed in words per minute, rounded. |
+| `wpm` | integer or null | unless CW | CW keying speed in words per minute, rounded. `null` on RTTY, FT8 and FT4 spots; an RTTY spot carries `baud` instead (MAN-322). |
+| `baud` | number or null | unless RTTY | RTTY symbol rate in baud, rounded to two decimals (`45.45` for standard amateur RTTY). `null` on CW, FT8 and FT4 spots. Agreed for `spots.v1` in dispensa Q-0085 (MAN-322). |
 | `rst` | string or null | when none decoded | The most recent RST signal report the spot's track decoded before the spot was sent, as three digits. The cut number `N` is read as `9`, so `5NN` is sent as `"599"`. `null` when the track decoded none. A three-digit contest serial without a `0` (`199`) reads as a report. A report decoded by a track that later merged into this one is not carried (MAN-272). Not yet in the dispensa contract. |
 | `qrlQuery` | boolean | never | `true` when the spot's track decoded `QRL?` ("is this frequency in use?") before the spot was sent. A bare `QRL` without the question mark does not count. Not yet in the dispensa contract (MAN-272). |
-| `decodeConfidence` | number | not today | Callsign confidence from 0 to 1 (SPEC-decode-core §4.6): the geometric mean of the per-character confidences times a repetition factor `1 - 0.5^r`, multiplied by 1.15 and capped at 1 when the call is in `master.scp`. |
+| `decodeConfidence` | number or null | on FT8/FT4 spots | `null` on FT8/FT4 spots: a decode that passed the FT8 CRC has no comparable score. CW: callsign confidence from 0 to 1 (SPEC-decode-core §4.6): the geometric mean of the per-character confidences times a repetition factor `1 - 0.5^r`, multiplied by 1.15 and capped at 1 when the call is in `master.scp`. |
 | `decoderVersion` | string | not today | Build identity, `manta-<version>+<commit>`, for example `manta-0.1.0+d3bfa7c0c47a`. The part after `+` is the commit as 12 lowercase hex digits, `unknown` (no `.git`), or a build-time `MANTA_GIT_SHA` override: any SemVer build-metadata string (dot-separated `[0-9A-Za-z-]` identifiers, at most 64 characters) kept verbatim, except that a full 40- or 64-hex commit is shortened to 12 digits. So it can be, for example, `20261010123045` or `release.1`; don't validate it as a SHA. Compare the part before `+` across releases; the whole string names the exact binary. It is not decoder output (MAN-83). |
 | `channelizerResolutionHz` | null | always | Reserved by the contract; manta does not fill it. |
 | `seq` | integer | never | This record's position in the session named by `hello`: 1 for the first spot or `spotGrade`, +1 per record in send order. See [Transport](#transport). Optional in dispensa's `spots.v1`; manta always sends it. |
@@ -163,9 +180,10 @@ graded spot is followed, once its comparison window has closed
 feed is silent), by one grade line on the same stream, raw TCP and
 WebSocket alike. Telnet and the RBN uplink never carry grades.
 
-Not every spot gets a grade. Spots refused because the comparator's pending
-queue was full, or lost because it fell behind the spot bus, are counted in
-`manta_rbn_compare_ungraded_total`. Spots still pending when the daemon
+Not every spot gets a grade. RTTY spots are never graded (RBN's reference
+feed is CW-only) and are not counted as ungraded (MAN-322). Spots refused
+because the comparator's pending queue was full, or lost because it fell
+behind the spot bus, are counted in `manta_rbn_compare_ungraded_total`. Spots still pending when the daemon
 stops are never graded. Do not wait for a grade that may not come.
 
 Tell the record shapes apart by the `kind` key. A spot has no `kind`
@@ -226,7 +244,10 @@ The cross-repo contract for this object is dispensa's
 `contracts/spots/spots.v1.schema.json` (ADR-0011). The dispensa repository is
 not publicly readable, so this page is the in-repo field reference. The one
 divergence today is `snrRefHz`, which the contract does not have yet; the
-proposed schema fragment is in the MAN-102 decision record below.
+proposed schema fragment is in the MAN-102 decision record below. `baud`,
+and `wpm` being `null` on an RTTY spot, were agreed for `spots.v1` in
+dispensa Q-0085; the proposed fragment is in the MAN-322 decision record
+below.
 
 Any change to what a field means follows the decoder-output rule in
 [CHANGELOG.md](../CHANGELOG.md): a change that alters decoder output is
@@ -266,3 +287,6 @@ MINOR version.
   [DECISIONS/2026-10-11-man301-live-rbn-comparison.md](DECISIONS/2026-10-11-man301-live-rbn-comparison.md)
   (MAN-301): the `SpotGrade` struct that builds every `spotGrade` field, the
   grading rules, and the proposed `spotGrade` contract fragment.
+- [DECISIONS/2026-11-01-man322-rtty-spot-outputs.md](DECISIONS/2026-11-01-man322-rtty-spot-outputs.md)
+  (MAN-322): `mode`, `baud` and the nullable `wpm`, and the proposed
+  `spots.v1` fragment.

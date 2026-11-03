@@ -71,6 +71,7 @@ async fn spawn_server(
             ),
             manta_server::tasks::CLIENT_DRAIN_DEADLINE,
             manta_server::rbn::LineFormat::Rbn,
+            manta_spot::SpotMode::Cw,
         )
         .await;
     });
@@ -91,6 +92,8 @@ fn sample_spot() -> Spot {
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     }
 }
 

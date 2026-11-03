@@ -1,6 +1,7 @@
 //! M0 pipeline: WAV -> frequency estimate -> single channel -> decoder.
 //! Grows into the PFB/track-manager engine at M2 (ARCHITECTURE §4, §10).
 
+pub mod cancel;
 pub mod check;
 pub mod config_file;
 pub mod listen;
@@ -23,7 +24,11 @@ pub use multi::{
     MAX_INPUTS,
 };
 pub mod quality;
+pub mod spectrum;
 pub use quality::{DecodeQualityObserver, DecodeQualitySnapshot, RAIL_RATIO_BUCKETS};
+pub use spectrum::{
+    spectrum_span, SpectrumFrame, SpectrumSink, SpectrumSpan, SPECTRUM_HOPS_PER_FRAME,
+};
 pub mod calibrate;
 pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
@@ -38,6 +43,7 @@ pub use soak_metrics::{
 };
 
 mod digital_windows;
+pub mod ftx;
 #[cfg(test)]
 mod static_crash_tests;
 mod track;
@@ -51,7 +57,7 @@ use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
 use manta_decode::timing::TimingEstimates;
-use manta_input::{IqSource, WavIqSource};
+use manta_input::{IqSource, ReadContinuity, WavIqSource};
 use num_complex::Complex32;
 use std::path::Path;
 use std::sync::Arc;
@@ -74,11 +80,13 @@ pub(crate) fn calibrate_freq_events(ev: &DecoderEvent, factor: f64) -> DecoderEv
             sample_ts,
             snr_2500_db,
             freq_hz,
+            last_char_ts,
         } => DecoderEvent::TrackMeta {
             track_id: *track_id,
             sample_ts: *sample_ts,
             snr_2500_db: *snr_2500_db,
             freq_hz: freq_hz * factor,
+            last_char_ts: *last_char_ts,
         },
         DecoderEvent::TrackPromoted {
             track_id,
@@ -280,6 +288,38 @@ fn bad_samples_suffix(n: u64) -> String {
         MAX_SAMPLE_MAGNITUDE
     )
 }
+
+/// MAN-204: `decode_source`'s "no signal found" error, typed so a caller
+/// can tell "nothing decodable" from a real failure without matching the
+/// message. Its `Display` text is the exact pre-MAN-204 message:
+/// `no signal found ({reason})` plus the MAN-234 bad-samples suffix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoSignal {
+    reason: &'static str,
+    suffix: String,
+}
+
+impl NoSignal {
+    fn new(reason: &'static str, bad_samples: u64) -> Self {
+        NoSignal {
+            reason,
+            suffix: bad_samples_suffix(bad_samples),
+        }
+    }
+
+    /// The parenthesised reason, e.g. "no keyed CW signal in the input".
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+}
+
+impl std::fmt::Display for NoSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no signal found ({}){}", self.reason, self.suffix)
+    }
+}
+
+impl std::error::Error for NoSignal {}
 
 /// MAN-314: one marked RTTY signal (SPEC §2.6), frequencies calibrated
 /// like `TrackMeta::freq_hz`. `marked_sample_ts`/`cleared_sample_ts` are
@@ -543,18 +583,32 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         while !eof && filled < CHUNK_SAMPLES && carry.is_empty() {
             let n = src.read(&mut chunk[filled..])?;
             if n == 0 {
+                // MAN-201: a stall is not an end of stream.
+                if src.take_stalled() {
+                    continue;
+                }
                 eof = true;
                 break;
             }
             nonzero |= chunk[filled..filled + n]
                 .iter()
                 .any(|s| s.re != 0.0 || s.im != 0.0);
-            if let Some(missing) = src.take_discontinuity() {
+            // MAN-202: every gap report is taken here. `missing_samples` is
+            // still ignored by file decode, as before (a follow-up: make
+            // `decode_source` honour `take_missing_samples`).
+            let cont = ReadContinuity::take(src);
+            if let Some(missing) = cont.discontinuity {
                 // These samples follow the outage: they open the next
                 // segment, after this one's partial chunk.
                 carry.extend_from_slice(&chunk[filled..filled + n]);
                 gap = Some(missing);
                 break;
+            }
+            if cont.unknown_gap {
+                // MAN-202: an unknown-length loss before data sample
+                // `consumed` of this segment; see `listen`'s main loop.
+                seg.tm
+                    .note_input_gap(track::first_hop_after_gap(consumed, seg.hop));
             }
             filled += n;
             consumed += n as u64;
@@ -590,15 +644,15 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         consumed = 0;
     }
     // MAN-258: a stream that ended during an outage is not an end of signal.
-    let terminal_gap = src.take_discontinuity().is_some();
+    // MAN-202: nor one that ended with an unknown gap pending (both taken).
+    let terminal_gap = src.take_discontinuity().is_some() | src.take_unknown_gap();
     if !nonzero {
         bail!("input is digital silence");
     }
     bad_samples += seg.ch.bad_samples();
     if !any_hops {
-        bail!(
-            "no signal found (input shorter than one filter length or empty){}",
-            bad_samples_suffix(bad_samples)
+        return Err(
+            NoSignal::new("input shorter than one filter length or empty", bad_samples).into(),
         );
     }
     let end = seg
@@ -623,17 +677,15 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     // were produced, so the input was long enough; with `non_cw_filter` on
     // an input of only speech, data or swept carriers lands here.
     if events.is_empty() && rtty.is_empty() {
-        bail!(
-            "no signal found (no keyed CW signal in the input){}",
-            bad_samples_suffix(bad_samples)
-        );
+        return Err(NoSignal::new("no keyed CW signal in the input", bad_samples).into());
     }
     let min_track_id = primary_track_id(&events);
     if min_track_id.is_none() && rtty.is_empty() {
-        bail!(
-            "no signal found (only detector promotion events, no decoder output){}",
-            bad_samples_suffix(bad_samples)
-        );
+        return Err(NoSignal::new(
+            "only detector promotion events, no decoder output",
+            bad_samples,
+        )
+        .into());
     }
     let this_track: Vec<DecoderEvent> = events
         .iter()
@@ -832,6 +884,7 @@ mod tests {
                 sample_ts: 15,
                 snr_2500_db: 20.0,
                 freq_hz: 14_012_340.0,
+                last_char_ts: 0,
             },
             DecoderEvent::CharDecoded {
                 track_id: 2,
@@ -1050,6 +1103,25 @@ mod tests {
                 "clearedSampleTs"
             ]
         );
+    }
+
+    #[test]
+    fn no_signal_errors_keep_their_text_and_downcast() {
+        let cfg = PipelineConfig::default();
+        let noise = manta_testkit::scene::render_scene(&[], 96_000.0, 10.0, Some(204))
+            .unwrap()
+            .0;
+        let err = decode_samples(&noise, 96_000.0, 14_000_000.0, &cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("no signal found (no keyed CW signal in the input)"),
+            "{err}"
+        );
+        let typed = err.downcast_ref::<NoSignal>().expect("typed NoSignal");
+        assert_eq!(typed.reason(), "no keyed CW signal in the input");
+        let silence = vec![Complex32::new(0.0, 0.0); 96_000];
+        let err = decode_samples(&silence, 96_000.0, 14_000_000.0, &cfg).unwrap_err();
+        assert!(err.downcast_ref::<NoSignal>().is_none(), "{err}");
     }
 
     #[test]

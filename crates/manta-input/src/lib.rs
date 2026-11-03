@@ -35,6 +35,7 @@ pub use recording::{
     start_recording, RecordingHandle, RecordingNotice, RecordingOutcome, RecordingSource,
 };
 
+mod overflow;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]
@@ -243,6 +244,32 @@ pub trait IqSource {
         None
     }
 
+    /// MAN-202: whether the source lost samples of *unknown* count immediately
+    /// before the samples returned by the most recent `read()` -- a SoapySDR
+    /// driver overflow reports that its ring dropped data, not how much.
+    /// Returns `true` once, then `false` until the next such loss. Default
+    /// `false`. There is no count, so the engine neither moves its sample clock
+    /// (spot timestamps after the loss run early by the lost time) nor rebuilds
+    /// the segment: it invalidates every track's continuity-dependent decode
+    /// state at the gap (`manta_engine::track::TrackManager::note_input_gap`).
+    /// Never report an unknown loss as `take_discontinuity(Some(0))`.
+    /// **Wrapper types must forward this**, as they forward the two counted
+    /// gap hooks.
+    fn take_unknown_gap(&mut self) -> bool {
+        false
+    }
+
+    /// MAN-201: `true` once for a live stream that has just stopped and may
+    /// come back. `read` returns `Ok(0)` with this set, and the `0` is not an
+    /// end of stream: the caller settles what it holds and reads again. A
+    /// stalled stream delivers no hops, so nothing else would end a track
+    /// and settle its last call before the stream recovers.
+    ///
+    /// **Wrapper types must forward this**, as they forward the gap hooks.
+    fn take_stalled(&mut self) -> bool {
+        false
+    }
+
     /// MAN-259: how far into this connection's `open()` call the stream
     /// `read()` returns began -- the offset from the call starting to
     /// immediately before the call that told the hardware to start
@@ -284,10 +311,45 @@ pub trait IqSource {
     /// **Wrapper types must forward this**, exactly as `manta-cli`'s
     /// `FixedCenterFreqSource` does -- the default `None` otherwise
     /// silently swallows the inner source's counters. The same holds for
-    /// both gap hooks, `take_discontinuity` and `take_missing_samples`
-    /// (MAN-305). Not enforceable by the type system; see that impl.
+    /// all three gap hooks, `take_discontinuity`, `take_missing_samples`
+    /// (MAN-305) and `take_unknown_gap` (MAN-202). Not enforceable by the
+    /// type system; see that impl.
     fn health_counters(&self) -> Option<std::sync::Arc<InputHealthCounters>> {
         None
+    }
+}
+
+/// MAN-202: every gap report one `read()` left pending, taken together.
+///
+/// The engine's read loops take all three hooks through
+/// [`ReadContinuity::take`] and nowhere else, so a loop cannot read one hook
+/// and forget another (MAN-305's lesson: `decode_source` and the calibration
+/// fill each once missed a hook). This is the seed of the "discontinuity
+/// status" field of investigation 12's source block
+/// (docs/DECISIONS/2026-09-09-decoder-recall-research.md).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadContinuity {
+    /// [`IqSource::take_missing_samples`]: a known-length loss the source
+    /// spliced over.
+    pub missing_samples: Option<u64>,
+    /// [`IqSource::take_discontinuity`]: a known-length outage.
+    pub discontinuity: Option<u64>,
+    /// [`IqSource::take_unknown_gap`]: a loss of unknown length.
+    pub unknown_gap: bool,
+}
+
+impl ReadContinuity {
+    /// Take every gap hook of `src` once, in the order the engine has always
+    /// read them: missing samples, then discontinuity, then unknown gap.
+    pub fn take(src: &mut (impl IqSource + ?Sized)) -> Self {
+        let missing_samples = src.take_missing_samples();
+        let discontinuity = src.take_discontinuity();
+        let unknown_gap = src.take_unknown_gap();
+        Self {
+            missing_samples,
+            discontinuity,
+            unknown_gap,
+        }
     }
 }
 
@@ -535,6 +597,77 @@ fn unsupported_wav(format: hound::SampleFormat, bits: u16) -> anyhow::Error {
 
 #[cfg(test)]
 mod tests {
+
+    /// A source with every gap report pending once (MAN-202).
+    struct AllGaps {
+        missing: Option<u64>,
+        disc: Option<u64>,
+        unknown: bool,
+    }
+
+    impl IqSource for AllGaps {
+        fn sample_rate(&self) -> f64 {
+            96_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+        fn take_missing_samples(&mut self) -> Option<u64> {
+            self.missing.take()
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.disc.take()
+        }
+        fn take_unknown_gap(&mut self) -> bool {
+            std::mem::take(&mut self.unknown)
+        }
+    }
+
+    struct Minimal;
+
+    impl IqSource for Minimal {
+        fn sample_rate(&self) -> f64 {
+            96_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, _buf: &mut [Complex32]) -> Result<usize> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn read_continuity_takes_every_hook_once() {
+        let mut src = AllGaps {
+            missing: Some(7),
+            disc: Some(11),
+            unknown: true,
+        };
+        assert_eq!(
+            ReadContinuity::take(&mut src),
+            ReadContinuity {
+                missing_samples: Some(7),
+                discontinuity: Some(11),
+                unknown_gap: true,
+            }
+        );
+        assert_eq!(ReadContinuity::take(&mut src), ReadContinuity::default());
+        let dyn_src: &mut dyn IqSource = &mut src;
+        assert_eq!(ReadContinuity::take(dyn_src), ReadContinuity::default());
+    }
+
+    #[test]
+    fn default_source_reports_no_unknown_gap() {
+        assert!(!Minimal.take_unknown_gap());
+        assert_eq!(
+            ReadContinuity::take(&mut Minimal),
+            ReadContinuity::default()
+        );
+    }
 
     #[test]
     fn unsupported_wav_text_names_sample_formats() {

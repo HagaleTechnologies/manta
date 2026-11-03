@@ -109,7 +109,7 @@ fn decode_recorded(src: Box<dyn IqSource>, path: &std::path::Path) -> DecodeRepo
     let (mut rec, handle) = start_recording(src, path, start, None).unwrap();
     let report = decode_source(&mut rec, &PipelineConfig::default()).unwrap();
     drop(rec);
-    match handle.finish(Duration::from_secs(5)) {
+    match handle.finish(Duration::from_secs(5), Duration::ZERO) {
         RecordingOutcome::Finished { .. } => {}
         other => panic!("recording did not finish: {other:?}"),
     }
@@ -301,7 +301,7 @@ fn listen_round_trip(split: usize, name: &str, expect_closure: bool) {
     let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_407_600);
     let (rec, handle) = start_recording(Box::new(source()), &path, start, None).unwrap();
     assert_eq!(listen_events(Box::new(rec)), want);
-    match handle.finish(Duration::from_secs(5)) {
+    match handle.finish(Duration::from_secs(5), Duration::ZERO) {
         RecordingOutcome::Finished { samples, .. } => {
             assert_eq!(samples, r.samples.len() as u64)
         }

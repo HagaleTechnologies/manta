@@ -308,9 +308,10 @@ impl ClientCtx {
         }
     }
 
-    /// One stream line: a spot rendered as today, or a MAN-301 `spotGrade`
-    /// record, already serialised, passed through verbatim. Both shapes,
-    /// and the `kind` key that tells them apart, are in `docs/SPOT-SCHEMA.md`.
+    /// One stream line: a spot rendered as today, an FT8/FT4 spot (MAN-323)
+    /// in the same shape, or a MAN-301 `spotGrade` record, already
+    /// serialised, passed through verbatim. The shapes, and the `kind` key
+    /// that tells them apart, are in `docs/SPOT-SCHEMA.md`.
     fn render(&self, item: &JsonItem) -> String {
         let (seq, bus_spot, rendered) = match item {
             JsonItem::Spot {
@@ -318,6 +319,15 @@ impl ClientCtx {
                 spot,
                 rendered,
             } => (seq, spot, rendered),
+            JsonItem::Ftx {
+                seq,
+                spot,
+                rendered,
+            } => {
+                return rendered
+                    .get_or_init(|| self.render_ftx(*seq, spot).into())
+                    .to_string()
+            }
             JsonItem::Grade { line, .. } | JsonItem::Live(line) => return line.to_string(),
         };
         // MAN-137: replay must repeat a record's contents, so the first
@@ -340,6 +350,21 @@ impl ClientCtx {
             &cty,
             &self.decoder_version,
             unix_ts,
+            self.bus.session_nonce(),
+            seq,
+        );
+        serde_json::to_string(&msg).expect("SpotMessage always serializes")
+    }
+
+    /// MAN-323: an FT8/FT4 spot against the client's current `cty.dat`.
+    fn render_ftx(&self, seq: u64, spot: &crate::spot_message::FtxSpot) -> String {
+        let cty = self.lists.cty.load();
+        let msg = SpotMessage::from_ftx(
+            spot,
+            &self.station_call,
+            self.station_location.as_ref(),
+            &cty,
+            &self.decoder_version,
             self.bus.session_nonce(),
             seq,
         );
@@ -1416,6 +1441,8 @@ mod tests {
                     sample_ts: 0,
                     rst: None,
                     qrl_query: false,
+                    mode: manta_spot::SpotMode::Cw,
+                    baud: None,
                 },
                 occurrence_count: 1,
             },

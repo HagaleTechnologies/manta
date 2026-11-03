@@ -76,6 +76,11 @@ station_callsign = "N0CALL"
 #live_port = 7303                    # live-state stream (JSON Lines/WebSocket)
 #live_bind_addr = "127.0.0.1"        # live-state listener address
 
+# RTTY telnet server: the same greeting, commands and line_format as
+# telnet_port, serving RTTY spots only (telnet_port serves CW spots only).
+# Off unless set. Listens on bind_addr.
+#rtty_telnet_port = 7304             # RTTY-only DX-cluster telnet server
+
 # Telnet spot-line layout: "rbn" (the Reverse Beacon Network's layout,
 # which most loggers read) or "skimmer" (CW Skimmer's own layout, for
 # running behind an Aggregator).
@@ -288,13 +293,29 @@ station_callsign = "N0CALL"
 # overwritten, so a restart needs a new name. No default: no recording.
 #record_iq = "captures/session.cf32"
 
+# `manta run` only: send this input's spectrum to N1MM+'s Spectrum Display
+# (N1MM+ listens on UDP 13064), about 3 times a second, as CW Skimmer's
+# "Send Spectrum via UDP" does. Needs a real RF frequency. No default:
+# send nothing.
+#spectrum_udp = "127.0.0.1:13064"
+# The source name N1MM+ lists for this feed. No default: "manta <name>".
+#spectrum_name = "manta 20m"
+
 
 # --- Spot filters ------------------------------------------------------------
 
 [spot]
 
-# Callsigns always spotted, skipping the plausibility checks, for example
-# ["W1AW", "K1ABC"]. A non-empty --allowlist replaces this list.
+# Callsigns that skip the plausibility checks (grammar, country allocation,
+# repetition), for example ["W1AW", "K1ABC"]. A listed call is still not
+# spotted where the decoded exchange shows it was only called or mentioned:
+# "W1AW DE K1ABC" spots K1ABC, never W1AW. A call followed by a lone "T" (a
+# beacon ID ending in long power-step dashes) spots as BEACON only when it is
+# listed here. The 18 NCDXF/IARU beacons are:
+# ["4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O",
+#  "VR2B", "4S7B", "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA",
+#  "OA4B", "YV5B"]
+# A non-empty --allowlist replaces this list.
 #allowlist = []
 
 # File of callsigns never to spot, one per line; `#` starts a comment.

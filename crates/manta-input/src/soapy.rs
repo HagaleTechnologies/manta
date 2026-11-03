@@ -7,10 +7,14 @@
 //! silent: each `ErrorCode::Overflow` records a gap event on the shared
 //! `InputHealthCounters` (`health_counters`, MAN-233) and fires a
 //! rate-limited operator notice (`with_overflow_notice`), so a dropping
-//! host is not mistaken for a quiet band. An overflow a driver reports
-//! only as the `SOAPY_SDR_END_ABRUPT` flag on a successful read is not
-//! counted: soapysdr 0.5.1's `RxStream::read` keeps the read flags private.
+//! host is not mistaken for a quiet band. Since MAN-202 each overflow is
+//! also reported through `take_unknown_gap`, so the engine invalidates its
+//! tracks' timing state instead of decoding the splice as Morse. An overflow
+//! a driver reports only as the `SOAPY_SDR_END_ABRUPT` flag on a successful
+//! read is not counted: soapysdr 0.5.1's `RxStream::read` keeps the read
+//! flags private.
 
+use crate::overflow::{account_overflow, UnknownGapLatch};
 use crate::InputHealthCounters;
 use crate::IqSource;
 use anyhow::Result;
@@ -40,6 +44,8 @@ pub struct SoapySdrIqSource {
     /// overflow. The rate-limit gate's state, kept where the events live so
     /// a burst inside one `read()` logs at most once.
     last_overflow_warn: Option<Instant>,
+    /// MAN-202: set by every overflow, taken by `take_unknown_gap()`.
+    unknown_gap: UnknownGapLatch,
     /// MAN-259: `open`'s runtime up to `stream.activate`; surfaced by
     /// `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
@@ -78,39 +84,6 @@ const MAX_TIMEOUT_RETRIES: u32 = 20;
 /// of overflows this long means the host genuinely can't keep up, which
 /// should surface as a real error instead of spinning forever.
 const MAX_OVERFLOW_RETRIES: u32 = 100;
-
-/// How often the operator overflow notice may fire (MAN-233). Fixed, not
-/// configurable: it matches the MAN-122 status-line default interval, and
-/// the counter carries the fine-grained data -- the warning only has to say
-/// "this is happening", not how often.
-const OVERFLOW_WARN_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Account one driver ring-buffer overflow (the field reality
-/// `MAX_OVERFLOW_RETRIES`' doc records): exactly one gap *event* -- an
-/// `ErrorCode::Overflow` carries no lost-sample count, so nothing is ever
-/// `record_dropped` and `dropped_packets` stays 0 -- and the operator
-/// notice only when the rate-limit gate is open. Free-function shape after
-/// kiwi's `account_snd_frame` so the count/rate-limit semantics are
-/// unit-testable with crafted `Instant`s and no device (MAN-233; the
-/// `soapy` feature cannot compile in the implement container).
-fn account_overflow(
-    counters: &InputHealthCounters,
-    last_warn: &mut Option<Instant>,
-    notice: &Option<Box<dyn Fn() + Send + Sync>>,
-    now: Instant,
-) {
-    counters.record_gap();
-    let gate_open = match *last_warn {
-        Some(last) => now.duration_since(last) >= OVERFLOW_WARN_INTERVAL,
-        None => true,
-    };
-    if gate_open {
-        *last_warn = Some(now);
-        if let Some(notice) = notice {
-            notice();
-        }
-    }
-}
 
 impl SoapySdrIqSource {
     /// Open `driver_args` (e.g. `"driver=rtlsdr"`), tune to `fs`/
@@ -179,6 +152,7 @@ impl SoapySdrIqSource {
             health: Arc::new(InputHealthCounters::new()),
             overflow_notice: None,
             last_overflow_warn: None,
+            unknown_gap: UnknownGapLatch::default(),
             acquisition_start_offset,
         })
     }
@@ -210,6 +184,12 @@ impl IqSource for SoapySdrIqSource {
         self.acquisition_start_offset
     }
 
+    /// MAN-202: every `ErrorCode::Overflow` dropped samples of unknown
+    /// count before the next successful read; reported once per read.
+    fn take_unknown_gap(&mut self) -> bool {
+        self.unknown_gap.take()
+    }
+
     /// A per-call SoapySDR read timeout (`ErrorCode::Timeout`) or buffer
     /// overflow (`ErrorCode::Overflow`) is a normal, expected event on a
     /// live stream -- neither is end-of-stream nor fatal on its own -- so
@@ -220,7 +200,9 @@ impl IqSource for SoapySdrIqSource {
     /// retried: each one is counted as a gap event on the shared
     /// `InputHealthCounters` (see `health_counters`) and, at most once per
     /// `OVERFLOW_WARN_INTERVAL`, fires the operator notice injected with
-    /// `with_overflow_notice`. A `Timeout` counts nothing -- that is how a
+    /// `with_overflow_notice`, and (MAN-202) is latched as an unknown gap
+    /// reported by `take_unknown_gap` after the read that resumes. A
+    /// `Timeout` counts and latches nothing -- that is how a
     /// quiet band presents, and counting it would recreate the
     /// dropped-input/quiet-band confusion MAN-233 removes. Only the error
     /// form is seen: SoapySDR also defines `SOAPY_SDR_END_ABRUPT`, the flag
@@ -246,12 +228,15 @@ impl IqSource for SoapySdrIqSource {
                 }
                 Err(e) if e.code == ErrorCode::Overflow => {
                     // Before the retry-bound check so the bound's own
-                    // `bail!` overflow is counted too (MAN-233).
+                    // `bail!` overflow is counted too (MAN-233). The
+                    // latch tells the engine the next samples are not
+                    // contiguous with the last ones (MAN-202).
                     account_overflow(
                         &self.health,
                         &mut self.last_overflow_warn,
                         &self.overflow_notice,
                         Instant::now(),
+                        &mut self.unknown_gap,
                     );
                     overflow_retries += 1;
                     if overflow_retries >= MAX_OVERFLOW_RETRIES {
@@ -329,70 +314,6 @@ mod tests {
             result.is_err(),
             "expected Err reading from type=null's stream (NotSupported)"
         );
-    }
-
-    /// MAN-233 decision 1/4: one overflow is exactly one gap *event* -- an
-    /// `ErrorCode::Overflow` carries no lost-sample count, so nothing is
-    /// ever `record_dropped` -- and only `Overflow` counts: a `Timeout` is
-    /// how a quiet band presents and must not move any counter.
-    #[test]
-    fn account_overflow_counts_one_gap_event_per_overflow_and_nothing_else() {
-        let counters = InputHealthCounters::new();
-        let mut last_warn = None;
-        let now = Instant::now();
-        for _ in 0..3 {
-            account_overflow(&counters, &mut last_warn, &None, now);
-        }
-        assert_eq!(counters.gaps_detected(), 3);
-        assert_eq!(counters.dropped_packets(), 0);
-        assert_eq!(counters.malformed_packets(), 0);
-    }
-
-    /// MAN-233 decision 2: the notice fires on the first overflow, then at
-    /// most once per OVERFLOW_WARN_INTERVAL. Deterministic `Instant`
-    /// arithmetic, no sleeping -- a burst of N overflows inside one
-    /// `read()` yields at most one line.
-    #[test]
-    fn account_overflow_notice_is_rate_limited_to_the_interval() {
-        let counters = InputHealthCounters::new();
-        let mut last_warn = None;
-        // The notice box is `dyn Fn() + Send + Sync + 'static`, so the
-        // closure must own its counter: share it through an `Arc`.
-        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let fired_in_notice = std::sync::Arc::clone(&fired);
-        let notice: Option<Box<dyn Fn() + Send + Sync>> = Some(Box::new(move || {
-            fired_in_notice.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }));
-
-        let t0 = Instant::now();
-        account_overflow(&counters, &mut last_warn, &notice, t0);
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(last_warn, Some(t0));
-
-        // A burst within the interval: counted, but silent.
-        account_overflow(
-            &counters,
-            &mut last_warn,
-            &notice,
-            t0 + Duration::from_secs(30),
-        );
-        account_overflow(
-            &counters,
-            &mut last_warn,
-            &notice,
-            t0 + Duration::from_secs(59),
-        );
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert_eq!(last_warn, Some(t0), "gate closed: last_warn must not move");
-
-        // At exactly the interval the gate opens again.
-        let t1 = t0 + OVERFLOW_WARN_INTERVAL;
-        account_overflow(&counters, &mut last_warn, &notice, t1);
-        assert_eq!(fired.load(std::sync::atomic::Ordering::SeqCst), 2);
-        assert_eq!(last_warn, Some(t1));
-
-        // Every event still counted, notice or not.
-        assert_eq!(counters.gaps_detected(), 4);
     }
 
     /// MAN-233 Scenario 1 at source level, on real SoapySDR code,

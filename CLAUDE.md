@@ -23,6 +23,10 @@ packaging,package_release,score_against_rbn_replay,ci_gates,verify_dependabot_di
 decisions_index,field_node}
 cargo clippy -p manta-input -p manta-cli --all-targets --features hpsdr --locked -- -D warnings
 cargo test -p manta-input -p manta-cli --features hpsdr --locked
+# MAN-323 (Linux/macOS only): the FT8/FT4 decoder behind the `ftx` feature
+cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
+cargo test -p manta-engine --features ftx --locked --lib ftx
+cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
 ```
 
 ## Status

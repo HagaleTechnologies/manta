@@ -888,7 +888,9 @@ criteria.
 ## Non-goals
 
 - Not an interactive receiver or panadapter. Use SDR++ or similar for a
-  waterfall.
+  waterfall. manta can feed N1MM+'s Spectrum Display the power spectrum it
+  already computes (`[input] spectrum_udp`, MAN-141), but it draws no
+  waterfall or band scope itself.
 - Not a general digital-mode skimmer. manta decodes no FT8 or RTTY (FT8 and
   RTTY decoding are out of scope for 1.0, though the channelizer
   architecture does not preclude them later). It can forward WSJT-X's
@@ -925,6 +927,8 @@ researchers each start, and lists every runbook.
 (KiwiSDR etiquette) · [docs/GUIDES/raspberry-pi.md](docs/GUIDES/raspberry-pi.md)
 (Pi install and service) · [docs/GUIDES/ka9q-radio.md](docs/GUIDES/ka9q-radio.md)
 (a ka9q-radio (radiod) channel over multicast) ·
+[docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md)
+(a receiver's spectrum in N1MM+'s Spectrum Display) ·
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what

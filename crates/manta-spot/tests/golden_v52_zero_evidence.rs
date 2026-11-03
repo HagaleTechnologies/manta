@@ -85,6 +85,7 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
 }
 
@@ -210,6 +211,8 @@ fn v52_emission_state_serializes_camel_case_and_documented_labels() {
         sample_ts: 4_123_456,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     };
     let json = serde_json::to_string(&base).unwrap();
     assert!(

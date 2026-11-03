@@ -127,7 +127,7 @@ fn a_recorded_source_reads_exactly_like_the_bare_one_and_replays_its_trace() {
     assert_eq!(rec.analytic_guard_hz(), 600.0);
     assert_eq!(trace(&mut rec), bare);
     drop(rec);
-    let outcome = handle.finish(Duration::from_secs(5));
+    let outcome = handle.finish(Duration::from_secs(5), Duration::ZERO);
     assert_eq!(
         outcome,
         RecordingOutcome::Finished {
@@ -174,7 +174,7 @@ fn a_source_error_passes_through_and_the_prefix_is_finalized_as_stopped() {
     let t = trace(&mut rec);
     assert_eq!(t.last().unwrap().0, Err("device lost".to_string()));
     drop(rec);
-    match handle.finish(Duration::from_secs(5)) {
+    match handle.finish(Duration::from_secs(5), Duration::ZERO) {
         RecordingOutcome::Finished {
             samples, reason, ..
         } => assert_eq!((samples, reason), (100, EndReason::Stopped)),
@@ -195,7 +195,7 @@ fn an_empty_capture_finalizes() {
     .unwrap();
     drop(rec);
     assert!(matches!(
-        handle.finish(Duration::from_secs(5)),
+        handle.finish(Duration::from_secs(5), Duration::ZERO),
         RecordingOutcome::Finished { samples: 0, .. }
     ));
     assert_eq!(
@@ -271,7 +271,7 @@ fn two_recorders_racing_for_one_destination_get_one_winner() {
     .is_err());
     drop(rec);
     assert!(matches!(
-        handle.finish(Duration::from_secs(5)),
+        handle.finish(Duration::from_secs(5), Duration::ZERO),
         RecordingOutcome::Finished { .. }
     ));
 }
@@ -301,7 +301,7 @@ fn concurrent_recorders_for_one_destination_get_one_winner() {
                             let mut buf = vec![Complex32::new(0.0, 0.0); 16];
                             while rec.read(&mut buf).unwrap() > 0 {}
                             drop(rec);
-                            Ok(handle.finish(Duration::from_secs(5)))
+                            Ok(handle.finish(Duration::from_secs(5), Duration::ZERO))
                         }
                         Err(e) => Err(e.to_string()),
                     }
@@ -381,7 +381,7 @@ fn an_end_after_a_stop_request_is_a_stopped_recording() {
         stop.store(stopping, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(rec.read(&mut buf).unwrap(), 0);
         drop(rec);
-        match handle.finish(Duration::from_secs(5)) {
+        match handle.finish(Duration::from_secs(5), Duration::ZERO) {
             RecordingOutcome::Finished {
                 samples: 10,
                 reason,
@@ -469,7 +469,7 @@ fn the_recorder_forwards_every_live_hook_and_records_a_gap_before_a_multi_block_
     assert_eq!(t[1].1, Some(4_800));
     assert_eq!(t[1].2, bits(&block(100, 13_000)));
     drop(rec);
-    match handle.finish(Duration::from_secs(5)) {
+    match handle.finish(Duration::from_secs(5), Duration::ZERO) {
         RecordingOutcome::Finished { samples, .. } => assert_eq!(samples, 13_100),
         other => panic!("{other:?}"),
     }

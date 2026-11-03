@@ -21,6 +21,7 @@ pub mod rbn;
 pub mod rbn_compare;
 pub mod relay;
 pub mod sett;
+pub mod spectrum;
 pub mod spot_message;
 pub mod status;
 pub mod status_doc;
