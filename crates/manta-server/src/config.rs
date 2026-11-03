@@ -1329,9 +1329,11 @@ impl PskReporterConfig {
     pub fn validate(&self) -> Result<(), String> {
         let host = self.host.trim();
         if host.is_empty() {
-            return Err("[pskreporter]: host is empty -- set PSKReporter's host name \
+            return Err(
+                "[pskreporter]: host is empty -- set PSKReporter's host name \
                         (\"report.pskreporter.info\") or a test listener's IPv4 address"
-                .to_string());
+                    .to_string(),
+            );
         }
         let bare = host.trim_start_matches('[').trim_end_matches(']');
         if bare.parse::<std::net::Ipv6Addr>().is_ok() {
@@ -1342,9 +1344,11 @@ impl PskReporterConfig {
             ));
         }
         if self.port == 0 {
-            return Err("[pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 \
+            return Err(
+                "[pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 \
                         (14739 for its test listener)"
-                .to_string());
+                    .to_string(),
+            );
         }
         if self.antenna.len() > PSKREPORTER_MAX_STRING_BYTES {
             return Err(format!(
@@ -1354,9 +1358,11 @@ impl PskReporterConfig {
             ));
         }
         if self.antenna.chars().any(char::is_control) {
-            return Err("[pskreporter]: antenna has a control character -- use plain text \
+            return Err(
+                "[pskreporter]: antenna has a control character -- use plain text \
                         such as \"Inverted V at 12 m\""
-                .to_string());
+                    .to_string(),
+            );
         }
         Ok(())
     }

@@ -119,6 +119,14 @@ impl Batcher {
                 .is_none_or(|t| now.saturating_duration_since(t) >= TEMPLATE_INTERVAL)
     }
 
+    /// The last datagram built carried templates but never reached the
+    /// OS (resolve or send failure): the next one carries them again, so
+    /// PSKReporter never gets data sets it has no templates for.
+    pub fn templates_not_sent(&mut self) {
+        self.datagrams = self.datagrams.saturating_sub(1);
+        self.last_templates = None;
+    }
+
     /// Offers one validated spot heard at `unix_ts`. `now` and
     /// `export_time` date the datagram returned in [`Offer::Full`].
     pub fn offer(&mut self, spot: &Spot, unix_ts: i64, now: Instant, export_time: u32) -> Offer {
@@ -433,6 +441,17 @@ mod tests {
                 Offer::Admitted
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn templates_that_were_not_sent_are_due_again() {
+        let mut b = Batcher::new(receiver(), UplinkSpotTypes::All, 1);
+        let t0 = Instant::now();
+        b.datagrams = TEMPLATED_STARTUP_DATAGRAMS;
+        b.last_templates = Some(t0);
+        assert!(!b.templates_due(t0));
+        b.templates_not_sent();
+        assert!(b.templates_due(t0));
     }
 
     #[tokio::test(start_paused = true)]

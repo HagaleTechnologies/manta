@@ -87,10 +87,15 @@ pub fn flush_offset(nonce: u128) -> Duration {
     Duration::from_secs((nonce % 30) as u64)
 }
 
+/// How long one lookup of `host` may take. The worker reads no spots
+/// while it waits, so a stuck resolver must not stall it for long.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The first IPv4 address `host:port` resolves to.
 async fn resolve(host: &str, port: u16) -> std::io::Result<SocketAddr> {
-    tokio::net::lookup_host((host, port))
-        .await?
+    tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| std::io::Error::other("the lookup timed out"))??
         .find(SocketAddr::is_ipv4)
         .ok_or_else(|| std::io::Error::other("no IPv4 address"))
 }
@@ -107,14 +112,17 @@ struct Sender {
 }
 
 impl Sender {
-    async fn send(&mut self, d: Datagram) {
+    /// Sends `d`, or counts its reports as lost. Returns whether it was
+    /// handed to the OS.
+    async fn send(&mut self, d: Datagram) -> bool {
         let n = d.reports as u64;
         // D9: resolve before the first send and with each template resend.
+        // A failed re-resolution keeps the last address that worked.
         if self.addr.is_none() || d.templates {
             match resolve(&self.host, self.port).await {
                 Ok(addr) => self.addr = Some(addr),
+                Err(_) if self.addr.is_some() => {}
                 Err(e) => {
-                    self.addr = None;
                     self.stats.record_dropped(PskDrop::ResolveError, n);
                     if !self.warned_resolve {
                         self.warned_resolve = true;
@@ -125,15 +133,18 @@ impl Sender {
                             self.host
                         );
                     }
-                    return;
+                    return false;
                 }
             }
         }
         let Some(addr) = self.addr else {
-            return;
+            return false;
         };
         match self.socket.send_to(&d.bytes, addr).await {
-            Ok(_) => self.stats.record_datagram(n),
+            Ok(_) => {
+                self.stats.record_datagram(n);
+                true
+            }
             Err(e) => {
                 self.stats.record_dropped(PskDrop::SendError, n);
                 if !self.warned_send {
@@ -143,8 +154,17 @@ impl Sender {
                          the lost reports in manta_pskreporter_dropped_total{{reason=\"send_error\"}}"
                     );
                 }
+                false
             }
         }
+    }
+}
+
+/// Sends `d`; templates that did not reach the OS are due again.
+async fn deliver(batcher: &mut Batcher, sender: &mut Sender, d: Datagram) {
+    let templates = d.templates;
+    if !sender.send(d).await && templates {
+        batcher.templates_not_sent();
     }
 }
 
@@ -163,7 +183,7 @@ async fn offer(
     match batcher.offer(&spot.spot, unix_ts, Instant::now(), export_time(clock)) {
         Offer::Admitted => {}
         Offer::Dropped(reason) => sender.stats.record_dropped(reason, 1),
-        Offer::Full(d) => sender.send(d).await,
+        Offer::Full(d) => deliver(batcher, sender, d).await,
     }
 }
 
@@ -210,7 +230,7 @@ pub async fn run(
             _ = tokio::time::sleep_until(next_flush) => {
                 next_flush += FLUSH_INTERVAL;
                 if let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
-                    sender.send(d).await;
+                    deliver(&mut batcher, &mut sender, d).await;
                 }
             }
             received = rx.recv() => match received {
@@ -229,7 +249,7 @@ pub async fn run(
         }
     }
     if let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
-        sender.send(d).await;
+        deliver(&mut batcher, &mut sender, d).await;
     }
 }
 

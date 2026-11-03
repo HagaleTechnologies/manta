@@ -5127,8 +5127,8 @@ fn start_spot_server(
             {
                 // `config::load` refused an enabled table without a grid.
                 let grid = station_grid.clone();
-                let call = manta_server::config::strip_ssid(&cfg.station_callsign)
-                    .to_ascii_uppercase();
+                let call =
+                    manta_server::config::strip_ssid(&cfg.station_callsign).to_ascii_uppercase();
                 logging::note(&spot_outputs::pskreporter_startup_line(&p, &call, &grid));
                 let nonce = bus.session_nonce();
                 let worker = manta_server::pskreporter::run(
