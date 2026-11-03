@@ -91,11 +91,39 @@ impl Reason {
         }
     }
 
-    /// This reason's position in `ALL`.
-    pub(crate) fn index(self) -> usize {
-        self as usize
+    /// This reason's position in `ALL`. Exhaustive on purpose: a new
+    /// variant fails to compile here until it has a slot, and it must take
+    /// the same position in `ALL` (checked at compile time below), or the
+    /// MAN-207 counters would index past their arrays.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Reason::Blocklist => 0,
+            Reason::Notch => 1,
+            Reason::Grammar => 2,
+            Reason::Cty => 3,
+            Reason::Repetition => 4,
+            Reason::Variant => 5,
+            Reason::Dedupe => 6,
+            Reason::PowerStepGuard => 7,
+            Reason::BeaconPending => 8,
+            Reason::BeaconSpeed => 9,
+            Reason::BeaconOverflow => 10,
+            Reason::BeaconDiscarded => 11,
+            Reason::NoEvidence => 12,
+            Reason::LookupPending => 13,
+            Reason::LookupNotFound => 14,
+        }
     }
 }
+
+// `ALL[i].index() == i` for every slot, so `ALL` and `index` agree.
+const _: () = {
+    let mut i = 0;
+    while i < Reason::ALL.len() {
+        assert!(Reason::ALL[i].index() == i);
+        i += 1;
+    }
+};
 
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]

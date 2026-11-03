@@ -1584,7 +1584,7 @@ impl Validator {
         involved_max_seq: u64,
         sample_ts: u64,
     ) {
-        let (first_suppression, freq_hz) = {
+        let (first_suppression, freq_hz, cause) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
                 return;
             };
@@ -1597,14 +1597,25 @@ impl Validator {
             // this function's own docs.
             let already_processed = word.last_spot_type == Some(SpotType::Beacon);
             let first_suppression = !word.power_step_suppressed && !already_processed;
+            // MAN-207: a word already decided as another spot type is
+            // reclassified by the burn, not decided for the first time.
+            let cause = if word.attempted {
+                Cause::Reclassified
+            } else {
+                Cause::Decided
+            };
             word.power_step_suppressed = true;
             word.attempted = true;
             word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
-            (first_suppression, track.freq_hz * self.freq_calibration)
+            (
+                first_suppression,
+                track.freq_hz * self.freq_calibration,
+                cause,
+            )
         };
         if first_suppression {
             self.suppression_counts.power_step_guard += 1;
-            let at = At::new(track_id, exact_seq, Cause::Decided);
+            let at = At::new(track_id, exact_seq, cause);
             self.decide(at, Some(Reason::PowerStepGuard), || {
                 Decision::withheld(
                     track_id,
@@ -2361,17 +2372,17 @@ impl Validator {
     }
 }
 
-/// Inserts `pb` at its `sample_ts` position (after any equal ones, so
-/// capture order breaks ties) and, past `MAX_PENDING_BEACONS`, removes and
-/// returns the oldest entry, which may be `pb` itself. Keeps `pending`
-/// sorted by `sample_ts`, so the cap always drops the true oldest
-/// (MAN-174).
 /// MAN-207: a pending beacon is decided later about the occurrence that
 /// captured it -- its origin track's word, even after a merge migrated it.
 fn settled_at(pb: &PendingBeacon) -> At {
     At::new(pb.origin_track_id, pb.word_seq, Cause::Settled)
 }
 
+/// Inserts `pb` at its `sample_ts` position (after any equal ones, so
+/// capture order breaks ties) and, past `MAX_PENDING_BEACONS`, removes and
+/// returns the oldest entry, which may be `pb` itself. Keeps `pending`
+/// sorted by `sample_ts`, so the cap always drops the true oldest
+/// (MAN-174).
 fn insert_by_age(pending: &mut Vec<PendingBeacon>, pb: PendingBeacon) -> Option<PendingBeacon> {
     let at = pending.partition_point(|p| p.sample_ts <= pb.sample_ts);
     pending.insert(at, pb);

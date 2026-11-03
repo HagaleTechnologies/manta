@@ -6973,12 +6973,18 @@ fn run_command() -> Result<std::process::ExitCode> {
             // leave the file empty.
             let written = match (&observations, observation_file) {
                 (Some(obs_path), Some(file)) => {
-                    let n =
-                        observations::write(file, policy.detail, report.sample_rate_hz, &observed)
-                            .with_context(|| {
+                    match observations::write(file, policy.detail, report.sample_rate_hz, &observed)
+                    {
+                        Ok(n) => Some((obs_path, n)),
+                        Err(e) => {
+                            // Best effort: a file cut short has no summary
+                            // trailer and must not look like a record.
+                            let _ = std::fs::remove_file(obs_path);
+                            return Err(e).with_context(|| {
                                 format!("write --observations {}", obs_path.display())
-                            })?;
-                    Some((obs_path, n))
+                            });
+                        }
+                    }
                 }
                 _ => None,
             };

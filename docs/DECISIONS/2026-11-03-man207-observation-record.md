@@ -110,6 +110,23 @@ owns:
 | revision/supersession | `Observation::supersedes`, `Draft::cause` |
 | bounded retention | `ObservationPolicy`, `LossCounts` |
 
+## Measured cost
+
+`manta decode` (release build, 32-core container) on V8 (120 s, 50
+signals, 49 spots), three runs each, wall clock:
+
+| Run | Times (s) | Median (s) | Records | File size |
+|---|---|---|---|---|
+| no flag | 9.51, 9.17, 8.63 | 9.17 | none | none |
+| `--observations` | 8.46, 10.50, 10.20 | 10.20 | 908 | 1,096,497 bytes |
+| `--observations --observation-text` | 11.10, 9.29, 8.32 | 9.29 | 908 | 1,228,551 bytes |
+
+The spread inside each row is wider than the gap between rows, so the
+record costs no time this measurement can separate from noise. stdout was
+byte-identical across the three modes. Every key in the text-detail file
+is documented in OBSERVATIONS.md, and its tables name no key the file
+lacks.
+
 ## Follow-ups
 
 This record is the first slice. Moved to a follow-up ticket:

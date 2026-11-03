@@ -584,6 +584,10 @@ fn settle_lookups(
         tap.decisions(validator.take_decisions());
         tap.end_batch(validator);
     }
+    // MAN-207: the settled lookups' decisions, as `emit` stores a batch's.
+    if let Some(q) = ctx.quality {
+        q.store_decisions(&validator.observation_counts());
+    }
 }
 
 fn emit(
@@ -5469,6 +5473,57 @@ mod tests {
         assert_eq!(
             spots_observed, spots_plain,
             "the observer must not change decode output"
+        );
+    }
+
+    /// MAN-207: after a V1 listen run the observer holds every decision
+    /// count a validator replaying the run's events arrives at.
+    #[test]
+    fn emit_stores_the_validators_decision_counts() {
+        use crate::quality::DecodeQualityObserver;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig::default();
+        let obs = Arc::new(DecodeQualityObserver::new());
+        let mut events = Vec::new();
+        listen_with_observers(
+            src,
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_quality: Some(obs.clone()),
+                ..Default::default()
+            },
+            |ev| events.push(ev.clone()),
+            |_spot| {},
+            |_n| {},
+        )
+        .unwrap();
+
+        let mut replay = cfg.validator(spec.fs).unwrap();
+        for ev in &events {
+            replay.ingest(ev);
+        }
+        let expected: Vec<_> = replay.observation_counts().iter().collect();
+        assert_eq!(obs.snapshot().decisions, expected);
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_none() && n > 0),
+            "V1 must spot"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_some() && n > 0),
+            "V1 must withhold something"
         );
     }
 
