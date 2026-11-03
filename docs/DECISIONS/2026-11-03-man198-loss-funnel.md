@@ -69,14 +69,27 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
   `manta_server::live_state::reason_label` delegates, so the live-state wire
   is unchanged.
 
+- D7. The header names the run: `truthLayer`, `spotter`, `captureStart`
+  (ISO-8601 UTC), `recordingFile`, `recordingSha256`, `sidecarSha256` (the
+  `<name>.json` or `PATH.meta.jsonl` beside the recording, or `null`),
+  `referenceFile`, `referenceSha256`, `configSha256`, `build`
+  (`DECODER_VERSION`), `engine`, `prior`, the geometry, the tolerances, the
+  stage order, `deliveredMeans` and `bypasses`. It carries no wall-clock
+  field, so two runs on the same inputs write the same bytes.
+
 ## Gherkin mapping
 
 - "A truth opportunity lost at detection": `attribute.rs`
   `gherkin_no_track_opened_is_detectable_energy`, and end to end
-  `listen.rs` `funnel_charges_one_stage_per_opportunity_on_v1` (OH2XYZ).
+  `crates/manta-engine/tests/loss_funnel.rs`
+  `funnel_charges_one_stage_per_opportunity_on_v1` (OH2XYZ: no candidate,
+  nothing counted past `detectableEnergy`).
 - "A truth opportunity decoded correctly counts as a full pass":
   `attribute.rs` `gherkin_validated_spot_is_delivered`, and end to end the
-  same `listen.rs` test (W1AW on vector V1).
+  same `loss_funnel.rs` test (W1AW on vector V1).
+- Through the binary: `crates/manta-cli/tests/oracle_funnel.rs` pins the
+  file shape, the stderr note, two-run byte identity, and that stdout and
+  `--jsonl` are byte-identical with and without `--funnel`.
 
 ## Follow-ups
 
@@ -86,6 +99,10 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
   transcript), always segregated as `oracleAssisted` lines after the
   production summary.
 - Running the funnel with the config's `[spot]` and `freq_correction_ppm`, as
-  `manta decode` does; the stage-scene golden and CLI byte-identity tests.
+  `manta decode` does; the nine-row stage-scene golden test.
+- When this branch is replayed onto a main that carries MAN-201's
+  `Reason::BeaconNoEvidence`, `Reason::label` gains `beaconNoEvidence` and
+  `reason_effect` charges it to `selfIdRecognized` (with grammar and cty),
+  as the plan's stage table places it.
 - The plain oracle's out-of-range rows (outside the recording or passband are
   still counted in its `n`).
