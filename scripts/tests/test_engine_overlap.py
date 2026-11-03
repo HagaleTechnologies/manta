@@ -264,6 +264,8 @@ class PairingTests(Base):
                                                           + [station("K4DD", False, offset_hz=801)])],
                                                    engine="hsmm")),
             "nothing pairs": (good_a, report([point(sts, condition="poor")], engine="hsmm")),
+            "format_version true": (dict(good_a, format_version=True), good_b),
+            "no stations pair": (report([point([])]), report([point([])], engine="hsmm")),
             "station missing a field": (good_a, report([dict(point(sts),
                                                              per_station=[{"trial": 0, "call": "K1AA"}])],
                                                        engine="hsmm")),
@@ -510,7 +512,8 @@ class BootstrapTests(Base):
         second = self.run_tool(args)
         self.assertEqual(first[0], 0, first[2])
         self.assertEqual(first[1], second[1])
-        self.assertIn("95% intervals, 300 recording resamples:", first[1])
+        self.assertIn("95% intervals, 300 signal-set (seed, condition, speed, trial) resamples:",
+                      first[1])
 
     def test_identical_outcomes_give_a_zero_width_interval(self):
         path = self.corpus()[0]
@@ -520,13 +523,14 @@ class BootstrapTests(Base):
             self.assertEqual(ci[lv]["exactly_one"], (0.0, 0.0))
             self.assertEqual(ci[lv]["headroom"], (0.0, 0.0))
 
-    def test_resamples_whole_recordings_with_the_documented_bounds(self):
+    def test_resamples_whole_signal_sets_with_the_documented_bounds(self):
         a, b = self.corpus()
         pairs = eo.pair_bench(eo.load_bench([a], "A"), eo.load_bench([b], "B"))[0]
         ci = eo.bootstrap(pairs, eo.BENCH_LEVELS, 40)
         lo, hi = ci["identity"]["recall_a"]
         self.assertLessEqual(lo, hi)
-        self.assertEqual(len({p.cluster for p in pairs}), 12)  # 3 SNRs x 4 trials
+        # The three SNRs of one signal set are one cluster: 1 condition x 1 speed x 4 trials.
+        self.assertEqual({p.cluster for p in pairs}, {(1, "awgn", 25, t) for t in range(4)})
 
     def test_bootstrap_0_prints_no_interval_line(self):
         a, b = self.corpus()
@@ -619,6 +623,8 @@ class OracleModeTests(Base):
         self.assertIn("## Engine overlap: legacy (A) vs hsmm (B), manta oracle", text)
         text = self.oracle(pa, pb, "--a-name", "hsmm", "--b-name", "hsmm")[1]
         self.assertIn("| hsmm (A) only | hsmm (B) only |", text)
+        text = self.oracle(pa, pb, "--a-name", "B", "--b-name", "A")[1]
+        self.assertIn("| B (A) only | A (B) only |", text)
 
     def test_different_reference_spots_exit_2(self):
         a, b = self.sides()

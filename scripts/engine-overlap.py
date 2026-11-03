@@ -51,9 +51,13 @@ Metric definitions (each is a row or column of the report):
                    per-point multiset intersection of the two engines' lists;
                    Either = A + B - Shared. The oracle scores reference calls
                    only, so oracle mode has no false-identity count.
-  95% interval     percentile bootstrap over recordings
-                   (seed, condition, wpm, snr_db, trial) in bench mode and over
-                   reference spots in oracle mode; --bootstrap resamples
+  95% interval     percentile bootstrap over whole signal sets
+                   (seed, condition, wpm, trial) in bench mode and over
+                   reference spots in oracle mode. The bench reuses one signal
+                   set and one noise trial at every SNR of a sweep, so a
+                   recording at one SNR is not independent of the same signal
+                   set at another; resampling the signal set keeps them
+                   together. --bootstrap resamples
                    (default 2000, 0 disables), random.Random(205), cluster
                    index int(random() * k); bounds are the sorted values at
                    int(0.025 * N) and int(0.975 * N) - 1.
@@ -110,7 +114,7 @@ DEFAULT_RESAMPLES = 2000
 DEFAULT_BAR_PP = 1.0
 BENCH_LEVELS = ("identity", "copy")
 ORACLE_LEVELS = ("as_word", "framed")
-# (strata key, JSON key, heading, value formatter)
+# (strata key, JSON key, section heading, column header, value formatter)
 BREAKDOWNS = (
     ("condition", "by_condition", "By condition", "Condition", str),
     ("wpm", "by_wpm", "By speed", "Speed", lambda v: f"{v} WPM"),
@@ -126,7 +130,7 @@ class InputError(Exception):
 @dataclass(frozen=True)
 class Pair:
     """One truth identity and both engines' outcomes, one bool per level."""
-    cluster: tuple  # bench: (seed, condition, wpm, snr_db, trial); oracle: (call, khz)
+    cluster: tuple  # bench: (seed, condition, wpm, trial), one signal set; oracle: (call, khz)
     strata: dict  # bench: condition, wpm, snr_db, trial; oracle: empty
     a: tuple
     b: tuple
@@ -247,7 +251,7 @@ def load_bench(paths, side):
         rep = _read_json(path)
         if not isinstance(rep, dict) or rep.get("report") != BENCH_REPORT:
             raise InputError(f"{path}: not a `{BENCH_REPORT}` report")
-        if rep.get("format_version") != BENCH_FORMAT:
+        if not _is_int(rep.get("format_version")) or rep["format_version"] != BENCH_FORMAT:
             raise InputError(f"{path}: format_version {rep.get('format_version')!r},"
                              f" expected {BENCH_FORMAT}")
         eng = _require(path, rep, "engine", lambda v: isinstance(v, str), "a string")
@@ -315,9 +319,11 @@ def pair_bench(a, b):
             st_b = sb[skey]
             trial = skey[0]
             pairs.append(Pair(
-                cluster=(seed, condition, wpm, snr_db, trial),
+                cluster=(seed, condition, wpm, trial),
                 strata={"condition": condition, "wpm": wpm, "snr_db": snr_db, "trial": trial},
                 a=station_outcome(st_a), b=station_outcome(st_b)))
+    if not pairs:
+        raise InputError("the paired points hold no stations")
     unpaired_a = len(set(a["points"]) - set(b["points"]))
     unpaired_b = len(set(b["points"]) - set(a["points"]))
     return pairs, unpaired_a, unpaired_b, common
@@ -459,9 +465,12 @@ def side_labels(name_a, name_b):
     if name_a == name_b:
         la, lb = f"{name_a} (A)", f"{name_b} (B)"
         return la, lb, la, lb
+    # A name that is the other side's letter would head the wrong column; tag it.
+    la = f"{name_a} (A)" if name_a == "B" else name_a
+    lb = f"{name_b} (B)" if name_b == "A" else name_b
     ta = name_a if name_a == "A" else f"{name_a} (A)"
     tb = name_b if name_b == "B" else f"{name_b} (B)"
-    return name_a, name_b, ta, tb
+    return la, lb, ta, tb
 
 
 def gate(overall, levels, bar_pp):
@@ -541,7 +550,8 @@ def render_markdown(rep):
     if rep["ci95"]:
         ci = rep["ci95"]
         l0, l1 = levels
-        unit = "recording" if rep["mode"] == "bench" else "reference-spot"
+        unit = ("signal-set (seed, condition, speed, trial)" if rep["mode"] == "bench"
+                else "reference-spot")
 
         def span_pct(v):
             return f"{100 * v[0]:.2f}% to {100 * v[1]:.2f}%"
