@@ -2239,9 +2239,12 @@ impl Validator {
         // copies: they are the damage the fusion already outvoted.
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&call));
         let rival = if !is_allowlisted && !scp_exempt {
-            self.ledger
-                .better_supported_rival(track_id, &call, sample_ts)
-                .filter(|(rival, _)| !fused.disagreeing.contains(rival))
+            self.ledger.better_supported_rival_except(
+                track_id,
+                &call,
+                sample_ts,
+                &fused.disagreeing,
+            )
         } else {
             None
         };
@@ -3002,6 +3005,50 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let d = v.take_decisions().pop().expect("released decision");
         assert_eq!(d.verdict, Verdict::Spotted);
         assert_eq!(d.confirmation, Some(Confirmation::Fused));
+    }
+
+    /// Codex review, PR #500: the episode's own copies are ignored inside
+    /// the rival search, so a copy that is the strongest rival cannot mask
+    /// a weaker rival outside the episode.
+    #[test]
+    fn an_episode_copy_does_not_mask_another_rival() {
+        let fused = |with_rival: bool| {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            let mut events = complementary_copies();
+            if with_rival {
+                // A bare W1AX, never a self-ID copy, weaker than both copies.
+                let at = events
+                    .iter()
+                    .position(|e| {
+                        matches!(
+                            e,
+                            DecoderEvent::CharDecoded {
+                                sample_ts: 100_000,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap();
+                let rival = "W1AX".chars().enumerate().map(|(i, c)| {
+                    DecoderEvent::char_decoded(1, 50_000 + i as u64 * 100, Glyph::Char(c), 0.5)
+                });
+                let mut words: Vec<_> = rival.collect();
+                words.push(DecoderEvent::word_boundary(1, 50_400));
+                events.splice(at..at, words);
+            }
+            let spots = run(&events, &mut v);
+            let log = v.take_decisions();
+            let last = decisions_for(&log, "W1AW").last().map(|d| (*d).clone());
+            (spots, last)
+        };
+        let (spots, d) = fused(false);
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(d.unwrap().confirmation, Some(Confirmation::Fused));
+        let (spots, d) = fused(true);
+        assert!(spots.is_empty(), "{spots:?}");
+        let d = d.expect("a W1AW decision");
+        assert_eq!(d.reason, Some(Reason::Variant));
+        assert_eq!(d.rival.map(|r| r.call), Some("W1AX".to_string()));
     }
 
     #[test]

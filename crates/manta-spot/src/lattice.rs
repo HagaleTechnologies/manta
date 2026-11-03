@@ -191,14 +191,26 @@ impl EvidenceLattice {
             })
             .collect();
         // D7: the same samples, near enough to be the same call, are a
-        // duplicate of the first arrival.
+        // duplicate of the first arrival. Its track's watermark still takes
+        // the overlapped copy's anchor under the never-regress rule, as
+        // `RepetitionGate::record_span` does (Codex review, PR #500).
         for &(id, _) in &eligible {
-            let ep = &self.episodes[&(input, id)];
-            if ep.copies.iter().any(|c| {
+            let ep = self.episodes.get_mut(&(input, id)).expect("eligible");
+            let overlapped = ep.copies.iter().position(|c| {
                 c.span.1 >= cutoff
                     && overlaps(c.span, span)
                     && levenshtein(&c.text, &copy.text) <= MAX_JOIN_EDITS
-            }) {
+            });
+            if let Some(i) = overlapped {
+                let anchor_ts = ep.occurrences[i].4;
+                ep.last_seen_by_track
+                    .entry(copy.track_id)
+                    .and_modify(|e| {
+                        if span.1 >= e.0 {
+                            *e = (span.1, copy.word_seq, anchor_ts);
+                        }
+                    })
+                    .or_insert((span.1, copy.word_seq, anchor_ts));
                 self.counts.duplicates += 1;
                 return AddOutcome::Duplicate(EpisodeKey { input, id });
             }
@@ -723,6 +735,42 @@ mod tests {
         let again = copy("W1EW", 100_000 + 1_000, 100_000 + 1_400, 2, 0);
         assert_eq!(l.add(0, again, active), AddOutcome::Duplicate(key));
         assert_eq!(l.evaluate(key, now(3), 2), before);
+    }
+
+    /// Codex review, PR #500: a duplicate still moves its track's
+    /// watermark, as `RepetitionGate::record_span` does, so that track's
+    /// later message counts while the first track stays active.
+    #[test]
+    fn a_duplicate_track_s_later_message_counts() {
+        let mut l = EvidenceLattice::new(FS);
+        let AddOutcome::Added(key) = l.add(
+            0,
+            copy_alt("W1AV", 0, 400, 1, 0, 3, 'W', 0.40, 0.45),
+            active,
+        ) else {
+            panic!("added");
+        };
+        assert_eq!(
+            l.add(0, copy("W1AV", 10, 420, 2, 0), active),
+            AddOutcome::Duplicate(key)
+        );
+        assert_eq!(
+            l.add(
+                0,
+                copy_alt("W1AQ", 5_000, 5_400, 2, 3, 3, 'W', 0.40, 0.45),
+                active
+            ),
+            AddOutcome::Added(key)
+        );
+        assert_eq!(l.repetitions(key, 5_400), 2);
+        let mut gate = crate::gate::RepetitionGate::new(FS);
+        gate.record_span(1, F, "W1AW", (0, 400), 0, active);
+        gate.record_span(2, F, "W1AW", (10, 420), 0, active);
+        assert_eq!(gate.record_span(2, F, "W1AW", (5_000, 5_400), 3, active), 2);
+        let Verdict::Confirmed(f) = l.evaluate(key, 5_400, 2) else {
+            panic!("{:?}", l.evaluate(key, 5_400, 2));
+        };
+        assert_eq!((f.call.as_str(), f.reps), ("W1AW", 2));
     }
 
     #[test]

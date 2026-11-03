@@ -224,13 +224,27 @@ impl SupportLedger {
         candidate: &str,
         now: u64,
     ) -> Option<(String, Support)> {
+        self.better_supported_rival_except(track_id, candidate, now, &[])
+    }
+
+    /// `better_supported_rival` that never considers a text in `ignored`
+    /// (MAN-200 D8: a fused winner's own episode copies). Skipping them in
+    /// the search, not after it, lets the strongest remaining rival still
+    /// win (Codex review, PR #500).
+    pub fn better_supported_rival_except(
+        &self,
+        track_id: u32,
+        candidate: &str,
+        now: u64,
+        ignored: &[String],
+    ) -> Option<(String, Support)> {
         let mine = self.support(track_id, candidate, now);
         let mut best: Option<(String, Support)> = None;
         for ((tid, text), obs) in self.seen.range((track_id, String::new())..) {
             if *tid != track_id {
                 break;
             }
-            if text == candidate {
+            if text == candidate || ignored.contains(text) {
                 continue;
             }
             let Some(rel) = variant::relation(candidate, text) else {

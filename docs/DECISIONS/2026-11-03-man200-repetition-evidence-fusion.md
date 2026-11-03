@@ -124,10 +124,13 @@ lets damaged copies confirm the call a clear per-position majority reads.
 - **D7. Independence.** A copy whose span overlaps a copy already in an
   eligible episode (same input, same channel, at most 2 edits apart) is a
   duplicate of it. It adds no observation and no vote, even if it reads
-  better; the first arrival stands, as the gate freezes its verdicts.
-  Message-distinctness reuses the gate's own `classify_new_occurrence` and
-  `promote_orphaned_leader` over the episode's observations, so "one message
-  counts once" means the same thing in both places.
+  better; the first arrival stands, as the gate freezes its verdicts. Its
+  track's watermark still takes the overlapped copy's anchor, as the gate's
+  does for an overlapped span, so that track's later message is judged
+  against it. Message-distinctness reuses the gate's own
+  `classify_new_occurrence` and `promote_orphaned_leader` over the episode's
+  observations, so "one message counts once" means the same thing in both
+  places.
 - **D8. Confirmation bar.** Every position decided (D5); the winner at least
   3 characters; message-distinct observations within 2 edits of the winner
   at least `required_reps(tier(winner))`. Then the winner goes through the
