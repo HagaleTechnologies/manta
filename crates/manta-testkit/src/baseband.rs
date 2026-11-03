@@ -235,7 +235,7 @@ fn units(t: &Timing) -> (f64, f64) {
 /// Key one character's elements; returns the time it took.
 fn key_char(clock: &mut Clock, c: char, t: &Timing, content: f64) -> Result<f64> {
     let Some(p) = itu(c) else {
-        bail!("no ITU Morse pattern for {:?}", c);
+        bail!("no ITU Morse pattern for '{}'", c.escape_debug());
     };
     let mut took = 0.0;
     let n = p.len();
@@ -319,7 +319,7 @@ pub(crate) fn timeline(tone: &ToneSpec, duration_s: f64) -> Result<(Vec<(f64, f6
             break;
         }
         if used <= rep_start {
-            bail!("looped text {:?} adds no time per repetition", tone.text);
+            bail!("looped text '{}' adds no time per repetition", tone.text);
         }
     }
     Ok((clock.marks, keyed.trim().to_string()))
@@ -411,15 +411,6 @@ fn fade_paths(profile: FadeProfile, seed: u64, sigma_scale: f64) -> [FadePath; 2
     let p1 = path();
     let p2 = path();
     [p1, p2]
-}
-
-/// Exact path gain at `t` seconds.
-fn exact_gain(path: &FadePath, t: f64) -> Complex64 {
-    let norm = 1.0 / (path.len() as f64).sqrt();
-    path.iter()
-        .map(|(f, p)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * t + p))
-        .sum::<Complex64>()
-        * norm
 }
 
 /// A path's gain every 1 ms (rotating phasors re-anchored exactly every
@@ -700,6 +691,15 @@ mod tests {
             (p[0] - 1.0).abs() < 0.1 && (p[1] - 1.0).abs() < 0.1,
             "{p:?}"
         );
+    }
+
+    /// Exact path gain at `t` seconds.
+    fn exact_gain(path: &FadePath, t: f64) -> Complex64 {
+        let norm = 1.0 / (path.len() as f64).sqrt();
+        path.iter()
+            .map(|(f, p)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * t + p))
+            .sum::<Complex64>()
+            * norm
     }
 
     #[test]

@@ -69,12 +69,15 @@ impl Minimized {
         self.steps
             .iter()
             .map(|s| {
+                let got = match &s.signature {
+                    Some(sig) => format!("[{}]", sig.join(", ")),
+                    None => "passes".to_string(),
+                };
                 format!(
-                    "{:<11} {:<8} {} -> {:?}\n",
+                    "{:<11} {:<8} {} -> {got}\n",
                     s.pass,
                     if s.accepted { "accepted" } else { "rejected" },
                     s.change,
-                    s.signature
                 )
             })
             .collect()
@@ -323,7 +326,7 @@ where
         let kept = ddmin(words, &mut |sub: &[String]| {
             let mut sig = base.signals[i].clone();
             sig.text = sub.join(" ");
-            let change = format!("{label} text {:?}", sig.text);
+            let change = format!("{label} text '{}'", sig.text);
             r.holds("text", change, &with_signal(&base, i, sig))
         })?;
         cur.signals[i].text = kept.join(" ");
@@ -336,7 +339,7 @@ where
                 ws[w] = sub.iter().collect();
                 let mut sig = base.signals[i].clone();
                 sig.text = ws.join(" ");
-                let change = format!("{label} text {:?}", sig.text);
+                let change = format!("{label} text '{}'", sig.text);
                 r.holds("text", change, &with_signal(&base, i, sig))
             })?;
             let mut ws = words.clone();

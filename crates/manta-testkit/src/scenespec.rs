@@ -225,7 +225,7 @@ impl SceneSpec {
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.schema == SCENE_SCHEMA,
-            "unknown scene schema {:?}",
+            "unknown scene schema '{}'",
             self.schema
         );
         let mut labels: Vec<&str> = self.signals.iter().map(|s| s.label.as_str()).collect();

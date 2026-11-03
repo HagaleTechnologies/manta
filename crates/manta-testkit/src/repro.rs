@@ -101,7 +101,7 @@ impl Repro {
         let r: Repro = serde_json::from_str(text)?;
         ensure!(
             r.schema == REPRO_SCHEMA,
-            "unknown repro schema {:?}",
+            "unknown repro schema '{}'",
             r.schema
         );
         r.scene.validate()?;
@@ -138,7 +138,7 @@ pub fn lint_repro(r: &Repro) -> Result<()> {
         let low = field.to_ascii_lowercase();
         for marker in corpus_markers() {
             if low.contains(&marker) {
-                bail!("repro {:?} names real recorded audio ({marker:?})", r.name);
+                bail!("repro '{}' names real recorded audio ('{marker}')", r.name);
             }
         }
     }
