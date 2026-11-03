@@ -266,9 +266,12 @@ pub trait IqSource {
     /// command, cpal's `start`, ka9q's data-group join), or, when the
     /// driver cannot return everything captured since its trigger, to the
     /// first sample it can still return (ka9q's startup stash evicts its
-    /// oldest packets past a byte cap). Everything before it was
-    /// certainly signal-silent; samples captured from it on are returned
-    /// by `read()`.
+    /// oldest packets past a byte cap). A driver that cannot time that
+    /// sample exactly reports an instant no later than it (ka9q stamps the
+    /// last read that found its socket empty, MAN-407), because a later
+    /// one counts the delay as both outage and returned samples.
+    /// Everything before it was certainly signal-silent; samples captured
+    /// from it on are returned by `read()`.
     /// `manta-cli`'s `ReconnectingSource` ends a reconnect's outage there
     /// rather than where `open()` returned, so the open call's remaining
     /// runtime is not counted both as outage and as returned samples,
