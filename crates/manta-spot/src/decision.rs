@@ -67,7 +67,7 @@ pub enum Reason {
 
 impl Reason {
     /// Every reason, in declaration order (MAN-207's counters index by it).
-    pub const ALL: [Reason; 15] = [
+    pub const ALL: [Reason; 16] = [
         Reason::Blocklist,
         Reason::Notch,
         Reason::Grammar,
@@ -76,6 +76,7 @@ impl Reason {
         Reason::Variant,
         Reason::Dedupe,
         Reason::PowerStepGuard,
+        Reason::BeaconNoEvidence,
         Reason::BeaconPending,
         Reason::BeaconSpeed,
         Reason::BeaconOverflow,
@@ -108,13 +109,14 @@ impl Reason {
             Reason::Variant => 5,
             Reason::Dedupe => 6,
             Reason::PowerStepGuard => 7,
-            Reason::BeaconPending => 8,
-            Reason::BeaconSpeed => 9,
-            Reason::BeaconOverflow => 10,
-            Reason::BeaconDiscarded => 11,
-            Reason::NoEvidence => 12,
-            Reason::LookupPending => 13,
-            Reason::LookupNotFound => 14,
+            Reason::BeaconNoEvidence => 8,
+            Reason::BeaconPending => 9,
+            Reason::BeaconSpeed => 10,
+            Reason::BeaconOverflow => 11,
+            Reason::BeaconDiscarded => 12,
+            Reason::NoEvidence => 13,
+            Reason::LookupPending => 14,
+            Reason::LookupNotFound => 15,
         }
     }
 }

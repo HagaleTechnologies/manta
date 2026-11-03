@@ -58,6 +58,7 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
 }
 
@@ -191,6 +192,32 @@ fn summary_detail_records_nothing_and_counts_everything() {
         1
     );
     assert_eq!(counts.total(), 1);
+}
+
+/// MAN-201's `<call> T` decision reaches the record and the counters like
+/// every other reason, keyed to the call's own word.
+#[test]
+fn a_beacon_no_evidence_decision_is_recorded_and_counted() {
+    let mut v = observing(ObservationPolicy::records());
+    run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+    close_track(&mut v, 1, 20.0, ClosureKind::SignalEnded);
+    let records = records_for(&v, "K5ARH");
+    let held = records
+        .iter()
+        .find(|o| decision(o).reason == Some(Reason::BeaconNoEvidence))
+        .unwrap_or_else(|| panic!("no beaconNoEvidence record: {records:#?}"));
+    assert_eq!(decision(held).verdict, Verdict::Withheld);
+    assert_eq!(held.draft.cause, Cause::Decided);
+    assert_eq!(held.draft.id.word_seq, 0, "keyed to the K5ARH word");
+    assert!(
+        held.draft.span.is_some(),
+        "spans read while the word is held"
+    );
+    assert_eq!(
+        v.observation_counts()
+            .decided(Verdict::Withheld, Some(Reason::BeaconNoEvidence)),
+        1
+    );
 }
 
 type Scenario = fn(&mut Validator) -> Vec<Spot>;
@@ -366,12 +393,16 @@ fn a_settled_lookup_supersedes_its_pending_record() {
 fn a_reclassified_word_supersedes_its_first_record() {
     let mut v = observing(ObservationPolicy::records());
     v.allowlist("K5ARH");
-    run(&transmission_events(1, &["K5ARH", "UP"], 0), &mut v);
+    // MAN-201 decides a call when its word settles, so `K5ARH UP` is now
+    // decided once, as `De`. The power-step burn still reclassifies:
+    // `CQ K5ARH` spots as `Cq`, then the trailing `T` re-types the same
+    // word as `Beacon`.
+    run(&transmission_events(1, &["CQ", "K5ARH", "T"], 0), &mut v);
     let records = records_for(&v, "K5ARH");
     assert_eq!(records.len(), 2, "{records:#?}");
-    assert_eq!(records[0].draft.spot_type(), SpotType::Unknown);
+    assert_eq!(records[0].draft.spot_type(), SpotType::Cq);
     assert_eq!(records[0].draft.cause, Cause::Decided);
-    assert_eq!(records[1].draft.spot_type(), SpotType::De);
+    assert_eq!(records[1].draft.spot_type(), SpotType::Beacon);
     assert_eq!(records[1].draft.cause, Cause::Reclassified);
     assert_eq!(records[1].supersedes, Some(records[0].seq));
     assert_eq!(records[1].draft.id, records[0].draft.id);

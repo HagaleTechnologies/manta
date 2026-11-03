@@ -7,14 +7,10 @@ use crate::context::{self, SpotType};
 use crate::cty;
 use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::{Dedupe, DedupeOutcome};
-<<<<<<< HEAD
+use crate::exchange::{self, ExchangeWord, Frame, Role};
 use crate::gate::{
     GateOccurrence, RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS,
 };
-=======
-use crate::exchange::{self, ExchangeWord, Frame, Role};
-use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
->>>>>>> 33340f544a9e256cdc37f9bd98e3506ec0e954bb
 use crate::grammar;
 use crate::lookup::{CallsignLookup, Existence, LookupStatus};
 use crate::message;
@@ -246,10 +242,15 @@ struct Word {
     /// occurrence is a property of the guard alone, so it needs its own
     /// per-occurrence bit.
     power_step_suppressed: bool,
-<<<<<<< HEAD
+    /// MAN-201: this word's `<call> T` occurrence has recorded its
+    /// `BeaconNoEvidence` decision; each occurrence counts once.
+    beacon_no_evidence_recorded: bool,
     /// MAN-207: the first character's `sample_ts`.
     start_ts: u64,
-    /// MAN-207: the `WordBoundary` that completed this word.
+    /// MAN-201: the `WordBoundary` `sample_ts` this word completed at. A
+    /// settled occurrence is evaluated -- repetition gate, dedupe, decision
+    /// and spot -- at this time, not at the event that settled it (D5).
+    /// MAN-207 also records it as the observation's sample-span end.
     end_ts: u64,
     /// MAN-207: the lowest and highest raw track frequency read while
     /// this word was decoded (`None` before the track's first `TrackMeta`).
@@ -258,22 +259,6 @@ struct Word {
     /// MAN-207: the decoder's competing glyphs per character, kept only at
     /// `Detail::Text` (empty, unallocated, otherwise).
     alternatives: Vec<Vec<(Glyph, f32)>>,
-}
-
-impl Word {
-    /// MAN-207: widens the frequency span with one reading.
-    fn note_freq(&mut self, freq_hz: f64) {
-        self.freq_lo_hz = Some(self.freq_lo_hz.map_or(freq_hz, |lo| lo.min(freq_hz)));
-        self.freq_hi_hz = Some(self.freq_hi_hz.map_or(freq_hz, |hi| hi.max(freq_hz)));
-    }
-=======
-    /// MAN-201: this word's `<call> T` occurrence has recorded its
-    /// `BeaconNoEvidence` decision; each occurrence counts once.
-    beacon_no_evidence_recorded: bool,
-    /// MAN-201: the `WordBoundary` `sample_ts` this word completed at. A
-    /// settled occurrence is evaluated -- repetition gate, dedupe, decision
-    /// and spot -- at this time, not at the event that settled it (D5).
-    end_ts: u64,
     /// MAN-201: a turn ends after this word -- an `AR`/`SK` prosign glyph,
     /// or `TURN_SILENCE_SECONDS` with no decoded character after it.
     ends_turn: bool,
@@ -284,7 +269,14 @@ impl Word {
     /// a framing word scrolling out of the window could turn a settled
     /// `relayed_mention` into `uncertain`.
     role: Option<(Role, Option<Frame>)>,
->>>>>>> 33340f544a9e256cdc37f9bd98e3506ec0e954bb
+}
+
+impl Word {
+    /// MAN-207: widens the frequency span with one reading.
+    fn note_freq(&mut self, freq_hz: f64) {
+        self.freq_lo_hz = Some(self.freq_lo_hz.map_or(freq_hz, |lo| lo.min(freq_hz)));
+        self.freq_hi_hz = Some(self.freq_hi_hz.map_or(freq_hz, |hi| hi.max(freq_hz)));
+    }
 }
 
 /// MAN-201: the silence, in seconds with no decoded character, that ends a
@@ -1152,30 +1144,26 @@ impl Validator {
                 alternatives,
             } => {
                 self.advance_clock(*sample_ts);
-<<<<<<< HEAD
                 let keep_text = self.observations.detail() == crate::observation::Detail::Text;
-=======
                 let turn_silence_samples = self.turn_silence_samples;
->>>>>>> 33340f544a9e256cdc37f9bd98e3506ec0e954bb
                 let track = self.tracks.entry(*track_id).or_default();
                 let buffer_empty = track.current.text.is_empty();
                 match glyph {
                     Glyph::Char(c) => {
-<<<<<<< HEAD
-                        if track.current.text.is_empty() {
+                        if buffer_empty {
+                            // MAN-207: the word's sample span and frequency
+                            // span start at its first character.
                             track.current.start_ts = *sample_ts;
                             if track.has_meta {
                                 track.current.note_freq(track.freq_hz);
-=======
-                        // MAN-201 D3: a first character arriving after
-                        // `TURN_SILENCE_SECONDS` of silence ends the
-                        // previous word's turn.
-                        if buffer_empty {
+                            }
+                            // MAN-201 D3: a first character arriving after
+                            // `TURN_SILENCE_SECONDS` of silence ends the
+                            // previous word's turn.
                             if let Some(back) = track.words.back_mut() {
                                 if sample_ts.saturating_sub(back.end_ts) >= turn_silence_samples {
                                     back.ends_turn = true;
                                 }
->>>>>>> 33340f544a9e256cdc37f9bd98e3506ec0e954bb
                             }
                         }
                         track.current.text.push(c.to_ascii_uppercase());
@@ -1845,8 +1833,14 @@ impl Validator {
                 return;
             };
             let freq_hz = track.freq_hz * self.freq_calibration;
+            // MAN-207: a word already decided as another spot type is
+            // reclassified by this decision, not decided for the first time.
+            let mut cause = Cause::Decided;
             if let Some(word) = track.words.iter_mut().find(|w| w.seq == seq) {
                 word.beacon_no_evidence_recorded = true;
+                if word.attempted {
+                    cause = Cause::Reclassified;
+                }
             }
             // A guarded occurrence stays explained by its CQ/DE framing,
             // also once that framing ages out of the window.
@@ -1854,7 +1848,8 @@ impl Validator {
                 continue;
             }
             self.suppression_counts.beacon_no_evidence += 1;
-            self.decide(|| {
+            let at = At::new(track_id, seq, cause);
+            self.decide(at, Some(Reason::BeaconNoEvidence), || {
                 Decision::withheld(
                     track_id,
                     end_ts,
@@ -2205,7 +2200,8 @@ impl Validator {
             .last_sample_ts(&candidate, freq_hz, input)
             .is_some_and(|last| sample_ts < last)
         {
-            self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
+            let reason = Reason::Dedupe;
+            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
             return None;
         }
         let outcome = self

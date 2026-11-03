@@ -85,7 +85,7 @@ owns:
   live-state record, so `manta-spot` carries no file format. Live misses
   are investigated by replaying a `run --record-iq` recording (MAN-309).
 - **D12. A counter on `/metrics`.** `manta_candidate_decisions_total{decision,reason}`
-  renders every valid pair (16 series, `reason="none"` on a spot) from the
+  renders every valid pair (17 series, `reason="none"` on a spot) from the
   first decode batch, stored once per batch like
   `manta_candidate_repetitions`.
 - **D13. The public contract is unchanged.** Telnet, the JSON spot stream,
@@ -133,8 +133,10 @@ This record is the first slice. Moved to a follow-up ticket:
 
 - MAN-201 roles: role evidence on each record, `episode` as the MAN-201
   turn index, `NotCandidate` records for role-skipped call occurrences and
-  `manta_call_occurrences_not_candidate_total{role}`. MAN-201 is on main
-  but not on this branch's base.
+  `manta_call_occurrences_not_candidate_total{role}`. MAN-201 reached this
+  branch through a merge of main; its `BeaconNoEvidence` decisions are
+  recorded and counted like every other reason, but none of the role work
+  above is.
 - A daemon records sink with a retention and privacy policy; per-spot
   delivery state; epoch for MAN-202 unknown gaps and for the daemon;
   `ReadingsHeld` readings in the trace; links to a variant rival's own
