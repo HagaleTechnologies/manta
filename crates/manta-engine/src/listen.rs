@@ -1019,27 +1019,17 @@ pub fn listen_with_observers(
                 if let Some(obs) = lifecycle {
                     obs.observe_peak(seg.tm.active_track_count());
                 }
-<<<<<<< HEAD
+                // MAN-201: a call that was held for its role is decided now;
+                // nothing later will settle it.
                 let events = seg.tm.finish_for_discontinuity();
                 emit(
                     events,
-=======
-                // MAN-201: a call that was held for its role is decided now;
-                // nothing later will settle it. Not evidence the signal
-                // ended, so the outage teardown.
-                let finish_events = seg.tm.finish_for_discontinuity();
-                emit(
-                    finish_events,
->>>>>>> d1ddf99a36ce63e9f59141fc84751cfc41391de1
                     &mut validator,
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
                 );
-<<<<<<< HEAD
                 report_active_tracks(0);
-=======
->>>>>>> d1ddf99a36ce63e9f59141fc84751cfc41391de1
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
                 // The final close moved the close and gate counts.
