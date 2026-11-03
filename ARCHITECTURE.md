@@ -1101,6 +1101,21 @@ truth with realistic HF impairment already exists.**
   recording, AWGN or Watterson good/poor) and reports recall/CER vs SNR in
   500 Hz; same build and flags, same bytes
   (`docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md`).
+- Independent generator gate (MAN-206): `manta_testkit::baseband` renders
+  keyed CW straight to complex baseband with its own Morse table, timeline,
+  carrier, fader and noise (no code shared with `keyer`/`scene`/`noise`,
+  `manta-decode` or `manta-dsp`), and `crosscheck` compares it with the
+  production routes through the independent `measure` estimators on envelope
+  durations, spectra, total power, 2500 Hz SNR, noise whiteness and fading
+  autocorrelation. Only `crosscheck::verified()` hands out the `Verified`
+  token that `independent_scene` requires, so no decoded-text comparison
+  can run on an unchecked generator
+  (`docs/DECISIONS/2026-11-03-man206-independent-generator-and-scene-minimizer.md`).
+- Failure minimizer (MAN-206): `manta_testkit::minimize` shrinks a failing
+  `scenespec::SceneSpec` (synthetic only, exact-float JSON) by duration,
+  signals, text and impairments while the probe's failure signature holds;
+  `repro` stores the result. `crates/manta-engine/tests/repros/` holds the
+  committed repros, replayed and linted by `synthetic_repros.rs`.
 
 ## 10. Concurrency model
 

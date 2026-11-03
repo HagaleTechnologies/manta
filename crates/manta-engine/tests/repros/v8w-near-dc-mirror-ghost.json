@@ -1,0 +1,46 @@
+{
+  "schema": "manta-testkit/repro/v1",
+  "origin": "synthetic",
+  "name": "v8w-near-dc-mirror-ghost",
+  "found_in": "manta-testkit vectors::v8w() s09 with vectors::v8() s00-s03 (MAN-206, 2026-11-03)",
+  "generator_revision": 1,
+  "expect": "fails",
+  "probe": "ghost",
+  "signature": [
+    "mirror:s09"
+  ],
+  "digests": {
+    "x86_64-linux": "b277920883d765a7"
+  },
+  "scene": {
+    "schema": "manta-testkit/scene/v1",
+    "origin": "synthetic",
+    "fs": "96000",
+    "duration_s": "30",
+    "center_freq_hz": "14000000",
+    "noise_seed": 91582817457720,
+    "signals": [
+      {
+        "label": "s09",
+        "text": "K",
+        "loop_text": true,
+        "wpm": "29.352282",
+        "offset_hz": "-324.57469677212066",
+        "snr_2500_db": "6.079727",
+        "jitter": null,
+        "qsb": null,
+        "watterson": {
+          "preset": "poor",
+          "seed": 91585562302002
+        },
+        "char_wpm": null,
+        "weight": "3",
+        "char_gap_units": "3",
+        "word_gap_units": "7",
+        "rise_ms": "5",
+        "dit_units": "1",
+        "element_gap_units": "1"
+      }
+    ]
+  }
+}
