@@ -5,13 +5,16 @@
 //! 24 kS/s (factors 2, 4), and 48 kHz rig audio down to 6 kS/s (factor 8).
 //! Each pair runs twice: one whole second of input per `process` call, and
 //! the live shape -- `RAW_CHUNK_SAMPLES (4096) * factor` input samples per
-//! call, which is what `DecimatingSource::read` feeds the decimator. Steady
+//! call, the size of the scratch buffer `DecimatingSource::read` fills from
+//! its inner source (a full read; packetized sources such as HPSDR return
+//! fewer samples per read, which this bench does not model). Steady
 //! state: the decimator is built once and fed repeatedly, so construction
 //! (the Kaiser design) is not in the timed loop. Throughput is input
-//! samples, so criterion's "elem/s" divided by the pair's `fs_in` is the
-//! fraction of one real-time stream the stage keeps up with. Not gated in
-//! CI; host numbers only (no Pi4 claim). The decision record quotes time
-//! per 1 s of input as the fraction of one host core.
+//! samples, so criterion's "elem/s" divided by the pair's `fs_in` is how
+//! many real-time streams of that rate one host core keeps up with; its
+//! inverse is the share of one core. Not gated in CI; host numbers only
+//! (no Pi4 claim). The decision record quotes time per 1 s of input as the
+//! share of one host core.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use manta_dsp::decimate::Decimator;
@@ -20,7 +23,9 @@ use std::hint::black_box;
 use std::time::Duration;
 
 /// `manta-input::decimate::RAW_CHUNK_SAMPLES`: decimated samples per
-/// `DecimatingSource` read; the raw read is this times the factor.
+/// `DecimatingSource` read; the raw read is this times the factor. A copy:
+/// `manta-dsp` cannot depend on `manta-input`, and the constant is private
+/// there. Keep the two in step.
 const RAW_CHUNK_SAMPLES: usize = 4096;
 
 /// (fs_in Hz, factor, label)

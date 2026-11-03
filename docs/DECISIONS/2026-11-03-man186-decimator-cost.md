@@ -59,9 +59,12 @@ SPEC-decode-core §6 rule 4 requires a fixed operation order for per-sample
 `f32` state. A reordered sum, such as a symmetric fold of mirrored taps,
 rounds differently, and no test can prove it bit-identical to the current
 order for every input once the result narrows to `f32`. The research phase
-found the only bit-identical speed-up (a contiguous history buffer instead
-of a `VecDeque`) worth about 5 %, inside bench noise on this host. Neither
-change is made.
+measured one bit-identical speed-up, a contiguous history buffer instead of
+a `VecDeque`, at about 5 %, inside bench noise on this host. Dropping
+`Decimator::process`'s up-front `iq.to_vec()` copy and the per-stage output
+allocations would also leave every output bit unchanged; the bench times
+them, and nothing here measures them separately. No speed-up is made in
+this ticket.
 
 ## Cost
 
@@ -78,7 +81,10 @@ numbers as indicative, as the MAN-273 record does.
 
 Each id times one second of input. `_whole_1s` passes the whole second to
 one `process` call. `_live_chunks` passes it as `4096 * factor` samples per
-call, the shape `DecimatingSource::read` uses. Criterion's `[low mid high]`:
+call, the size of a full `DecimatingSource::read` from its inner source.
+The bench calls `Decimator::process` directly, so `DecimatingSource`'s own
+bookkeeping (gap counters, the pending queue) is not timed. Criterion's
+`[low mid high]`:
 
 | Id | Time per 1 s of input |
 |---|---|
@@ -106,13 +112,19 @@ Share of one host core (mid time of the whole-second case divided by 1 s):
 | 96k to 24k, x4 | 0.75 % |
 | 48k to 6k, x8 | 0.46 % |
 
-The chunked live shape costs the same as one whole-second call within
-noise, so the per-read overhead of `DecimatingSource` is negligible. Each
-extra stage runs at half the rate of the one before it, so at 192 kS/s the
-second stage adds about 5.1 ms and the third a further 1.5 ms to the
-first stage's 9.7 ms. The planning run on the same host at load 37 to 47
-measured 10 to 20 % higher. The research run at load 19 measured close to
-these figures.
+In five of the six pairs the chunked shape costs the same as one
+whole-second call within noise. At 96k x4 the chunked intervals sit about
+7 % above the whole-second ones and do not overlap, so per-call cost at
+that pair is not zero on this run; at this load average that gap may also
+be host noise. Packetized sources hand `process` far smaller chunks than
+`4096 * factor`, and this bench does not measure that shape. At 192 kS/s
+the second stage adds about 5.1 ms and the third a further 1.5 ms to the
+first stage's 9.7 ms. Each stage runs at half the rate of the one before,
+so a pure MAC model predicts about 4.9 ms and 2.4 ms; the third stage
+measured below that prediction, most likely load noise on this shared
+host. The planning run on the same host at load 37 to
+47 measured 10 to 20 % higher. The research run at load 19 measured close
+to these figures.
 
 ## What this does not claim
 
