@@ -276,10 +276,15 @@ mod tests {
     /// split.
     #[test]
     fn render_scene_split_keeps_direct_route_bytes() {
+        // MAN-112 moved V7 to 10,000/10,150 Hz after this digest was
+        // pinned; render the scene it was pinned on (channels 107 and 111).
+        let mut v7_pinned = vectors::v7();
+        v7_pinned.signals[0].offset_hz = 107.0 * 93.75;
+        v7_pinned.signals[1].offset_hz = 111.0 * 93.75;
         for (spec, want) in [
             (vectors::v1(), 0xb689_3351_782c_1da3u64),
             (vectors::v6(), 0x912c_6564_8c14_91c1),
-            (vectors::v7(), 0xe9c4_7623_22c3_0d1a),
+            (v7_pinned, 0xe9c4_7623_22c3_0d1a),
             (vectors::v8(), 0x6fac_e2d0_35cf_5a59),
             (vectors::vr4(), 0x44ce_2d62_f984_63c2),
             (vectors::vw3(), 0x10d1_2485_40b3_f7d0),

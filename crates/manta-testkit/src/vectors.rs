@@ -248,27 +248,10 @@ pub fn v34() -> VectorSpec {
     spec
 }
 
-/// SPEC §7 V7 "adjacent": 24 WPM @ channel 107 (10,031.25 Hz) and 28 WPM @
-/// channel 111 (10,406.25 Hz), both +15 dB, AWGN. Pass: exactly 2 tracks;
-/// both char >= 95%; both freqs within ±15 Hz.
-///
-/// Deviates from SPEC §7's literal 150 Hz (~1.6 channels @
-/// `CHANNEL_SPACING_HZ = 93.75` Hz, fs=96000/N=1024) separation: two
-/// independently-keyed signals that close together fall inside each other's
-/// ±1-channel ownership window (SPEC §2.5) and interleave hop-to-hop,
-/// producing dozens of spurious garbled tracks (measured: 27) rather than 2
-/// clean ones — empirically confirmed below this channelizer's ~2.5-channel
-/// separation floor. This is fixture calibration, not a detector bug; see
-/// `docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` (item 4).
-/// Both offsets are bin-centered (exact channel multiples of 93.75 Hz) and 4
-/// channels apart. An offline replica measured 0.0 Hz freq error on this
-/// exact pair; a real in-pipeline run measured 11.0/1.5 Hz -- both
-/// comfortably under the ±15 Hz criterion, but the gap vs. the replica's
-/// prediction is attributed to the channelizer's known parabolic-
-/// interpolation bias (deferred separately, see `Track::freq_hz`'s doc
-/// comment), not to this fixture's separation.
+/// SPEC §7 V7: independent 24/28 WPM signals at 10,000/10,150 Hz,
+/// both +15 dB. Exactly two tracks, CER <= 0.05 and frequency error <= 15 Hz.
+/// See docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md.
 pub fn v7() -> VectorSpec {
-    const CHANNEL_SPACING_HZ: f64 = 93.75;
     VectorSpec {
         name: "v7",
         fs: 96_000.0,
@@ -282,7 +265,7 @@ pub fn v7() -> VectorSpec {
                 text: "CQ CQ DE N1AA N1AA K".into(),
                 loop_text: true,
                 wpm: 24.0,
-                offset_hz: 107.0 * CHANNEL_SPACING_HZ,
+                offset_hz: 10_000.0,
                 snr_2500_db: 15.0,
                 jitter: None,
                 qsb: None,
@@ -299,7 +282,7 @@ pub fn v7() -> VectorSpec {
                 text: "CQ CQ DE N2BB N2BB K".into(),
                 loop_text: true,
                 wpm: 28.0,
-                offset_hz: 111.0 * CHANNEL_SPACING_HZ,
+                offset_hz: 10_150.0,
                 snr_2500_db: 15.0,
                 jitter: None,
                 qsb: None,
@@ -312,6 +295,43 @@ pub fn v7() -> VectorSpec {
             },
         ],
         rise_ms: 5.0,
+    }
+}
+
+/// Deterministic close-pair scene with V7's independently keyed texts.
+pub fn close_pair(
+    name: &'static str,
+    a_offset_hz: f64,
+    spacing_hz: f64,
+    snr_a_db: f64,
+    snr_b_db: f64,
+) -> VectorSpec {
+    let mut spec = v7();
+    spec.name = name;
+    spec.signals[0].offset_hz = a_offset_hz;
+    spec.signals[1].offset_hz = a_offset_hz + spacing_hz;
+    spec.signals[0].snr_2500_db = snr_a_db as f32;
+    spec.signals[1].snr_2500_db = snr_b_db as f32;
+    spec
+}
+
+/// Single-signal carrier-offset control for the MAN-112 recall sweep.
+pub fn single_at_offset(name: &'static str, offset_ch: f64, wpm: f64, snr_db: f64) -> VectorSpec {
+    let mut spec = close_pair(name, (107.0 + offset_ch) * 93.75, 250.0, snr_db, snr_db);
+    spec.signals.truncate(1);
+    spec.signals[0].wpm = wpm as f32;
+    spec
+}
+
+#[cfg(test)]
+mod close_pair_tests {
+    #[test]
+    fn close_pair_keeps_the_two_independent_texts() {
+        let spec = super::close_pair("x", 10_031.25, 150.0, 15.0, 15.0);
+        assert_eq!(spec.signals[1].offset_hz, 10_181.25);
+        for (a, b) in spec.signals.iter().zip(super::v7().signals) {
+            assert_eq!(a.text, b.text);
+        }
     }
 }
 
