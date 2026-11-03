@@ -2054,6 +2054,31 @@ fn legacy_soapy_freq_and_rate_spellings_still_parse() {
     }
 }
 
+#[test]
+#[cfg(feature = "soapy")]
+fn soapy_gain_help_warns_that_sdrplay_reads_it_as_attenuation() {
+    // `-h` shows only a doc comment's first paragraph, so the warning must sit there.
+    let warning = "On an SDRplay a higher value means more attenuation, not more gain";
+    for cmd in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        for flag in ["-h", "--help"] {
+            let out = manta().args([cmd, flag]).output().unwrap();
+            assert!(out.status.success(), "manta {cmd} {flag} failed");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                text.contains(warning),
+                "manta {cmd} {flag} must warn that --soapy-gain is attenuation on an SDRplay: {text}"
+            );
+            if flag == "--help" {
+                assert!(
+                    text.contains("0 is the most sensitive setting and 48 the least"),
+                    "manta {cmd} --help must give the measured RSP1B range: {text}"
+                );
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // MAN-261: one TOML file drives a deployment. Phase 1 -- the strict loader;
 // servers start iff [server] is present; scenario 3 (table) and scenario 4.

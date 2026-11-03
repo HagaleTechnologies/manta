@@ -318,7 +318,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -629,7 +635,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -886,7 +898,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -1136,7 +1154,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
