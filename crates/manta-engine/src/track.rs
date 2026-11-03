@@ -3103,7 +3103,9 @@ impl TrackManager {
         // trusted band, in both the k and k+1 slots -- the same-hop
         // adjacent-rise arbitration must not route around the veto.
         // MAN-273: likewise the analytic front end's DC/Nyquist guard.
-        self.trace_spawn_vetoes(&rise, past_warmup, suppress, &hop.power, sample_ts);
+        // MAN-198: a new condition here also belongs in
+        // `trace_spawn_vetoes`, or the funnel reports its refusals as noRise.
+        let owners_before = self.funnel.as_ref().map(|_| self.owner_of.clone());
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
@@ -3146,6 +3148,9 @@ impl TrackManager {
                 }
                 k += 1;
             }
+        }
+        if let Some(before) = owners_before {
+            self.trace_spawn_vetoes(&rise, &before, past_warmup, suppress, &hop.power, sample_ts);
         }
         self.recompute_ownership();
         // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
@@ -3274,13 +3279,15 @@ impl TrackManager {
         }
     }
 
-    /// MAN-198: the trace's spawn-veto census. For each rising channel the
-    /// spawn scan below refuses, the condition it fails: source masks
-    /// first, then the scan's own order. Reads state only, and only with a
-    /// trace; a rise that passes every condition is the scan's to spawn.
+    /// MAN-198: the trace's spawn-veto census, run after the spawn scan.
+    /// A rising channel a track born this hop claimed (its owner differs
+    /// from `owners_before`) was the scan's to spawn, not a refusal. Every
+    /// other rising channel failed a scan condition; this names one, source
+    /// masks first, then the scan's own order. Reads state only.
     fn trace_spawn_vetoes(
         &self,
         rise: &[bool],
+        owners_before: &[Option<u32>],
         past_warmup: bool,
         suppress: bool,
         power: &[f32],
@@ -3293,35 +3300,38 @@ impl TrackManager {
         let n = self.n_channels();
         let fs = self.channel_spacing_hz * n as f64;
         let second = (sample_ts as f64 / fs) as u64;
-        let refused = (0..n).filter(|&k| rise[k]).filter_map(|k| {
-            let veto = if self.trusted_vetoes_spawn(k) {
-                V::TrustedBand
-            } else if self.guard_vetoes_spawn(k) {
-                V::AnalyticGuard
-            } else if self.digital_vetoes_spawn(k) {
-                V::DigitalWindow
-            } else if self.mirror_vetoes_spawn(k, power) {
-                V::MirrorImage
-            } else if !past_warmup {
-                V::Warmup
-            } else if suppress {
-                V::StaticCrash
-            } else if self.owner_of[k].is_some() {
-                V::OwnedByTrack
-            } else if self.spawn_window_cooling_down(k) {
-                V::CoolingDown
-            } else if !self.is_local_peak(k) {
-                V::NotLocalPeak
-            } else if self.rtty_vetoes_spawn(k) {
-                V::Rtty
-            } else if self.comod_vetoes_spawn(k) {
-                V::CoModulated
-            } else {
-                return None;
-            };
-            let f = self.center_freq_hz + wrapped_channel_offset(k, n) * self.channel_spacing_hz;
-            Some((second, (f * 100.0).round() as i64, veto))
-        });
+        let refused = (0..n)
+            .filter(|&k| rise[k] && self.owner_of[k] == owners_before[k])
+            .filter_map(|k| {
+                let veto = if self.trusted_vetoes_spawn(k) {
+                    V::TrustedBand
+                } else if self.guard_vetoes_spawn(k) {
+                    V::AnalyticGuard
+                } else if self.digital_vetoes_spawn(k) {
+                    V::DigitalWindow
+                } else if self.mirror_vetoes_spawn(k, power) {
+                    V::MirrorImage
+                } else if !past_warmup {
+                    V::Warmup
+                } else if suppress {
+                    V::StaticCrash
+                } else if self.owner_of[k].is_some() {
+                    V::OwnedByTrack
+                } else if self.spawn_window_cooling_down(k) {
+                    V::CoolingDown
+                } else if !self.is_local_peak(k) {
+                    V::NotLocalPeak
+                } else if self.rtty_vetoes_spawn(k) {
+                    V::Rtty
+                } else if self.comod_vetoes_spawn(k) {
+                    V::CoModulated
+                } else {
+                    return None;
+                };
+                let f =
+                    self.center_freq_hz + wrapped_channel_offset(k, n) * self.channel_spacing_hz;
+                Some((second, (f * 100.0).round() as i64, veto))
+            });
         trace.vetoes(refused);
     }
 

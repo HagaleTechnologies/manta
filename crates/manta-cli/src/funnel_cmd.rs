@@ -65,7 +65,7 @@ fn sidecar_sha256(recording: &Path) -> Result<Option<String>> {
     let sidecar = if manta_input::is_native_recording(recording) {
         manta_input::metadata_path(recording)
     } else {
-        recording.with_extension("json")
+        manta_input::sidecar_path(recording)
     };
     if sidecar.is_file() {
         sha256_file(&sidecar).map(Some)
@@ -186,4 +186,24 @@ pub(crate) fn run(args: &FunnelArgs, pipeline: &PipelineConfig, duration_s: f64)
         args.out.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc_iso;
+
+    #[test]
+    fn utc_iso_round_trips_the_capture_start_parser() {
+        for iso in [
+            "1970-01-01T00:00:00Z",
+            "2000-02-29T12:34:56Z",
+            "2024-02-29T23:59:59Z",
+            "2025-11-29T00:00:00Z",
+            "2026-12-31T00:00:01Z",
+            "2100-03-01T00:00:00Z",
+        ] {
+            let unix_s = manta_testkit::oracle::parse_utc_timestamp(iso).unwrap();
+            assert_eq!(utc_iso(unix_s), iso);
+        }
+    }
 }

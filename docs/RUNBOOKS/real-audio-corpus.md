@@ -228,25 +228,28 @@ truth to the earliest pipeline stage that lost it. It is a diagnostic, not
 a score: nothing gates on it.
 
 1. The oracle reads the centre frequency from a `<name>.json` sidecar next
-   to the WAV, not from `--center-freq-hz`. Write one beside B2 once:
+   to the WAV, not from `--center-freq-hz`. Link B2 into a scratch
+   directory outside the repository and write the sidecar there:
    ```sh
-   echo '{"center_freq_hz": 7080000.0}' > \
-     crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.json
+   mkdir -p /tmp/b2-funnel
+   ln -sf "$PWD/crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.wav" \
+     /tmp/b2-funnel/b2.wav
+   echo '{"center_freq_hz": 7080000.0}' > /tmp/b2-funnel/b2.json
    ```
 2. Run the oracle with the funnel:
    ```sh
-   target/release/manta oracle \
-     crates/manta-testkit/audio-corpus/B2_20251129_000000_7080kHz.source.wav \
+   target/release/manta oracle /tmp/b2-funnel/b2.wav \
      crates/manta-testkit/audio-corpus/ground-truth/B2_20251129_000000_7080kHz.rbn.csv \
-     --spotter K5TR --capture-start 2025-11-29T00:00:00Z --funnel b2.funnel.jsonl
+     --spotter K5TR --capture-start 2025-11-29T00:00:00Z \
+     --funnel /tmp/b2-funnel/b2.funnel.jsonl
    ```
    stdout is the plain oracle summary, unchanged. One `note: loss funnel:`
    line on stderr gives the per-stage loss counts.
-3. Read `b2.funnel.jsonl`: a header, one `lossFunnel` record per episode
+3. Read `/tmp/b2-funnel/b2.funnel.jsonl`: a header, one `lossFunnel` record per episode
    with `lostAt` and `detail`, and a `lossFunnelSummary`. The stages and
    every `detail` value are defined in
    [the decision record](../DECISIONS/2026-11-03-man198-loss-funnel.md).
 
-Do not commit funnel outputs or the sidecar: B2 and its truth are not in
-the repository, and the numbers belong in the decision record of the
-ticket that acts on them.
+Do not commit funnel outputs: B2 and its truth are not in the repository,
+and the numbers belong in the decision record of the ticket that acts on
+them.
