@@ -120,6 +120,11 @@ pub struct ListenObservers {
     /// A source with no RF centre publishes nothing. `None` (the default)
     /// skips everything, so `listen()`'s existing callers pay nothing.
     pub spectrum: Option<Arc<dyn SpectrumSink>>,
+    /// MAN-198: the loss funnel's write-only track trace -- every candidate
+    /// birth, confirmation and close (`crate::funnel::FunnelTrace`). Set
+    /// only by `crate::funnel::run_funnel`; decoding and spots are
+    /// unchanged. `None` (the default) records nothing.
+    pub funnel_trace: Option<Arc<crate::funnel::FunnelTrace>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -851,6 +856,7 @@ pub fn listen_with_observers(
         occupancy,
         spectrum.as_ref(),
     )?;
+    seg.tm.set_funnel_trace(observers.funnel_trace.clone());
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -1081,6 +1087,7 @@ pub fn listen_with_observers(
                     return Err(e);
                 }
             };
+            seg.tm.set_funnel_trace(observers.funnel_trace.clone());
             let hops = seg.channelize(&padding);
             let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
@@ -1919,6 +1926,143 @@ mod tests {
             c.not_cw,
             c.unkeyed,
         ]
+    }
+
+    #[test]
+    fn funnel_trace_observer_leaves_events_and_spots_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers| {
+            let mut events = Vec::new();
+            let mut spots = Vec::new();
+            listen_with_observers(
+                Box::new(FixedFreqSource {
+                    samples: rendered.samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                }),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| events.push(ev.clone()),
+                |spot| spots.push(spot.clone()),
+                |_| {},
+            )
+            .unwrap();
+            (events, spots)
+        };
+        let expected = run(ListenObservers::default());
+        let trace = crate::funnel::FunnelTrace::new();
+        assert_eq!(
+            expected,
+            run(ListenObservers {
+                funnel_trace: Some(trace.clone()),
+                ..Default::default()
+            })
+        );
+        let log = trace.take();
+        let spawned = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Spawned { .. }))
+            .count();
+        let closed = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Closed { .. }))
+            .count();
+        assert!(spawned >= 1);
+        assert!(closed <= spawned);
+        assert!(log
+            .records
+            .iter()
+            .any(|r| matches!(r, crate::funnel::TrackTraceRecord::Confirmed { .. })));
+    }
+
+    /// MAN-198, both Gherkin scenarios end to end: the v1 station decoded
+    /// as a validated spot is delivered; a frequency where no track ever
+    /// opened is charged to detectable energy and nothing later.
+    #[test]
+    fn funnel_charges_one_stage_per_opportunity_on_v1() {
+        use crate::funnel::{run_funnel, Opportunity, Stage, Tolerances};
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src = Box::new(FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let op = |call: &str, freq_hz: f64, t: f64| Opportunity {
+            call: call.into(),
+            freq_hz,
+            first_s: t,
+            last_s: t,
+            rows: 1,
+            snr_db: 20,
+            wpm: Some(20.0),
+        };
+        let ops = [
+            op("W1AW", 14_012_300.0, 60.0),
+            op("OH2XYZ", 14_030_000.0, 60.0),
+            op("W9LATE", 14_012_300.0, 660.0),
+            op("VE3OUT", 14_060_000.0, 60.0),
+        ];
+        let duration_s = rendered.samples.len() as f64 / spec.fs;
+        let report = run_funnel(
+            src,
+            &PipelineConfig::default(),
+            &ops,
+            &Tolerances::default(),
+            duration_s,
+        )
+        .unwrap();
+        let by_call = |c: &str| report.records.iter().find(|r| r.call == c).unwrap();
+        let w1aw = by_call("W1AW");
+        assert_eq!(w1aw.reached, Some(Stage::Delivered), "{w1aw:?}");
+        assert_eq!(w1aw.lost_at, None);
+        assert!(!w1aw.spots.is_empty());
+        let oh2 = by_call("OH2XYZ");
+        assert_eq!(oh2.lost_at, Some(Stage::DetectableEnergy), "{oh2:?}");
+        assert_eq!(oh2.detail.as_deref(), Some("noCandidate"));
+        assert_eq!(oh2.tracks.candidates, 0);
+        assert_eq!(
+            by_call("W9LATE").detail.as_deref(),
+            Some("outsideRecording")
+        );
+        assert_eq!(by_call("VE3OUT").detail.as_deref(), Some("outsidePassband"));
+        let s = &report.summary;
+        assert_eq!(s.opportunities, 4);
+        assert_eq!(s.delivered, 1);
+        assert_eq!(s.lost_at.detectable_energy, 1);
+        assert_eq!(s.lost_at.input_coverage, 2);
+        assert_eq!(
+            Stage::ALL
+                .iter()
+                .map(|st| s.lost_at.get(*st))
+                .sum::<usize>()
+                + s.delivered,
+            s.opportunities
+        );
+        assert!(s.births.candidates >= s.births.confirmed);
+        assert!(s.births.confirmed >= s.births.leased);
+        assert!(s.births.leased >= 1);
+        // Deterministic: a second run gives the same report.
+        let again = run_funnel(
+            Box::new(FixedFreqSource {
+                samples: rendered.samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            }),
+            &PipelineConfig::default(),
+            &ops,
+            &Tolerances::default(),
+            duration_s,
+        )
+        .unwrap();
+        assert_eq!(report, again);
     }
 
     #[test]

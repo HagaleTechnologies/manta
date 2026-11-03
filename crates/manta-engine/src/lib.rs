@@ -43,6 +43,7 @@ pub use soak_metrics::{
 
 mod digital_windows;
 pub mod ftx;
+pub mod funnel;
 #[cfg(test)]
 mod static_crash_tests;
 mod track;

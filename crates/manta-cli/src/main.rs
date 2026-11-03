@@ -32,6 +32,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod funnel_cmd;
 mod grade_cmd;
 mod grade_paired;
 mod grade_transcript;
@@ -218,6 +219,22 @@ enum Command {
         /// summary always goes to stdout as well.
         #[arg(long)]
         jsonl: Option<PathBuf>,
+        /// Also run the full pipeline once and write a stage-attributed loss
+        /// funnel (JSON Lines) to PATH. Diagnostic only: stdout and --jsonl
+        /// are unchanged
+        #[arg(long, value_name = "PATH")]
+        funnel: Option<PathBuf>,
+        /// Frequency tolerance for matching a candidate or track to a truth
+        /// row, plus half a channel width
+        #[arg(long, value_name = "HZ", default_value_t = 150.0, value_parser = parse_funnel_tol)]
+        funnel_track_tol_hz: f64,
+        /// Frequency tolerance for matching a decision or spot to a truth row
+        #[arg(long, value_name = "HZ", default_value_t = 500.0, value_parser = parse_funnel_tol)]
+        funnel_spot_tol_hz: f64,
+        /// Time tolerance for matching a decision or spot to a truth row's
+        /// first and last report
+        #[arg(long, value_name = "SECONDS", default_value_t = 90.0, value_parser = parse_funnel_tol)]
+        funnel_spot_window_s: f64,
     },
     /// Generate a synthetic CW test recording.
     ///
@@ -2902,6 +2919,15 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     Ok(window_s)
+}
+
+/// MAN-198: the oracle's `--funnel-*` tolerances: finite and non-negative.
+fn parse_funnel_tol(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("must be finite and non-negative, got {s}"));
+    }
+    Ok(v)
 }
 
 /// MAN-309: `--sample-rate-hz` for headerless IQ: finite, above 0 and at
@@ -6931,6 +6957,10 @@ fn run_command() -> Result<std::process::ExitCode> {
             engine,
             prior,
             jsonl,
+            funnel,
+            funnel_track_tol_hz,
+            funnel_spot_tol_hz,
+            funnel_spot_window_s,
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "oracle", &["decode", "spot"]);
@@ -6968,7 +6998,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 build_pipeline_config(0.0, &spot, loaded.detector, decode.engine)?;
             pipeline.decode = decode;
             attach_language_prior(&mut pipeline, &spot, None)?;
-            let cfg = pipeline.decode;
+            let cfg = pipeline.decode.clone();
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -6979,6 +7009,25 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
             }
             outln!("{}", serde_json::to_string_pretty(&summary)?)?;
+            // MAN-198: after stdout, so the oracle's own output is unchanged.
+            if let Some(out) = funnel {
+                let args = funnel_cmd::FunnelArgs {
+                    recording: &path,
+                    rbn_csv: &rbn_csv,
+                    spotter: &spotter,
+                    capture_start_unix_s: capture_start,
+                    config: config.as_deref(),
+                    out: &out,
+                    tol: manta_engine::funnel::Tolerances {
+                        track_tol_hz: funnel_track_tol_hz,
+                        spot_tol_hz: funnel_spot_tol_hz,
+                        window_s,
+                        spot_window_s: funnel_spot_window_s,
+                        ..Default::default()
+                    },
+                };
+                funnel_cmd::run(&args, &pipeline, iq.len() as f64 / fs)?;
+            }
         }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
@@ -7871,6 +7920,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     detector_confirmations: None,
                     track_lifecycle: None,
                     spectrum: spectrum_sink,
+                    funnel_trace: None,
                 },
                 |ev| {
                     if json {

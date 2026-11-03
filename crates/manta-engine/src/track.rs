@@ -1734,6 +1734,12 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-198: the loss funnel's trace; `None` (the default) records
+    /// nothing.
+    funnel: Option<std::sync::Arc<crate::funnel::FunnelTrace>>,
+    /// MAN-198: the current hop's `sample_ts`, kept only while `funnel` is
+    /// set, for close records made outside `step_hop`'s own scope.
+    funnel_ts: u64,
     /// MAN-171: channel -> hop_counter before which a new CANDIDATE may not
     /// spawn on that channel, set on a `CloseReason::Silent` closure (see
     /// `DetectorConfig::silent_respawn_cooldown_hops`). `0` (the default,
@@ -1948,6 +1954,8 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            funnel: None,
+            funnel_ts: 0,
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
             quality: None,
@@ -2474,6 +2482,9 @@ impl TrackManager {
         Vec<DecoderEvent>,
     ) {
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
+        if self.funnel.is_some() {
+            self.funnel_ts = sample_ts;
+        }
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -2718,13 +2729,19 @@ impl TrackManager {
                     unreachable!("DORMANT entry and wake are handled before this match")
                 }
                 LifecycleEvent::Closed(reason) => {
-                    self.close_counts.record(reason);
+                    self.note_close(id, reason);
                     close_reasons.insert(id, reason);
                     closed.push(id);
                 }
                 LifecycleEvent::Promoted => {
                     // MAN-313: every detector confirmation, qualified or not.
                     self.confirmations += 1;
+                    if let Some(trace) = &self.funnel {
+                        trace.push(crate::funnel::TrackTraceRecord::Confirmed {
+                            track_id: id,
+                            sample_ts,
+                        });
+                    }
                     // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
                     // deviation): seed TrackMeta.freq_hz from this track's
                     // own centroid EMA (already warm from its
@@ -2998,6 +3015,13 @@ impl TrackManager {
             let n = self.n_channels();
             for (&id, track) in &self.tracks {
                 if !close_reasons.contains_key(&id) && fsk.in_hard_span(track.owned(n)[1]) {
+                    if let Some(trace) = &self.funnel {
+                        trace.push(crate::funnel::TrackTraceRecord::Closed {
+                            track_id: id,
+                            sample_ts,
+                            reason: CloseReason::Rtty.into(),
+                        });
+                    }
                     self.close_counts.record(CloseReason::Rtty);
                     close_reasons.insert(id, CloseReason::Rtty);
                     closed.push(id);
@@ -3111,11 +3135,13 @@ impl TrackManager {
                         }
                         // both channels claimed by this decision; skip past k+1
                         // next iteration so we don't re-evaluate it as its own birth.
-                        self.spawn(winner);
+                        let id = self.spawn(winner);
+                        self.trace_spawn(id, winner, sample_ts);
                         k += 2;
                         continue;
                     }
-                    self.spawn(winner);
+                    let id = self.spawn(winner);
+                    self.trace_spawn(id, winner, sample_ts);
                 }
                 k += 1;
             }
@@ -3207,7 +3233,7 @@ impl TrackManager {
     /// `current_snr_db` and would otherwise always prefer any already-driven
     /// track over one that (correctly, but only from next hop on) hasn't
     /// had `current_snr_db` populated yet.
-    fn spawn(&mut self, birth_channel: usize) {
+    fn spawn(&mut self, birth_channel: usize) -> u32 {
         let id = self.next_id;
         // MAN-13 (D3): step by the input's stride; on overflow the input
         // wraps to its own first id, never into another input's ids.
@@ -3231,6 +3257,38 @@ impl TrackManager {
             self.owner_of[ch] = Some(id);
         }
         self.tracks.insert(id, track);
+        id
+    }
+
+    /// MAN-198: the trace's candidate-birth record; nothing without a trace.
+    fn trace_spawn(&self, id: u32, birth_channel: usize, sample_ts: u64) {
+        if let Some(trace) = &self.funnel {
+            let n = self.n_channels();
+            trace.push(crate::funnel::TrackTraceRecord::Spawned {
+                track_id: id,
+                freq_hz: self.center_freq_hz
+                    + wrapped_channel_offset(birth_channel, n) * self.channel_spacing_hz,
+                sample_ts,
+            });
+        }
+    }
+
+    /// Counts one close and, MAN-198, traces it when a trace is set.
+    fn note_close(&mut self, id: u32, reason: CloseReason) {
+        self.close_counts.record(reason);
+        if let Some(trace) = &self.funnel {
+            trace.push(crate::funnel::TrackTraceRecord::Closed {
+                track_id: id,
+                sample_ts: self.funnel_ts,
+                reason: reason.into(),
+            });
+        }
+    }
+
+    /// MAN-198: attach (or, with `None`, detach) the loss funnel's write-only
+    /// trace. Decoding is unchanged either way.
+    pub fn set_funnel_trace(&mut self, trace: Option<std::sync::Arc<crate::funnel::FunnelTrace>>) {
+        self.funnel = trace;
     }
 
     /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
@@ -3280,7 +3338,7 @@ impl TrackManager {
         let ever_emitted_closed = to_close
             .into_iter()
             .filter_map(|(loser, survivor)| {
-                self.close_counts.record(CloseReason::Merged);
+                self.note_close(loser, CloseReason::Merged);
                 let mut track = self.tracks.remove(&loser)?;
                 if !track.has_emitted {
                     return None;
@@ -3327,7 +3385,7 @@ impl TrackManager {
                 .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
                 .unwrap();
-            self.close_counts.record(CloseReason::Evicted);
+            self.note_close(loser, CloseReason::Evicted);
             // MAN-19: only report as `TrackClosed`-worthy if it actually
             // emitted a real event -- see `step_hop`'s matching comment.
             if let Some(mut track) = self.tracks.remove(&loser) {
