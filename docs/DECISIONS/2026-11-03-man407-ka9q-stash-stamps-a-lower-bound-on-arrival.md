@@ -107,10 +107,16 @@ drain pass:
   early by up to the stall. The research measured about 300 ms early for
   an onset 300 ms into a 400 ms stall, where the dequeue stamp read about
   100 ms late.
-- Packets read in the same pass as a post-stall backlog share the
-  pre-stall floor. Only the first replayable packet sets the anchor, and
-  for a stream already running before the stall that packet arrived near
-  the floor, because a full UDP receive buffer keeps its oldest datagrams.
+- A post-stall backlog shares the pre-stall floor until a pass finds the
+  socket empty, because passes cut off by `DRAIN_BATCH` never raise it.
+  Only the first replayable packet sets the anchor. For a stream already
+  running before the stall, that packet arrived near the floor, because a
+  full UDP receive buffer keeps its oldest datagrams. But when the stash
+  cap evicts inside the backlog (a stash already near its cap before the
+  stall, or a kernel buffer raised to hold more than the cap), the first
+  retained packet arrived later than the floor it carries. The anchor then
+  reads early by up to the evicted span: the stall plus the passes it takes
+  to drain the backlog (about 1 ms per 256 datagrams).
 
 Early is the direction MAN-259's residual already accepts. Late is the
 direction this ticket forbids. A kernel receive stamp (`SO_TIMESTAMP`)

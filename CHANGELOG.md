@@ -329,7 +329,9 @@ the git history and `docs/DECISIONS/`.
   data socket. The startup stash now stamps each packet with the last
   instant it saw the socket empty, not the instant it read the packet, so
   the outage ends no later than the first replayed packet's arrival. A
-  400 ms stall had moved every later spot about 400 ms late. See
+  400 ms stall had moved every later spot about 400 ms late. The stamp can
+  now read early instead: by up to the stall when the stream starts inside
+  it or the stash evicts its backlog. See
   docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md.
 - MAN-202: with a SoapySDR input, a driver overflow no longer decodes the
   dropped span as Morse timing. A wrong character (for example `K` read as
