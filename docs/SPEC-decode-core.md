@@ -94,8 +94,10 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    `DC_CORNER_HZ = 5.0`: `y[n] = x[n] − dc[n]`, then
    `dc[n+1] = dc[n] + a_n·clamp(y[n])` with `a_n = max(2π·5/fs, 1/(n+1))`,
    `dc[0] = 0`, f64 state, and the update's magnitude clamped to 1.0
-   (full scale). It reads only `y`, so `x[n] = y[n] + dc[n]` inverts it
-   exactly. Every stage is causal and per-sample, so the hops do not
+   (full scale); exact-zero samples before the first nonzero one (the
+   lead-in padding) leave the state untouched, so `n` counts from the
+   first real sample. It reads only `y`, so `x[n] = y[n] + dc[n]` inverts
+   it exactly. Every stage is causal and per-sample, so the hops do not
    depend on how the input is split into `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
 1. **Window & fold:** `u[n] = x[n] · h[LN−1−n]` for `n = 0..LN`, then fold to

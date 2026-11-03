@@ -8,7 +8,10 @@
 //! impulse moves the estimate by at most `a_n`. The update reads only
 //! the f32 output `y`, so [`revert_dc`] rebuilds every `dc[n]` from the
 //! corrected stream and restores `x[n] = y[n] + dc[n]` exactly up to the
-//! f32 rounding of `y`. State is f64.
+//! f32 rounding of `y`. State is f64. Exact-zero samples before the first
+//! nonzero one (lead-in padding) do not advance the state, so `n` counts
+//! from the first real sample and reverting the stream with or without
+//! its leading zeros gives the same result.
 
 use num_complex::{Complex32, Complex64};
 
@@ -53,8 +56,15 @@ impl DcBlocker {
         y
     }
 
-    /// Advances the estimate from one corrected output sample.
+    /// Advances the estimate from one corrected output sample. Exact-zero
+    /// samples before the first nonzero one (the engine's lead-in padding)
+    /// leave the state untouched, so the fast start begins at the first
+    /// real sample. The rule reads only `y` and the state, so
+    /// [`revert_dc`] applies it identically.
     fn advance(&mut self, y: Complex32) {
+        if self.n == 0 && y.re == 0.0 && y.im == 0.0 {
+            return;
+        }
         let a = self.a.max(1.0 / (self.n as f64 + 1.0));
         let mut innov = Complex64::new(y.re as f64, y.im as f64);
         let mag = innov.norm();
@@ -123,6 +133,35 @@ mod tests {
             let tol = 1e-6 * a.norm().max(1e-2);
             assert!((a - b).norm() <= tol, "sample {i}: {a} vs {b}");
         }
+    }
+
+    #[test]
+    fn leading_zeros_keep_the_fast_start_and_the_inverse() {
+        let pad = 8192;
+        let mut x = vec![Complex32::new(0.0, 0.0); pad];
+        let mut tail = noise(FS as usize / 4, 5, 0.05);
+        for s in tail.iter_mut() {
+            *s += Complex32::new(0.01, 0.007);
+        }
+        x.extend_from_slice(&tail);
+        let y = apply(&x);
+        // The padding passes through as zeros and starts no clock.
+        assert!(y[..pad].iter().all(|s| s.re == 0.0 && s.im == 0.0));
+        // Reverting only the post-padding samples restores them exactly.
+        let back = revert_dc(&y[pad..], FS);
+        for (a, b) in tail.iter().zip(&back) {
+            assert!((a - b).norm() <= 1e-6 * a.norm().max(1e-2), "{a} vs {b}");
+        }
+        // The running-mean start settles within 50 ms of the first sample.
+        let mut b = DcBlocker::new(FS);
+        for &s in &x[..pad + (FS as usize / 20)] {
+            b.process_sample(s);
+        }
+        let l = b.level();
+        assert!(
+            (l.re - 0.01).abs() < 3e-3 && (l.im - 0.007).abs() < 3e-3,
+            "{l}"
+        );
     }
 
     #[test]

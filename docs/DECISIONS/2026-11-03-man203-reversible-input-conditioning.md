@@ -52,7 +52,14 @@ output changes, and no operator surface changes in this slice.
   `a_n = max(2π·5/fs, 1/(n+1))`, f64 state, `y[n] = x[n] - dc[n]`, then
   `dc[n+1] = dc[n] + a_n·clamp(y[n])` with the update's magnitude clamped to
   `DC_UPDATE_CLAMP = 1.0` (full scale). A stray impulse moves the estimate
-  by at most `a_n` (test `dc_update_clamp_bounds_an_impulse_kick`). The
+  by at most `a_n` (test `dc_update_clamp_bounds_an_impulse_kick`).
+  Exact-zero samples before the first nonzero one leave the state untouched,
+  so the engine's lead-in padding neither uses up the fast start nor shifts
+  the inverse (test `leading_zeros_keep_the_fast_start_and_the_inverse`).
+  Known limit, for the follow-up: a sample the MAN-234 guard replaced with
+  silence mid-stream is treated as input, so with `Apply` it leaves as
+  `-dc` and nudges the estimate; keeping it silent and the inverse exact
+  needs the guard's replacement positions in the log. The
   corner is a constant: 2, 5 and 20 Hz were indistinguishable in the
   research, and a station within about 40 Hz of the centre is undecodable
   in bypass anyway. 60 Hz loses under 0.05 dB
