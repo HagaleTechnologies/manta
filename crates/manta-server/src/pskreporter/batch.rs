@@ -61,7 +61,8 @@ pub struct Batcher {
     gate: HashMap<(String, &'static str), i64>,
     pending: Vec<Report>,
     pending_len: usize,
-    /// Reports in datagrams already built (the header's sequence number).
+    /// Data records in datagrams already built, each datagram's receiver
+    /// record included (the header's sequence number).
     sequence: u32,
     datagrams: u64,
     last_templates: Option<Instant>,
@@ -222,7 +223,9 @@ impl Batcher {
             templates,
             &reports,
         );
-        self.sequence = self.sequence.wrapping_add(reports.len() as u32);
+        // RFC 7011 section 3.1: every data record counts, so the receiver
+        // record does too; template records do not.
+        self.sequence = self.sequence.wrapping_add(reports.len() as u32 + 1);
         self.datagrams += 1;
         if templates {
             self.last_templates = Some(now);
@@ -483,19 +486,25 @@ mod tests {
             "{}",
             first.bytes.len()
         );
-        assert_eq!(sequence(&first), 3);
+        // Three earlier datagrams, each one report and the receiver record.
+        assert_eq!(sequence(&first), 6);
         // What did not fit beside the templates waits with the new spot.
         assert_eq!(b.pending(), 61 - first.reports + 1);
         let rest = b.flush(due_at, 0).expect("the rest");
         assert!(!rest.templates && !templated(&rest));
         assert!(rest.bytes.len() <= MAX_DATAGRAM_BYTES);
         assert_eq!(first.reports + rest.reports, 62);
-        assert_eq!(sequence(&rest), 3 + first.reports as u32);
+        assert_eq!(sequence(&rest), 6 + first.reports as u32 + 1);
         assert_eq!(b.flush(due_at, 0), None);
     }
 
+    /// RFC 7011 section 3.1 counts every data record, the receiver record
+    /// each datagram carries included; only template records are left out.
+    /// The page's example agrees: its datagram with sequence 1 carries one
+    /// receiver and two sender records, and it sends the same data "later
+    /// in the session (say with sequence number 4)", which is 1 + 3.
     #[tokio::test(start_paused = true)]
-    async fn the_sequence_number_counts_earlier_reports() {
+    async fn the_sequence_number_counts_earlier_data_records() {
         let mut b = batcher();
         let now = Instant::now();
         let mut seqs = Vec::new();
@@ -518,7 +527,8 @@ mod tests {
                 d.bytes[11],
             ]));
         }
-        assert_eq!(seqs, vec![0, 2, 5]);
+        // Reports plus one receiver record per datagram: 0, 2 + 1, 3 + 4.
+        assert_eq!(seqs, vec![0, 3, 7]);
     }
 
     #[tokio::test(start_paused = true)]

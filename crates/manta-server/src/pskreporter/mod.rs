@@ -427,7 +427,8 @@ mod tests {
             let d = d.expect("a datagram per flush");
             seen.push((templated(&d), sequence(&d)));
         }
-        assert_eq!(seen, vec![(true, 0), (true, 1), (true, 2), (false, 3)]);
+        // Each datagram adds its report and its receiver record.
+        assert_eq!(seen, vec![(true, 0), (true, 2), (true, 4), (false, 6)]);
     }
 
     #[tokio::test(start_paused = true)]

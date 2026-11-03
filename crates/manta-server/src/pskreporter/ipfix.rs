@@ -129,7 +129,9 @@ pub struct Report {
 pub struct Header {
     /// Unix seconds.
     pub export_time: u32,
-    /// Reports sent in earlier datagrams of the session (RFC 5101 §3.1).
+    /// Data records in datagrams built earlier in the session, reports and
+    /// receiver records alike, counting datagrams a failed lookup or send
+    /// dropped; template records are not counted (RFC 7011 §3.1).
     pub sequence: u32,
     /// Constant for the session.
     pub observation_domain: u32,
