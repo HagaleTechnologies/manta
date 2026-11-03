@@ -312,4 +312,44 @@ mod manta_run {
             "{got:?}"
         );
     }
+
+    /// `enabled = false` keeps the block but sends nothing, while manta
+    /// still validates the spot.
+    #[test]
+    fn manta_run_sends_nothing_from_a_disabled_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = v1_48k(dir.path());
+        let logger = FakeLogger::bind("127.0.0.1:0");
+        let config = format!(
+            "[server]\nstation_callsign = \"W5AU\"\noperator_grid = \"EM10dh\"\n\
+             bind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\n\
+             json_port = 0\nmetrics_port = 0\nstatus_interval_secs = 0\n\n\
+             [[wsjtx_output]]\ndestination = \"127.0.0.1:{}\"\nenabled = false\n\n\
+             [input]\ntype = \"file\"\npath = {:?}\niq = true\nreplay_epoch = 1793650000\n",
+            logger.port(),
+            wav.to_str().unwrap()
+        );
+        let path = dir.path().join("manta.toml");
+        std::fs::write(&path, config).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+        for (key, _) in std::env::vars() {
+            if key.starts_with("MANTA_") {
+                cmd.env_remove(key);
+            }
+        }
+        let out = cmd.args(["run", "--config"]).arg(&path).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("SPOT: W1AW"), "{stdout}\n{stderr}");
+        assert!(
+            !stderr.contains(&format!(
+                "wsjtx_output 127.0.0.1:{}: sending spots",
+                logger.port()
+            )),
+            "{stderr}"
+        );
+        let got = logger.drain();
+        assert!(got.is_empty(), "{got:?}\n{stderr}");
+    }
 }

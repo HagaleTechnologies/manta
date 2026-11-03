@@ -322,6 +322,36 @@ mod manta_run {
         );
     }
 
+    /// The scope note's "nothing public until an operator enables it": a
+    /// `[pskreporter]` table with `enabled` unset or `false` reports
+    /// nothing, even to a loopback host the replay guard would allow, while
+    /// manta still validates the spot.
+    #[test]
+    fn manta_run_reports_nothing_until_pskreporter_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = v1_48k(dir.path());
+        for off in ["", "enabled = false\n"] {
+            let collector = FakeCollector::bind();
+            let enabled = config(&wav, "127.0.0.1", collector.port());
+            let not_enabled = enabled.replace("enabled = true\n", off);
+            assert_ne!(not_enabled, enabled);
+            let out = manta_run(dir.path(), &not_enabled);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{off:?}: {stderr}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("SPOT: W1AW"), "{off:?}: {stdout}\n{stderr}");
+            assert!(
+                !stderr.contains(&format!(
+                    "pskreporter: reporting cq_beacon spots to 127.0.0.1:{}",
+                    collector.port()
+                )),
+                "{off:?}: {stderr}"
+            );
+            let got = collector.drain();
+            assert!(got.is_empty(), "{off:?}: {got:?}\n{stderr}");
+        }
+    }
+
     #[test]
     fn manta_run_does_not_report_a_replay_to_a_non_loopback_host() {
         let dir = tempfile::tempdir().unwrap();
