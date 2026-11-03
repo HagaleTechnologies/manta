@@ -32,9 +32,10 @@ the README said nothing about direction either.
 ## Guard
 
 `soapy_gain_help_warns_that_sdrplay_reads_it_as_attenuation`
-(`crates/manta-cli/tests/cli.rs`) checks `-h` and `--help` for all six
-commands. It needs the `soapy` feature, so only CI's `test-soapy` job
-(not a required check) runs it.
+(`crates/manta-cli/tests/cli.rs`) checks `-h` and `--help` for each
+command that takes the flag, including `listen`, which is `run`'s alias
+and shares its declaration. It needs the `soapy` feature, so only CI's
+`test-soapy` job (not a required check) runs it.
 
 ## Out of scope
 
