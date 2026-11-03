@@ -284,7 +284,9 @@ enum ReasonEffect {
 
 fn reason_effect(r: Reason) -> ReasonEffect {
     match r {
-        Reason::Grammar | Reason::Cty | Reason::PowerStepGuard => ReasonEffect::RejectsSelfId,
+        Reason::Grammar | Reason::Cty | Reason::PowerStepGuard | Reason::BeaconNoEvidence => {
+            ReasonEffect::RejectsSelfId
+        }
         Reason::Repetition
         | Reason::Variant
         | Reason::NoEvidence
@@ -1075,6 +1077,7 @@ mod tests {
             Reason::Variant,
             Reason::Dedupe,
             Reason::PowerStepGuard,
+            Reason::BeaconNoEvidence,
             Reason::BeaconPending,
             Reason::BeaconSpeed,
             Reason::BeaconOverflow,
@@ -1085,9 +1088,10 @@ mod tests {
         ];
         for r in all {
             let expected = match r {
-                Reason::Grammar | Reason::Cty | Reason::PowerStepGuard => {
-                    ReasonEffect::RejectsSelfId
-                }
+                Reason::Grammar
+                | Reason::Cty
+                | Reason::PowerStepGuard
+                | Reason::BeaconNoEvidence => ReasonEffect::RejectsSelfId,
                 Reason::Repetition
                 | Reason::Variant
                 | Reason::NoEvidence

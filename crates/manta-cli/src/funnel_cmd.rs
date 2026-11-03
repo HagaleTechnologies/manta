@@ -5,7 +5,7 @@
 //! docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 
 use anyhow::{Context, Result};
-use manta_engine::funnel::{self, Opportunity, Stage, Tolerances, TruthLayer};
+use manta_engine::funnel::{self, Bypass, Opportunity, Stage, Tolerances, TruthLayer};
 use manta_engine::PipelineConfig;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -19,6 +19,10 @@ pub(crate) struct FunnelArgs<'a> {
     pub capture_start_unix_s: i64,
     pub config: Option<&'a Path>,
     pub out: &'a Path,
+    /// Oracle-bypass experiments, written after the production summary.
+    pub bypasses: &'a [Bypass],
+    /// The whole recording, for the bypasses.
+    pub iq: &'a [num_complex::Complex32],
     pub tol: Tolerances,
 }
 
@@ -124,8 +128,16 @@ pub(crate) fn run(args: &FunnelArgs, pipeline: &PipelineConfig, duration_s: f64)
         })
         .collect();
     let src = manta_input::open_iq_file(args.recording, manta_input::IqFileOptions::default())?;
+    let center_hz = src.center_freq_hz();
     let report = funnel::run_funnel(src, pipeline, &opportunities, &args.tol, duration_s)?;
     let geo = report.geometry;
+    // Each named once, in the order first given.
+    let mut bypasses: Vec<Bypass> = Vec::new();
+    for b in args.bypasses {
+        if !bypasses.contains(b) {
+            bypasses.push(*b);
+        }
+    }
     let header = Header {
         kind: "lossFunnelHeader",
         schema: 1,
@@ -154,10 +166,24 @@ pub(crate) fn run(args: &FunnelArgs, pipeline: &PipelineConfig, duration_s: f64)
         tolerances: args.tol,
         stages: Stage::ALL.iter().map(|s| s.as_str()).collect(),
         delivered_means: "emitted (offline replay has no sink that drops)",
-        // Bypass experiments are a follow-up; their lines would come after
-        // the production summary, flagged `oracleAssisted`.
-        bypasses: Vec::new(),
+        bypasses: bypasses.iter().map(|b| b.label()).collect(),
     };
+    // Run before the file is created, so a failed bypass leaves no file
+    // whose header names lines that never follow.
+    let bypassed = bypasses
+        .iter()
+        .map(|b| {
+            funnel::run_bypass(
+                *b,
+                args.iq,
+                center_hz,
+                pipeline,
+                &report.records,
+                &geo,
+                &args.tol,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     let file = std::fs::File::create(args.out)
         .with_context(|| format!("create {}", args.out.display()))?;
     let mut w = std::io::BufWriter::new(file);
@@ -166,6 +192,15 @@ pub(crate) fn run(args: &FunnelArgs, pipeline: &PipelineConfig, duration_s: f64)
         writeln!(w, "{}", serde_json::to_string(r)?)?;
     }
     writeln!(w, "{}", serde_json::to_string(&report.summary)?)?;
+    // Oracle-assisted lines only after the production summary: every line
+    // after the header (which names the bypasses) is the same bytes with or
+    // without them.
+    for (lines, summary) in &bypassed {
+        for l in lines {
+            writeln!(w, "{}", serde_json::to_string(l)?)?;
+        }
+        writeln!(w, "{}", serde_json::to_string(summary)?)?;
+    }
     w.flush()?;
     let s = &report.summary;
     let lost: Vec<String> = Stage::ALL

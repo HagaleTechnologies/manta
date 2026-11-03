@@ -202,3 +202,108 @@ fn bad_funnel_tolerance_exits_2() {
         );
     }
 }
+
+/// `--funnel-bypass known-frequency` appends oracle-assisted lines after the
+/// production summary; the production lines before them are the same bytes
+/// as without the bypass.
+#[test]
+fn funnel_bypass_known_frequency_appends_after_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 45.0;
+    manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap();
+    let wav = dir.path().join(format!("{}.wav", spec.name));
+    let csv = dir.path().join("rbn.csv");
+    std::fs::write(&csv, RBN_CSV).unwrap();
+    let (plain, bypassed) = (dir.path().join("p.jsonl"), dir.path().join("b.jsonl"));
+    let a = oracle(&wav, &csv, &["--funnel".as_ref(), plain.as_os_str()]);
+    let b = oracle(
+        &wav,
+        &csv,
+        &[
+            "--funnel".as_ref(),
+            bypassed.as_os_str(),
+            "--funnel-bypass".as_ref(),
+            "known-frequency".as_ref(),
+        ],
+    );
+    for out in [&a, &b] {
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(a.stdout, b.stdout);
+
+    let p = std::fs::read_to_string(&plain).unwrap();
+    let q = std::fs::read_to_string(&bypassed).unwrap();
+    let (p_lines, q_lines): (Vec<&str>, Vec<&str>) = (p.lines().collect(), q.lines().collect());
+    // The header names the bypass; every production line after it is
+    // unchanged.
+    assert_eq!(p_lines.len(), 6);
+    assert_eq!(&q_lines[1..6], &p_lines[1..6]);
+    let header: serde_json::Value = serde_json::from_str(q_lines[0]).unwrap();
+    assert_eq!(header["bypasses"], serde_json::json!(["knownFrequency"]));
+
+    let extra: Vec<serde_json::Value> = q_lines[6..]
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(extra.len(), 5, "4 bypass lines and their summary");
+    for (i, v) in extra.iter().enumerate() {
+        let kind = if i < 4 {
+            "lossFunnelBypass"
+        } else {
+            "lossFunnelBypassSummary"
+        };
+        assert_eq!(v["kind"], kind);
+        assert_eq!(v["bypass"], "knownFrequency");
+        assert_eq!(v["oracleAssisted"], true);
+        let o = v.as_object().unwrap();
+        for key in ["dxCall", "frequency", "spots"] {
+            assert!(!o.contains_key(key), "{key} in {v}");
+        }
+    }
+    assert_eq!(
+        extra[0]["forcedStages"],
+        serde_json::json!(["detectableEnergy", "admittedTrack"])
+    );
+    let summary = &extra[4];
+    assert_eq!(summary["opportunities"], 4);
+    assert_eq!(summary["available"], 2);
+    assert_eq!(summary["unavailable"]["outsidePassband"], 1);
+    assert_eq!(summary["unavailable"]["outsideRecording"], 1);
+    assert!(summary["upperBound"].as_u64().unwrap() >= 1);
+}
+
+#[test]
+fn funnel_bypass_rejects_unbuilt_names_and_needs_funnel() {
+    let base = [
+        "oracle",
+        "missing.wav",
+        "missing.csv",
+        "--spotter",
+        "K5TR",
+        "--capture-start",
+        "2026-10-19T00:00:00Z",
+    ];
+    for extra in [
+        &[
+            "--funnel",
+            "f.jsonl",
+            "--funnel-bypass",
+            "known-transitions",
+        ][..],
+        &[
+            "--funnel",
+            "f.jsonl",
+            "--funnel-bypass",
+            "known-frequency,bogus",
+        ][..],
+        &["--funnel-bypass", "known-frequency"][..],
+    ] {
+        let out = manta().args(base).args(extra).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}");
+    }
+}

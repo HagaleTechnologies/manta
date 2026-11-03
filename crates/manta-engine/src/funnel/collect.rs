@@ -42,13 +42,13 @@ impl LiveStateSink for DecisionLog {
 
 /// Per-track state from the event stream.
 #[derive(Default)]
-struct EventTrack {
+pub(super) struct EventTrack {
     last_ts: u64,
     promoted_freq_hz: Option<f64>,
     meta_freq_hz: Option<f64>,
-    speeds: Vec<(u64, f32)>,
-    text: String,
-    readings: Vec<String>,
+    pub(super) speeds: Vec<(u64, f32)>,
+    pub(super) text: String,
+    pub(super) readings: Vec<String>,
 }
 
 fn event_track(e: &DecoderEvent) -> (u32, Option<u64>) {
@@ -89,7 +89,7 @@ fn event_track(e: &DecoderEvent) -> (u32, Option<u64>) {
     }
 }
 
-fn observe(tracks: &mut BTreeMap<u32, EventTrack>, e: &DecoderEvent) {
+pub(super) fn observe(tracks: &mut BTreeMap<u32, EventTrack>, e: &DecoderEvent) {
     let (id, ts) = event_track(e);
     let t = tracks.entry(id).or_default();
     if let Some(ts) = ts {
@@ -119,7 +119,7 @@ fn observe(tracks: &mut BTreeMap<u32, EventTrack>, e: &DecoderEvent) {
     }
 }
 
-fn spot_type_label(t: SpotType) -> &'static str {
+pub(super) fn spot_type_label(t: SpotType) -> &'static str {
     match t {
         SpotType::Cq => "cq",
         SpotType::De => "de",

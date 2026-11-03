@@ -11,6 +11,7 @@
 //! docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 
 mod attribute;
+mod bypass;
 mod collect;
 mod trace;
 
@@ -19,5 +20,6 @@ pub use attribute::{
     Record, RecordSpot, SpotFact, Stage, StageCounts, Summary, Tolerances, TrackFacts, TrackTally,
     TruthLayer, VetoFact, TRACK_TEXT_CHARS,
 };
+pub use bypass::{run_bypass, summarize_bypass, Bypass, BypassRecord, BypassSummary};
 pub use collect::{run_funnel, FunnelReport};
 pub use trace::{FunnelTrace, SpawnVeto, TraceLog, TrackCloseReason, TrackTraceRecord, VetoKey};

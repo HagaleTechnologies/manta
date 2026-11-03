@@ -526,7 +526,9 @@ docs/DECISIONS/2026-11-03-man198-loss-funnel.md. Bypass rule: an
 oracle-bypass experiment (known frequency, transitions, timing or
 transcript) is an upper bound for one intervention, never a score; its
 lines carry `oracleAssisted: true` and follow the production summary, so
-the production lines stay a byte-identical prefix and no gate reads them.
+the production lines stay a byte-identical prefix (the header's `bypasses`
+names what ran) and no gate reads them.
+Built so far: known frequency (`--funnel-bypass known-frequency`).
 
 ### 8.4 Gates (design §6)
 

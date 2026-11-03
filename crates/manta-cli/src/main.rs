@@ -224,6 +224,18 @@ enum Command {
         /// are unchanged
         #[arg(long, value_name = "PATH")]
         funnel: Option<PathBuf>,
+        /// Add oracle-bypass experiments to the funnel file, comma-separated:
+        /// known-frequency. Each forces stages with truth and reports an
+        /// upper bound after the production summary; never a score.
+        /// Requires --funnel
+        #[arg(
+            long,
+            value_name = "BYPASS",
+            value_delimiter = ',',
+            requires = "funnel",
+            value_parser = parse_funnel_bypass
+        )]
+        funnel_bypass: Vec<manta_engine::funnel::Bypass>,
         /// Frequency tolerance for matching a candidate or track to a truth
         /// row, plus half a channel width
         #[arg(long, value_name = "HZ", default_value_t = 150.0, value_parser = parse_funnel_tol)]
@@ -2924,6 +2936,15 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
         ));
     }
     Ok(window_s)
+}
+
+/// MAN-198: `--funnel-bypass` names. Only the bypasses RBN truth can feed
+/// are offered; known-frequency is the one built.
+fn parse_funnel_bypass(s: &str) -> std::result::Result<manta_engine::funnel::Bypass, String> {
+    match s {
+        "known-frequency" => Ok(manta_engine::funnel::Bypass::KnownFrequency),
+        _ => Err(format!("unknown bypass `{s}`: expected known-frequency")),
+    }
 }
 
 /// MAN-198: the oracle's `--funnel-*` tolerances: finite and non-negative.
@@ -6963,6 +6984,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             prior,
             jsonl,
             funnel,
+            funnel_bypass,
             funnel_track_tol_hz,
             funnel_spot_tol_hz,
             funnel_spot_window_s,
@@ -7023,6 +7045,8 @@ fn run_command() -> Result<std::process::ExitCode> {
                     capture_start_unix_s: capture_start,
                     config: config.as_deref(),
                     out: &out,
+                    bypasses: &funnel_bypass,
+                    iq: &iq,
                     tol: manta_engine::funnel::Tolerances {
                         track_tol_hz: funnel_track_tol_hz,
                         spot_tol_hz: funnel_spot_tol_hz,

@@ -314,28 +314,7 @@ pub fn decision_label(v: Verdict) -> &'static str {
 
 /// `reason` labels, as documented in `docs/LIVE-STATE.md`.
 pub fn reason_label(r: Reason) -> &'static str {
-<<<<<<< HEAD
     r.label()
-=======
-    match r {
-        Reason::Blocklist => "blocklist",
-        Reason::Notch => "notch",
-        Reason::Grammar => "grammar",
-        Reason::Cty => "cty",
-        Reason::Repetition => "repetition",
-        Reason::Variant => "variant",
-        Reason::Dedupe => "dedupe",
-        Reason::PowerStepGuard => "powerStepGuard",
-        Reason::BeaconNoEvidence => "beaconNoEvidence",
-        Reason::BeaconPending => "beaconPending",
-        Reason::BeaconSpeed => "beaconSpeed",
-        Reason::BeaconOverflow => "beaconOverflow",
-        Reason::BeaconDiscarded => "beaconDiscarded",
-        Reason::NoEvidence => "noEvidence",
-        Reason::LookupPending => "lookupPending",
-        Reason::LookupNotFound => "lookupNotFound",
-    }
->>>>>>> 3aca4c37be0047959bc1dcb31aaed101ea47b52c
 }
 
 #[cfg(test)]

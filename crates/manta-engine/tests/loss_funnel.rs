@@ -4,7 +4,9 @@
 //! rules are unit-tested in `funnel/attribute.rs`.
 
 use anyhow::Result;
-use manta_engine::funnel::{run_funnel, FunnelReport, Opportunity, Stage, Tolerances};
+use manta_engine::funnel::{
+    run_bypass, run_funnel, Bypass, FunnelReport, Opportunity, Stage, Tolerances, TRACK_TEXT_CHARS,
+};
 use manta_engine::PipelineConfig;
 use num_complex::Complex32;
 
@@ -163,4 +165,91 @@ fn source_mask_is_input_coverage() {
     assert_eq!(r.lost_at, Some(Stage::InputCoverage));
     assert_eq!(r.detail.as_deref(), Some("sourceMask:analyticGuard"));
     assert_eq!(r.tracks.candidates, 0);
+}
+
+/// The known-frequency bypass on V1: every line is flagged oracle-assisted,
+/// the opportunities without audio are unavailable, the forced stages pass,
+/// W1AW's text is the oracle's own, and the bound is no lower than
+/// production.
+#[test]
+fn known_frequency_bypass_on_v1() {
+    let ops = [
+        op("W1AW", 14_012_300.0, 25.0),
+        op("OH2XYZ", 14_030_000.0, 25.0),
+        op("W9LATE", 14_012_300.0, 660.0),
+        op("VE3OUT", 14_060_000.0, 25.0),
+    ];
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 45.0;
+    let iq = manta_testkit::vectors::render(&spec).unwrap().samples;
+    let production = funnel_on(spec.clone(), 0.0, &ops);
+    let cfg = PipelineConfig::default();
+    let (lines, summary) = run_bypass(
+        Bypass::KnownFrequency,
+        &iq,
+        spec.center_freq_hz,
+        &cfg,
+        &production.records,
+        &production.geometry,
+        &Tolerances::default(),
+    )
+    .unwrap();
+    assert_eq!(lines.len(), production.records.len());
+    for (line, prod) in lines.iter().zip(&production.records) {
+        assert!(line.oracle_assisted);
+        assert_eq!(line.call, prod.call);
+        assert_eq!(line.production_lost_at, prod.lost_at);
+        assert_eq!(
+            line.forced_stages,
+            [Stage::DetectableEnergy, Stage::AdmittedTrack]
+        );
+        if line.available {
+            assert!(line.reached >= Some(Stage::AdmittedTrack), "{line:?}");
+        }
+    }
+    let by_call = |c: &str| lines.iter().find(|r| r.call == c).unwrap();
+    for (call, why) in [
+        ("W9LATE", "outsideRecording"),
+        ("VE3OUT", "outsidePassband"),
+    ] {
+        let r = by_call(call);
+        assert!(!r.available, "{r:?}");
+        assert_eq!(r.detail.as_deref(), Some(why));
+        assert_eq!((r.reached, r.lost_at), (None, None));
+    }
+    // Production lost OH2XYZ at detection; the bypass forces past it.
+    let oh2 = by_call("OH2XYZ");
+    assert!(oh2.available);
+    assert_eq!(oh2.production_lost_at, Some(Stage::DetectableEnergy));
+
+    let w1aw = by_call("W1AW");
+    assert_eq!(w1aw.lost_at, None, "{w1aw:?}");
+    let oracle_spot = manta_testkit::oracle::OracleSpot {
+        call: "W1AW".into(),
+        khz: 14_012.3,
+        t_sec: 25.0,
+        snr_db: 20,
+        wpm: 20,
+    };
+    let (oracle, _) = manta_testkit::oracle::run_oracle(
+        &iq,
+        spec.fs,
+        spec.center_freq_hz,
+        &[oracle_spot],
+        Tolerances::default().window_s,
+        &cfg.decode,
+    )
+    .unwrap();
+    let oracle_text: String = oracle[0].text.chars().take(TRACK_TEXT_CHARS).collect();
+    assert_eq!(w1aw.track_text.as_deref(), Some(oracle_text.as_str()));
+
+    assert!(summary.oracle_assisted);
+    assert_eq!(summary.opportunities, 4);
+    assert_eq!(summary.available, 2);
+    assert_eq!(summary.unavailable.values().sum::<usize>(), 2);
+    assert!(summary.upper_bound >= production.summary.delivered);
+    assert_eq!(
+        summary.lost_at.values().sum::<usize>() + summary.delivered,
+        summary.available
+    );
 }

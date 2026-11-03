@@ -137,7 +137,10 @@ the git history and `docs/DECISIONS/`.
   episode charged to exactly one earliest failed stage (or none when
   delivered), and a `lossFunnelSummary` with candidate, confirmed and
   leased track births kept apart. Diagnostic only: the oracle's stdout and
-  `--jsonl` are unchanged. See docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
+  `--jsonl` are unchanged. `--funnel-bypass known-frequency` adds the
+  known-frequency oracle-bypass experiment after the production summary,
+  flagged `oracleAssisted`: an upper bound, never a score. See
+  docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times

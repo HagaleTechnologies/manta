@@ -29,14 +29,15 @@ opportunity is never counted twice.
 | `admittedTrack` | one of those candidates leased a decoder (`TrackPromoted`) | `closed:<closeReason>` or `openAtEnd`, for the most advanced candidate (confirmed first, then the latest) |
 | `usableTiming` | a leased candidate's speed came within max(3 WPM, 20%) of the RBN speed, or RBN gave none and the track has any estimate | `noSpeedUpdate`, `speedOff` |
 | `textContainsCall` | a leased track within `spotTolHz` and the spot window decoded the call as a whole word, or held it as a reading | `substringOnly`, `noCall` |
-| `selfIdRecognized` | a validator decision for the call that grammar, cty and the power-step guard did not reject | `rejected:<reason>`, `noDecision` |
+| `selfIdRecognized` | a validator decision for the call that grammar, cty, the power-step guard and the beacon-evidence check did not reject | `rejected:<reason>`, `noDecision` |
 | `sufficientEvidence` | a decision that cleared the repetition, variant, zero-evidence and beacon gates | `<reason> <reps>/<required>` |
 | `emitted` | a spot for the call within the spot tolerances, or a `dedupe` withhold | `policy:blocklist`, `policy:notch`, `lookupPending`, `lookupNotFound`, `notEmitted` |
 | `delivered` | as `emitted`: offline, `SpotBus::publish` drops nothing (`deliveredMeans` in the header) | none offline |
 
 The `Reason` mapping is an exhaustive `match` (`funnel/attribute.rs`
 `reason_effect`): a new `Reason` does not compile until someone places it.
-Grammar, cty and power-step guard lose at `selfIdRecognized`; repetition,
+Grammar, cty, power-step guard and MAN-201's `beaconNoEvidence` lose at
+`selfIdRecognized`; repetition,
 variant, no-evidence and the four beacon reasons at `sufficientEvidence`;
 blocklist, notch and the two lookup reasons at `emitted`. `dedupe` is
 evidence of delivery: the validator withholds a duplicate only after
@@ -45,6 +46,35 @@ delivering the same call within 600 s, shorter than the episode gap.
 The summary keeps candidate births, confirmations and leased (active) track
 births apart in `births`, as the ticket asks, and counts closes by reason plus
 `openAtEnd`.
+
+## Oracle-bypass experiments
+
+`--funnel-bypass known-frequency` (requires `--funnel`) adds the one bypass
+built so far. For each opportunity with audio it leases a fresh decoder on
+the truth frequency over the acoustic window clipped to the recording, fed
+the channel with the highest mean power of the three around it (the rule
+`manta oracle` uses, applied over the episode's whole window), and passes
+its events through a fresh production validator. Call-keyed evidence is
+still judged over the wider spot window, which the bypass does not decode,
+so a bypass line can lose where production passed; `upperBound` counts
+production's deliveries too.
+The same `attribute` function then charges the result. `detectableEnergy`
+and `admittedTrack` are forced (`forcedStages`); opportunities lost at
+`inputCoverage` as `outsideRecording` or `outsidePassband` are
+`available: false`. A source-mask loss is available: the bypass skips the
+mask with everything else before the decoder.
+
+The header's `bypasses` lists what ran. After the production summary come
+one `lossFunnelBypass` line per opportunity and one
+`lossFunnelBypassSummary`, each with `oracleAssisted: true`. The summary's
+`upperBound` counts opportunities delivered by production or by the bypass;
+`recoveredOverProduction` counts those only the bypass delivered. Neither
+is a recall score, no exit code reads them, and no bypass line has a
+`dxCall`, `frequency` or `spots` key. Apart from the header's `bypasses`,
+the production lines are the same bytes with or without bypasses
+(`oracle_funnel.rs`
+`funnel_bypass_known_frequency_appends_after_summary`). Unknown names,
+including the three unbuilt ones below, exit 2.
 
 ## Decisions
 
@@ -65,9 +95,11 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
   default) records nothing; every close still goes through the same
   `close_counts`. A test pins that events and spots are equal with and
   without the trace.
-- D5a. The spawn-veto census. With a trace set, each hop, before its spawn
-  scan, the tracker records for every rising channel the scan will refuse
-  the condition it fails, counted per (stream second, channel). Source masks
+- D5a. The spawn-veto census. With a trace set, each hop, after its spawn
+  scan, the tracker records for every rising channel the scan refused the
+  condition it fails, counted per (stream second, channel). A rising channel
+  that a track born this hop now owns (its owner differs from the snapshot
+  taken before the scan) was spawned, not refused, and is skipped. Source masks
   are tested first: a channel inside the input's trusted band, analytic
   guard, digital window or mirror image can never spawn, whatever else
   holds. The scan itself is untouched. A truth frequency with no candidate
@@ -107,14 +139,11 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
 ## Follow-ups
 
 - The validator role log (`role:<addressee|...>` details at `selfIdRecognized`).
-- The oracle-bypass experiments (known frequency, transitions, timing,
-  transcript), always segregated as `oracleAssisted` lines after the
-  production summary.
+- The other three oracle-bypass experiments: known timing (needs a
+  `SpeedTracker` seed in `manta-decode`), and known key transitions and
+  known transcript (need synthetic keying truth). Each would be one more
+  `Bypass` variant through `run_bypass`, segregated the same way.
 - Running the funnel with the config's `[spot]` and `freq_correction_ppm`, as
   `manta decode` does; the nine-row stage-scene golden test.
-- When this branch is replayed onto a main that carries MAN-201's
-  `Reason::BeaconNoEvidence`, `Reason::label` gains `beaconNoEvidence` and
-  `reason_effect` charges it to `selfIdRecognized` (with grammar and cty),
-  as the plan's stage table places it.
 - The plain oracle's out-of-range rows (outside the recording or passband are
   still counted in its `n`).
