@@ -344,6 +344,14 @@ tracks on its tones close. The marked set is reported in `decode --json`,
 the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
 §2.6 is normative.
 
+**Guarded cancellation (MAN-204, offline experiment).** `manta-dsp::cancel`
+estimates a strong keyed station's received waveform from raw IQ and checks
+whether subtracting it would uncover a neighbour; `manta-engine::cancel`
+runs it around an unchanged `decode_samples` and decodes the residual with a
+separate validator. It sits outside the data flow above: nothing in `decode`,
+`run` or `listen` calls it, and no recovered identity reaches any output. See
+[the decision record](docs/DECISIONS/2026-11-03-man204-guarded-two-stage-cancellation.md).
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
