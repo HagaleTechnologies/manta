@@ -1,13 +1,19 @@
 //! Lock-free decode-quality observer (MAN-118): characters decoded,
 //! garbles, each decoding track's keying-rail ratio once per second, and
-//! the repetition gate's result distribution. Shared-atomic for the same
+//! the repetition gate's result distribution, and the validator's
+//! decisions by reason (MAN-207). Shared-atomic for the same
 //! reason `latency.rs` is: the decode loop must never block on whatever is
 //! consuming this. `observe_rail_ratio` runs on `drain_pool`'s rayon
 //! workers, so every method takes `&self` and uses relaxed atomics only.
 //!
 //! Write-only from the decode path: nothing here is read back into
 //! decoding, so file replay stays byte-identical with or without it.
+use manta_spot::decision::{Reason, Verdict};
+use manta_spot::observation::ObservationCounts;
 use manta_spot::{RepetitionCounts, REPETITION_BUCKETS};
+
+/// Spotted, plus one slot per `Reason` (MAN-207).
+const DECISION_SLOTS: usize = 1 + Reason::ALL.len();
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Upper bounds of the `manta_track_rail_ratio` histogram's buckets. The
@@ -30,6 +36,9 @@ pub struct DecodeQualitySnapshot {
     /// Length `REPETITION_BUCKETS.len() + 1`.
     pub repetition_bucket_counts: Vec<u64>,
     pub repetition_sum: u64,
+    /// MAN-207: every valid (verdict, reason) pair with its count, in
+    /// `ObservationCounts::iter` order (`None` is a spot).
+    pub decisions: Vec<(Verdict, Option<Reason>, u64)>,
 }
 
 pub struct DecodeQualityObserver {
@@ -41,6 +50,8 @@ pub struct DecodeQualityObserver {
     rail_count: AtomicU64,
     repetition_buckets: [AtomicU64; REPETITION_BUCKETS.len() + 1],
     repetition_sum: AtomicU64,
+    /// MAN-207: in `ObservationCounts::iter` order.
+    decisions: [AtomicU64; DECISION_SLOTS],
 }
 
 impl Default for DecodeQualityObserver {
@@ -59,6 +70,7 @@ impl DecodeQualityObserver {
             rail_count: AtomicU64::new(0),
             repetition_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             repetition_sum: AtomicU64::new(0),
+            decisions: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -103,6 +115,14 @@ impl DecodeQualityObserver {
         self.repetition_sum.store(counts.sum, Ordering::Relaxed);
     }
 
+    /// MAN-207: overwrites the decision counts with the validator's own,
+    /// which are already cumulative for the life of the `listen()` call.
+    pub fn store_decisions(&self, counts: &ObservationCounts) {
+        for (slot, (_, _, n)) in self.decisions.iter().zip(counts.iter()) {
+            slot.store(n, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> DecodeQualitySnapshot {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         DecodeQualitySnapshot {
@@ -113,6 +133,11 @@ impl DecodeQualityObserver {
             rail_ratio_count: load(&self.rail_count),
             repetition_bucket_counts: self.repetition_buckets.iter().map(load).collect(),
             repetition_sum: load(&self.repetition_sum),
+            decisions: ObservationCounts::default()
+                .iter()
+                .zip(&self.decisions)
+                .map(|((verdict, reason, _), n)| (verdict, reason, load(n)))
+                .collect(),
         }
     }
 }
@@ -162,6 +187,33 @@ mod tests {
         let snap = obs.snapshot();
         assert_eq!(snap.chars_total, 7);
         assert_eq!(snap.garbles_total, 1);
+    }
+
+    #[test]
+    fn store_decisions_overwrites_rather_than_adds() {
+        let obs = DecodeQualityObserver::new();
+        let fresh = obs.snapshot().decisions;
+        assert_eq!(fresh.len(), 1 + Reason::ALL.len());
+        assert!(fresh.iter().all(|&(_, _, n)| n == 0));
+        assert_eq!(fresh[0], (Verdict::Spotted, None, 0));
+
+        let mut log =
+            manta_spot::ObservationLog::new(1000.0, manta_spot::ObservationPolicy::summary());
+        log.count_decision(Some(Reason::Repetition));
+        log.count_decision(Some(Reason::Repetition));
+        obs.store_decisions(log.counts());
+        log.count_decision(None);
+        obs.store_decisions(log.counts());
+        let snap = obs.snapshot();
+        let count = |reason| {
+            snap.decisions
+                .iter()
+                .find(|&&(_, r, _)| r == reason)
+                .map(|&(_, _, n)| n)
+        };
+        assert_eq!(count(Some(Reason::Repetition)), Some(2));
+        assert_eq!(count(None), Some(1));
+        assert_eq!(snap.decisions.iter().map(|&(_, _, n)| n).sum::<u64>(), 3);
     }
 
     #[test]

@@ -648,6 +648,7 @@ fn emit(
     if let Some(q) = ctx.quality {
         q.add_chars(chars);
         q.store_repetitions(validator.repetition_counts());
+        q.store_decisions(&validator.observation_counts());
     }
 }
 
@@ -5453,6 +5454,15 @@ mod tests {
             snap.repetition_bucket_counts.iter().sum::<u64>() >= 1,
             "V1's repeated call must reach the repetition gate"
         );
+
+        // MAN-207: emit stores the validator's decision counts; every spot
+        // is one `spotted` decision.
+        let spotted = snap
+            .decisions
+            .iter()
+            .find(|&&(_, reason, _)| reason.is_none())
+            .map(|&(_, _, n)| n);
+        assert_eq!(spotted, Some(spots_observed.len() as u64));
 
         let (_, spots_plain) = run(ListenObservers::default());
         assert!(!spots_plain.is_empty(), "V1 must spot");

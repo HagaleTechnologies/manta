@@ -3,6 +3,8 @@
 //! candidate callsign, with its reason. Opt-in through
 //! `Validator::record_decisions`; off, the validator allocates nothing for
 //! it. See docs/DECISIONS/2026-10-12-man324-live-state-stream.md D4.
+//! MAN-207 keeps these decisions, with their evidence, in the bounded
+//! observation record (`crate::observation`).
 
 use crate::context::SpotType;
 use crate::support::Support;
@@ -60,6 +62,41 @@ pub enum Reason {
     LookupNotFound,
 }
 
+impl Reason {
+    /// Every reason, in declaration order (MAN-207's counters index by it).
+    pub const ALL: [Reason; 15] = [
+        Reason::Blocklist,
+        Reason::Notch,
+        Reason::Grammar,
+        Reason::Cty,
+        Reason::Repetition,
+        Reason::Variant,
+        Reason::Dedupe,
+        Reason::PowerStepGuard,
+        Reason::BeaconPending,
+        Reason::BeaconSpeed,
+        Reason::BeaconOverflow,
+        Reason::BeaconDiscarded,
+        Reason::NoEvidence,
+        Reason::LookupPending,
+        Reason::LookupNotFound,
+    ];
+
+    /// The verdict a decision with this reason carries: `Deferred` while a
+    /// beacon or lookup is pending, else `Withheld`.
+    pub fn verdict(self) -> Verdict {
+        match self {
+            Reason::BeaconPending | Reason::LookupPending => Verdict::Deferred,
+            _ => Verdict::Withheld,
+        }
+    }
+
+    /// This reason's position in `ALL`.
+    pub(crate) fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rival {
@@ -102,11 +139,7 @@ impl Decision {
         spot_type: SpotType,
         reason: Reason,
     ) -> Self {
-        let verdict = if matches!(reason, Reason::BeaconPending | Reason::LookupPending) {
-            Verdict::Deferred
-        } else {
-            Verdict::Withheld
-        };
+        let verdict = reason.verdict();
         Self {
             track_id,
             sample_ts,
