@@ -62,7 +62,7 @@ failing scene before debugging it.
 | D1 | "Production Hilbert path" means both the generation-side route (129 taps, `scene.rs`) and the receive side (`AudioIqSource`, 511 taps). The gate covers the first; `receive_side_hilbert.rs` covers the second. | Investigation 17 names both, and the two designs differ by 20 dB or more below 2 kHz. |
 | D2 | Independence means no code shared with the production generator or the decoder. External crates are allowed. The jitter recipe (ChaCha8, two `next_u64` per segment, Box–Muller cosine value, clamp ±3σ) is reimplemented from its written description. | Two implementations agreeing confirms the recipe; supplying timings from `keyer.rs` would share the code the ticket worries about. |
 | D3 | The gate's ordering is enforced by a type (`Verified`), not by test order. | MAN-101: an earlier failing assert silently disables later checks; a token cannot be skipped. |
-| D4 | Tolerances are named constants in `crosscheck.rs`, each at least 2× the measured disagreement. When a measurement exceeds half a tolerance, averaging increases; a tolerance changes only with a line here. | Keeps the gate discriminating. Four negative controls prove it fails on real defects. |
+| D4 | Tolerances are named constants in `crosscheck.rs`; a tolerance changes only with a line here. The target was 2× the measured disagreement. Most rows hold it; noise whiteness (1.5×), ensemble mean (1.6×) and ensemble standard error (1.4×) do not, nor do the full sweep's worst fading and ensemble rows (1.5× and 1.6×). Averaging went up once, when the Good ensemble standard error broke its ceiling at 32 seeds (now 48), and was not raised further to restore 2×. | Keeps the gate discriminating. Five negative controls prove it fails on real defects. More seeds would lengthen the compact gate, which three test processes run. |
 | D5 | The 129-tap route's verified domain is \|offset\| ≥ 2 kHz at 96 kS/s. `faded_signals_inside_the_verified_domain` pins the shipped exceptions (26 vectors plus the sensitivity series) to exactly `{v8w s09}`. | One shipped exception; a new near-DC faded signal fails loudly. |
 | D6 | The independent fader is a sum of 256 complex sinusoids per path (Doppler from N(0, (spread/2)²), uniform phases), evaluated every 1 ms by rotating phasors re-anchored exactly every second, linearly interpolated; two equal-power paths with typed ITU-R F.1487 delays. Compared with coppa on statistics only. | A different construction is what makes agreement evidence. 64 sinusoids (the research prototype) left Poor τ = 0.5 s at 0.260 against theory 0.291 with these seeds (error 0.032 > 0.03); the estimator's standard error at M = 64 × 32 seeds is 0.014, so this was variance, and M went to 256. |
 | D7 | The minimizer runs on `SceneSpec` only. | "Synthetic only" is true by construction. |
@@ -85,15 +85,23 @@ Domain: fs 96 kS/s for keying and spectra (8 kS/s for fading); \|offset\| ≥
 | Dimension | Cases | Tolerance | Measured (worst) |
 |---|---|---|---|
 | Morse table | 48 ITU characters (`+` excepted: manta keys `.-.-.` as AR) | 0 mismatches | 0 |
-| Envelope | V1 loop 10 s; 35 WPM 8 % jitter loop; Farnsworth 15/25; weight 2.6, gaps 2.5/5, dit 0.8, element gap 1.2, 0.5 ms, jitter; `key_text` once | on-run count and keyed text equal; start/duration ≤ 1 sample; magnitude ≤ 1e-6 | equal; equal; 1 sample (Farnsworth); 1.5e-7 |
-| Total power | direct +12340, −8200, V6 QSB at 9100; 129-tap +12340, +5600, +2000, −8200 Hz | ≤ 0.01 dB | 8.6e-4 dB (129-tap, 2 kHz) |
+| Envelope | V1 loop 10 s; 35 WPM 8 % jitter loop; Farnsworth 15/25; weight 2.6, gaps 2.5/5, dit 0.8, element gap 1.2, 0.5 ms, jitter; `key_text` once | on-run count and keyed text equal; start/duration ≤ 1 sample; magnitude ≤ 1e-6 | equal; equal; 0 samples; 1.5e-7 |
+| Total power | direct +12340, −8200, V6 QSB at 9100; 129-tap +12340, +5600, +2000, −8200 Hz; one direct +12340 Hz scene through both scene renderers (`HEADROOM` vs `MASTER_SCALE`) | ≤ 0.01 dB | 8.6e-4 dB (129-tap, 2 kHz); scene scale 3.7e-8 dB |
 | Spectra | same pairs, Welch 2^14 | main band ≤ 0.01 dB; per bin within 60 dB of peak ≤ 0.1 dB | 8.6e-4 dB; 0.011 dB (129-tap, 2 kHz) |
 | Image | same | ≤ −75 dBc | −80.1 dBc (129-tap, 2 kHz) |
 | Group delay | 129-tap route | exactly 64 samples | 64 |
 | SNR (2500 Hz) | 20 and 0 dB requests, 3 s, each generator's own noise | ≤ 0.3 dB of request; ≤ 0.2 dB between | 0.039 dB; 0.029 dB |
 | Noise whiteness | both generators, 96 bands of 1 kHz | ≤ 0.5 dB of the mean | 0.32 dB |
-| Fading autocorrelation | Poor 0.1/0.2/0.5 s, Good 0.5/1/2 s; 48 seeds × 60 s at 8 kS/s, 2 kHz | ≤ 0.03 vs theory; ≤ 0.03 between | 0.0042; 0.0074 |
+| Fading autocorrelation | Poor 0.1/0.2/0.5 s, Good 0.5/1/2 s; 48 seeds × 60 s at 8 kS/s, 2 kHz | ≤ 0.03 vs theory; ≤ 0.03 between | 0.0041; 0.0074 |
 | Ensemble power | same | \|mean − 1\| ≤ 4 SE; SE ≤ 0.06 | 2.4 SE (Poor independent, mean 0.971, SE 0.012); SE 0.044 (Good) |
+
+Envelope start/duration is a whole-sample count, so 1 sample is the
+smallest non-zero tolerance; a re-run during remediation measured 0 in
+every case (an earlier draft of this table said 1, Farnsworth). The scene
+scale row is the only one that compares `HEADROOM` with `MASTER_SCALE`: the
+per-signal rows compare unscaled contributions and the SNR rows cancel the
+scale. It is noise-free, so it ties the signal path at 0.01 dB; the two
+noise floors agree only through the SNR rows (0.2 dB).
 
 Two estimator choices were measured, not assumed. On-runs use 0.3 of the
 plateau (`ON_RUN_FRACTION`), because 0.5 falls exactly on a sample of a
@@ -109,7 +117,8 @@ Negative controls, each asserting its row fails:
 `gate_catches_the_near_dc_hilbert_image` (129-tap route at 600 Hz, image
 above −20 dBc), `gate_catches_doppler_sigma_equal_to_spread` (the historical
 coppa defect, fading at τ = 0.2 s), `gate_catches_a_one_db_amplitude_error`
-(SNR).
+(SNR), `gate_ties_headroom_to_master_scale` (independent scene
+scaled by +0.1 dB, power).
 
 The full sweep (`generator_cross_check_full_sweep`, `#[ignore]`: real-route
 offsets 2 to 45 kHz in 8 steps of both signs with 120 s keying, Moderate

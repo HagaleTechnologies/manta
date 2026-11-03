@@ -3,7 +3,8 @@
 //! Compares the testkit's production routes (`scene`: direct NCO and the
 //! 129-tap real-passband route with coppa's Watterson fader) with the
 //! independent generator (`baseband`) through the independent estimators
-//! (`measure`), on envelope durations, spectra, total power,
+//! (`measure`), on envelope durations, spectra, total power (including the
+//! independent `HEADROOM` against `scene::MASTER_SCALE`),
 //! reference-bandwidth SNR, noise whiteness and fading autocorrelation.
 //!
 //! Ordering is enforced by a type: the only public way to get an
@@ -13,8 +14,10 @@
 //!
 //! Verified domain: keying and spectra at 96 kS/s, fading at 8 kS/s,
 //! |offset| >= [`VERIFIED_MIN_OFFSET_HZ`] for the 129-tap route, scenes of 3
-//! to 60 s. Tolerances are the named constants below; each is at least
-//! twice the disagreement measured in the MAN-206 research
+//! to 60 s. Tolerances are the named constants below. Most hold at least
+//! twice the measured disagreement; noise whiteness, ensemble power and the
+//! full sweep's worst fading row hold less (1.4x to 1.6x). The decision
+//! record lists the worst measurement per dimension
 //! (docs/DECISIONS/2026-11-03-man206-independent-generator-and-scene-minimizer.md).
 
 use crate::baseband::{self, FadeProfile, IndependentScene, Timing, ToneSpec};
@@ -71,7 +74,7 @@ const FADE_SECONDS: f64 = 60.0;
 const FADE_DECIMATE: usize = 8;
 /// Realizations per preset in the compact gate. 32 left the Good preset's
 /// ensemble standard error at 0.0601 against the 0.06 ceiling, so the gate
-/// averages 48 (MAN-206 D4: increase averaging, never loosen the bound).
+/// averages 48 (MAN-206 D4: the averaging went up, not the bound).
 pub const FADE_SEEDS: u64 = 48;
 
 /// One measured comparison.
@@ -445,6 +448,40 @@ pub(crate) fn check_route(
     Ok(())
 }
 
+/// Total power of one noise-free scene through `scene::render_scene`
+/// (`MASTER_SCALE`) and the independent scene renderer (`HEADROOM`). The
+/// per-signal rows compare unscaled contributions and the SNR rows cancel
+/// the scale, so this row is the one that compares the two scales (on the
+/// signal path; the noise floors agree through the SNR rows).
+/// `scale_error_db` scales the independent scene (the row's negative
+/// control).
+pub(crate) fn check_scene_scale(
+    r: &mut CrossCheckReport,
+    case: &str,
+    sig: &SignalSpec,
+    duration_s: f64,
+    scale_error_db: f64,
+) -> Result<()> {
+    let (p, _) = scene::render_scene(std::slice::from_ref(sig), KEY_FS, duration_s, None)?;
+    let (mut q, _) = baseband::render(&IndependentScene {
+        fs: KEY_FS,
+        duration_s,
+        noise_seed: None,
+        tones: vec![tone_from_signal(sig)],
+    })?;
+    let gain = 10f64.powf(scale_error_db / 20.0) as f32;
+    for z in &mut q {
+        *z *= gain;
+    }
+    r.at_most(
+        "power",
+        format!("{case}: scene total power, HEADROOM vs MASTER_SCALE, dB"),
+        db(measure::total_power(&p) / measure::total_power(&q)).abs(),
+        POWER_DB_TOL,
+    );
+    Ok(())
+}
+
 /// Reference-bandwidth SNR and noise whiteness. `amp_error_db` scales the
 /// independent carrier (the gate's negative control).
 pub(crate) fn check_snr(
@@ -691,6 +728,13 @@ fn run(full: bool) -> Result<CrossCheckReport> {
         Route::Direct,
         10.0,
     )?;
+    check_scene_scale(
+        &mut r,
+        "direct 12340 Hz scene",
+        &tone_at(12_340.0),
+        3.0,
+        0.0,
+    )?;
     let mut real_offsets = vec![12_340.0, 5_600.0, 2_000.0, -8_200.0];
     if full {
         real_offsets.clear();
@@ -908,6 +952,22 @@ mod tests {
         let mut r = CrossCheckReport::default();
         check_snr(&mut r, "20 dB, +1 dB carrier", &sig, 3.0, 0x2062, 1.0).unwrap();
         assert!(!r.failed("snr").is_empty(), "{r}");
+    }
+
+    #[test]
+    fn gate_ties_headroom_to_master_scale() {
+        let rows = &verified().expect("gate passes").report().rows;
+        assert!(
+            rows.iter()
+                .any(|row| row.dimension == "power" && row.case.contains("HEADROOM")),
+            "no HEADROOM vs MASTER_SCALE row"
+        );
+        let sig = signal("CQ CQ DE W1AW W1AW K", true, 20.0, 12_340.0, 20.0);
+        let mut r = CrossCheckReport::default();
+        check_scene_scale(&mut r, "scene, +0.1 dB scale", &sig, 3.0, 0.1).unwrap();
+        let failed = r.failed("power");
+        assert_eq!(failed.len(), 1, "{r}");
+        assert!((failed[0].measured - 0.1).abs() < 1e-3, "{r}");
     }
 
     #[test]
