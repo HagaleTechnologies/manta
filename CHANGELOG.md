@@ -24,6 +24,22 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-201: manta now reads each decoded callsign as the sending station,
+  the station called, a station mentioned, or uncertain, and spots only a
+  sending station. `DE W1AW DE K1ABC K` spots K1ABC, not W1AW. A `CQ` types
+  a `DE <call>` as CQ only when it leads straight into it (`CQ CQ DE`,
+  `CQ TEST DE`), not from anywhere in the window. Every CQ/DE call in the
+  window is considered, not only the first. A call is decided when its next
+  word, a turn end (`K`, `KN`, `BK`, `AR`, `SK`, 5 s with no character) or
+  the track's end shows its role, so a spot can arrive one word later; it
+  keeps the call's own timestamp. A run of one bare call waits for a
+  different word. An input that stalls or fails closes its tracks, which
+  settles their last calls. A call followed by a lone `T` spots as `BEACON`
+  only when it is on `[spot].allowlist`; other such decodes are withheld as
+  `beaconNoEvidence`. An allowlisted call heard only as the station called
+  or mentioned is no longer spotted. `decode --json` `TrackMeta` events gain
+  `lastCharTs`. See
+  [docs/DECISIONS/2026-11-02-man201-callsign-roles.md](docs/DECISIONS/2026-11-02-man201-callsign-roles.md).
 - MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
   gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
   spot is still CW, so `mode` is `"CW"` and `baud` is `null` on every spot

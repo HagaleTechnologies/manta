@@ -2082,6 +2082,11 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_unknown_gap()
     }
 
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
+    }
+
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
     /// end an outage where acquisition began.
     fn acquisition_start_offset(&self) -> std::time::Duration {

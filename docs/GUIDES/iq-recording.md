@@ -192,7 +192,11 @@ side of it together. A loss the input splices over and counts instead
 (MAN-305: HPSDR protocol 2's lost datagrams, `take_missing_samples`)
 moves the live engine's clock on without closing tracks, but the
 recording does not carry it: a replay runs the spliced samples together,
-so its timestamps after such a loss are early by the lost duration.
+so its timestamps after such a loss are early by the lost duration. A stream
+that stops long enough for the engine to close its tracks and then resumes
+with no reconnect (ka9q after 5 s, MAN-201) leaves a zero-length `gap` record,
+so a replay closes its tracks there too; its timestamps after the pause are
+early by the pause.
 
 `manta decode` handles them the same way: it closes its tracks at each
 gap, as a discontinuity rather than an end of signal, and starts a fresh

@@ -199,6 +199,21 @@ fn classify_new_occurrence(
     time_gap_samples: u64,
     is_track_active: &impl Fn(u32) -> bool,
 ) -> (bool, u64) {
+    // MAN-201: this track's newest touch, once it is a full message behind
+    // this occurrence. A touch that deferred to another track's message
+    // then says this word is a later message than that one, however long
+    // the other track's identity stays active: a dead input's closed track
+    // (the "conservatively active" no-survivor alias) would otherwise hold
+    // every repeat here until the time gap.
+    let own_last = accepted
+        .iter()
+        .rev()
+        .find(|&&(_, _, t, ..)| t == tid)
+        .map(|&(t_ts, t_seq, ..)| (t_ts, t_seq))
+        .or(own_last_seen.map(|(t_ts, t_seq, _)| (t_ts, t_seq)));
+    let past_own_touch = |prev_ts: u64| {
+        own_last.is_some_and(|(t_ts, t_seq)| prev_ts <= t_ts && seq >= t_seq + MIN_MESSAGE_WORD_GAP)
+    };
     let own_anchor = accepted
         .iter()
         .rev()
@@ -228,7 +243,7 @@ fn classify_new_occurrence(
         Some(&(prev_ts, prev_seq, prev_tid, _, _)) => {
             let gap = ts.saturating_sub(prev_ts);
             let distinct = if tid != prev_tid {
-                !is_track_active(prev_tid) || gap >= time_gap_samples
+                !is_track_active(prev_tid) || gap >= time_gap_samples || past_own_touch(prev_ts)
             } else {
                 seq >= prev_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples
             };
@@ -2074,6 +2089,18 @@ mod tests {
     /// timestamp, but C is only 0.2s after B's rejected touch. Must
     /// compare against the entry's most recent activity overall, not just
     /// the last accepted occurrence.
+    /// MAN-201: a track that deferred to another track's message is its own
+    /// later message once it is a full message past that touch, even while
+    /// the other track's identity stays active (a dead input's closed track).
+    #[test]
+    fn a_repeat_past_its_deferred_touch_counts_while_the_other_track_stays_active() {
+        let mut g = RepetitionGate::new(FS);
+        assert_eq!(g.record(2, 14_012_340.0, "K5ARH", 1_000, 3, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 1_000, 3, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 2_000, 4, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 9_000, 9, |_| true), 2);
+    }
+
     #[test]
     fn near_duplicate_gap_is_measured_from_the_latest_touch_not_just_the_last_accepted() {
         let mut gate = RepetitionGate::new(FS);

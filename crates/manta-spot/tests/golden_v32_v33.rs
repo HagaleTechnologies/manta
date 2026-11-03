@@ -64,6 +64,7 @@ fn seed_meta(v: &mut Validator, track_id: u32) {
         sample_ts: 0,
         snr_2500_db: 20.0,
         freq_hz: 14_000_000.0,
+        last_char_ts: 0,
     });
 }
 
@@ -147,7 +148,8 @@ fn v33_spot_is_flagged_when_the_track_sent_qrl_query() {
 #[test]
 fn v33_a_cq_after_qrl_query_is_flagged() {
     let mut v = validator();
-    let spots = twice(&mut v, 1, &["QRL?", "QRL?", "CQ", "K5ARH", "K5ARH"], 0);
+    // MAN-201 (D5): the trailing `K` settles the call's role.
+    let spots = twice(&mut v, 1, &["QRL?", "QRL?", "CQ", "K5ARH", "K5ARH", "K"], 0);
     assert_eq!(spots.len(), 1, "got {spots:?}");
     assert_eq!(spots[0].spot_type, SpotType::Cq);
     assert!(spots[0].qrl_query);
@@ -169,6 +171,8 @@ fn v33_the_ticket_transmission_carries_both() {
     let mut v = validator();
     let words = [
         "QRL?", "QRL?", "CQ", "TEST", "K5ARH", "K5ARH", "TU", "5NN", "CQ", "K5ARH",
+        // MAN-201 (D5): the trailing `K` settles the last K5ARH.
+        "K",
     ];
     let spots = run(&transmission_events(1, &words, 0), &mut v);
     assert_eq!(spots.len(), 1, "got {spots:?}");
