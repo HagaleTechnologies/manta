@@ -52,8 +52,9 @@ fn close_pair_strong_weak_on_bin_150() {
 fn close_pair_weak_strong_mid_bin_200() {
     check(10_078.125, 200.0, 10.0, 25.0);
 }
+// The steered frontend was not promoted on this cell (promotion criterion
+// 4); the channel path passes it since the hand-landing's selection fixes.
 #[test]
-#[ignore = "MAN-112 frontend not promoted: mid-bin 100 Hz fails the copy gate (promotion criterion 4)"]
 fn close_pair_mid_bin_100() {
     check(10_078.125, 100.0, 15.0, 15.0);
 }
@@ -68,4 +69,12 @@ fn close_pair_weak_strong_mid_bin_150() {
 #[test]
 fn close_pair_mid_bin_125() {
     check(10_078.125, 125.0, 15.0, 15.0);
+}
+
+// A neighbor more than two channels away must not trigger the straddle
+// override: reading the upper track from its away channel put its spot
+// 17-18 Hz high, outside the 15 Hz gate that main meets.
+#[test]
+fn close_pair_quarter_bin_200() {
+    check(10_054.687_5, 200.0, 15.0, 15.0);
 }

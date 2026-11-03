@@ -29,7 +29,8 @@ A split within an owned window needs phase evidence, a non-DORMANT owner,
 a peak at least 0.8 channel from that owner, and a measured carrier at least
 100 Hz away. Two consecutive observations must exceed the floor by 6 dB.
 A usable phase position more than 0.6 channel from a peak bin rejects birth
-for unowned peaks too. Missing phase observations retain the unowned
+for unowned peaks too, when a track is within 2.5 channels (an isolated
+birth keeps the old rule; see the hand-landing below). Missing phase observations retain the unowned
 power-only test path. These guards preserve MAN-108's dormant identity and
 reject the roughly one-channel keying sidelobe exposed by the loud-CW
 filter-on/off regression. None of these rules is a TOML setting.
@@ -151,7 +152,8 @@ Promotion verdict:
    for Steered. Filtering decoder input cannot repair that association.
 
 Do not promote. Keep the experimental stage off. The mid-bin 100 Hz golden
-remains explicitly ignored with the failed promotion criterion in its reason.
+was ignored with the failed promotion criterion in its reason; the
+hand-landing's channel path passes it, so it now runs.
 The supported target region is equal-power pairs from 125 Hz at the tested
 alignments, plus on-bin and quarter-bin 100 Hz, and strong/weak pairs from
 150 Hz. The final matrix and CI results, rather than this initial F1 table,
@@ -191,8 +193,9 @@ Half-spacing the PFB is rejected. It changes the SPEC's N/hop-rate contract,
 doubles per-channel state and estimated FFT/filter work, and does not remove
 keying sidebands. The two CPU-budget legs remain open. No ML path is added.
 
-Follow up after landing on the mid-bin 100 Hz association gap, the 100/125 Hz
-15 dB strong/weak gap, and the full SignalTrack/TransmissionEpisode/
+Follow up after landing on the quarter-bin 100 Hz and mid-bin 175 Hz
+association gaps (mid-bin 100 Hz passes after the hand-landing), the
+100/125 Hz 15 dB strong/weak gap, and the full SignalTrack/TransmissionEpisode/
 StationHypothesis identity model from recall-research investigation 8.
 Joint neighbor fitting or cancellation belongs with investigation 14.
 The frontend must repeat its promotion sweep at a level with a measurable
@@ -262,19 +265,166 @@ after the bounded self-review and is verified only by the terminal gate.
 The first gate attempt was stopped during its build because the focused
 regression was known red; the one allowed gate retry includes this repair.
 
-## Incomplete handover
+## Hand-landing (2026-11-03)
 
-This implement phase did not pass its terminal gate. An earlier
-`cargo build --all-targets` succeeded before the final repairs. The last
-focused mid-bin 125 Hz check before birth-centre seeding failed at CER
-0.206. The first terminal attempt was stopped during build, exit 143.
-The retry started at 20:59:40 UTC, one second after the permitted cutoff,
-and was stopped, exit 143. The final birth-centre repair has type-checked
-through Clippy but has not completed an all-target build or runtime gate.
-No green full-workspace or final 125 Hz claim is made.
+Catalyst's implement phase stopped before its gate (exit 143, a stopped
+process) and its four remediation rounds pushed only un-gated
+`catalyst/wip/MAN-112/remediate/*` partials, so the ticket was landed by
+hand. The branch was merged with main at `33340f54` (MAN-204, MAN-201,
+MAN-322; only CHANGELOG and wiki index conflicted). At that merge the
+full workspace gate failed nine tests: `close_pair_mid_bin_125`, both V7
+engines, two MAN-78 listen tests that need V7's N1AA, and four
+`non_cw.rs` tests.
 
-UNVERIFIED: made after the last gate run: this incomplete-handover
-paragraph records the stopped attempts and directs the next phase to run
-the all-target build and close-pair goldens on the current tree first.
-The birth-centre seeding and immediate ownership refresh were introduced
-after the first stopped attempt; the late retry did not verify them.
+### Channel selection (from remediation round 7)
+
+Two fixes from the last remediation partial are kept, unchanged and now
+gated. Before a neighbor has its own track, max-power selection could
+read that neighbor's carrier: an outer owned channel is rejected when two
+consecutive observations clear the phase SNR gate and its measured
+carrier is more than 0.6 channel from this track's centroid; the
+strongest remaining exclusive, non-cooling owned channel passing that
+check is used instead. The straddle override applies from 0.40 channel
+off the nearest integer, not 0.35: restored V7's 106.667 centre drifting
+to 106.64 had switched its input to channel 106. These fix
+`close_pair_mid_bin_125` (CER 0.206 before), both V7 engines and the two
+listen tests.
+
+The hand-landing found one more selection defect with an A/B through the
+CLI binary against main. Quarter-bin 200 Hz (107.25/109.38) put the upper
+spot 17-18 Hz high, outside the 15 Hz gate that main meets. Its centre
+drifted past 109.40, the straddle override switched it to channel 110,
+away from a neighbor 2.13 channels off, and phase read from the away
+channel pulled the centre to 109.5. A neighbor two or more channels away
+no longer triggers the override: its main lobe does not reach the facing
+channel (about 30 dB down 1.75 channels away in that scene).
+`close_pair_quarter_bin_200` and a selection unit test pin it.
+
+### Swept carriers
+
+Three sweep tests failed: `swept_carrier_7000_to_7040_starts_no_cw_track`
+(4 promotions), `single_channel_sweep_bumps_do_not_qualify_as_short_transmissions`
+(37) and `non_cw_only_input_reports_no_keyed_cw`. Frequency-anchored
+association keeps a sweep's tracks where they were born, so each
+track's edge channel kept reading the carrier after it left. Traces of
+the promoted tracks showed three readings counted as key-down: the
+carrier one or two channels away, 10-25 dB louder than the selected
+channel; the channel filter's ringing after a fast sweep, phase-coherent
+with the channel's own frequency (so a phase gate cannot see it); and, at
++40/+60 dB, the departed carrier's far skirt about 45 dB below its
+in-channel level. These hops flattened the slope fit (−93 to −290 Hz/s
+for a +2000 Hz/s sweep) and let D′ or D qualify the track. In the
+1000 Hz/s scene the queued amplitudes rippled into 3-7 `keyed_marks`
+while the track's key-down evidence was one run.
+
+Key-down evidence (SPEC §2.8 B) now also requires that no channel within
+two channels of `k` is 10 dB or more louder, and that the hop is no more
+than 30 dB below the track's strongest key-down so far. D′ also needs
+`SHORT_MIN_MARKS` debounced marks in that evidence. A mark ends 10 dB
+under its own maximum and the next starts 10 dB over the gap's minimum,
+each held for four hops. Two simpler counters failed: an absolute
+`on_snr_db` threshold merged a 35 WPM element gap that the channel filter
+keeps above it (`regression_short_high_wpm`, "DA" at +28 dB, two runs),
+and a threshold 10 dB under the track's strongest key-down let a loud
+onset transient hide every later mark (`listen_audio`'s noiseless audio
+tone, one mark). None of these touch decoding: they decide only whether
+an unqualified track qualifies.
+
+The previous round's phase-position gate on key-down hops fixed the sweeps
+but broke MAN-402's dah-heavy rows; these power rules keep both. The heavy
+`sweeps_across_rates_and_levels_start_no_cw_track` matrix fails on main
+(4000 Hz/s +20 dB ramped, 1 promotion) and passes here.
+
+### SSB scene guard
+
+`ssb_voice_at_14040_starts_far_fewer_cw_tracks` failed its scene guard,
+not its filter check. With the filter off the SSB scene promoted 29
+tracks in band at the PR head against a guard of more than 50; with the
+filter on it promotes none and spots nothing. Main measures 80 off-filter
+tracks: the fragmentation this ticket removes. Remediation round 7 found
+41 with phase-seeded birth centres disabled and 42 with the spawn
+phase-outlier check also disabled. The owner chose (MAN-488, option A) to
+lower the guard to a count the scene still meets: more than 25. The final
+branch gives 34 off and 0 on. The 80 % reduction and no-spot checks are
+unchanged.
+
+### Isolated births and promotions
+
+The decode A/B grid (`man398_grid`, 288 single-signal cases) against main
+found two rows worse at the merged PR head, before any hand change:
+row 59 (`IS`, 14.6 WPM) and row 111 (`E 0000`, 28.2 WPM). Neither has a
+second signal. In row 59 a rising-edge phase observation, read across the
+key-down edge, put the birth 1.04 channels from its peak bin; the 0.6
+channel veto rejected it and the track was born two hops later. The
+decoder's start then misread the first three seconds (CER at 14 s 0.036
+to 0.714, at 30 s 0.016 to 0.328). In row 111 the track was born on the carrier's skirt channel,
+0.88 channel from the carrier. The 0.6 channel centroid gate then
+rejected every observation of its own carrier, and a split birth took the
+carrier channel. Both rules exist for close pairs; neither had a neighbor
+to protect against.
+
+A birth with no open track's centre within 2.5 channels now keeps the
+pre-MAN-112 rule: unowned peak, power only, centre at the birth bin. At
+promotion, a track with no other centre within 2.5 channels re-seeds its
+centre to the median of the ungated phase positions it saw as a
+candidate, if there are at least 8 within a 0.2 channel interquartile
+range. Two alternatives were measured and rejected. Dropping the centroid
+gate for isolated tracks, or restoring the power centroid for them,
+fixed both rows but broke close pairs (on-bin 100 and 125 Hz with the
+power centroid; mid-bin 100 Hz and on-bin 100 Hz strong/weak with the
+gate dropped), the SSB scene and the heavy sweep matrix. Requiring the two birth observations to
+lie within 3 dB fixed row 59 but made row 35 worse.
+
+### Measurements
+
+All runs use generated IQ; no live-SDR claim is made. Main is
+`33340f54`, re-measured on 2026-11-03 rather than taken from the
+plan's baseline.
+
+- Decode A/B grid, release build, main against the final branch: 288
+  rows, 288 identical CER at 14 s and 30 s, 0 better, 0 worse.
+- Close-pair matrix through the CLI binary (`manta decode --json`; pass
+  means two promoted and decoded tracks, CER at most 0.05 and frequency
+  error at most 15 Hz for both): main passes 9 of the 30 pair cells, the
+  branch 24. No cell main passes fails on the branch. V7 at the restored
+  150 Hz spacing fails on main and passes on the branch; the old
+  four-channel V7 passes on both.
+
+| Scene | Promoted main/branch | CER main | CER branch | Freq error Hz main | Freq error Hz branch | Pass main/branch |
+| --- | --- | --- | --- | --- | --- | --- |
+| on/100/15/15 | 1/2 | 0.933/0.942 | 0.008/0.004 | 54.7/45.3 | 0.2/0.3 | false/true |
+| on/125/15/15 | 1/2 | 0.937/0.946 | 0.004/0.004 | 47.7/77.3 | 0.0/1.2 | false/true |
+| on/150/15/15 | 8/2 | 0.885/0.989 | 0.004/0.004 | 29.0/2.9 | 0.0/2.6 | false/true |
+| on/175/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.3/0.1 | 0.0/0.4 | true/true |
+| on/200/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.1/0.6 | 0.0/0.4 | true/true |
+| on/250/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.0/1.4 | 0.0/1.4 | true/true |
+| quarter/100/15/15 | 1/1 | 0.933/0.939 | 0.933/0.939 | 41.7/58.3 | 0.6/100.6 | false/false |
+| quarter/125/15/15 | 28/2 | 0.996/0.942 | 0.004/0.004 | 0.2/1.4 | 1.0/2.8 | false/true |
+| quarter/150/15/15 | 3/2 | 0.036/0.072 | 0.004/0.004 | 0.5/0.1 | 0.9/0.5 | false/true |
+| quarter/175/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.8/0.9 | 0.9/0.4 | true/true |
+| quarter/200/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.9/2.7 | 0.9/2.2 | true/true |
+| quarter/250/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.9/0.2 | 0.9/0.3 | true/true |
+| mid/100/15/15 | 1/2 | 0.941/0.950 | 0.004/0.004 | 73.1/26.9 | 4.8/3.5 | false/true |
+| mid/125/15/15 | 6/2 | 0.929/0.993 | 0.004/0.004 | 115.7/3.2 | 4.9/0.6 | false/true |
+| mid/150/15/15 | 8/2 | 0.988/0.939 | 0.004/0.004 | 0.4/8.8 | 4.9/0.3 | false/true |
+| mid/175/15/15 | 35/2 | 0.988/0.946 | 0.004/0.676 | 0.1/7.8 | 4.0/1.2 | false/false |
+| mid/200/15/15 | 20/2 | 0.960/0.054 | 0.004/0.004 | 0.1/1.9 | 2.2/2.0 | false/true |
+| mid/250/15/15 | 2/2 | 0.004/0.004 | 0.004/0.004 | 2.4/0.7 | 2.2/0.6 | true/true |
+| on/100/25/10 | 1/2 | 0.004/0.353 | 0.004/0.647 | 1.3/98.7 | 0.0/3.6 | false/false |
+| on/100/10/25 | 1/2 | 0.383/0.004 | 0.261/0.004 | 98.7/1.3 | 3.2/0.2 | false/false |
+| on/125/25/10 | 1/2 | 0.004/0.353 | 0.004/0.637 | 1.1/123.9 | 0.0/6.8 | false/false |
+| on/125/10/25 | 1/2 | 0.383/0.004 | 0.237/0.097 | 122.2/2.8 | 1.3/27.5 | false/false |
+| on/150/25/10 | 42/2 | 0.004/0.993 | 0.004/0.004 | 0.4/3.0 | 0.0/2.6 | false/true |
+| on/150/10/25 | 17/2 | 1.000/0.004 | 0.004/0.004 | 111.5/2.5 | 0.4/2.5 | false/true |
+| on/200/25/10 | 2/2 | 0.004/0.421 | 0.004/0.004 | 0.0/6.9 | 0.0/0.7 | false/true |
+| on/200/10/25 | 2/2 | 0.032/0.004 | 0.004/0.004 | 4.4/0.4 | 0.0/0.4 | true/true |
+| mid/150/25/10 | 1/2 | 0.166/0.457 | 0.004/0.011 | 5.5/144.5 | 5.7/0.9 | false/true |
+| mid/150/10/25 | 28/2 | 0.996/0.004 | 0.004/0.004 | 14.2/0.6 | 5.3/0.3 | false/true |
+| mid/200/25/10 | 2/2 | 0.004/0.004 | 0.004/0.004 | 2.6/0.1 | 2.2/2.0 | true/true |
+| mid/200/10/25 | 19/2 | 0.988/1.000 | 0.024/0.004 | 2.2/1.4 | 7.4/2.0 | false/true |
+| V7-150 | 1/2 | 0.937/0.946 | 0.004/0.004 | 104.5/45.5 | 1.3/1.0 | false/true |
+| V7-old-4ch | 2/2 | 0.004/0.004 | 0.004/0.004 | 0.1/0.1 | 0.0/0.0 | true/true |
+
+Still failing on the branch: quarter-bin 100 Hz, mid-bin 175 Hz, and the
+100 and 125 Hz 15 dB strong/weak pairs. They fail on main too and stay
+follow-up work. Mid-bin 100 Hz now passes this matrix.

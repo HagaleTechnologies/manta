@@ -29,6 +29,9 @@ the git history and `docs/DECISIONS/`.
   Close-pair track identities, decoded text and spot frequencies change.
   See docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md for the
   measured separation limits and the experimental frontend verdict.
+  With the non-CW filter on, key-down evidence ignores a channel that a
+  louder carrier within two channels dominates or that sits 30 dB under
+  the track's own key-down, so swept carriers still start no CW track.
 
 - MAN-201: manta now reads each decoded callsign as the sending station,
   the station called, a station mentioned, or uncertain, and spots only a

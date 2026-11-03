@@ -112,6 +112,12 @@ Per hop, for a track whose selected channel is `k₀`, two estimators run.
   unwrap the lag-1 phase position (defined below) near `C`. Accept only
   positions within 0.6 channel of `C`; update `C` with EMA α = 0.01.
   The same outlier gate guards the spot-frequency phase sum (MAN-112).
+- At CANDIDATE → ACTIVE, a track with no other track's centre within 2.5
+  channels re-seeds `C` to the median of the phase positions it saw as a
+  CANDIDATE (ungated, same 6 dB rule), when there are at least 8 and their
+  interquartile range is at most 0.2 channel. A birth on the carrier's
+  skirt channel, more than 0.6 channel from the carrier, could otherwise
+  never pass the gate, and a split birth then took its carrier (MAN-112).
 - Key-up holds `C`. Power-only synthetic hops without complex observations
   retain the three-bin dB parabola for detector unit tests only.
 
@@ -399,7 +405,10 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   This prevents a loud carrier's skirt from posing as an independent signal.
   For unowned peaks too, a usable phase position more than 0.6 channel from
   the peak bin vetoes birth; missing phase observations keep the power-only
-  unowned-peak rule.
+  unowned-peak rule. A birth with no open track's centre within 2.5
+  channels is isolated: it uses the power-only unowned-peak rule and starts
+  at `k₀`, because one rising-edge phase observation can veto or mis-seed
+  it, which shifted single-signal births by a few hops (MAN-112).
   Closer candidates are absorbed (MAN-112).
 - A DORMANT track (§2.4) keeps its ownership: its channels block spawns,
   and a rise sustained there re-acquires it instead (MAN-108).
@@ -449,15 +458,24 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   Distances wrap around the FFT; exact ties go to the lower track id.
   If no exclusive channel remains, use the existing cooldown-aware maximum,
   falling back to the plain maximum only when all owned channels are cooling
-  (MAN-197). The centre snapshot is taken before driving any track.
+  (MAN-197). Before the straddle override, if a selected channel is more
+  than 1.0 channel from the centre, two consecutive complex observations
+  at least 6 dB above its floor reject it when its phase position is more
+  than 0.6 channel from the centre. Select the strongest remaining exclusive,
+  non-cooling owned channel passing that phase check; if none remains,
+  retain the previous selection. Missing phase evidence does not reject a
+  channel. The centre snapshot is taken before driving any track.
 - With a neighbor within 2.5 channels, decoder input uses
   the rounded centre when that channel is exclusive and
   not cooling; otherwise it uses the selected channel. Tracking retains the
   exclusive max-power selection (F1, MAN-112). The optional
-  refiner remains on the centroid channel. At a straddle (at least 0.35
-  channel from the nearest integer), the closest neighbor within 2.5 channels
+  refiner remains on the centroid channel. At a straddle (at least 0.40
+  channel from the nearest integer), the closest neighbor within 2.0 channels
   selects the straddle channel away from that neighbor, provided it is
-  exclusive and not cooling. This selection stays fixed through keying. The experimental steered frontend
+  exclusive and not cooling. This selection ignores instantaneous neighbor strength.
+  A neighbor 2.0 channels or more away leaves the selection alone: the
+  facing channel is outside its main lobe, and reading the away channel
+  biases the centroid toward the straddle (MAN-112). The experimental steered frontend
   is off by default and is available only through the Rust pipeline config.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
   both pass the ownership admission rule, a spawn decision at `k` creates one CANDIDATE at the
@@ -772,6 +790,9 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `SHORT_MARK_DEBOUNCE_HOPS` | 4 | D′: key-down/key-up run debounce for a keyed mark |
 | `SHORT_HYST_FRAC` | 0.15 | D′: keyed-marks hysteresis half-band, fraction of the Q10–Q90 gap |
 | `SHORT_MIN_KEYING_RATIO` | 2.0 | D′: Q90/Q10 ratio the queued input must show at all |
+| `KEYDOWN_DOMINANCE_CH` / `KEYDOWN_DOMINANCE_DB` | 2 / 10.0 | MAN-112: a channel this close and this much louder than `k` makes the hop not key-down |
+| `KEYDOWN_LEVEL_SPAN_DB` | 30.0 | MAN-112: a key-down hop lies within this of the track's strongest key-down SNR |
+| `KEYDOWN_MARK_SWING_DB` | 10.0 | MAN-112, D′: a key-down mark ends this far under its own maximum; the next starts this far over the gap's minimum |
 
 **A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
 hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
@@ -798,7 +819,14 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
   at each evaluation, so D′ can fire only at the first evaluation after a
   drop.
 - A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
-  track's selected channel (§2.5). On it, until the track qualifies:
+  track's selected channel (§2.5), where no channel within
+  `KEYDOWN_DOMINANCE_CH` of `k` is `KEYDOWN_DOMINANCE_DB` or more louder,
+  and whose SNR is no more than `KEYDOWN_LEVEL_SPAN_DB` below the
+  strongest key-down SNR so far (MAN-112). Frequency-anchored association
+  (§2.5) keeps a swept carrier's track in place after the carrier moves
+  on; without these two clauses its edge channel kept reading the
+  departed carrier (its skirt, or the channel filter's ringing) as
+  key-down, which flattened the slope. On it, until the track qualifies:
   - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
     `t = hop − first key-down hop` and `f = wrap(k − k₀) + δ` in
     channels, where `k₀` is the birth channel, `wrap` maps to
@@ -807,6 +835,13 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
     key-down hop's `t`. The slope in Hz/s is the least-squares `df/dt`
     (channels per hop) × channel spacing × hops per second
     (4 × spacing; 375 at 93.75 Hz).
+  - **Key-down marks** (MAN-112, D′): over every hop until the track
+    qualifies, with each non-key-down hop read as −∞ dB, a mark ends after
+    `SHORT_MARK_DEBOUNCE_HOPS` hops at least `KEYDOWN_MARK_SWING_DB` under
+    the mark's maximum SNR, and the next mark starts, and counts, after as
+    many hops that far over the gap's minimum. The thresholds follow the
+    local extremes, so a fast element gap that the channel filter keeps
+    above `on_snr_db` still separates two marks.
   - **Flatness:** let `side = max(PdB[k±2], PdB[k±3])` (indices mod N).
     The hop is **non-flat** when `|PdB[k] − side| ≥ ISO_DB`: a neighbour
     at least 6 dB louder is a different signal, so only a neighbourhood
@@ -938,6 +973,9 @@ track qualifies when all hold:
   The count is computed only at an evaluation where the track is in HANG
   with `dropped_since_eval` set — one quantile selection over the bounded
   queue per drop, nowhere else.
+- **key-down marks ≥ `SHORT_MIN_MARKS`** (MAN-112, B): a carrier swept
+  past a frequency-anchored track is one key-down run, however its queued
+  amplitudes ripple below `on_snr_db` after it has passed.
 
 Qualification through D′ leases the decoder, replays the queue and emits
 the deferred `TrackPromoted` exactly as D does. A track still unqualified

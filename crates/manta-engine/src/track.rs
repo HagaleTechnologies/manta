@@ -701,6 +701,9 @@ pub(crate) struct Track {
     /// split admission. Individual gated products also steer the centroid. Zero until the first
     /// such hop. A merge survivor keeps its own (D5).
     phase_z: Complex64,
+    /// MAN-112: ungated phase positions seen while CANDIDATE, for the
+    /// isolated-promotion re-seed. Cleared at promotion.
+    confirm_positions: Vec<f64>,
     envelope: VecDeque<(u64, f32)>,
     /// MAN-114 (Codex review, PR #346): `phase_z` before each of the last
     /// `CRASH_MIN_HOPS - 1` unsuppressed hops, oldest first. A crash is
@@ -858,6 +861,50 @@ fn keyed_marks(amps: &[f32]) -> u64 {
     marks
 }
 
+/// MAN-112: a channel within this many channels of the selected one that
+/// is louder by at least `KEYDOWN_DOMINANCE_DB` means the selected channel
+/// is reading another carrier's skirt or a swept carrier's filter ringing,
+/// not this track's own key-down.
+const KEYDOWN_DOMINANCE_CH: usize = 2;
+/// MAN-112: see `KEYDOWN_DOMINANCE_CH`.
+const KEYDOWN_DOMINANCE_DB: f64 = 10.0;
+/// MAN-112: key-down evidence lies within this many dB of the track's
+/// strongest key-down hop so far.
+const KEYDOWN_LEVEL_SPAN_DB: f64 = 30.0;
+/// MAN-112 (SPEC §2.8 D′): a key-down mark ends when the SNR stays this
+/// many dB under the mark's own maximum, and the next starts when it stays
+/// this many dB over the gap's minimum. Relative to the local extremes, so
+/// a fast element gap that the channel filter keeps above `on_snr_db`
+/// still separates two marks, and one loud onset sets no level for later
+/// marks.
+const KEYDOWN_MARK_SWING_DB: f64 = 10.0;
+
+/// MAN-112 (SPEC §2.8): is `k` dominated by a nearby louder channel? Such a
+/// hop is not keying evidence for the track on `k`: frequency-anchored
+/// association keeps a swept carrier's track in place after the carrier
+/// has moved on, and its edge channel keeps reading the departed carrier.
+fn neighbor_dominates(power_db: &[f64], k: usize) -> bool {
+    let n = power_db.len();
+    (1..=KEYDOWN_DOMINANCE_CH).any(|d| {
+        [power_db[(k + d) % n], power_db[(k + n - d) % n]]
+            .into_iter()
+            .any(|p| p - power_db[k] >= KEYDOWN_DOMINANCE_DB)
+    })
+}
+
+/// MAN-112: the median of `positions` when there are at least
+/// `RESEED_MIN_OBS` and their interquartile range is at most
+/// `RESEED_MAX_IQR_CH`; `None` otherwise.
+fn agreeing_median(mut positions: Vec<f64>) -> Option<f64> {
+    let n = positions.len();
+    if n < RESEED_MIN_OBS {
+        return None;
+    }
+    positions.sort_by(f64::total_cmp);
+    let (q1, q3) = (positions[n / 4], positions[(3 * n) / 4]);
+    (q3 - q1 <= RESEED_MAX_IQR_CH).then_some(positions[n / 2])
+}
+
 /// MAN-313 (SPEC §2.8): one promoted track's evidence that it is keyed CW,
 /// plus the state its unkeyed close reads. Every field is integer-hop
 /// driven and summed in a fixed order, so the decision is deterministic.
@@ -897,6 +944,16 @@ struct KeyingEvidence {
     t_last: u64,
     /// Key-down hops whose neighbourhood was not flat (Discovery 7).
     non_flat: u64,
+    /// MAN-112 (SPEC §2.8 D′): debounced key-down marks in the evidence
+    /// hops themselves (`note_keydown`): the count, whether a mark is in
+    /// progress, the current mark's maximum or gap's minimum SNR, and how
+    /// many consecutive hops have met the opposite transition.
+    keydown_marks: u64,
+    keydown_now: bool,
+    keydown_extreme_db: f64,
+    keydown_switch_hops: u32,
+    /// MAN-112: the strongest key-down SNR so far, in dB.
+    peak_keydown_snr_db: f64,
     /// Hop of the promotion or the latest HANG -> ACTIVE re-rise.
     last_rise_hop: u64,
     /// `hop_counter` at the end of the latest batch that decoded a
@@ -926,6 +983,11 @@ impl KeyingEvidence {
             sum_tf: 0.0,
             t_last: 0,
             non_flat: 0,
+            keydown_marks: 0,
+            keydown_now: false,
+            keydown_extreme_db: f64::NEG_INFINITY,
+            keydown_switch_hops: 0,
+            peak_keydown_snr_db: f64::NEG_INFINITY,
             last_rise_hop: promo_hop,
             last_char_hop: 0,
             word: String::new(),
@@ -948,6 +1010,7 @@ impl KeyingEvidence {
         k: usize,
         birth_channel: usize,
         keydown: bool,
+        snr_db: f64,
         power: &[f32],
         power_db: &[f64],
     ) {
@@ -971,7 +1034,11 @@ impl KeyingEvidence {
             self.active_run += 1;
             self.active_hops_since_eval += 1;
         }
-        if qualified || !keydown {
+        if qualified {
+            return;
+        }
+        self.note_keydown(if keydown { snr_db } else { f64::NEG_INFINITY });
+        if !keydown {
             return;
         }
         let n_ch = power.len();
@@ -997,6 +1064,50 @@ impl KeyingEvidence {
             .fold(f64::NEG_INFINITY, f64::max);
         if (power_db[k] - side).abs() >= ISO_DB {
             self.non_flat += 1;
+        }
+    }
+
+    /// MAN-112: a hop far below this track's strongest key-down is the
+    /// far skirt of a carrier that has left, not this track's key-down.
+    /// Raises the running peak for every admitted hop.
+    fn admits_keydown_level(&mut self, snr_db: f64) -> bool {
+        if snr_db < self.peak_keydown_snr_db - KEYDOWN_LEVEL_SPAN_DB {
+            return false;
+        }
+        self.peak_keydown_snr_db = self.peak_keydown_snr_db.max(snr_db);
+        true
+    }
+
+    /// MAN-112 (SPEC §2.8 D′): count marks in this track's own key-down
+    /// evidence. `snr_db` is the hop's SNR when it is a key-down hop and
+    /// `NEG_INFINITY` otherwise. A mark ends after
+    /// `SHORT_MARK_DEBOUNCE_HOPS` hops at least `KEYDOWN_MARK_SWING_DB`
+    /// under its maximum; the next begins, and counts, after as many hops
+    /// that far over the gap's minimum. A swept carrier crossing the channel
+    /// is one mark however its decoder-input amplitude ripples.
+    fn note_keydown(&mut self, snr_db: f64) {
+        let switching = if self.keydown_now {
+            snr_db <= self.keydown_extreme_db - KEYDOWN_MARK_SWING_DB
+        } else {
+            snr_db.is_finite() && snr_db >= self.keydown_extreme_db + KEYDOWN_MARK_SWING_DB
+        };
+        if !switching {
+            self.keydown_switch_hops = 0;
+            self.keydown_extreme_db = if self.keydown_now {
+                self.keydown_extreme_db.max(snr_db)
+            } else {
+                self.keydown_extreme_db.min(snr_db)
+            };
+            return;
+        }
+        self.keydown_switch_hops += 1;
+        if self.keydown_switch_hops >= SHORT_MARK_DEBOUNCE_HOPS {
+            self.keydown_now = !self.keydown_now;
+            self.keydown_switch_hops = 0;
+            self.keydown_extreme_db = snr_db;
+            if self.keydown_now {
+                self.keydown_marks += 1;
+            }
         }
     }
 
@@ -1096,6 +1207,7 @@ impl KeyingEvidence {
             && self.slope_hz_s(spacing_hz).abs() <= self.short_slope_tolerance()
             && self.non_flat_fraction() >= ISO_MIN_FRACTION
             && keyed_marks >= SHORT_MIN_MARKS
+            && self.keydown_marks >= SHORT_MIN_MARKS
     }
 
     /// A decoded character (`None` for a prosign) at batch-end hop `hop`.
@@ -1134,7 +1246,19 @@ const FINE_FREQ_MIN_SNR_DB: f64 = 6.0;
 
 /// MAN-112: reject phase observations pulled toward a neighboring carrier.
 const CENTROID_OUTLIER_CH: f64 = 0.6;
+/// MAN-112: with no other track's centre this close (the F1 neighbor
+/// distance), a birth or a promotion is isolated.
+const ISOLATION_CH: f64 = 2.5;
+/// MAN-112: confirm-window phase positions an isolated promotion needs to
+/// re-seed its centre, and the largest interquartile spread they may show.
+const RESEED_MIN_OBS: usize = 8;
+const RESEED_MAX_IQR_CH: f64 = 0.2;
 const SPLIT_MIN_CH: f64 = 0.8;
+/// MAN-112: the straddle override applies only to a neighbor closer than
+/// this. Farther away, the channel facing it sits outside the neighbor's
+/// main lobe, and the away channel's off-carrier phase reading biases the
+/// centroid toward the straddle that selected it.
+const STRADDLE_NEIGHBOR_CH: f64 = 2.0;
 /// The supported close-pair region starts at 100 Hz. An owned peak at
 /// one channel spacing can be a keyed carrier's sidelobe (MAN-112).
 const SPLIT_MIN_FREQ_CH: f64 = 100.0 / manta_dsp::channelizer::CHANNEL_SPACING_HZ;
@@ -1225,6 +1349,7 @@ impl Track {
             keying: None,
             qualified: false,
             phase_z: Complex64::new(0.0, 0.0),
+            confirm_positions: Vec::new(),
             envelope: VecDeque::new(),
             phase_hist: VecDeque::new(),
         }
@@ -1750,10 +1875,10 @@ impl Track {
         now: u64,
         n: usize,
     ) -> usize {
-        if (self.center - self.center.round()).abs() < 0.35 {
+        if (self.center - self.center.round()).abs() < 0.40 {
             return selected;
         }
-        let mut nearest = 2.5;
+        let mut nearest = STRADDLE_NEIGHBOR_CH;
         let mut candidate = selected;
         for &(id, center) in centers {
             let distance = channel_distance(center, self.center, n);
@@ -2774,6 +2899,43 @@ impl TrackManager {
                 self.hop_counter,
                 n,
             );
+            // Before the neighbor has its own track, its stronger channel
+            // must not train this track: `k` feeds tracking (envelope, rise,
+            // SNR, phase) as well as decoder input. Reject measured carriers
+            // outside this identity's centroid gate, just as centroid
+            // updates do.
+            let phase_matches = |ch: usize| {
+                if channel_distance(ch as f64, track.center, n) <= 1.0 {
+                    return true;
+                }
+                let floor = self.floor.effective_floor_db(ch);
+                if power_db_vals[ch] - floor < FINE_FREQ_MIN_SNR_DB
+                    || prev_hop
+                        .as_ref()
+                        .is_none_or(|prev| power_db(prev.power[ch]) - floor < FINE_FREQ_MIN_SNR_DB)
+                {
+                    return true;
+                }
+                prev_hop
+                    .as_ref()
+                    .and_then(|prev| phase_lag_product(prev, hop, ch))
+                    .and_then(|z| phase_position(z, track.center))
+                    .is_none_or(|pos| (pos - track.center).abs() <= CENTROID_OUTLIER_CH)
+            };
+            let k = if phase_matches(k) {
+                k
+            } else {
+                track
+                    .owned(n)
+                    .into_iter()
+                    .filter(|&ch| {
+                        self.channel_cooldown_until[ch] <= self.hop_counter
+                            && track.channel_exclusive(ch, &centers, n)
+                            && phase_matches(ch)
+                    })
+                    .max_by(|&a, &b| hop.power[a].total_cmp(&hop.power[b]))
+                    .unwrap_or(k)
+            };
             // A stronger neighbor can contaminate one side of a straddle.
             let k = track.select_straddle_channel(
                 k,
@@ -2821,6 +2983,11 @@ impl TrackManager {
                 // spot-frequency estimator.
                 if power_db_vals[k] - self.floor.effective_floor_db(k) >= FINE_FREQ_MIN_SNR_DB {
                     if let Some(z) = prev_hop.as_ref().and_then(|p| phase_lag_product(p, hop, k)) {
+                        if prev_state == LifecycleState::Candidate {
+                            if let Some(pos) = phase_position(z, track.center) {
+                                track.confirm_positions.push(pos);
+                            }
+                        }
                         track.observe_phase(z, power_db_vals[k] - self.floor.effective_floor_db(k));
                     }
                 }
@@ -2887,8 +3054,10 @@ impl TrackManager {
             let hop_now = self.hop_counter;
             let qualified = track.qualified;
             if let Some(ev) = track.keying.as_mut() {
-                let keydown = power_db_vals[k] - self.floor.effective_floor_db(k)
-                    >= f64::from(self.cfg.on_snr_db);
+                let snr_db = power_db_vals[k] - self.floor.effective_floor_db(k);
+                let keydown = snr_db >= f64::from(self.cfg.on_snr_db)
+                    && !neighbor_dominates(&power_db_vals, k)
+                    && ev.admits_keydown_level(snr_db);
                 ev.on_hop(
                     hop_now,
                     prev_state,
@@ -2897,6 +3066,7 @@ impl TrackManager {
                     k,
                     track.birth_channel,
                     keydown,
+                    snr_db,
                     &hop.power,
                     &power_db_vals,
                 );
@@ -2927,6 +3097,19 @@ impl TrackManager {
                 LifecycleEvent::Promoted => {
                     // MAN-313: every detector confirmation, qualified or not.
                     self.confirmations += 1;
+                    // MAN-112: an isolated promotion re-seeds its centre from
+                    // the confirm window's agreeing phase positions. A birth
+                    // on the carrier's skirt channel more than 0.6 channel
+                    // away could otherwise never pass the centroid gate.
+                    let isolated = centers.iter().all(|&(other, center)| {
+                        other == id || channel_distance(center, track.center, n) >= ISOLATION_CH
+                    });
+                    let positions = std::mem::take(&mut track.confirm_positions);
+                    if isolated {
+                        if let Some(c) = agreeing_median(positions) {
+                            track.center = c;
+                        }
+                    }
                     // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
                     // deviation): seed TrackMeta.freq_hz from this track's
                     // own centroid EMA (already warm from its
@@ -3164,13 +3347,14 @@ impl TrackManager {
                             LifecycleState::Dormant => "D",
                         };
                         eprintln!(
-                            "[man372]   id={id} k={k} state={state_tag} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} qual={qualifies} || {}",
+                            "[man372]   id={id} k={k} state={state_tag} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} kd_marks={} qual={qualifies} || {}",
                             ev.qualifies(comod, k, spacing),
                             ev.qualifies_short(comod, k, spacing, state, marks),
                             ev.slope_hz_s(spacing),
                             ev.n,
                             ev.t_last,
                             comod.diag_best_rho(k),
+                            ev.keydown_marks,
                             ev.diag_gates(comod, k, spacing),
                         );
                     }
@@ -3406,6 +3590,9 @@ impl TrackManager {
     /// MAN-112: both the peak channel and its measured carrier must be
     /// separate from the owner. Dormant identities retain their window.
     fn spawn_admits(&self, k: usize, position: Option<f64>) -> bool {
+        if self.birth_isolated(k) {
+            return self.owner_of[k].is_none();
+        }
         // A distant carrier's sidelobe cannot claim this bin's identity.
         // Empty complex observations retain power-only detector test semantics.
         if position.is_some_and(|pos| {
@@ -3426,6 +3613,14 @@ impl TrackManager {
                                     >= SPLIT_MIN_FREQ_CH)
                     })
                 }))
+    }
+
+    /// MAN-112: no open track's centre is within `ISOLATION_CH` of `k`.
+    fn birth_isolated(&self, k: usize) -> bool {
+        let n = self.n_channels();
+        self.tracks
+            .values()
+            .all(|t| channel_distance(t.center, k as f64, n) >= ISOLATION_CH)
     }
 
     /// MAN-171: is `k` still serving out a post-`Silent`-closure spawn
@@ -3451,7 +3646,11 @@ impl TrackManager {
     /// for spawn admission. An integer-bin seed can lock a straddling birth
     /// onto a neighbor's skirt before the slow centroid EMA settles.
     fn spawn_positioned(&mut self, k: usize, hop: &HopOutput, prev: Option<&HopOutput>) {
-        let position = self.spawn_phase_position(k, hop, prev);
+        let position = if self.birth_isolated(k) {
+            None
+        } else {
+            self.spawn_phase_position(k, hop, prev)
+        };
         let id = self.next_id;
         self.spawn(k);
         if let Some(position) = position {
@@ -5238,6 +5437,36 @@ mod tests {
     }
 
     #[test]
+    fn untracked_neighbor_cannot_train_a_straddling_tracks_decoder() {
+        let mut tm = TrackManager::new(
+            1024,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(108);
+        tm.tracks.get_mut(&1).unwrap().center = 107.52;
+        let spectrum = |m| {
+            let mut x = vec![num_complex::Complex32::new(0.0, 0.0); 1024];
+            for (k, pos, amp) in [(107, 107.5, 1.0), (108, 107.5, 0.9), (109, 108.833, 3.0)] {
+                x[k] = num_complex::Complex32::from_polar(
+                    amp,
+                    (std::f64::consts::FRAC_PI_2 * (pos - k as f64) * m as f64) as f32,
+                ) * odd_channel_sign_correction(m, k);
+            }
+            hop_with_x(m, x)
+        };
+        tm.prev_hop = Some(spectrum(0));
+        tm.step_hop(&spectrum(1), 1);
+        let observed_db = tm.tracks[&1].envelope.back().unwrap().1;
+        assert!(
+            observed_db.abs() < 1e-4,
+            "must read the 0 dB own carrier, not the stronger untracked neighbor: {observed_db}"
+        );
+    }
+
+    #[test]
     fn phase_centroid_rejects_an_outlier_more_than_0_6_channel_away() {
         let mut t = Track::new(1, 107, &DetectorConfig::default());
         t.update_centroid_phase(Complex64::from_polar(
@@ -5358,6 +5587,72 @@ mod tests {
         tm.tracks.get_mut(&1).unwrap().center = 10.5;
         assert!(!tm.spawn_admits(11, Some(11.07)));
     }
+    #[test]
+    fn off_midpoint_neighbor_does_not_force_the_outer_straddle_channel() {
+        let mut t = Track::new(1, 107, &DetectorConfig::default());
+        // Restored V7 is at 106.667. Small centroid noise must not switch
+        // its decoder to 106, where transition sidelobes bias phase tracking.
+        t.center = 106.64;
+        let centers = [(1, t.center), (2, 108.27)];
+        assert_eq!(
+            t.select_straddle_channel(107, &centers, &[0; 1024], 0, 1024),
+            107
+        );
+    }
+
+    /// MAN-112: the isolated-promotion re-seed needs enough agreeing
+    /// confirm-window positions; a scattered or short set keeps the centre.
+    #[test]
+    fn agreeing_median_needs_enough_tight_positions() {
+        let tight = vec![
+            1013.1, 1013.15, 1013.12, 1013.08, 1013.2, 1013.11, 1013.13, 1013.1,
+        ];
+        assert_eq!(agreeing_median(tight.clone()), Some(1013.12));
+        assert_eq!(agreeing_median(tight[..7].to_vec()), None);
+        let scattered = vec![
+            1012.5, 1013.8, 1013.1, 1012.9, 1013.6, 1012.7, 1013.4, 1013.0,
+        ];
+        assert_eq!(agreeing_median(scattered), None);
+    }
+
+    /// MAN-112: a birth with no track within 2.5 channels keeps the
+    /// pre-MAN-112 unowned-peak rule, so one rising-edge phase position can
+    /// neither veto it nor seed it; near a track the phase veto stays.
+    #[test]
+    fn isolated_birth_ignores_its_phase_position() {
+        let mut tm = TrackManager::new(
+            1024,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        assert!(tm.spawn_admits(25, Some(23.96)));
+        tm.spawn(27);
+        tm.recompute_ownership();
+        assert!(!tm.spawn_admits(25, Some(23.96)));
+    }
+
+    /// MAN-112: a neighbor two or more channels away does not move a
+    /// straddling track off its selected channel. In the quarter-bin 200 Hz
+    /// pair the override read the upper track from its away channel, whose
+    /// biased phase pulled the centre up to 109.5 and the spot 18 Hz high.
+    #[test]
+    fn straddle_override_ignores_a_neighbor_two_channels_away() {
+        let mut t = Track::new(2, 109, &DetectorConfig::default());
+        t.center = 109.42;
+        let far = [(1, 107.25), (2, t.center)];
+        assert_eq!(
+            t.select_straddle_channel(109, &far, &[0; 1024], 0, 1024),
+            109
+        );
+        let near = [(1, 107.6), (2, t.center)];
+        assert_eq!(
+            t.select_straddle_channel(109, &near, &[0; 1024], 0, 1024),
+            110
+        );
+    }
+
     #[test]
     fn stronger_neighbor_does_not_choose_the_contaminated_straddle_channel() {
         let mut t = Track::new(1, 11, &DetectorConfig::default());
@@ -9170,7 +9465,74 @@ mod tests {
             ev.sum_tf += tt * f;
             ev.non_flat += 1;
         }
+        ev.keydown_marks = SHORT_MIN_MARKS;
         ev
+    }
+
+    /// MAN-112: D′ also needs `SHORT_MIN_MARKS` debounced key-down runs in
+    /// the evidence hops. A swept carrier's decoder input can ripple into
+    /// several `keyed_marks` while its key-down evidence is one run.
+    #[test]
+    fn short_rule_needs_marks_in_the_keydown_evidence() {
+        let comod = CoModDetector::new(NC_N);
+        let mut ev = short_evidence(120, 0.0);
+        ev.keydown_marks = SHORT_MIN_MARKS - 1;
+        assert!(!ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Hang, 6));
+    }
+
+    /// MAN-112: marks debounce like `keyed_marks`, count once however long
+    /// they last, and follow the local level: a loud onset sets no
+    /// threshold for later, quieter marks, and a 6 dB ripple is no gap.
+    #[test]
+    fn keydown_marks_debounce_and_follow_the_local_level() {
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        let feed = |db: f64, hops: usize, ev: &mut KeyingEvidence| {
+            for _ in 0..hops {
+                ev.note_keydown(db);
+            }
+        };
+        feed(124.0, 20, &mut ev);
+        assert_eq!(ev.keydown_marks, 1);
+        feed(f64::NEG_INFINITY, 2, &mut ev); // shorter than the debounce
+        feed(108.0, 10, &mut ev);
+        assert_eq!(ev.keydown_marks, 1);
+        feed(60.0, 8, &mut ev); // a gap the filter keeps above on_snr_db
+        feed(108.0, 3, &mut ev); // too short to count yet
+        assert_eq!(ev.keydown_marks, 1);
+        feed(108.0, 1, &mut ev);
+        assert_eq!(ev.keydown_marks, 2);
+        for i in 0..40 {
+            feed(if i % 8 < 4 { 13.0 } else { 19.0 }, 1, &mut ev);
+        }
+        assert_eq!(ev.keydown_marks, 2, "a 6 dB ripple is one mark");
+    }
+
+    /// MAN-112: a hop 30 dB under the strongest key-down so far is not
+    /// key-down evidence, and it does not lower the running peak.
+    #[test]
+    fn keydown_level_rejects_a_departed_carriers_far_skirt() {
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        assert!(ev.admits_keydown_level(56.0));
+        assert!(!ev.admits_keydown_level(12.0));
+        assert!(ev.admits_keydown_level(27.0));
+        assert_eq!(ev.peak_keydown_snr_db, 56.0);
+    }
+
+    /// MAN-112: a channel within two channels and 10 dB louder dominates
+    /// the selected one; three channels away, or 9 dB louder, does not.
+    #[test]
+    fn neighbor_dominance_window_and_margin() {
+        let mut p = vec![0.0_f64; 16];
+        p[8] = 20.0;
+        p[10] = 30.0;
+        assert!(neighbor_dominates(&p, 8));
+        p[10] = 29.0;
+        assert!(!neighbor_dominates(&p, 8));
+        p[10] = 0.0;
+        p[5] = 60.0;
+        assert!(!neighbor_dominates(&p, 8));
+        p[15] = 40.0; // wraps: channel 15 is one below channel 0
+        assert!(neighbor_dominates(&p, 0));
     }
 
     /// D′ fires only at the first evaluation after an ACTIVE → HANG drop,
