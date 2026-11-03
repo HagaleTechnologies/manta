@@ -115,6 +115,24 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
+  by default) reports validated CQ and beacon spots (`spot_types = "all"`
+  for every type) to PSKReporter's public map at
+  `report.pskreporter.info:4739` as IPFIX over UDP, each call at most once
+  per band every 5 minutes, in at most one datagram every 5 minutes. It
+  needs `[server]` with a grid, and a file replay reports only to a loopback
+  host. `[[wsjtx_output]]` sends every validated spot to a LAN address
+  (unicast, broadcast or multicast) as WSJT-X `Heartbeat`, `Status`,
+  `Decode` and `Close` messages, one instance per band (`manta-20m`), with
+  `Off air` set on a file replay. `[[wsjtx_relay]]` now ignores datagrams
+  from manta's own output (`manta_relay_dropped_total{reason="own_output"}`).
+  With `[server]`, `/metrics` gains `manta_pskreporter_reports_total`,
+  `manta_pskreporter_datagrams_total`, `manta_pskreporter_dropped_total`,
+  `manta_wsjtx_output_spots_total`, `manta_wsjtx_output_datagrams_total`
+  and `manta_wsjtx_output_dropped_total`. Spots are unchanged. Tested
+  against fake local listeners; a live PSKReporter report and a real
+  logger are still to be checked. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times

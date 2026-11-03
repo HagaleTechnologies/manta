@@ -1269,6 +1269,152 @@ impl WsjtxRelayConfig {
     }
 }
 
+/// MAN-142: PSKReporter's collector.
+pub const DEFAULT_PSKREPORTER_HOST: &str = "report.pskreporter.info";
+/// MAN-142: PSKReporter's IPFIX port.
+pub const DEFAULT_PSKREPORTER_PORT: u16 = 4739;
+/// MAN-142: the longest string PSKReporter keeps (one IPFIX length byte).
+pub const PSKREPORTER_MAX_STRING_BYTES: usize = 254;
+
+fn default_pskreporter_host() -> String {
+    DEFAULT_PSKREPORTER_HOST.to_string()
+}
+
+fn default_pskreporter_port() -> u16 {
+    DEFAULT_PSKREPORTER_PORT
+}
+
+/// MAN-142: `[pskreporter]`, public reports to PSKReporter. Off unless
+/// `enabled = true`, because anyone can read the reports (D2).
+/// Restart-only.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PskReporterConfig {
+    /// `true` reports spots publicly to PSKReporter.
+    #[serde(default)]
+    pub enabled: bool,
+    /// PSKReporter's collector, or a local test listener's IPv4 address.
+    #[serde(default = "default_pskreporter_host")]
+    pub host: String,
+    #[serde(default = "default_pskreporter_port")]
+    pub port: u16,
+    /// Shown on PSKReporter's map; empty when unset.
+    #[serde(default)]
+    pub antenna: String,
+    /// Which spot types are reported, as for `[[rbn_uplink]]` (D4).
+    #[serde(default)]
+    pub spot_types: UplinkSpotTypes,
+}
+
+impl Default for PskReporterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: default_pskreporter_host(),
+            port: default_pskreporter_port(),
+            antenna: String::new(),
+            spot_types: UplinkSpotTypes::default(),
+        }
+    }
+}
+
+impl PskReporterConfig {
+    /// `host:port`, the table's label in logs and messages.
+    pub fn label(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Rejects an empty host, an IPv6 host, port 0 and an antenna longer
+    /// than PSKReporter keeps (D8, D9).
+    pub fn validate(&self) -> Result<(), String> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("[pskreporter]: host is empty -- set PSKReporter's host name \
+                        (\"report.pskreporter.info\") or a test listener's IPv4 address"
+                .to_string());
+        }
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+            return Err(format!(
+                "[pskreporter]: host \"{}\" is an IPv6 address -- PSKReporter has no IPv6 \
+                 address; use a host name or an IPv4 address",
+                self.host
+            ));
+        }
+        if self.port == 0 {
+            return Err("[pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 \
+                        (14739 for its test listener)"
+                .to_string());
+        }
+        if self.antenna.len() > PSKREPORTER_MAX_STRING_BYTES {
+            return Err(format!(
+                "[pskreporter]: antenna is {} bytes; PSKReporter keeps at most {}",
+                self.antenna.len(),
+                PSKREPORTER_MAX_STRING_BYTES
+            ));
+        }
+        if self.antenna.chars().any(char::is_control) {
+            return Err("[pskreporter]: antenna has a control character -- use plain text \
+                        such as \"Inverted V at 12 m\""
+                .to_string());
+        }
+        Ok(())
+    }
+}
+
+/// MAN-142: whether `host` names this machine: an IPv4 loopback literal
+/// (`127.0.0.0/8`) or `localhost` in any case. A file replay reports to
+/// PSKReporter only at such a host (D10).
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// MAN-142: `[[wsjtx_output]]`, spots as WSJT-X UDP for LAN loggers.
+/// Adding the block is the opt-in, as for `[[wsjtx_relay]]` (D2).
+/// Restart-only.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WsjtxOutputConfig {
+    /// `false` keeps the block but sends nothing.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// A logger's `IP:port`, an IPv4 broadcast address or an IPv4
+    /// multicast group. No default.
+    pub destination: std::net::SocketAddr,
+}
+
+impl WsjtxOutputConfig {
+    /// The `destination`, the block's label in logs, metrics and errors.
+    pub fn label(&self) -> String {
+        self.destination.to_string()
+    }
+
+    /// Rejects the unspecified addresses, port 0 and IPv6 multicast (D13).
+    pub fn validate(&self) -> Result<(), String> {
+        let d = self.destination;
+        if d.ip().is_unspecified() || d.port() == 0 {
+            return Err(format!(
+                "[[wsjtx_output]]: destination \"{d}\" is not an address manta can send to -- \
+                 use a logger's address, a broadcast address such as \"192.168.1.255:2237\", or \
+                 a multicast group such as \"224.0.0.1:2237\""
+            ));
+        }
+        if let std::net::SocketAddr::V6(v6) = d {
+            if v6.ip().is_multicast() {
+                return Err(format!(
+                    "[[wsjtx_output]]: destination \"{d}\" is an IPv6 multicast group -- use an \
+                     IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
