@@ -174,13 +174,13 @@ fn a_known_gap_starts_a_new_epoch() {
     let before: Vec<u32> = run
         .records
         .iter()
-        .filter(|o| o.draft.decision.sample_ts < resumed)
+        .filter(|o| o.draft.sample_ts() < resumed)
         .map(|o| o.draft.source.epoch)
         .collect();
     let after: Vec<u32> = run
         .records
         .iter()
-        .filter(|o| o.draft.decision.sample_ts >= resumed)
+        .filter(|o| o.draft.sample_ts() >= resumed)
         .map(|o| o.draft.source.epoch)
         .collect();
     assert!(

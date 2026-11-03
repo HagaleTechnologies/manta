@@ -7,7 +7,7 @@ use crate::context::{self, SpotType};
 use crate::cty;
 use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::{Dedupe, DedupeOutcome};
-use crate::exchange::{self, ExchangeWord, Frame, Role};
+use crate::exchange::{self, Basis, ExchangeWord, Frame, Role};
 use crate::gate::{
     GateOccurrence, RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS,
 };
@@ -16,8 +16,8 @@ use crate::lookup::{CallsignLookup, Existence, LookupStatus};
 use crate::message;
 use crate::notch::NotchList;
 use crate::observation::{
-    Cause, Draft, EvidenceLink, FreqSpan, ObservationCounts, ObservationId, ObservationLog,
-    ObservationPolicy, SampleSpan, Scores, Source, TextTrace,
+    Cause, Draft, EvidenceLink, Finding, FreqSpan, ObservationCounts, ObservationId,
+    ObservationLog, ObservationPolicy, RoleEvidence, SampleSpan, Scores, Source, TextTrace,
 };
 use crate::scp;
 use crate::support::SupportLedger;
@@ -269,6 +269,17 @@ struct Word {
     /// a framing word scrolling out of the window could turn a settled
     /// `relayed_mention` into `uncertain`.
     role: Option<(Role, Option<Frame>)>,
+    /// MAN-207: the rule that decided `role`, latched with it.
+    basis: Option<Basis>,
+    /// MAN-207: the first and last `seq` of the words that decided `role`,
+    /// latched with it.
+    context_seqs: Option<(u64, u64)>,
+    /// MAN-207 D6: the MAN-201 turn index on the track, the number of turn
+    /// ends before this word. Set when the word is pushed.
+    episode: u32,
+    /// MAN-207 D10: this word's role-skip has been counted and recorded;
+    /// each occurrence counts once.
+    not_candidate_recorded: bool,
 }
 
 impl Word {
@@ -951,7 +962,7 @@ impl Validator {
         }
         let for_log = if keep {
             let for_log = self.decisions.is_some().then(|| decision.clone());
-            let draft = self.observation_draft(at, decision);
+            let draft = self.observation_draft(at, Finding::Decided(decision));
             self.observations.append(draft, self.now_ts);
             for_log
         } else {
@@ -965,23 +976,35 @@ impl Validator {
     /// MAN-207: a record of `decision` about `at`, with the occurrence's
     /// spans, confidence and (at `Detail::Text`) trace while its word is
     /// still in the track's window.
-    fn observation_draft(&self, at: At, decision: Decision) -> Draft {
+    fn observation_draft(&self, at: At, finding: Finding) -> Draft {
         let source = Source {
             input: self.input_of(at.id.track_id),
             epoch: self.observations.epoch(),
         };
-        let mut draft = Draft::new(at.id, at.cause, source, decision);
+        let mut draft = Draft::of(at.id, at.cause, source, finding);
         draft.scores = at.scores;
         draft.evidence = at.evidence;
-        let word = self
-            .tracks
-            .get(&at.id.track_id)
-            .and_then(|t| t.words.iter().find(|w| w.seq == at.id.word_seq));
-        if let Some(word) = word {
+        let track = self.tracks.get(&at.id.track_id);
+        let word = track.and_then(|t| t.words.iter().find(|w| w.seq == at.id.word_seq));
+        if let (Some(track), Some(word)) = (track, word) {
             draft.span = Some(SampleSpan {
                 start_ts: word.start_ts,
                 end_ts: word.end_ts,
             });
+            draft.episode = Some(word.episode);
+            draft.role = word.role.map(|(role, frame)| RoleEvidence {
+                role,
+                frame,
+                basis: word.basis,
+            });
+            // MAN-207 D3: a role-skipped word that became a candidate later
+            // is reclassified, not decided for the first time.
+            if draft.cause == Cause::Decided
+                && word.not_candidate_recorded
+                && matches!(draft.finding, Finding::Decided(_))
+            {
+                draft.cause = Cause::Reclassified;
+            }
             if let (Some(lo), Some(hi)) = (word.freq_lo_hz, word.freq_hi_hz) {
                 draft.freq = Some(FreqSpan {
                     lo_hz: lo * self.freq_calibration,
@@ -992,10 +1015,19 @@ impl Validator {
                 draft.scores.word_confidence = Some(confidence::geo_mean(&word.confidences));
             }
             if self.observations.detail() == crate::observation::Detail::Text {
+                let context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
+                    track
+                        .words
+                        .iter()
+                        .filter(|w| (lo..=hi).contains(&w.seq))
+                        .map(|w| w.text.as_str())
+                        .collect()
+                });
                 draft.trace = Some(TextTrace::new(
                     &word.text,
                     &word.confidences,
                     &word.alternatives,
+                    &context,
                 ));
             }
         }
@@ -1215,6 +1247,12 @@ impl Validator {
                     track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     word.end_ts = *sample_ts;
+                    // MAN-207 D6: the previous word's `ends_turn` is final
+                    // once a later word is pushed.
+                    word.episode = track
+                        .words
+                        .back()
+                        .map_or(0, |prev| prev.episode + u32::from(prev.ends_turn));
                     track.next_word_seq += 1;
                     newly_completed = Some((
                         word.text.clone(),
@@ -1524,7 +1562,17 @@ impl Validator {
         // (role, frame, involved_max_seq) per word index, settled only.
         let mut roles: Vec<Option<(Role, Option<Frame>, u64)>> = vec![None; seqs.len()];
         for o in occurrences.iter().filter(|o| o.settled) {
-            let (role, frame) = *track.words[o.index].role.get_or_insert((o.role, o.frame));
+            let word = &mut track.words[o.index];
+            if word.role.is_none() {
+                // MAN-207: the basis and the deciding words latch with the role.
+                word.basis = Some(o.basis);
+                word.context_seqs =
+                    match (seqs.get(o.span.start), seqs.get(o.span.end.wrapping_sub(1))) {
+                        (Some(&lo), Some(&hi)) if !o.span.is_empty() => Some((lo, hi)),
+                        _ => None,
+                    };
+            }
+            let (role, frame) = *word.role.get_or_insert((o.role, o.frame));
             let involved = o
                 .span
                 .clone()
@@ -1909,7 +1957,48 @@ impl Validator {
                 sample_ts,
             );
         }
+        self.record_not_candidates(track_id);
         spots
+    }
+
+    /// MAN-207 D10: counts, and at `Detail::Records` and above records,
+    /// each settled call occurrence on `track_id` that its role kept from
+    /// becoming a candidate. Each occurrence once. Only a word with a
+    /// plausible callsign structure counts: the exchange grammar also gives
+    /// roles to ordinary call-shaped words (`TNX`, `NAME`).
+    fn record_not_candidates(&mut self, track_id: u32) {
+        let Some(track) = self.tracks.get_mut(&track_id) else {
+            return;
+        };
+        let freq_hz = track.freq_hz * self.freq_calibration;
+        let mut skipped = Vec::new();
+        for word in track.words.iter_mut() {
+            let Some((role, _)) = word.role else {
+                continue;
+            };
+            if word.attempted
+                || word.power_step_suppressed
+                || word.beacon_no_evidence_recorded
+                || word.not_candidate_recorded
+                || !grammar::is_plausible(&word.text)
+            {
+                continue;
+            }
+            word.not_candidate_recorded = true;
+            skipped.push((role, word.seq, word.text.clone(), word.end_ts));
+        }
+        for (role, seq, call, end_ts) in skipped {
+            self.observations.count_not_candidate(role);
+            if self.observations.keeps_records() {
+                let finding = Finding::NotCandidate {
+                    call,
+                    sample_ts: end_ts,
+                    freq_hz,
+                };
+                let draft = self.observation_draft(At::new(track_id, seq, Cause::Decided), finding);
+                self.observations.append(draft, self.now_ts);
+            }
+        }
     }
 
     fn evaluate_candidate(

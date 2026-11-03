@@ -396,6 +396,9 @@ pub struct DecodeQuality {
     /// MAN-207: `(decision, reason, count)` for every valid pair, `reason`
     /// `"none"` on a spot, in a fixed order.
     pub decisions: Vec<(&'static str, &'static str, u64)>,
+    /// MAN-207: `(role, count)` for every role a role-skipped call
+    /// occurrence can have, in a fixed order.
+    pub not_candidates: Vec<(&'static str, u64)>,
 }
 
 /// Writes `h` as Prometheus histogram samples under `name`: cumulative
@@ -3012,6 +3015,17 @@ impl Metrics {
                 ));
             }
         }
+        out.push_str(
+            "# HELP manta_call_occurrences_not_candidate_total Decoded callsign occurrences that never became a spot candidate because of their role in the exchange.\n",
+        );
+        out.push_str("# TYPE manta_call_occurrences_not_candidate_total counter\n");
+        if let Some(q) = &quality {
+            for (role, n) in &q.not_candidates {
+                out.push_str(&format!(
+                    "manta_call_occurrences_not_candidate_total{{role=\"{role}\"}} {n}\n"
+                ));
+            }
+        }
 
         // MAN-128: health gauges, computed from the SAME `health_at` that
         // backs `/healthz` -- a Prometheus-only operator never sees a
@@ -4164,6 +4178,12 @@ mod tests {
                 ("withheld", "repetition", 211),
                 ("deferred", "lookupPending", 0),
             ],
+            not_candidates: vec![
+                ("addressee", 12),
+                ("relayed_mention", 0),
+                ("self_id", 3),
+                ("uncertain", 7),
+            ],
         }
     }
 
@@ -4186,6 +4206,20 @@ mod tests {
                 r#"manta_candidate_decisions_total{decision="deferred",reason="lookupPending"} 0"#,
             ]
         );
+        assert!(text.contains("# TYPE manta_call_occurrences_not_candidate_total counter\n"));
+        let roles: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_call_occurrences_not_candidate_total{"))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                r#"manta_call_occurrences_not_candidate_total{role="addressee"} 12"#,
+                r#"manta_call_occurrences_not_candidate_total{role="relayed_mention"} 0"#,
+                r#"manta_call_occurrences_not_candidate_total{role="self_id"} 3"#,
+                r#"manta_call_occurrences_not_candidate_total{role="uncertain"} 7"#,
+            ]
+        );
     }
 
     #[test]
@@ -4203,6 +4237,7 @@ mod tests {
             ("manta_track_rail_ratio", "histogram"),
             ("manta_candidate_repetitions", "histogram"),
             ("manta_candidate_decisions_total", "counter"),
+            ("manta_call_occurrences_not_candidate_total", "counter"),
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
             assert!(

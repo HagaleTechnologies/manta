@@ -236,8 +236,9 @@ jq -c 'select(.trackId==12)' session.jsonl
 
 Each line names the candidate, its `decision` and `reason` (for example
 `withheld` for `repetition`: only one copy was heard), and the earlier
-copies the repetition gate counted. Add `--observation-text` for the decoded
-characters.
+copies the repetition gate counted. A call heard only as the station being
+called is a `notCandidate` line with its `role` (`addressee`). Add
+`--observation-text` for the decoded characters.
 
 ## Headerless cf32 and ci16
 

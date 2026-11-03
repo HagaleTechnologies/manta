@@ -1,7 +1,7 @@
 //! Lock-free decode-quality observer (MAN-118): characters decoded,
 //! garbles, each decoding track's keying-rail ratio once per second, and
 //! the repetition gate's result distribution, and the validator's
-//! decisions by reason (MAN-207). Shared-atomic for the same
+//! decisions by reason and role-skipped call occurrences by role (MAN-207). Shared-atomic for the same
 //! reason `latency.rs` is: the decode loop must never block on whatever is
 //! consuming this. `observe_rail_ratio` runs on `drain_pool`'s rayon
 //! workers, so every method takes `&self` and uses relaxed atomics only.
@@ -9,7 +9,8 @@
 //! Write-only from the decode path: nothing here is read back into
 //! decoding, so file replay stays byte-identical with or without it.
 use manta_spot::decision::{Reason, Verdict};
-use manta_spot::observation::ObservationCounts;
+use manta_spot::exchange::Role;
+use manta_spot::observation::{ObservationCounts, NOT_CANDIDATE_ROLES};
 use manta_spot::{RepetitionCounts, REPETITION_BUCKETS};
 
 /// Spotted, plus one slot per `Reason` (MAN-207).
@@ -39,6 +40,9 @@ pub struct DecodeQualitySnapshot {
     /// MAN-207: every valid (verdict, reason) pair with its count, in
     /// `ObservationCounts::iter` order (`None` is a spot).
     pub decisions: Vec<(Verdict, Option<Reason>, u64)>,
+    /// MAN-207: role-skipped call occurrences per role, in
+    /// `NOT_CANDIDATE_ROLES` order.
+    pub not_candidates: Vec<(Role, u64)>,
 }
 
 pub struct DecodeQualityObserver {
@@ -52,6 +56,8 @@ pub struct DecodeQualityObserver {
     repetition_sum: AtomicU64,
     /// MAN-207: in `ObservationCounts::iter` order.
     decisions: [AtomicU64; DECISION_SLOTS],
+    /// MAN-207: in `NOT_CANDIDATE_ROLES` order.
+    not_candidates: [AtomicU64; NOT_CANDIDATE_ROLES.len()],
 }
 
 impl Default for DecodeQualityObserver {
@@ -71,6 +77,7 @@ impl DecodeQualityObserver {
             repetition_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             repetition_sum: AtomicU64::new(0),
             decisions: std::array::from_fn(|_| AtomicU64::new(0)),
+            not_candidates: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -115,10 +122,14 @@ impl DecodeQualityObserver {
         self.repetition_sum.store(counts.sum, Ordering::Relaxed);
     }
 
-    /// MAN-207: overwrites the decision counts with the validator's own,
-    /// which are already cumulative for the life of the `listen()` call.
+    /// MAN-207: overwrites the decision and role-skip counts with the
+    /// validator's own, which are already cumulative for the life of the
+    /// `listen()` call.
     pub fn store_decisions(&self, counts: &ObservationCounts) {
         for (slot, (_, _, n)) in self.decisions.iter().zip(counts.iter()) {
+            slot.store(n, Ordering::Relaxed);
+        }
+        for (slot, (_, n)) in self.not_candidates.iter().zip(counts.iter_not_candidates()) {
             slot.store(n, Ordering::Relaxed);
         }
     }
@@ -137,6 +148,11 @@ impl DecodeQualityObserver {
                 .iter()
                 .zip(&self.decisions)
                 .map(|((verdict, reason, _), n)| (verdict, reason, load(n)))
+                .collect(),
+            not_candidates: NOT_CANDIDATE_ROLES
+                .iter()
+                .zip(&self.not_candidates)
+                .map(|(&role, n)| (role, load(n)))
                 .collect(),
         }
     }
@@ -214,6 +230,31 @@ mod tests {
         assert_eq!(count(Some(Reason::Repetition)), Some(2));
         assert_eq!(count(None), Some(1));
         assert_eq!(snap.decisions.iter().map(|&(_, _, n)| n).sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn store_decisions_overwrites_the_role_skip_counts() {
+        let obs = DecodeQualityObserver::new();
+        let fresh = obs.snapshot().not_candidates;
+        assert_eq!(fresh.len(), NOT_CANDIDATE_ROLES.len());
+        assert!(fresh.iter().all(|&(_, n)| n == 0));
+
+        let mut log =
+            manta_spot::ObservationLog::new(1000.0, manta_spot::ObservationPolicy::summary());
+        log.count_not_candidate(Role::Addressee);
+        obs.store_decisions(log.counts());
+        log.count_not_candidate(Role::Addressee);
+        log.count_not_candidate(Role::Uncertain);
+        obs.store_decisions(log.counts());
+        assert_eq!(
+            obs.snapshot().not_candidates,
+            vec![
+                (Role::Addressee, 2),
+                (Role::RelayedMention, 0),
+                (Role::SelfId, 0),
+                (Role::Uncertain, 1),
+            ]
+        );
     }
 
     #[test]

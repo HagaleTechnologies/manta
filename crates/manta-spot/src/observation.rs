@@ -7,6 +7,7 @@
 
 use crate::context::SpotType;
 use crate::decision::{Decision, Reason, Verdict};
+use crate::exchange::{Basis, Frame, Role};
 use manta_decode::tree::Glyph;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -17,6 +18,9 @@ pub const DEFAULT_MAX_RECORDS: usize = 20_000;
 pub const DEFAULT_RETENTION_SECONDS: f64 = 900.0;
 /// The most characters a `TextTrace` keeps of one word.
 pub const MAX_TRACE_CHARS: usize = 64;
+/// The most characters a `TextTrace` keeps of the words that decided the
+/// role (the live text bound).
+pub const MAX_CONTEXT_CHARS: usize = 128;
 
 /// How much the log keeps. Ordered: each level keeps what the one before
 /// it keeps.
@@ -27,8 +31,8 @@ pub enum Detail {
     Summary,
     /// Records with calls, reasons, scores and evidence, but no decoded text.
     Records,
-    /// Records plus each word's characters, confidences, erasures and
-    /// decoder alternatives.
+    /// Records plus each word's characters, confidences, erasures,
+    /// decoder alternatives and the words that decided its role.
     Text,
 }
 
@@ -91,14 +95,42 @@ impl fmt::Display for ObservationId {
 /// Why a record exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cause {
-    /// The occurrence's first decision.
+    /// The occurrence's first decision, or its role-skip.
     Decided,
-    /// The same word, evaluated again as a new spot type.
+    /// The same word, evaluated again as a new spot type, or a role-skipped
+    /// word that became a candidate later.
     Reclassified,
     /// A pending beacon or lookup decided later.
     Settled,
     /// A re-decode of the same evidence (`ObservationLog::revise`).
     Refined,
+}
+
+/// What the record says about the occurrence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Finding {
+    /// The validator's decision: call, spot type, verdict, reason, reps,
+    /// pattern tier and rival (MAN-324).
+    Decided(Decision),
+    /// A settled call occurrence that never became a spot candidate because
+    /// of its MAN-201 role (an addressee, a relayed mention, an uncertain
+    /// call, or a sign-off self-ID with no spot form).
+    NotCandidate {
+        call: String,
+        /// The word's `WordBoundary` time.
+        sample_ts: u64,
+        /// The calibrated track frequency when it was recorded.
+        freq_hz: f64,
+    },
+}
+
+/// The MAN-201 role the exchange grammar latched on the occurrence's word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleEvidence {
+    pub role: Role,
+    /// `Some` only for `Role::SelfId`.
+    pub frame: Option<Frame>,
+    pub basis: Option<Basis>,
 }
 
 /// Where the occurrence came from: the input (MAN-13) and the gap-free
@@ -151,16 +183,36 @@ pub struct TextTrace {
     /// The decoder's competing glyphs per position; empty when no position
     /// had any.
     pub alternatives: Vec<Vec<(Glyph, f32)>>,
-    /// Set when `MAX_TRACE_CHARS` cut the word.
+    /// The words that decided the role, in order; empty when none did.
+    pub context: Vec<String>,
+    /// Set when `MAX_TRACE_CHARS` cut the word or `MAX_CONTEXT_CHARS` cut
+    /// the context.
     pub truncated: bool,
 }
 
 impl TextTrace {
     /// Keeps at most `MAX_TRACE_CHARS` characters (and their confidences
-    /// and alternatives).
-    pub fn new(text: &str, confidences: &[f32], alternatives: &[Vec<(Glyph, f32)>]) -> Self {
+    /// and alternatives), and the context's words while their characters,
+    /// spaces included, fit `MAX_CONTEXT_CHARS`.
+    pub fn new(
+        text: &str,
+        confidences: &[f32],
+        alternatives: &[Vec<(Glyph, f32)>],
+        context: &[&str],
+    ) -> Self {
         let chars: Vec<char> = text.chars().collect();
-        let truncated = chars.len() > MAX_TRACE_CHARS;
+        let mut truncated = chars.len() > MAX_TRACE_CHARS;
+        let mut kept_context = Vec::new();
+        let mut used = 0usize;
+        for word in context {
+            let len = word.chars().count() + usize::from(!kept_context.is_empty());
+            if used + len > MAX_CONTEXT_CHARS {
+                truncated = true;
+                break;
+            }
+            used += len;
+            kept_context.push((*word).to_string());
+        }
         let kept: String = chars.iter().take(MAX_TRACE_CHARS).collect();
         let erasures = kept
             .chars()
@@ -178,6 +230,7 @@ impl TextTrace {
             confidences: confidences.iter().take(MAX_TRACE_CHARS).copied().collect(),
             erasures,
             alternatives,
+            context: kept_context,
             truncated,
         }
     }
@@ -192,9 +245,10 @@ pub struct Draft {
     pub source: Source,
     pub span: Option<SampleSpan>,
     pub freq: Option<FreqSpan>,
-    /// The validator's decision: call, spot type, verdict, reason, reps,
-    /// pattern tier and rival (MAN-324).
-    pub decision: Decision,
+    /// The MAN-201 turn index on the track: turn ends before this word.
+    pub episode: Option<u32>,
+    pub role: Option<RoleEvidence>,
+    pub finding: Finding,
     pub scores: Scores,
     pub evidence: Vec<EvidenceLink>,
     pub trace: Option<TextTrace>,
@@ -213,24 +267,56 @@ pub struct Observation {
     pub draft: Draft,
 }
 
-/// Decisions so far, by reason (`None` is a spot). Fixed arrays: counting
-/// never allocates.
+/// Decisions so far, by reason (`None` is a spot), and role-skipped call
+/// occurrences by role. Fixed arrays: counting never allocates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObservationCounts {
     decided: [u64; DECIDED_SLOTS],
+    not_candidate: [u64; NOT_CANDIDATE_ROLES.len()],
 }
 
 const DECIDED_SLOTS: usize = 1 + Reason::ALL.len();
+
+/// Every role a role-skipped occurrence can have, in counter order.
+pub const NOT_CANDIDATE_ROLES: [Role; 4] = [
+    Role::Addressee,
+    Role::RelayedMention,
+    Role::SelfId,
+    Role::Uncertain,
+];
 
 impl Default for ObservationCounts {
     fn default() -> Self {
         Self {
             decided: [0; DECIDED_SLOTS],
+            not_candidate: [0; NOT_CANDIDATE_ROLES.len()],
         }
     }
 }
 
 impl ObservationCounts {
+    fn role_slot(role: Role) -> usize {
+        match role {
+            Role::Addressee => 0,
+            Role::RelayedMention => 1,
+            Role::SelfId => 2,
+            Role::Uncertain => 3,
+        }
+    }
+
+    /// Role-skipped call occurrences with this role.
+    pub fn not_candidates(&self, role: Role) -> u64 {
+        self.not_candidate[Self::role_slot(role)]
+    }
+
+    /// Every role with its role-skipped count, in `NOT_CANDIDATE_ROLES`
+    /// order.
+    pub fn iter_not_candidates(&self) -> impl Iterator<Item = (Role, u64)> + '_ {
+        NOT_CANDIDATE_ROLES
+            .iter()
+            .map(|&r| (r, self.not_candidate[Self::role_slot(r)]))
+    }
+
     fn slot(reason: Option<Reason>) -> usize {
         match reason {
             None => 0,
@@ -259,7 +345,7 @@ impl ObservationCounts {
         )
     }
 
-    /// Every decision counted.
+    /// Every decision counted (role-skips are not decisions).
     pub fn total(&self) -> u64 {
         self.decided.iter().sum()
     }
@@ -456,6 +542,12 @@ impl ObservationLog {
         self.counts.decided[ObservationCounts::slot(reason)] += 1;
     }
 
+    /// Counts one role-skipped call occurrence. Always on, at every detail
+    /// level.
+    pub fn count_not_candidate(&mut self, role: Role) {
+        self.counts.not_candidate[ObservationCounts::role_slot(role)] += 1;
+    }
+
     pub fn losses(&self) -> LossCounts {
         self.losses
     }
@@ -480,28 +572,57 @@ impl ObservationLog {
 }
 
 impl Draft {
-    /// A draft with no spans, scores, evidence or trace.
+    /// A draft of `decision` with no spans, episode, role, scores, evidence
+    /// or trace.
     pub fn new(id: ObservationId, cause: Cause, source: Source, decision: Decision) -> Self {
+        Self::of(id, cause, source, Finding::Decided(decision))
+    }
+
+    /// A draft of `finding` with no spans, episode, role, scores, evidence
+    /// or trace.
+    pub fn of(id: ObservationId, cause: Cause, source: Source, finding: Finding) -> Self {
         Self {
             id,
             cause,
             source,
             span: None,
             freq: None,
-            decision,
+            episode: None,
+            role: None,
+            finding,
             scores: Scores::default(),
             evidence: Vec::new(),
             trace: None,
         }
     }
 
-    /// The candidate call.
+    /// The call the record is about.
     pub fn call(&self) -> &str {
-        &self.decision.call
+        match &self.finding {
+            Finding::Decided(d) => &d.call,
+            Finding::NotCandidate { call, .. } => call,
+        }
     }
 
-    pub fn spot_type(&self) -> SpotType {
-        self.decision.spot_type
+    /// The candidate's spot type; `None` for a role-skipped occurrence.
+    pub fn spot_type(&self) -> Option<SpotType> {
+        self.decision().map(|d| d.spot_type)
+    }
+
+    /// The validator's decision; `None` for a role-skipped occurrence.
+    pub fn decision(&self) -> Option<&Decision> {
+        match &self.finding {
+            Finding::Decided(d) => Some(d),
+            Finding::NotCandidate { .. } => None,
+        }
+    }
+
+    /// When the decision or role-skip was made.
+    pub fn sample_ts(&self) -> u64 {
+        match &self.finding {
+            Finding::Decided(d) => d.sample_ts,
+            Finding::NotCandidate { sample_ts, .. } => *sample_ts,
+        }
     }
 }
 
@@ -742,21 +863,31 @@ mod tests {
     #[test]
     fn a_trace_longer_than_the_cap_is_truncated() {
         let text = "A".repeat(200);
-        let trace = TextTrace::new(&text, &[0.5; 200], &[]);
+        let trace = TextTrace::new(&text, &[0.5; 200], &[], &[]);
         assert_eq!(trace.text.len(), MAX_TRACE_CHARS);
         assert_eq!(trace.confidences.len(), MAX_TRACE_CHARS);
         assert!(trace.truncated);
-        let short = TextTrace::new("K5?RH", &[0.9, 0.9, 0.0, 0.9, 0.9], &[]);
+        let short = TextTrace::new("K5?RH", &[0.9, 0.9, 0.0, 0.9, 0.9], &[], &["DE", "K5?RH"]);
         assert!(!short.truncated);
         assert_eq!(short.erasures, vec![2]);
         assert!(short.alternatives.is_empty());
+        assert_eq!(short.context, vec!["DE", "K5?RH"]);
+    }
+
+    #[test]
+    fn a_context_longer_than_the_cap_is_truncated() {
+        let word = "A".repeat(60);
+        let trace = TextTrace::new("K5ARH", &[0.9; 5], &[], &[&word, &word, &word]);
+        // 60 + 1 + 60 = 121 fits; a third word would reach 182.
+        assert_eq!(trace.context.len(), 2);
+        assert!(trace.truncated);
     }
 
     #[test]
     fn records_detail_drops_a_supplied_trace() {
         let mut l = log(ObservationPolicy::records());
         let mut d = draft(1, 0, "K5ARH", Reason::Repetition);
-        d.trace = Some(TextTrace::new("K5ARH", &[0.9; 5], &[]));
+        d.trace = Some(TextTrace::new("K5ARH", &[0.9; 5], &[], &[]));
         l.append(d, 0);
         assert_eq!(l.get(0).unwrap().draft.trace, None);
     }
@@ -791,5 +922,39 @@ mod tests {
             0
         );
         assert_eq!(l.counts().total(), 1 + Reason::ALL.len() as u64);
+        for r in NOT_CANDIDATE_ROLES {
+            l.count_not_candidate(r);
+        }
+        l.count_not_candidate(Role::Addressee);
+        let roles: Vec<(Role, u64)> = l.counts().iter_not_candidates().collect();
+        assert_eq!(
+            roles,
+            vec![
+                (Role::Addressee, 2),
+                (Role::RelayedMention, 1),
+                (Role::SelfId, 1),
+                (Role::Uncertain, 1),
+            ]
+        );
+        assert_eq!(l.counts().not_candidates(Role::Addressee), 2);
+        assert_eq!(l.counts().total(), 1 + Reason::ALL.len() as u64);
+    }
+
+    #[test]
+    fn a_not_candidate_draft_has_no_decision() {
+        let d = Draft::of(
+            id(1, 0),
+            Cause::Decided,
+            Source::default(),
+            Finding::NotCandidate {
+                call: "W1AW".into(),
+                sample_ts: 77,
+                freq_hz: 14_025_000.0,
+            },
+        );
+        assert_eq!(d.call(), "W1AW");
+        assert_eq!(d.spot_type(), None);
+        assert_eq!(d.decision(), None);
+        assert_eq!(d.sample_ts(), 77);
     }
 }

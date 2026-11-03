@@ -2,9 +2,10 @@
 
 Date: 2026-11-03. Ticket: MAN-207.
 
-**Status:** accepted, first slice. Builds on the
+**Status:** accepted. Builds on the
 [MAN-324 decision log](2026-10-12-man324-live-state-stream.md) and the
-[MAN-118 decode-quality metrics](2026-10-12-man118-decode-quality-metrics.md).
+[MAN-118 decode-quality metrics](2026-10-12-man118-decode-quality-metrics.md)
+and the [MAN-201 callsign roles](2026-11-02-man201-callsign-roles.md).
 Source: investigation 18 of
 [the decoder recall research](2026-09-09-decoder-recall-research.md).
 
@@ -22,10 +23,12 @@ live-hardware detection-gap threads) rebuilt the context by hand.
 format) and an append-only, bounded `ObservationLog` that every `Validator`
 owns:
 
-- **D1. Wrap `Decision`, do not change it.** A record's `Draft` holds the
-  MAN-324 `Decision` (call, spot type, verdict, reason, reps, required
-  reps, pattern tier, rival). No `Decision` field and no `Reason` variant
-  was added, so the live-state record and its pins are unchanged.
+- **D1. Wrap `Decision`, do not change it.** A record's `Draft` holds a
+  `Finding`: `Decided` wraps the MAN-324 `Decision` (call, spot type,
+  verdict, reason, reps, required reps, pattern tier, rival), and
+  `NotCandidate` carries a role-skipped call, its time and frequency. No
+  `Decision` field and no `Reason` variant was added, so the live-state
+  record and its pins are unchanged.
 - **D2. Two identities.** The observation ID is
   `ObservationId { track_id, word_seq }`, shown `t{track}.w{seq}`: one
   decoded occurrence, unique in a run (track ids are never reused, word
@@ -33,8 +36,9 @@ owns:
   counter `seq`. Both are deterministic for a given input and config.
 - **D3. Append-only revisions.** A record about an occurrence that already
   has a retained record gets `supersedes = Some(<that record's seq>)`.
-  `Cause` says why it exists: `Decided`, `Reclassified` (the same word as
-  a new spot type), `Settled` (a pending beacon or lookup decided later, or
+  `Cause` says why it exists: `Decided` (a first decision or a role-skip),
+  `Reclassified` (the same word as a new spot type, or a role-skipped word
+  that became a candidate later), `Settled` (a pending beacon or lookup decided later, or
   a beacon overflow or discard), `Refined` (`ObservationLog::revise`). No
   stored record is ever changed. If the predecessor has expired,
   `supersedes` is `None` and `LossCounts::orphaned_revisions` counts it.
@@ -59,6 +63,13 @@ owns:
   `manta_engine::decode_source_observed` calls it, at the event index where
   each MAN-309 segment after the first begins. MAN-202 unknown-length gaps
   do not advance it, and the daemon writes no records.
+- **D7a. Episode and role.** `episode` is the MAN-201 turn index on the
+  track: a word's `episode` is the previous word's plus one if that word
+  ended a turn (an `AR`/`SK` prosign or 5 s of silence, the MAN-108
+  dormancy hang), set when the word is pushed, when the previous word's
+  turn end is final. `role` is the `RoleEvidence` (`Role`, `Frame`,
+  `Basis`) MAN-201 latched on the word at its first settle; the basis and
+  the deciding words' seqs latch with it.
 - **D8. Spans, not modeled uncertainty.** `SampleSpan` runs from the
   word's first character to its `WordBoundary`. `FreqSpan` is the lowest
   and highest calibrated track frequency read while the word was decoded.
@@ -66,7 +77,8 @@ owns:
 - **D9. Text is opt-in.** At `Records` a record carries the candidate call
   and numbers only. `Text` adds `TextTrace`: the word (at most 64
   characters), its confidences, `'?'` erasure positions and the decoder's
-  per-position alternatives, with `truncated` set when the cap cut it.
+  per-position alternatives, and the words that decided the role (at most
+  128 characters), with `truncated` set when either cap cut something.
   Transcripts can hold personal traffic.
 - **D10. Evidence links.** At `Records` and above the repetition gate's
   `record_traced` returns the occurrences it holds for the call, each with
@@ -75,6 +87,15 @@ owns:
   its evidence is on the record it supersedes. A pending beacon or lookup
   is decided about its origin occurrence, even after a merge migrated it
   to a survivor track.
+- **D10a. Role-skipped occurrences are recorded.** At the end of each
+  `try_spot`, a word in the window with a latched role that no candidate
+  path touched (`attempted`, `power_step_suppressed`,
+  `beacon_no_evidence_recorded`) and whose text is a plausible callsign
+  (`grammar::is_plausible`; the exchange grammar also gives roles to
+  ordinary words such as `TNX`) is counted once by role and, at `Records`
+  and above, recorded once as a `NotCandidate`. The count is not undone if
+  an allowlist reload later makes the word a candidate. This covers the common
+  live miss of a call heard only as the station being called.
 - **D11. The inspection command is `decode`, command-line only.**
   `manta decode FILE --observations PATH [--observation-text]` writes the
   record as JSON Lines, schema `manta-observations.v1`
@@ -84,9 +105,10 @@ owns:
   wire structs in `manta-cli` (`observations.rs`), as MAN-324 split the
   live-state record, so `manta-spot` carries no file format. Live misses
   are investigated by replaying a `run --record-iq` recording (MAN-309).
-- **D12. A counter on `/metrics`.** `manta_candidate_decisions_total{decision,reason}`
-  renders every valid pair (17 series, `reason="none"` on a spot) from the
-  first decode batch, stored once per batch like
+- **D12. Counters on `/metrics`.** `manta_candidate_decisions_total{decision,reason}`
+  renders every valid pair (17 series, `reason="none"` on a spot) and
+  `manta_call_occurrences_not_candidate_total{role}` every role (4 series)
+  from the first decode batch, stored once per batch like
   `manta_candidate_repetitions`.
 - **D13. The public contract is unchanged.** Telnet, the JSON spot stream,
   the RBN uplink, the live-state stream, `decode --json` and `decode`'s
@@ -102,7 +124,8 @@ owns:
 | source/epoch | `Draft::source` (`input`, `epoch`) |
 | stable observation ID | `Draft::id` (`ObservationId`), `Observation::seq` |
 | sample/RF interval and uncertainty | `Draft::span`, `Draft::freq` (spans, D8) |
-| track association | `ObservationId::track_id` |
+| track/episode association | `ObservationId::track_id`, `Draft::episode` |
+| identity role | `Draft::role` (`RoleEvidence`: role, frame, basis), `Finding::NotCandidate` |
 | text alternatives/erasures | `TextTrace::alternatives`, `TextTrace::erasures` |
 | scores | `Draft::scores` (`word_confidence`, `call_confidence`), `Decision::reps`/`required_reps` |
 | rejection reason | `Decision::verdict`, `Decision::reason`, `Decision::rival` |
@@ -129,14 +152,6 @@ lacks.
 
 ## Follow-ups
 
-This record is the first slice. Moved to a follow-up ticket:
-
-- MAN-201 roles: role evidence on each record, `episode` as the MAN-201
-  turn index, `NotCandidate` records for role-skipped call occurrences and
-  `manta_call_occurrences_not_candidate_total{role}`. MAN-201 reached this
-  branch through a merge of main; its `BeaconNoEvidence` decisions are
-  recorded and counted like every other reason, but none of the role work
-  above is.
 - A daemon records sink with a retention and privacy policy; per-spot
   delivery state; epoch for MAN-202 unknown gaps and for the daemon;
   `ReadingsHeld` readings in the trace; links to a variant rival's own

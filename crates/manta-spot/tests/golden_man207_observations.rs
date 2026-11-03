@@ -6,7 +6,8 @@
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_decode::tree::Glyph;
 use manta_spot::decision::{Decision, Reason, Verdict};
-use manta_spot::observation::{Cause, Draft, EvidenceLink, Observation};
+use manta_spot::exchange::{Basis, Frame, Role};
+use manta_spot::observation::{Cause, Draft, EvidenceLink, Finding, Observation, RoleEvidence};
 use manta_spot::{
     CallsignLookup, Existence, LookupStatus, ObservationId, ObservationPolicy, Spot, SpotType,
     Validator,
@@ -75,13 +76,13 @@ fn observing(policy: ObservationPolicy) -> Validator {
 }
 
 fn decision(o: &Observation) -> &Decision {
-    &o.draft.decision
+    o.draft.decision().expect("a decided record")
 }
 
 fn records_for<'a>(v: &'a Validator, call: &str) -> Vec<&'a Observation> {
     v.observations()
         .iter()
-        .filter(|o| o.draft.call() == call)
+        .filter(|o| o.draft.call() == call && o.draft.decision().is_some())
         .collect()
 }
 
@@ -121,7 +122,16 @@ fn a_once_sent_call_withheld_for_repetition_stays_queryable_after_its_track_clos
     assert_eq!(d.required_reps, 2);
     assert_eq!(r.draft.cause, Cause::Decided);
     assert_eq!(r.supersedes, None);
-    assert_eq!(r.draft.spot_type(), SpotType::De);
+    assert_eq!(r.draft.spot_type(), Some(SpotType::De));
+    assert_eq!(
+        r.draft.role,
+        Some(RoleEvidence {
+            role: Role::SelfId,
+            frame: Some(Frame::De),
+            basis: Some(Basis::AfterDe),
+        })
+    );
+    assert_eq!(r.draft.episode, Some(0));
     assert_eq!(r.draft.id.track_id, 1);
     assert_eq!(
         r.draft.id.to_string(),
@@ -400,9 +410,9 @@ fn a_reclassified_word_supersedes_its_first_record() {
     run(&transmission_events(1, &["CQ", "K5ARH", "T"], 0), &mut v);
     let records = records_for(&v, "K5ARH");
     assert_eq!(records.len(), 2, "{records:#?}");
-    assert_eq!(records[0].draft.spot_type(), SpotType::Cq);
+    assert_eq!(records[0].draft.spot_type(), Some(SpotType::Cq));
     assert_eq!(records[0].draft.cause, Cause::Decided);
-    assert_eq!(records[1].draft.spot_type(), SpotType::Beacon);
+    assert_eq!(records[1].draft.spot_type(), Some(SpotType::Beacon));
     assert_eq!(records[1].draft.cause, Cause::Reclassified);
     assert_eq!(records[1].supersedes, Some(records[0].seq));
     assert_eq!(records[1].draft.id, records[0].draft.id);
@@ -445,7 +455,82 @@ fn alternatives_reach_the_text_trace() {
     assert_eq!(trace.alternatives.len(), 5);
     assert_eq!(trace.alternatives[4], vec![(Glyph::Char('M'), 0.3)]);
     assert!(trace.alternatives[..4].iter().all(Vec::is_empty));
+    assert_eq!(
+        trace.context,
+        vec!["DE", "K5ARH"],
+        "the words that decided its role"
+    );
     assert!(!trace.truncated);
+}
+
+#[test]
+fn an_addressee_only_call_is_recorded_as_not_a_candidate() {
+    let mut v = observing(ObservationPolicy::records());
+    run(
+        &transmission_events(1, &["W1AW", "DE", "K5ARH", "K"], 0),
+        &mut v,
+    );
+    let not_candidates: Vec<&Observation> = v
+        .observations()
+        .iter()
+        .filter(|o| matches!(o.draft.finding, Finding::NotCandidate { .. }))
+        .collect();
+    assert_eq!(not_candidates.len(), 1, "{not_candidates:#?}");
+    let r = not_candidates[0];
+    assert_eq!(r.draft.call(), "W1AW");
+    assert_eq!(r.draft.cause, Cause::Decided);
+    assert_eq!(r.draft.spot_type(), None);
+    assert_eq!(
+        r.draft.role,
+        Some(RoleEvidence {
+            role: Role::Addressee,
+            frame: None,
+            basis: Some(Basis::BeforeDe),
+        })
+    );
+    assert_eq!(r.draft.episode, Some(0));
+    assert!(r.draft.span.is_some());
+    assert!(r.draft.evidence.is_empty());
+    assert_eq!(v.observation_counts().not_candidates(Role::Addressee), 1);
+    // K5ARH is the self-ID: decided, not role-skipped.
+    assert_eq!(records_for(&v, "K5ARH").len(), 1);
+
+    // Re-scanning the window on later words does not record W1AW again,
+    // and call-shaped words with no callsign structure are not calls.
+    run(
+        &transmission_events(1, &["TNX", "FER", "RRR", "5NN", "TU"], 100_000),
+        &mut v,
+    );
+    close_track(&mut v, 1, 20.0, ClosureKind::SignalEnded);
+    let again = v
+        .observations()
+        .iter()
+        .filter(|o| matches!(o.draft.finding, Finding::NotCandidate { .. }))
+        .count();
+    assert_eq!(again, 1);
+    assert_eq!(v.observation_counts().not_candidates(Role::Addressee), 1);
+}
+
+#[test]
+fn a_turn_end_starts_the_next_episode() {
+    let mut v = observing(ObservationPolicy::records());
+    // `AR` ends the first turn; the second `DE K5ARH` is in the next one.
+    let mut events = transmission_events(1, &["CQ", "DE", "K5ARH"], 0);
+    events.push(DecoderEvent::char_decoded(
+        1,
+        50_000,
+        Glyph::Prosign(manta_decode::tree::Prosign::Ar),
+        0.95,
+    ));
+    events.push(DecoderEvent::word_boundary(1, 50_100));
+    events.extend(transmission_events(1, &["DE", "K5ARH", "K"], 400_000));
+    run(&events, &mut v);
+    let episodes: Vec<Option<u32>> = records_for(&v, "K5ARH")
+        .iter()
+        .map(|o| o.draft.episode)
+        .collect();
+    assert_eq!(episodes.first(), Some(&Some(0)), "{episodes:?}");
+    assert_eq!(episodes.last(), Some(&Some(1)), "{episodes:?}");
 }
 
 #[test]
@@ -465,7 +550,10 @@ fn a_refinement_does_not_touch_the_repetition_gate() {
     let reps = v.repetition_counts();
 
     let mut refined: Draft = original.draft.clone();
-    refined.decision.call = "K5ARM".to_string();
+    let Finding::Decided(d) = &mut refined.finding else {
+        panic!("a decided record");
+    };
+    d.call = "K5ARM".to_string();
     let now = 3_300_000;
     let seq = v
         .observations_mut()

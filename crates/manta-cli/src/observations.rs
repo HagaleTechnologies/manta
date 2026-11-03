@@ -9,9 +9,10 @@ use anyhow::{Context, Result};
 use manta_engine::ObservedRun;
 use manta_server::live_state::{decision_label, reason_label};
 use manta_spot::decision::{Decision, Rival};
+use manta_spot::exchange::{Basis, Frame};
 use manta_spot::observation::{
-    Cause, Detail, Draft, EvidenceLink, FreqSpan, LossCounts, Observation, SampleSpan, Scores,
-    Source, TextTrace,
+    Cause, Detail, Draft, EvidenceLink, Finding, FreqSpan, LossCounts, Observation, RoleEvidence,
+    SampleSpan, Scores, Source, TextTrace,
 };
 use serde::Serialize;
 use std::io::Write;
@@ -44,6 +45,7 @@ struct TraceLine {
     /// `[]` when no position had any; else one `[glyph, mass]` list per
     /// character.
     alternatives: Vec<Vec<(manta_decode::tree::Glyph, f32)>>,
+    context: Vec<String>,
     truncated: bool,
 }
 
@@ -60,17 +62,21 @@ struct ObservationLine {
     epoch: u32,
     track_id: u32,
     word_seq: u64,
+    episode: Option<u32>,
     start_sample_ts: Option<u64>,
     end_sample_ts: Option<u64>,
     decided_sample_ts: u64,
     frequency: f64,
     frequency_span: Option<[f64; 2]>,
     call: String,
-    spot_type: manta_spot::SpotType,
+    spot_type: Option<manta_spot::SpotType>,
+    role: Option<&'static str>,
+    frame: Option<&'static str>,
+    basis: Option<&'static str>,
     decision: &'static str,
     reason: Option<&'static str>,
     reps: Option<u32>,
-    required_reps: u32,
+    required_reps: Option<u32>,
     pattern_tier: Option<&'static str>,
     word_confidence: Option<f32>,
     call_confidence: Option<f32>,
@@ -90,10 +96,18 @@ struct DecisionCount {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RoleCount {
+    role: &'static str,
+    count: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SummaryLine {
     kind: &'static str,
     records: usize,
     decisions: Vec<DecisionCount>,
+    not_candidates: Vec<RoleCount>,
     expired: u64,
     evicted: u64,
     orphaned_revisions: u64,
@@ -117,6 +131,98 @@ pub fn cause_label(c: Cause) -> &'static str {
     }
 }
 
+pub fn frame_label(f: Frame) -> &'static str {
+    match f {
+        Frame::Cq => "cq",
+        Frame::De => "de",
+        Frame::Up => "up",
+        Frame::Beacon => "beacon",
+        Frame::SignOff => "signOff",
+    }
+}
+
+pub fn basis_label(b: Basis) -> &'static str {
+    match b {
+        Basis::AfterDe => "afterDe",
+        Basis::AfterCq => "afterCq",
+        Basis::AfterTest => "afterTest",
+        Basis::BeaconPreamble => "beaconPreamble",
+        Basis::BeforeUp => "beforeUp",
+        Basis::AfterSignOff => "afterSignOff",
+        Basis::BeforeDe => "beforeDe",
+        Basis::BeforeReport => "beforeReport",
+        Basis::BeforeQuery => "beforeQuery",
+        Basis::TestSignOff => "testSignOff",
+        Basis::Corrected => "corrected",
+        Basis::MentionInTurn => "mentionInTurn",
+        Basis::NoFrame => "noFrame",
+    }
+}
+
+/// The `decision` of a role-skipped occurrence.
+pub const NOT_CANDIDATE: &str = "notCandidate";
+
+/// The decision's fields as the line carries them; a role-skipped
+/// occurrence has only a call, a time and a frequency.
+struct Decided {
+    sample_ts: u64,
+    call: String,
+    freq_hz: f64,
+    spot_type: Option<manta_spot::SpotType>,
+    decision: &'static str,
+    reason: Option<&'static str>,
+    reps: Option<u32>,
+    required_reps: Option<u32>,
+    pattern_tier: Option<&'static str>,
+    rival: Option<String>,
+}
+
+fn decided(finding: &Finding) -> Decided {
+    match finding {
+        Finding::Decided(Decision {
+            track_id: _,
+            sample_ts,
+            call,
+            freq_hz,
+            spot_type,
+            verdict,
+            reason,
+            reps,
+            required_reps,
+            pattern_tier,
+            rival,
+            spot: _,
+        }) => Decided {
+            sample_ts: *sample_ts,
+            call: call.clone(),
+            freq_hz: *freq_hz,
+            spot_type: Some(*spot_type),
+            decision: decision_label(*verdict),
+            reason: reason.map(reason_label),
+            reps: *reps,
+            required_reps: Some(*required_reps),
+            pattern_tier: pattern_tier.map(|t| t.as_str()),
+            rival: rival.as_ref().map(|Rival { call, .. }| call.clone()),
+        },
+        Finding::NotCandidate {
+            call,
+            sample_ts,
+            freq_hz,
+        } => Decided {
+            sample_ts: *sample_ts,
+            call: call.clone(),
+            freq_hz: *freq_hz,
+            spot_type: None,
+            decision: NOT_CANDIDATE,
+            reason: None,
+            reps: None,
+            required_reps: None,
+            pattern_tier: None,
+            rival: None,
+        },
+    }
+}
+
 fn observation_line(o: &Observation) -> ObservationLine {
     let Observation {
         seq,
@@ -130,7 +236,9 @@ fn observation_line(o: &Observation) -> ObservationLine {
         source: Source { input, epoch },
         span,
         freq,
-        decision,
+        episode,
+        role,
+        finding,
         scores: Scores {
             word_confidence,
             call_confidence,
@@ -138,20 +246,26 @@ fn observation_line(o: &Observation) -> ObservationLine {
         evidence,
         trace,
     } = draft;
-    let Decision {
-        track_id: _,
+    let Decided {
         sample_ts,
         call,
         freq_hz,
         spot_type,
-        verdict,
+        decision,
         reason,
         reps,
         required_reps,
         pattern_tier,
         rival,
-        spot: _,
-    } = decision;
+    } = decided(finding);
+    let (role, frame, basis) = match role {
+        Some(RoleEvidence { role, frame, basis }) => (
+            Some(role.as_str()),
+            frame.map(frame_label),
+            basis.map(basis_label),
+        ),
+        None => (None, None, None),
+    };
     ObservationLine {
         kind: "observation",
         seq: *seq,
@@ -163,21 +277,25 @@ fn observation_line(o: &Observation) -> ObservationLine {
         epoch: *epoch,
         track_id: id.track_id,
         word_seq: id.word_seq,
+        episode: *episode,
         start_sample_ts: span.map(|SampleSpan { start_ts, .. }| start_ts),
         end_sample_ts: span.map(|SampleSpan { end_ts, .. }| end_ts),
-        decided_sample_ts: *sample_ts,
-        frequency: *freq_hz,
+        decided_sample_ts: sample_ts,
+        frequency: freq_hz,
         frequency_span: freq.map(|FreqSpan { lo_hz, hi_hz }| [lo_hz, hi_hz]),
-        call: call.clone(),
-        spot_type: *spot_type,
-        decision: decision_label(*verdict),
-        reason: reason.map(reason_label),
-        reps: *reps,
-        required_reps: *required_reps,
-        pattern_tier: pattern_tier.map(|t| t.as_str()),
+        call,
+        spot_type,
+        role,
+        frame,
+        basis,
+        decision,
+        reason,
+        reps,
+        required_reps,
+        pattern_tier,
         word_confidence: *word_confidence,
         call_confidence: *call_confidence,
-        rival: rival.as_ref().map(|Rival { call, .. }| call.clone()),
+        rival,
         evidence: evidence
             .iter()
             .map(
@@ -198,12 +316,14 @@ fn observation_line(o: &Observation) -> ObservationLine {
                  confidences,
                  erasures,
                  alternatives,
+                 context,
                  truncated,
              }| TraceLine {
                 text: text.clone(),
                 confidences: confidences.clone(),
                 erasures: erasures.clone(),
                 alternatives: alternatives.clone(),
+                context: context.clone(),
                 truncated: *truncated,
             },
         ),
@@ -227,6 +347,15 @@ fn summary_line(run: &ObservedRun) -> SummaryLine {
             .map(|(verdict, reason, count)| DecisionCount {
                 decision: decision_label(verdict),
                 reason: reason.map(reason_label),
+                count,
+            })
+            .collect(),
+        not_candidates: run
+            .counts
+            .iter_not_candidates()
+            .filter(|&(_, n)| n > 0)
+            .map(|(role, count)| RoleCount {
+                role: role.as_str(),
                 count,
             })
             .collect(),
@@ -265,7 +394,8 @@ pub fn write(
 mod tests {
     use super::*;
     use manta_decode::tree::Glyph;
-    use manta_spot::observation::{ObservationCounts, ObservationId};
+    use manta_spot::exchange::Role;
+    use manta_spot::observation::{ObservationCounts, ObservationId, NOT_CANDIDATE_ROLES};
     use manta_spot::{Reason, Verdict};
 
     fn documented() -> String {
@@ -312,6 +442,12 @@ mod tests {
             lo_hz: 14_012_339.6,
             hi_hz: 14_012_340.9,
         });
+        draft.episode = Some(0);
+        draft.role = Some(RoleEvidence {
+            role: Role::SelfId,
+            frame: Some(Frame::De),
+            basis: Some(Basis::AfterDe),
+        });
         draft.scores.word_confidence = Some(0.97);
         draft.scores.call_confidence = Some(0.49);
         draft.evidence = vec![EvidenceLink {
@@ -329,9 +465,31 @@ mod tests {
                 vec![],
                 vec![(Glyph::Char('M'), 0.3)],
             ],
+            &["DE", "K5ARH"],
         ));
         log.append(draft, 577_792);
         log.count_decision(Some(Reason::Variant));
+        let skipped = ObservationId {
+            track_id: 1,
+            word_seq: 0,
+        };
+        let mut not_candidate = Draft::of(
+            skipped,
+            Cause::Decided,
+            Source::default(),
+            Finding::NotCandidate {
+                call: "W1AW".into(),
+                sample_ts: 500_000,
+                freq_hz: 14_012_340.2,
+            },
+        );
+        not_candidate.role = Some(RoleEvidence {
+            role: Role::Addressee,
+            frame: None,
+            basis: Some(Basis::BeforeDe),
+        });
+        log.append(not_candidate, 577_792);
+        log.count_not_candidate(Role::Addressee);
         ObservedRun {
             records: log.take_appended(),
             counts: *log.counts(),
@@ -363,9 +521,12 @@ mod tests {
         write(&mut buf, Detail::Text, 96_000.0, &full_run()).unwrap();
         let text = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 3, "header, one observation, summary");
+        assert_eq!(lines.len(), 4, "header, two observations, summary");
         assert!(lines[1].contains(r#""trace":"#));
         assert!(lines[1].contains(r#""rival":"K5ARM""#));
+        assert!(lines[1].contains(r#""role":"self_id","frame":"de","basis":"afterDe""#));
+        assert!(lines[2].contains(r#""decision":"notCandidate","reason":null"#));
+        assert!(lines[3].contains(r#""notCandidates":[{"role":"addressee","count":1}]"#));
         let doc = documented();
         for line in lines {
             for key in keys(line) {
@@ -378,19 +539,50 @@ mod tests {
     }
 
     #[test]
-    fn every_cause_and_detail_label_is_documented() {
+    fn every_cause_frame_basis_and_role_label_is_documented() {
         let doc = documented();
+        let label = |l: &str| assert!(doc.contains(&format!("`{l}`")), "`{l}`");
         for c in [
             Cause::Decided,
             Cause::Reclassified,
             Cause::Settled,
             Cause::Refined,
         ] {
-            assert!(doc.contains(&format!("`{}`", cause_label(c))), "{c:?}");
+            label(cause_label(c));
         }
         for d in [Detail::Records, Detail::Text] {
-            assert!(doc.contains(&format!("`{}`", detail_label(d))), "{d:?}");
+            label(detail_label(d));
         }
+        for f in [
+            Frame::Cq,
+            Frame::De,
+            Frame::Up,
+            Frame::Beacon,
+            Frame::SignOff,
+        ] {
+            label(frame_label(f));
+        }
+        for b in [
+            Basis::AfterDe,
+            Basis::AfterCq,
+            Basis::AfterTest,
+            Basis::BeaconPreamble,
+            Basis::BeforeUp,
+            Basis::AfterSignOff,
+            Basis::BeforeDe,
+            Basis::BeforeReport,
+            Basis::BeforeQuery,
+            Basis::TestSignOff,
+            Basis::Corrected,
+            Basis::MentionInTurn,
+            Basis::NoFrame,
+        ] {
+            label(basis_label(b));
+        }
+        for r in NOT_CANDIDATE_ROLES {
+            label(r.as_str());
+        }
+        label(NOT_CANDIDATE);
     }
 
     #[test]

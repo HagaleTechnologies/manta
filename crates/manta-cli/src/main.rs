@@ -4368,6 +4368,12 @@ fn decode_quality_of(
                 )
             })
             .collect(),
+        // MAN-207: the MAN-201 role labels.
+        not_candidates: s
+            .not_candidates
+            .iter()
+            .map(|&(role, n)| (role.as_str(), n))
+            .collect(),
     }
 }
 
@@ -12559,6 +12565,15 @@ mod tests {
                 .filter(|&&(d, _, _)| d == "spotted")
                 .count(),
             1
+        );
+        assert_eq!(
+            q.not_candidates,
+            vec![
+                ("addressee", 0),
+                ("relayed_mention", 0),
+                ("self_id", 0),
+                ("uncertain", 0),
+            ]
         );
     }
 

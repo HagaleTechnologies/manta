@@ -588,11 +588,13 @@ validation (MAN-28). Dedupe (step 5) still applies.
 
 **Observation record (MAN-207).** Every decision passes one boundary,
 `Validator::decide`, which counts it by reason in the validator's
-`ObservationLog` (`manta_spot::observation`). By default the log keeps those
-counters only; `Validator::with_observations` can make it keep records
-(call, reason, scores, sample and frequency spans, and links to the
-occurrences the repetition gate counted) or records plus each word's text
-trace. A later decision about the same occurrence (reclassification, a
+`ObservationLog` (`manta_spot::observation`); a settled call occurrence its
+MAN-201 role kept from ever becoming a candidate (an addressee, say) is
+counted by role. By default the log keeps those counters only;
+`Validator::with_observations` can make it keep records (call, reason,
+role, turn, scores, sample and frequency spans, and links to the
+occurrences the repetition gate counted, plus a `notCandidate` record per
+role-skipped occurrence) or records plus each word's text trace. A later decision about the same occurrence (reclassification, a
 settled beacon or lookup, a refinement) appends a record that supersedes
 the earlier one and never rewrites it. Records are capped and expire by
 sample time. See
@@ -963,8 +965,9 @@ sample time. See
   per second) and `manta_candidate_repetitions` (the repetition gate's
   count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
   [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
-  **MAN-207** adds `manta_candidate_decisions_total{decision,reason}`, the
-  validator's decision counts, on the same path.
+  **MAN-207** adds `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`, the validator's
+  decision and role-skip counts, on the same path.
   **MAN-13** (several `[[input]]` entries) adds no family: the `{source}`
   label of `manta_source_health` and the other per-source families is each
   input's `name`; `manta_active_tracks` and `manta_static_crashes_total`
