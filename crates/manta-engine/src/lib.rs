@@ -32,6 +32,8 @@ pub mod calibrate;
 pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
+/// MAN-203's input-conditioning settings, for `PipelineConfig::conditioning`.
+pub use manta_dsp::condition::{ConditioningConfig, StageMode};
 pub mod soak;
 pub use manta_spot::reference::ReferenceLists;
 pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
@@ -169,6 +171,11 @@ pub struct PipelineConfig {
     pub patterns: Option<Arc<manta_spot::pattern::Table>>,
     /// Repetition thresholds by callsign-pattern rarity.
     pub validation_level: manta_spot::ValidationLevel,
+    /// MAN-203: the optional input-conditioning chain every decode
+    /// channelizer runs after the sample guard (SPEC §1.3 step 0a). The
+    /// default turns every stage off, which is bit-identical to no chain.
+    /// `check` does not use it: it reports the raw receiver.
+    pub conditioning: ConditioningConfig,
 }
 
 impl PipelineConfig {
@@ -222,6 +229,7 @@ impl Default for PipelineConfig {
             scp: None,
             patterns: None,
             validation_level: manta_spot::ValidationLevel::default(),
+            conditioning: ConditioningConfig::default(),
         }
     }
 }
@@ -413,9 +421,13 @@ impl SourceBands {
     /// unchanged while `DetectorConfig::guard_hz` is 0 (the config loader
     /// rejects `[detector] guard_hz`, so only code can raise it).
     fn segment(&self, cfg: &PipelineConfig, base: u64, next_id: u32) -> Result<OfflineSegment> {
-        let ch = manta_dsp::channelizer::Channelizer::new(self.fs, self.center_freq_hz)
-            .map_err(|e| anyhow::anyhow!(e))
-            .context("channelizer")?;
+        let ch = manta_dsp::channelizer::Channelizer::with_conditioning(
+            self.fs,
+            self.center_freq_hz,
+            &cfg.conditioning,
+        )
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("channelizer")?;
         let hop = ch.hop() as u64;
         debug_assert!(
             (self.fs / hop as f64 - manta_decode::FO_HZ).abs() < 0.01,

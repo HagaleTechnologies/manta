@@ -83,6 +83,21 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    so output on clean input is bit-identical to an unguarded channelizer
    (§6). `manta calibrate`, which does not use the channelizer, applies
    the same replacement to its read buffer.
+
+   0a. **Optional input conditioning (MAN-203):** after step 0, the new
+   samples pass, in stream order, through the conditioning stages
+   `ConditioningConfig` turns on. Each stage is `off` (the default: no
+   stage runs, so output is bit-identical to an unconditioned
+   channelizer), `observe` (measures, never writes a sample) or `apply`
+   (corrects, and records each corrected run of samples as a span with a
+   per-stage counter). The DC stage is a first-order blocker with corner
+   `DC_CORNER_HZ = 5.0`: `y[n] = x[n] − dc[n]`, then
+   `dc[n+1] = dc[n] + a_n·clamp(y[n])` with `a_n = max(2π·5/fs, 1/(n+1))`,
+   `dc[0] = 0`, f64 state, and the update's magnitude clamped to 1.0
+   (full scale). It reads only `y`, so `x[n] = y[n] + dc[n]` inverts it
+   exactly. Every stage is causal and per-sample, so the hops do not
+   depend on how the input is split into `process` calls. `check` runs
+   no conditioning: it reports the raw receiver.
 1. **Window & fold:** `u[n] = x[n] · h[LN−1−n]` for `n = 0..LN`, then fold to
    `N` points: `v[j] = Σ_{p=0..L-1} u[j + pN]`, `j = 0..N`.
 2. **Phase correction for hop < N:** circularly rotate `v` left by
@@ -1774,7 +1789,8 @@ rules:
    bit-equality is NOT assumed — the byte-identical requirement applies to
    like-for-like builds, and cross-platform equality is asserted at the
    *decoded-text* level (test vectors, §7), not the sample level.
-   Replacement (§1.3 step 0) is a deterministic function of the input.
+   Replacement (§1.3 step 0) is a deterministic function of the input, and
+   so is input conditioning (step 0a), for any split of the input.
 5. **Beam tie-break:** equal scores order by (element-sequence lexical order,
    dit < dah). Softmax computed with the max-subtraction trick, fixed order.
 6. **Pool scheduling must not affect output:** decoder workers may run in any

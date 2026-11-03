@@ -1,6 +1,7 @@
 //! WOLA polyphase filterbank channelizer (SPEC §1.1-1.3): the full
 //! N-channel successor to the M0 single-channel shim (`single.rs`).
 
+use crate::condition::{ConditioningConfig, ConditioningLog, InputConditioner};
 use crate::proto::{design_prototype, TAPS_PER_BRANCH};
 use crate::sample_guard;
 use coppa_dsp::fft::FftProcessor;
@@ -134,12 +135,27 @@ pub struct Channelizer {
     /// MAN-234: input samples `process` replaced with silence since
     /// construction.
     bad_samples: u64,
+    /// MAN-203: the optional input-conditioning chain, `None` when every
+    /// stage is off.
+    conditioner: Option<InputConditioner>,
 }
 
 impl Channelizer {
     /// A channelizer for a supported table rate (`fs/93.75` a power of
-    /// two). SPEC §1.1.
+    /// two), with no input conditioning. SPEC §1.1.
     pub fn new(fs: f64, center_freq_hz: f64) -> Result<Self, String> {
+        Self::with_conditioning(fs, center_freq_hz, &ConditioningConfig::default())
+    }
+
+    /// [`Channelizer::new`] plus the MAN-203 input-conditioning chain
+    /// `cfg`, run on every input sample right after the MAN-234 sample
+    /// guard (SPEC §1.3 step 0a). With every stage off this is exactly
+    /// `new`: no conditioner is built and no sample is touched.
+    pub fn with_conditioning(
+        fs: f64,
+        center_freq_hz: f64,
+        cfg: &ConditioningConfig,
+    ) -> Result<Self, String> {
         let nf = fs / CHANNEL_SPACING_HZ;
         let n = nf.round() as usize;
         if (nf - n as f64).abs() > 1e-9 || !n.is_power_of_two() {
@@ -158,7 +174,14 @@ impl Channelizer {
             fs,
             center_freq_hz,
             bad_samples: 0,
+            conditioner: InputConditioner::new(fs, cfg),
         })
+    }
+
+    /// What the input-conditioning chain did since construction, or `None`
+    /// when every stage is off (MAN-203).
+    pub fn conditioning(&self) -> Option<&ConditioningLog> {
+        self.conditioner.as_ref().map(InputConditioner::log)
     }
 
     /// Number of channels, N. SPEC §1.1.
@@ -196,11 +219,16 @@ impl Channelizer {
     /// Feed input IQ; returns however many hops became available. SPEC §1.3.
     /// Step 0 (MAN-234): an unusable sample (`sample_guard::is_usable`) is
     /// replaced with `0+0j` as it enters the window and counted in
-    /// `bad_samples`; usable samples are never written.
+    /// `bad_samples`; usable samples are never written. Step 0a (MAN-203):
+    /// the optional conditioning chain then runs on the new samples, in
+    /// stream order, so the hops do not depend on how the input is split.
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<HopOutput> {
         let start = self.buf.len();
         self.buf.extend_from_slice(iq);
         self.bad_samples += sample_guard::replace_unusable(&mut self.buf[start..]);
+        if let Some(c) = self.conditioner.as_mut() {
+            c.condition(&mut self.buf[start..]);
+        }
         let ln = self.taps.len();
         let mut outputs = Vec::new();
         while self.read + ln <= self.buf.len() {
@@ -394,6 +422,98 @@ mod tests {
         assert_eq!(hops_whole.len(), hops_chunked.len());
         for (a, b) in hops_whole.iter().zip(hops_chunked.iter()) {
             assert_eq!(a.x, b.x);
+        }
+    }
+
+    /// MAN-203 fixture: a tone at +6 kHz plus a DC offset.
+    fn tone_with_dc(n: usize) -> Vec<Complex32> {
+        tone(6_000.0, n, 0.1, FS)
+            .into_iter()
+            .map(|s| s + Complex32::new(0.01, 0.007))
+            .collect()
+    }
+
+    fn dc_cfg(mode: crate::condition::StageMode) -> ConditioningConfig {
+        ConditioningConfig { dc: mode }
+    }
+
+    #[test]
+    fn all_off_conditioning_is_bit_identical_to_new() {
+        let iq = tone_with_dc(20_000);
+        let mut plain = Channelizer::new(FS, 0.0).unwrap();
+        let mut off =
+            Channelizer::with_conditioning(FS, 0.0, &ConditioningConfig::default()).unwrap();
+        assert!(off.conditioning().is_none());
+        assert_hops_bitwise_equal(&plain.process(&iq), &off.process(&iq));
+    }
+
+    #[test]
+    fn observe_never_changes_a_hop() {
+        use crate::condition::StageMode;
+        let iq = tone_with_dc(FS as usize);
+        let mut plain = Channelizer::new(FS, 0.0).unwrap();
+        let mut obs = Channelizer::with_conditioning(FS, 0.0, &dc_cfg(StageMode::Observe)).unwrap();
+        assert_hops_bitwise_equal(&plain.process(&iq), &obs.process(&iq));
+        let log = obs.conditioning().unwrap();
+        let level = log.dc_level().unwrap();
+        assert!(
+            (level.re - 0.01).abs() < 1e-3 && (level.im - 0.007).abs() < 1e-3,
+            "{level}"
+        );
+        assert_eq!(log.spans().count(), 0);
+    }
+
+    #[test]
+    fn dc_apply_removes_the_centre_channel_offset() {
+        use crate::condition::{Mark, Stage, StageMode};
+        let iq = tone_with_dc(FS as usize);
+        let mut plain = Channelizer::new(FS, 0.0).unwrap();
+        let mut dc = Channelizer::with_conditioning(FS, 0.0, &dc_cfg(StageMode::Apply)).unwrap();
+        let hp = plain.process(&iq);
+        let hd = dc.process(&iq);
+        assert_eq!(hp.len(), hd.len());
+        // Average the last half second's powers, after the blocker settled.
+        let tail = hp.len() / 2;
+        let avg = |hops: &[HopOutput], k: usize| -> f64 {
+            hops[tail..].iter().map(|h| h.power[k] as f64).sum::<f64>() / (hops.len() - tail) as f64
+        };
+        let k_tone = 64; // +6 kHz at 93.75 Hz spacing.
+        let drop_dc = 10.0 * (avg(&hp, 0) / avg(&hd, 0)).log10();
+        let tone_change = 10.0 * (avg(&hd, k_tone) / avg(&hp, k_tone)).log10();
+        assert!(drop_dc >= 30.0, "channel 0 fell only {drop_dc} dB");
+        assert!(tone_change.abs() <= 0.05, "the tone moved {tone_change} dB");
+        let log = dc.conditioning().unwrap();
+        assert_eq!(log.count(Stage::Dc, Mark::Corrected), iq.len() as u64);
+    }
+
+    #[test]
+    fn conditioned_process_is_chunk_invariant() {
+        use crate::condition::StageMode;
+        let iq = tone_with_dc(30_000);
+        let cfg = dc_cfg(StageMode::Apply);
+        let mut whole = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+        let hops_whole = whole.process(&iq);
+        for size in [1usize, 7, 255, 4096] {
+            let mut chunked = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+            let mut hops = Vec::new();
+            for chunk in iq.chunks(size) {
+                hops.extend(chunked.process(chunk));
+            }
+            assert_hops_bitwise_equal(&hops_whole, &hops);
+            assert_eq!(
+                whole.conditioning().unwrap().count(
+                    crate::condition::Stage::Dc,
+                    crate::condition::Mark::Corrected
+                ),
+                chunked.conditioning().unwrap().count(
+                    crate::condition::Stage::Dc,
+                    crate::condition::Mark::Corrected
+                )
+            );
+            assert_eq!(
+                whole.conditioning().unwrap().spans().collect::<Vec<_>>(),
+                chunked.conditioning().unwrap().spans().collect::<Vec<_>>()
+            );
         }
     }
 
