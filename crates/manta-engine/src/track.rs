@@ -7490,6 +7490,7 @@ mod tests {
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_000_000.0,
+            last_char_ts: 0,
         };
         let mut events = vec![
             meta(2),
@@ -7499,7 +7500,7 @@ mod tests {
             },
         ];
         let mut ts = 1_000;
-        for word in ["K5ARH", "T"] {
+        for word in ["V", "V", "V", "K5ARH"] {
             for c in word.chars() {
                 events.push(DecoderEvent::char_decoded(
                     2,
