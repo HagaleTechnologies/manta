@@ -102,14 +102,18 @@ pub fn render_signal(
 
 /// `render_signal` on an explicit route. `RealPassband` with
 /// `watterson: None` skips only the fader, so the cross-check can measure
-/// the Hilbert route on its own. The direct route applies `qsb`; the real
-/// route does not (no shipped vector combines QSB with fading).
+/// the Hilbert route on its own. Only the direct route applies `qsb`, so
+/// `qsb` on the real route is an error (no shipped vector combines QSB with
+/// fading).
 pub fn render_signal_with_route(
     sig: &SignalSpec,
     fs: f64,
     duration_s: f64,
     route: Route,
 ) -> Result<(Vec<Complex32>, String)> {
+    if route == Route::RealPassband && sig.qsb.is_some() {
+        anyhow::bail!("QSB on the real-passband (faded) route is not implemented");
+    }
     let n = (duration_s * fs).round() as usize;
     let mut acc = vec![Complex32::new(0.0, 0.0); n];
     let spec = KeyerSpec {
@@ -216,21 +220,34 @@ pub fn render_signal_with_route(
 pub fn mix(contributions: &[&[Complex32]], n: usize, noise_seed: Option<u64>) -> Vec<Complex32> {
     let mut acc = vec![Complex32::new(0.0, 0.0); n];
     for c in contributions {
-        for (out, a) in acc.iter_mut().zip(c.iter()) {
-            *out += a;
-        }
+        accumulate(&mut acc, c);
     }
+    finish(&mut acc, noise_seed);
+    acc
+}
+
+/// `acc += contribution`, sample by sample (the order `mix` sums in).
+fn accumulate(acc: &mut [Complex32], contribution: &[Complex32]) {
+    for (out, a) in acc.iter_mut().zip(contribution.iter()) {
+        *out += a;
+    }
+}
+
+/// Noise, then `MASTER_SCALE`: the tail of `mix`.
+fn finish(acc: &mut [Complex32], noise_seed: Option<u64>) {
     if let Some(seed) = noise_seed {
-        add_unit_awgn(&mut acc, seed);
+        add_unit_awgn(acc, seed);
     }
-    for s in &mut acc {
+    for s in acc.iter_mut() {
         *s *= MASTER_SCALE;
     }
-    acc
 }
 
 /// Render signals (slice order) + optional noise, then MASTER_SCALE.
 /// Returns the scene and the keyed text of each signal. ARCHITECTURE §9.
+/// Same arithmetic as `mix` over every `render_signal`, but each
+/// contribution is added and dropped in turn, so a 50-signal scene holds
+/// one contribution at a time.
 pub fn render_scene(
     signals: &[SignalSpec],
     fs: f64,
@@ -238,15 +255,15 @@ pub fn render_scene(
     noise_seed: Option<u64>,
 ) -> Result<(Vec<Complex32>, Vec<String>)> {
     let n = (duration_s * fs).round() as usize;
-    let mut parts = Vec::with_capacity(signals.len());
+    let mut acc = vec![Complex32::new(0.0, 0.0); n];
     let mut texts = Vec::with_capacity(signals.len());
     for sig in signals {
         let (c, text) = render_signal(sig, fs, duration_s)?;
-        parts.push(c);
+        accumulate(&mut acc, &c);
         texts.push(text);
     }
-    let refs: Vec<&[Complex32]> = parts.iter().map(|p| p.as_slice()).collect();
-    Ok((mix(&refs, n, noise_seed), texts))
+    finish(&mut acc, noise_seed);
+    Ok((acc, texts))
 }
 
 #[cfg(test)]

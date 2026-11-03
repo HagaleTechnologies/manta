@@ -2,7 +2,7 @@
   "schema": "manta-testkit/repro/v1",
   "origin": "synthetic",
   "name": "v8w-near-dc-mirror-ghost",
-  "found_in": "manta-testkit vectors::v8w() s09 with vectors::v8() s00-s03 (MAN-206, 2026-11-03)",
+  "found_in": "manta-testkit vectors::v8w() (MAN-206 research, 2026-11-02)",
   "generator_revision": 1,
   "expect": "fails",
   "probe": "ghost",

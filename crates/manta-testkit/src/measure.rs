@@ -317,7 +317,7 @@ mod tests {
         let x = white(1 << 17, 5);
         let psd = welch_psd(&x, fs, 1 << 12);
         let db = 10.0 * (psd.total_power() / total_power(&x)).log10();
-        assert!(db.abs() < 0.05, "white noise: {db} dB");
+        assert!(db.abs() < 0.01, "white noise: {db} dB");
         let t = tone(1 << 16, 1.3, 12_000.0, fs);
         let psd = welch_psd(&t, fs, 1 << 12);
         let db = 10.0 * (psd.total_power() / total_power(&t)).log10();
@@ -414,7 +414,7 @@ mod tests {
         let r = fade_autocorr(std::slice::from_ref(&g), &lags);
         for (lag, got) in lags.iter().zip(r) {
             let want = (std::f64::consts::TAU * f1 * *lag as f64 / rate).cos();
-            assert!((got - want).abs() < 1e-2, "lag {lag}: {got} vs {want}");
+            assert!((got - want).abs() < 1e-3, "lag {lag}: {got} vs {want}");
         }
     }
 

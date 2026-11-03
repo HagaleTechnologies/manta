@@ -333,8 +333,10 @@ pub(crate) fn check_envelope(
         (rp.len() as f64 - rq.len() as f64).abs(),
         0.0,
     );
-    let mut worst = 0.0f64;
-    for (a, b) in rp.iter().zip(&rq) {
+    // Pairwise comparison is meaningful only when the counts agree.
+    let counts_agree = rp.len() == rq.len();
+    let mut worst = if counts_agree { 0.0f64 } else { f64::NAN };
+    for (a, b) in rp.iter().zip(&rq).filter(|_| counts_agree) {
         worst = worst
             .max((a.0 as f64 - b.0 as f64).abs())
             .max((a.1 as f64 - b.1 as f64).abs());

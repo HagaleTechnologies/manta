@@ -24,6 +24,11 @@ pub const SCENE_SCHEMA: &str = "manta-testkit/scene/v1";
 /// Bump when a change moves rendered bytes for an unchanged `SceneSpec`.
 pub const GENERATOR_REVISION: u32 = 1;
 
+/// Largest sample rate a scene may ask for, S/s.
+pub const MAX_FS: f64 = 1_000_000.0;
+/// Longest scene, seconds.
+pub const MAX_DURATION_S: f64 = 600.0;
+
 /// Where a scene came from. Only synthetic scenes exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -229,8 +234,18 @@ impl SceneSpec {
         labels.dedup();
         ensure!(labels.len() == n, "signal labels are not unique");
         ensure!(
-            self.fs > 0.0 && self.duration_s > 0.0,
-            "fs and duration_s must be positive"
+            self.fs.is_finite() && self.fs > 0.0 && self.fs <= MAX_FS,
+            "fs must be in (0, {MAX_FS}]"
+        );
+        ensure!(
+            self.duration_s.is_finite()
+                && self.duration_s > 0.0
+                && self.duration_s <= MAX_DURATION_S,
+            "duration_s must be in (0, {MAX_DURATION_S}]"
+        );
+        ensure!(
+            self.center_freq_hz.is_finite(),
+            "center_freq_hz must be finite"
         );
         Ok(())
     }
@@ -426,6 +441,20 @@ mod tests {
         let mut dup = s.clone();
         dup.signals[1].label = "s00".into();
         assert!(dup.validate().is_err());
+    }
+
+    #[test]
+    fn non_finite_or_huge_sizes_are_rejected() {
+        let s = SceneSpec::from_vector(&vectors::v1()).to_json().unwrap();
+        for bad in ["\"inf\"", "\"NaN\"", "\"1e12\""] {
+            let j = s.replacen(
+                "\"duration_s\": \"120\"",
+                &format!("\"duration_s\": {bad}"),
+                1,
+            );
+            assert_ne!(j, s);
+            assert!(SceneSpec::from_json(&j).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -25,6 +25,9 @@ use std::collections::HashMap;
 /// A failure signature: sorted, deduplicated.
 pub type Signature = Vec<String>;
 
+/// Most bytes of signal contributions the minimizer keeps cached.
+pub const CACHE_BYTES: usize = 1 << 30;
+
 /// Shortest duration the duration pass tries, seconds.
 pub const MIN_DURATION_S: f64 = 2.0;
 
@@ -103,16 +106,41 @@ where
     fn render(&mut self, scene: &SceneSpec) -> Result<Vec<Complex32>> {
         scene.validate()?;
         let n = (scene.duration_s * scene.fs).round() as usize;
-        let mut keys = Vec::with_capacity(scene.signals.len());
+        // Keep only this duration's contributions, and at most
+        // CACHE_BYTES of them; a signal past the cap is rendered per probe.
+        let d = scene.duration_s.to_bits();
+        self.cache.retain(|k, _| k.1 == d);
+        let mut cached_bytes: usize = self
+            .cache
+            .values()
+            .map(|c| c.0.len() * std::mem::size_of::<Complex32>())
+            .sum();
+        let mut fresh: Vec<Vec<Complex32>> = Vec::new();
+        let mut slots: Vec<Result<(String, u64), usize>> = Vec::with_capacity(scene.signals.len());
         for sig in &scene.signals {
-            let key = (serde_json::to_string(sig)?, scene.duration_s.to_bits());
-            if !self.cache.contains_key(&key) {
-                let c = render_signal(&sig.signal_spec(), scene.fs, scene.duration_s)?;
-                self.cache.insert(key.clone(), c);
+            let key = (serde_json::to_string(sig)?, d);
+            if self.cache.contains_key(&key) {
+                slots.push(Ok(key));
+                continue;
             }
-            keys.push(key);
+            let c = render_signal(&sig.signal_spec(), scene.fs, scene.duration_s)?;
+            let bytes = c.0.len() * std::mem::size_of::<Complex32>();
+            if cached_bytes + bytes <= CACHE_BYTES {
+                cached_bytes += bytes;
+                self.cache.insert(key.clone(), c);
+                slots.push(Ok(key));
+            } else {
+                slots.push(Err(fresh.len()));
+                fresh.push(c.0);
+            }
         }
-        let parts: Vec<&[Complex32]> = keys.iter().map(|k| self.cache[k].0.as_slice()).collect();
+        let parts: Vec<&[Complex32]> = slots
+            .iter()
+            .map(|s| match s {
+                Ok(k) => self.cache[k].0.as_slice(),
+                Err(i) => fresh[*i].as_slice(),
+            })
+            .collect();
         Ok(mix(&parts, n, scene.noise_seed))
     }
 

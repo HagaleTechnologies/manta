@@ -126,9 +126,15 @@ fn corpus_markers() -> Vec<String> {
     m
 }
 
-/// Lint one repro's identity fields against the real-audio corpus.
+/// Lint one repro's identity fields (`name`, `found_in`, `probe`, and every
+/// signal's label and text) against the real-audio corpus.
 pub fn lint_repro(r: &Repro) -> Result<()> {
-    for field in [&r.name, &r.found_in] {
+    let mut fields = vec![&r.name, &r.found_in, &r.probe];
+    for s in &r.scene.signals {
+        fields.push(&s.label);
+        fields.push(&s.text);
+    }
+    for field in fields {
         let low = field.to_ascii_lowercase();
         for marker in corpus_markers() {
             if low.contains(&marker) {
@@ -214,6 +220,9 @@ mod tests {
         assert!(lint_repro(&r).is_err());
         let mut r = small_repro();
         r.name = "74eba71e00fede9cab8067f9ff5a043396066015bbf8c23232788279b9f1c5f2".into();
+        assert!(lint_repro(&r).is_err());
+        let mut r = small_repro();
+        r.scene.signals[0].label = "wpx_cw_iq_96khz.wav".into();
         assert!(lint_repro(&r).is_err());
         assert!(lint_repro(&small_repro()).is_ok());
     }

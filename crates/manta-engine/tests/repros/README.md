@@ -31,12 +31,13 @@ the directory.
 2. Write a probe returning `None` (passes) or a sorted failure signature;
    `support/ghost.rs` is the example. Map decode errors to their own entry.
 3. Run `manta_testkit::minimize::minimize` and write the result with
-   `manta_testkit::repro::from_minimized`. The existing repro came from:
+   `manta_testkit::repro::from_minimized`. The existing repro came from
+   (about 6 minutes):
 
    ```sh
    MANTA_REPRO_OUT="$PWD/crates/manta-engine/tests/repros/v8w-near-dc-mirror-ghost.json" \
      cargo test -p manta-engine --locked --test minimizer \
-     minimizer_shrinks_a_120s_multi_signal_scene -- --nocapture
+     minimizer_shrinks_the_v8w_pileup -- --ignored --nocapture
    ```
 
 4. Add the probe's name to `synthetic_repros.rs` if it is new.

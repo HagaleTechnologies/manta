@@ -92,8 +92,8 @@ Domain: fs 96 kS/s for keying and spectra (8 kS/s for fading); \|offset\| ≥
 | Group delay | 129-tap route | exactly 64 samples | 64 |
 | SNR (2500 Hz) | 20 and 0 dB requests, 3 s, each generator's own noise | ≤ 0.3 dB of request; ≤ 0.2 dB between | 0.039 dB; 0.029 dB |
 | Noise whiteness | both generators, 96 bands of 1 kHz | ≤ 0.5 dB of the mean | 0.32 dB |
-| Fading autocorrelation | Poor 0.1/0.2/0.5 s, Good 0.5/1/2 s; 48 seeds × 60 s at 8 kS/s, 2 kHz | ≤ 0.03 vs theory; ≤ 0.03 between | see the gate's report |
-| Ensemble power | same | \|mean − 1\| ≤ 4 SE; SE ≤ 0.06 | Poor independent 2.4 SE; Good SE 0.044 |
+| Fading autocorrelation | Poor 0.1/0.2/0.5 s, Good 0.5/1/2 s; 48 seeds × 60 s at 8 kS/s, 2 kHz | ≤ 0.03 vs theory; ≤ 0.03 between | 0.0042; 0.0074 |
+| Ensemble power | same | \|mean − 1\| ≤ 4 SE; SE ≤ 0.06 | 2.4 SE (Poor independent, mean 0.971, SE 0.012); SE 0.044 (Good) |
 
 Two estimator choices were measured, not assumed. On-runs use 0.3 of the
 plateau (`ON_RUN_FRACTION`), because 0.5 falls exactly on a sample of a
@@ -113,8 +113,10 @@ coppa defect, fading at τ = 0.2 s), `gate_catches_a_one_db_amplitude_error`
 
 The full sweep (`generator_cross_check_full_sweep`, `#[ignore]`: real-route
 offsets 2 to 45 kHz in 8 steps of both signs with 120 s keying, Moderate
-added, 64 seeds) and the V8w acceptance (`minimizer_shrinks_the_v8w_pileup`,
-`#[ignore]`) results are recorded in the section below.
+added, 64 seeds) passed in 75.5 s; its worst fading row used 0.65 of its
+tolerance (0.019) and its worst ensemble row 0.61. It does not cover the
+511-tap route at 96 kS/s; `receive_side_hilbert.rs` covers 511 taps at
+48 kHz.
 
 ## The V8w `s09` defect
 
@@ -125,10 +127,23 @@ promotes a track near +323 Hz where no signal exists (research R2: 120 s,
 none). `ghost_probe` (`crates/manta-engine/tests/support/ghost.rs`) reports
 it as `mirror:s09`.
 
-`minimizer_shrinks_a_120s_multi_signal_scene` starts from 120 s, five
-signals (`s09` plus V8 `s00`..`s03`) and ends, in 12 probes and 33 s, at
-30 s with `s09` alone, text `K`, jitter dropped and the Watterson fade kept
-(dropping it removes the ghost). That output is the committed repro.
+`minimizer_shrinks_a_120s_multi_signal_scene` (required CI) starts from
+120 s, five signals (`s09` plus V8 `s00`..`s03`) and ends, in 12 probes and
+33 s, at 30 s with `s09` alone, text `K`, jitter dropped and the Watterson
+fade kept (dropping it removes the ghost). The acceptance run on the whole
+V8w scene (`minimizer_shrinks_the_v8w_pileup`, `#[ignore]`, 50 signals,
+120 s) took 364 s and 18 probes and reached the same scene, with the same
+x86_64-linux digest; its output is the committed repro. Halving to 15 s
+removed the ghost in both runs.
+
+Review fixes made in this change: `render_scene` adds and drops each
+signal's contribution in turn (holding all 50 V8w contributions at 120 s
+would need about 4.6 GB); the minimizer keeps only the current duration's
+contributions, capped at 1 GiB; `render_signal_with_route` errors on QSB
+with a fade (the real route never applied it, so the generators would
+silently disagree); `SceneSpec::validate` bounds `fs` and `duration_s`; the
+lint covers `probe` and every signal label and text; the independent
+timeline errors on a loop that adds no time and on jitter sigma ≥ 1/3.
 
 Not fixed here: changing the faded route for `s09` moves V8w bytes.
 
@@ -141,5 +156,4 @@ Not fixed here: changing the faded route for `s09` moves V8w bytes.
   only in committed repros.
 - Cross-check the RTTY (`fsk.rs`), FT8 (`ftx.rs`) and non-CW (`noncw.rs`)
   generators, and represent V9's drift staircase in `SceneSpec`.
-- The full sweep does not include the 511-tap route at 96 kS/s; the
-  receive-side test covers 511 taps at 48 kHz only.
+- Add the 511-tap route at 96 kS/s to the full sweep.

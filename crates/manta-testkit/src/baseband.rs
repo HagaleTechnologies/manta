@@ -251,6 +251,12 @@ fn key_char(clock: &mut Clock, c: char, t: &Timing, content: f64) -> Result<f64>
 /// Key a tone's text: marks as `(start_s, end_s)` and the keyed text.
 pub(crate) fn timeline(tone: &ToneSpec, duration_s: f64) -> Result<(Vec<(f64, f64)>, String)> {
     let t = &tone.timing;
+    if let Some((sigma, _)) = t.jitter {
+        // 1 + sigma * z with |z| <= 3 must stay positive.
+        if !(0.0..1.0 / 3.0).contains(&sigma) {
+            bail!("jitter sigma {sigma} outside [0, 1/3)");
+        }
+    }
     let (content, spacing) = units(t);
     let words: Vec<String> = tone
         .text
@@ -284,6 +290,7 @@ pub(crate) fn timeline(tone: &ToneSpec, duration_s: f64) -> Result<(Vec<(f64, f6
     let mut keyed = String::new();
     let mut used = 0.0f64;
     'rep: loop {
+        let rep_start = used;
         for (wi, w) in words.iter().enumerate() {
             let cs: Vec<char> = w.chars().collect();
             for (ci, c) in cs.iter().enumerate() {
@@ -310,6 +317,9 @@ pub(crate) fn timeline(tone: &ToneSpec, duration_s: f64) -> Result<(Vec<(f64, f6
         keyed.push(' ');
         if used >= duration_s {
             break;
+        }
+        if used <= rep_start {
+            bail!("looped text {:?} adds no time per repetition", tone.text);
         }
     }
     Ok((clock.marks, keyed.trim().to_string()))
@@ -373,10 +383,17 @@ pub(crate) fn fade_gain(
     fs: f64,
     n: usize,
 ) -> [Vec<Complex64>; 2] {
+    let [p1, p2] = fade_paths(profile, seed, sigma_scale);
+    [path_gain(&p1, fs, n), path_gain(&p2, fs, n)]
+}
+
+/// One path's sinusoids: `(doppler_hz, phase_rad)`.
+type FadePath = Vec<(f64, f64)>;
+
+/// Draw both paths' Doppler frequencies (N(0, sigma²)) and phases.
+fn fade_paths(profile: FadeProfile, seed: u64, sigma_scale: f64) -> [FadePath; 2] {
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ FADE_DOMAIN);
     let sigma = sigma_scale * profile.spread_hz() / 2.0;
-    let step = 1.0 / FADE_GAIN_RATE_HZ;
-    let points = ((n as f64 / fs) / step).ceil() as usize + 2;
     let mut path = || {
         let mut freqs = Vec::with_capacity(FADE_SINUSOIDS);
         while freqs.len() < FADE_SINUSOIDS {
@@ -386,43 +403,58 @@ pub(crate) fn fade_gain(
                 freqs.push(b * sigma);
             }
         }
-        let phases: Vec<f64> = (0..FADE_SINUSOIDS)
-            .map(|_| std::f64::consts::TAU * uniform(&mut rng))
-            .collect();
-        // Rotating phasors, re-anchored exactly every 1000 points.
-        let norm = 1.0 / (FADE_SINUSOIDS as f64).sqrt();
-        let rot: Vec<Complex64> = freqs
-            .iter()
-            .map(|f| Complex64::from_polar(1.0, std::f64::consts::TAU * f * step))
-            .collect();
-        let mut ph: Vec<Complex64> = Vec::new();
-        let mut coarse = Vec::with_capacity(points);
-        for k in 0..points {
-            if k % 1000 == 0 {
-                let t = k as f64 * step;
-                ph = freqs
-                    .iter()
-                    .zip(&phases)
-                    .map(|(f, p)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * t + p))
-                    .collect();
-            }
-            coarse.push(ph.iter().sum::<Complex64>() * norm);
-            for (p, r) in ph.iter_mut().zip(&rot) {
-                *p *= r;
-            }
-        }
-        (0..n)
-            .map(|i| {
-                let x = i as f64 / fs / step;
-                let k = x.floor() as usize;
-                let w = x - k as f64;
-                coarse[k] * (1.0 - w) + coarse[k + 1] * w
-            })
-            .collect::<Vec<Complex64>>()
+        freqs
+            .into_iter()
+            .map(|f| (f, std::f64::consts::TAU * uniform(&mut rng)))
+            .collect::<FadePath>()
     };
-    let g1 = path();
-    let g2 = path();
-    [g1, g2]
+    let p1 = path();
+    let p2 = path();
+    [p1, p2]
+}
+
+/// Exact path gain at `t` seconds.
+fn exact_gain(path: &FadePath, t: f64) -> Complex64 {
+    let norm = 1.0 / (path.len() as f64).sqrt();
+    path.iter()
+        .map(|(f, p)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * t + p))
+        .sum::<Complex64>()
+        * norm
+}
+
+/// A path's gain every 1 ms (rotating phasors re-anchored exactly every
+/// 1000 points), linearly interpolated to `n` samples at `fs`.
+fn path_gain(path: &FadePath, fs: f64, n: usize) -> Vec<Complex64> {
+    let step = 1.0 / FADE_GAIN_RATE_HZ;
+    let points = ((n as f64 / fs) / step).ceil() as usize + 2;
+    let norm = 1.0 / (path.len() as f64).sqrt();
+    let rot: Vec<Complex64> = path
+        .iter()
+        .map(|(f, _)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * step))
+        .collect();
+    let mut ph: Vec<Complex64> = Vec::new();
+    let mut coarse = Vec::with_capacity(points);
+    for k in 0..points {
+        if k % 1000 == 0 {
+            let t = k as f64 * step;
+            ph = path
+                .iter()
+                .map(|(f, p)| Complex64::from_polar(1.0, std::f64::consts::TAU * f * t + p))
+                .collect();
+        }
+        coarse.push(ph.iter().sum::<Complex64>() * norm);
+        for (p, r) in ph.iter_mut().zip(&rot) {
+            *p *= r;
+        }
+    }
+    (0..n)
+        .map(|i| {
+            let x = i as f64 / fs / step;
+            let k = x.floor() as usize;
+            let w = x - k as f64;
+            coarse[k] * (1.0 - w) + coarse[k + 1] * w
+        })
+        .collect()
 }
 
 /// One tone's unscaled contribution and keyed text.
@@ -672,18 +704,29 @@ mod tests {
 
     #[test]
     fn fader_gain_interpolation_error_is_below_1e_4() {
-        // At 1 kHz, a 1 Hz-sigma path moves little in 1 ms; linear
-        // interpolation midway between points is close to the exact sum.
+        // Interpolated gain (rotating phasors, 1 ms points) against the exact
+        // sinusoid sum, at every sample of a 10 s Poor path at 8 kS/s.
         let fs = 8000.0;
-        let g = fade_gain(FadeProfile::Poor, 9, 1.0, fs, 80_000);
-        let mut worst = 0.0f64;
-        for k in 1..(g[0].len() - 1) {
-            let d = (g[0][k + 1] - 2.0 * g[0][k] + g[0][k - 1]).norm();
-            if k % 8 != 0 {
-                worst = worst.max(d);
-            }
-        }
+        let n = 80_000;
+        let [p1, _] = fade_paths(FadeProfile::Poor, 9, 1.0);
+        let g = path_gain(&p1, fs, n);
+        let worst = (0..n)
+            .map(|i| (g[i] - exact_gain(&p1, i as f64 / fs)).norm())
+            .fold(0.0f64, f64::max);
         assert!(worst < 1e-4, "{worst}");
+        assert_eq!(fade_gain(FadeProfile::Poor, 9, 1.0, fs, n)[0], g);
+    }
+
+    #[test]
+    fn a_loop_that_adds_no_time_and_oversized_jitter_are_errors() {
+        let mut t = Timing::standard(20.0);
+        t.word_gap_units = 0.0;
+        assert!(timeline(&tone("", t, true), 10.0).is_err());
+        let t = Timing {
+            jitter: Some((0.4, 1)),
+            ..Timing::standard(20.0)
+        };
+        assert!(timeline(&tone("E", t, true), 10.0).is_err());
     }
 
     #[test]
