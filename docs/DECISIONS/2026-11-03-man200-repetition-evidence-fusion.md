@@ -144,8 +144,10 @@ lets damaged copies confirm the call a clear per-position majority reads.
   `Repetition` withhold. Copies enter the lattice before the operator and
   plausibility checks, because a damaged copy is often implausible. If the
   winner is the candidate's own text, the fused spot replaces that
-  candidate's `Repetition` decision. Otherwise the candidate's own withhold
-  is recorded first, then the winner's decision. A refused fusion records no
+  candidate's `Repetition` decision; after a `Grammar` or `Cty` withhold that
+  text would fail the same check, so it is not tried and records nothing
+  more. Otherwise the candidate's own withhold is recorded first, then the
+  winner's decision. A refused fusion records no
   decision for the hypothetical winner.
 - **D11. The fused spot** uses the triggering copy's track, `end_ts`,
   frequency, SNR, speed, spot type and RST/QRL annotations. Its confidence is
@@ -183,8 +185,8 @@ lets damaged copies confirm the call a clear per-position majority reads.
   see an ordinary confirmed spot.
 - **The bar as built.** A strict majority at every position and a lead of at
   least half a copy, from as many separate messages as the tier needs. The
-  calibration ladder below tightens it only if the synthetic grid finds a
-  wrong fused call.
+  synthetic grid below found one wrong fused call that neither tightening
+  step removes, so the bar is unchanged and fusion stays off (ladder step 3).
 
 ## Calibration on the synthetic pileup
 
@@ -194,30 +196,82 @@ The instrument is `crates/manta-engine/tests/man200_fusion_grid.rs`:
 cargo test --release -p manta-engine --test man200_fusion_grid -- --ignored --nocapture
 ```
 
-It decodes each point of the MAN-116 grid once (`Condition::WattersonGood`
-and `WattersonPoor`; 15 and 25 WPM; 3, 6, 9, 12, 15 and 20 dB; legacy engine;
-plus the HSMM engine at both conditions, 25 WPM, 6 and 12 dB), replays the
-events through a fusion-off and a fusion-on validator, checks the off replay
-reproduces the decode's own spots, and prints one `MAN200` row per point. A
-wrong call is a spot whose call is none of the 10 station calls, or a station
-call more than 150 Hz from that station. It asserts that fusion-on spots no
-more wrong calls than fusion-off at any point.
+It renders the MAN-116 pileup (`series_signals`, trial 0, seed 1, 90 s, ten
+stations) and decodes each grid point once: `Condition::WattersonGood` and
+`WattersonPoor`; 15 and 25 WPM; 3, 6, 9, 12, 15 and 20 dB (2500 Hz, through
+`sensitivity::gain_for_snr_2500`); legacy engine. Two bounds differ from the
+MAN-116 benchmark: its SNR labels are 500 Hz figures, about 7 dB lower, so
+this grid's 3 dB is MAN-116's 10 dB and its weakest points are not sampled;
+and its default length is 60 s, not 90 s. It adds the HSMM engine at
+both conditions, 25 WPM, 6 and 12 dB. Each decode's events are replayed
+through a fusion-off and a fusion-on validator from
+`PipelineConfig::validator`, and the off replay must equal the decode's own
+spots. A wrong call is a spot whose call is none of the 10 station calls, or
+a station call more than 150 Hz from that station. A station counts as
+spotted when it has a spot that is not wrong. The instrument prints one
+`MAN200` row per point and asserts that fusion-on spots no more wrong calls
+than fusion-off at any point.
 
-The tightening ladder, applied in order only if a point fails:
+Measured on 2026-11-03 at the remediate round's tree, 28 rows. Totals per
+condition and speed, stations spotted out of 10 per point (60 for a legacy
+row of 6 SNR points, 20 for an HSMM row of 2):
 
-1. Every supporting observation within 1 edit of the winner
-   (`MAX_SUPPORT_EDITS = 1`; joining stays at 2).
-2. A fusion decided by top-1 votes alone also needs one exact copy of the
-   winner.
-3. Stop tightening: fusion stays off and this record says how many wrong
-   calls it produced.
+| Engine | Condition | WPM | Spotted off | Spotted on | Fused spots | Wrong off | Wrong on |
+|---|---|---|---|---|---|---|---|
+| legacy | good | 15 | 23 | 23 | 4 | 0 | 0 |
+| legacy | good | 25 | 51 | 53 | 17 | 0 | 1 |
+| legacy | poor | 15 | 14 | 15 | 3 | 0 | 0 |
+| legacy | poor | 25 | 20 | 24 | 12 | 0 | 0 |
+| hsmm | good | 25 (6, 12 dB) | 14 | 15 | 3 | 0 | 0 |
+| hsmm | poor | 25 (6, 12 dB) | 0 | 0 | 0 | 0 | 0 |
+| **all** | | | **122** | **130** | **39** | **0** | **1** |
 
-Not measured yet. The implement round of 2026-11-03 ran out of time
-before the instrument `crates/manta-engine/tests/man200_fusion_grid.rs` was
-written, so no grid rows exist and no ladder step was applied. Fusion
-therefore ships default off with no synthetic-grid evidence for or against
-it; the instrument and its 28 rows are the first follow-up below, and
-default-on stays gated on them and on the real-traffic gate.
+The lift is 8 station-points of 280. Every row with a fused spot:
+
+| Engine | Condition | WPM | dB | Spotted off | Spotted on | Fused | Wrong off | Wrong on |
+|---|---|---|---|---|---|---|---|---|
+| legacy | good | 15 | 12 | 5 | 5 | 2 | 0 | 0 |
+| legacy | good | 15 | 15 | 5 | 5 | 1 | 0 | 0 |
+| legacy | good | 15 | 20 | 5 | 5 | 1 | 0 | 0 |
+| legacy | good | 25 | 3 | 7 | 7 | 4 | 0 | 1 |
+| legacy | good | 25 | 6 | 7 | 8 | 2 | 0 | 0 |
+| legacy | good | 25 | 9 | 9 | 9 | 2 | 0 | 0 |
+| legacy | good | 25 | 12 | 9 | 9 | 2 | 0 | 0 |
+| legacy | good | 25 | 15 | 9 | 10 | 4 | 0 | 0 |
+| legacy | good | 25 | 20 | 10 | 10 | 3 | 0 | 0 |
+| legacy | poor | 15 | 15 | 3 | 4 | 1 | 0 | 0 |
+| legacy | poor | 15 | 20 | 5 | 5 | 2 | 0 | 0 |
+| legacy | poor | 25 | 6 | 2 | 3 | 1 | 0 | 0 |
+| legacy | poor | 25 | 9 | 3 | 4 | 2 | 0 | 0 |
+| legacy | poor | 25 | 15 | 4 | 5 | 4 | 0 | 0 |
+| legacy | poor | 25 | 20 | 6 | 7 | 5 | 0 | 0 |
+| hsmm | good | 25 | 6 | 5 | 5 | 2 | 0 | 0 |
+| hsmm | good | 25 | 12 | 9 | 10 | 1 | 0 | 0 |
+
+The remaining 11 rows have no fused spot and equal counts off and on.
+
+**The one wrong fused call.** At good, 25 WPM, 3 dB, legacy, fusion spotted
+`K3BK` at 14036092.6 Hz (track 4, sample 6101760). The station there sends
+`K3BGK` (14036084.4 Hz). The episode's three copies, each withheld for
+`Repetition` on the exact path, were `K3BK` (sample 607488, the `G` lost),
+`K3BGK` (sample 1769984, exact) and `K3BB` (sample 6101760, the last `K` read
+as `B`). `K3BK` starts first, so it seeds the columns. `K3BGK` adds a `G`
+column where the other two have nothing, and nothing wins it 2 to 1. The last
+column is `K` 2 to `B` 1. Three separate messages support `K3BK`.
+
+**The ladder.** Neither tightening step removes that call, so the ladder
+stops at step 3:
+
+1. Every supporting observation within 1 edit of the winner: `K3BGK` and
+   `K3BB` are each 1 edit from `K3BK`, so all three still support it.
+2. A fusion decided by top-1 votes alone needs one exact copy of the winner:
+   the first copy reads `K3BK` exactly.
+3. Stop tightening. **Fusion produced 1 wrong call on the synthetic grid; do
+   not enable it.** It ships default off. The instrument keeps its assertion
+   as the bar default-on must pass, so today it fails at that one point.
+
+Steps 1 and 2 were not built and re-run: the copies above show that neither
+can change this episode's outcome.
 
 ### V8, V8w and VC3 with fusion on
 
@@ -259,15 +313,16 @@ gains one `candidateDecision` property, appended to `required` after
 
 Fusion's precision and lift on real traffic are unmeasured: no audio corpus is
 committed, and the calibration above is synthetic. HSMM alternative scores
-are relative margins, not probabilities; D4's `min(a / top, 1)` is measured
-only on the grid's HSMM points.
+are relative margins, not probabilities. D4's `min(a / top, 1)` has no
+measurement of its own: the grid's HSMM points made 3 fused spots and no
+wrong call, and the instrument does not record whether an alternative
+decided any of them. The HSMM engine spotted nothing at Watterson poor.
 
 ## Follow-ups
 
-- The calibration instrument `crates/manta-engine/tests/man200_fusion_grid.rs`
-  (MAN-116 pileup, 24 legacy points plus 4 HSMM points, fusion off and on,
-  asserting wrong calls on <= off) and its rows here, with the tightening
-  ladder applied if a point fails.
+- A bar that refuses the grid's `K3BK` fusion (a deletion copy and a
+  substitution copy outvoting the one exact copy of `K3BGK`), measured with
+  `man200_fusion_grid` before any default-on.
 - Expose the legacy beam's survivors as `alternatives`.
 - Element-level (dit and dah) alignment from decoder data.
 - The lattice as a subtractive variant arbiter.
@@ -286,6 +341,10 @@ only on the grid's HSMM points.
   the overlap rule, alignment, votes, the unknown hypothesis, independence,
   joining, bounds and arrival-order independence.
 - `v8_v8w_and_vc3_with_repetition_fusion_on_stay_at_zero_bogus`.
+- `man200_fusion_grid` (ignored; the measuring instrument above).
+- `a_grammar_or_cty_withhold_is_decided_once_per_word`: with fusion on, a
+  call withheld for `Grammar` or `Cty` is decided once per word, not a
+  second time by the fused path.
 - Config: `repetition_fusion_defaults_off_and_reads_true`,
   `repetition_fusion_rejects_a_non_boolean`,
   `env_repetition_fusion_overrides_the_file`,
