@@ -49,6 +49,36 @@ pub fn add_impulses(x: &mut [Complex32], at: &[(usize, Complex32)]) {
     }
 }
 
+/// `rate_hz` impulses per second of value `v`, for `duration_s` seconds
+/// from 0.5 s, at evenly spaced sample indices.
+pub fn impulse_train(rate_hz: f64, duration_s: f64, v: Complex32) -> Vec<(usize, Complex32)> {
+    let n = (rate_hz * duration_s).round() as usize;
+    (0..n)
+        .map(|k| {
+            (
+                ((0.5 + k as f64 / rate_hz) * SAMPLE_RATE_HZ).round() as usize,
+                v,
+            )
+        })
+        .collect()
+}
+
+/// The conditioning log a channelizer running `cfg` writes over `x`: the
+/// chain decode builds, run standalone so a test can read its counts.
+/// Decode also feeds `filter_len()` zeros of lead-in padding first, so its
+/// span indices and one-second block boundaries sit that many samples
+/// later than here.
+pub fn condition_log(
+    x: &[Complex32],
+    cfg: &manta_engine::ConditioningConfig,
+) -> manta_dsp::condition::ConditioningLog {
+    let mut ch =
+        manta_dsp::channelizer::Channelizer::with_conditioning(SAMPLE_RATE_HZ, CENTER_FREQ_HZ, cfg)
+            .expect("a supported sample rate");
+    ch.process(x);
+    ch.conditioning().expect("a stage is on").clone()
+}
+
 /// One station (`series_calls(trial)[0]`) at `offset_hz` and `snr_db`
 /// (2500 Hz reference), plus the trial's noise and a DC offset
 /// `(dc, 0.7 dc)`.

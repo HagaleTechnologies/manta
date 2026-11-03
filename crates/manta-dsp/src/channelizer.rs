@@ -138,6 +138,10 @@ pub struct Channelizer {
     /// MAN-203: the optional input-conditioning chain, `None` when every
     /// stage is off.
     conditioner: Option<InputConditioner>,
+    /// MAN-203: `buf[..ready]` is final (conditioned); the rest is held
+    /// back by an applying impulse stage's lookahead. Windows are formed
+    /// only from final samples.
+    ready: usize,
 }
 
 impl Channelizer {
@@ -175,6 +179,7 @@ impl Channelizer {
             center_freq_hz,
             bad_samples: 0,
             conditioner: InputConditioner::new(fs, cfg),
+            ready: 0,
         })
     }
 
@@ -222,16 +227,23 @@ impl Channelizer {
     /// `bad_samples`; usable samples are never written. Step 0a (MAN-203):
     /// the optional conditioning chain then runs on the new samples, in
     /// stream order, so the hops do not depend on how the input is split.
+    /// An applying impulse stage holds back its 21-sample lookahead, so
+    /// windows are formed only up to the last final sample: sample indices
+    /// do not move, and at most the stream's final `ceil(21 / hop)` hops
+    /// are never formed (one hop at every rate from 12 kS/s up, where
+    /// `hop >= 32`).
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<HopOutput> {
         let start = self.buf.len();
         self.buf.extend_from_slice(iq);
         self.bad_samples += sample_guard::replace_unusable(&mut self.buf[start..]);
-        if let Some(c) = self.conditioner.as_mut() {
-            c.condition(&mut self.buf[start..]);
-        }
+        let ready = self.ready;
+        self.ready = match self.conditioner.as_mut() {
+            Some(c) => ready + c.condition(&mut self.buf[ready..]),
+            None => self.buf.len(),
+        };
         let ln = self.taps.len();
         let mut outputs = Vec::new();
-        while self.read + ln <= self.buf.len() {
+        while self.read + ln <= self.ready {
             let window = &self.buf[self.read..self.read + ln];
 
             // Step 1: window & fold. u[n] = x[n]*h[LN-1-n]; v[j] = sum_p
@@ -270,6 +282,7 @@ impl Channelizer {
         }
         if self.read >= ln {
             self.buf.drain(..self.read);
+            self.ready -= self.read;
             self.read = 0;
         }
         outputs
@@ -434,7 +447,10 @@ mod tests {
     }
 
     fn dc_cfg(mode: crate::condition::StageMode) -> ConditioningConfig {
-        ConditioningConfig { dc: mode }
+        ConditioningConfig {
+            dc: mode,
+            ..ConditioningConfig::default()
+        }
     }
 
     #[test]
@@ -515,6 +531,76 @@ mod tests {
                 chunked.conditioning().unwrap().spans().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// MAN-203 fixture: [`tone_with_dc`] plus isolated impulses.
+    fn tone_with_impulses(n: usize) -> Vec<Complex32> {
+        let mut iq = tone_with_dc(n);
+        for (i, v) in [(4_000, 1e8f32), (9_001, -4e3), (17_777, 1e9)] {
+            iq[i] = Complex32::new(v, 0.5 * v);
+        }
+        iq
+    }
+
+    #[test]
+    fn impulse_apply_is_chunk_invariant() {
+        use crate::condition::{Mark, Stage, StageMode};
+        let iq = tone_with_impulses(30_000);
+        let cfg = ConditioningConfig {
+            impulse: StageMode::Apply,
+            dc: StageMode::Apply,
+        };
+        let mut whole = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+        let hops_whole = whole.process(&iq);
+        assert_eq!(
+            whole
+                .conditioning()
+                .unwrap()
+                .count(Stage::Impulse, Mark::Repaired),
+            3
+        );
+        for size in [1usize, 13, 4096] {
+            let mut chunked = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+            let mut hops = Vec::new();
+            for chunk in iq.chunks(size) {
+                hops.extend(chunked.process(chunk));
+            }
+            assert_hops_bitwise_equal(&hops_whole, &hops);
+            assert_eq!(whole.conditioning(), chunked.conditioning());
+        }
+    }
+
+    #[test]
+    fn impulse_apply_loses_at_most_the_final_hop() {
+        use crate::condition::StageMode;
+        let iq = tone_with_dc(30_000);
+        let cfg = ConditioningConfig {
+            impulse: StageMode::Apply,
+            ..ConditioningConfig::default()
+        };
+        let mut plain = Channelizer::new(FS, 0.0).unwrap();
+        let mut imp = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+        let hp = plain.process(&iq);
+        let hi = imp.process(&iq);
+        assert!(hp.len() - hi.len() <= 1, "{} vs {}", hp.len(), hi.len());
+        // No impulse: the hops it formed are the plain ones, bit for bit.
+        assert_hops_bitwise_equal(&hp[..hi.len()], &hi);
+    }
+
+    #[test]
+    fn impulse_observe_never_changes_a_hop() {
+        use crate::condition::{Mark, Stage, StageMode};
+        let iq = tone_with_impulses(30_000);
+        let cfg = ConditioningConfig {
+            impulse: StageMode::Observe,
+            ..ConditioningConfig::default()
+        };
+        let mut plain = Channelizer::new(FS, 0.0).unwrap();
+        let mut obs = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
+        assert_hops_bitwise_equal(&plain.process(&iq), &obs.process(&iq));
+        let log = obs.conditioning().unwrap();
+        assert_eq!(log.count(Stage::Impulse, Mark::Flagged), 3);
+        assert_eq!(log.count(Stage::Impulse, Mark::Repaired), 0);
     }
 
     fn assert_hops_bitwise_equal(a: &[HopOutput], b: &[HopOutput]) {

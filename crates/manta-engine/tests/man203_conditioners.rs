@@ -9,6 +9,7 @@
 #[path = "support/man203.rs"]
 mod support;
 
+use manta_dsp::condition::{Mark, Stage};
 use manta_engine::{ConditioningConfig, PipelineConfig, StageMode};
 use num_complex::Complex32;
 use support::*;
@@ -30,10 +31,24 @@ fn dc_apply() -> PipelineConfig {
     PipelineConfig {
         conditioning: ConditioningConfig {
             dc: StageMode::Apply,
+            ..ConditioningConfig::default()
         },
         ..PipelineConfig::default()
     }
 }
+
+fn impulse_apply() -> PipelineConfig {
+    PipelineConfig {
+        conditioning: ConditioningConfig {
+            impulse: StageMode::Apply,
+            ..ConditioningConfig::default()
+        },
+        ..PipelineConfig::default()
+    }
+}
+
+/// The sample index of a scene's single injected impulse (5 s in).
+const IMPULSE_AT: usize = 5 * 96_000;
 
 /// Stations found over the near-centre offsets and trials, for each config.
 fn near_centre_found(dc: f32, cfgs: &[&PipelineConfig]) -> Vec<(usize, Vec<String>)> {
@@ -157,4 +172,100 @@ fn dc_apply_alone_is_no_worse_than_bypass_on_a_huge_impulse() {
     let d = found(&scene, &decode(&scene.samples, &dc_apply()));
     eprintln!("one 1e8 impulse: bypass {b} of 10, dc_block apply {d} of 10");
     assert!(d >= b, "DC removal found {d}, bypass {b}");
+}
+
+#[test]
+fn impulse_suppression_recovers_a_single_huge_impulse() {
+    for trial in 1..=2 {
+        let clean = series_scene(12.0, trial);
+        let want = found_calls(&clean, &decode(&clean.samples, &bypass()));
+        for v in [1e8f32, 1e9] {
+            let mut scene = series_scene(12.0, trial);
+            add_impulses(&mut scene.samples, &[(IMPULSE_AT, Complex32::new(v, 0.0))]);
+            let b = found(&scene, &decode(&scene.samples, &bypass()));
+            let applied = found_calls(&scene, &decode(&scene.samples, &impulse_apply()));
+            let log = condition_log(&scene.samples, &impulse_apply().conditioning);
+            eprintln!(
+                "trial {trial}, one {v:e} impulse: clean {} of 10, bypass {b}, impulse_suppress apply {}",
+                want.len(),
+                applied.len()
+            );
+            assert!(b <= 2, "the fixture stopped hurting bypass ({b} of 10)");
+            assert_eq!(
+                applied, want,
+                "suppression should find what the clean scene finds"
+            );
+            assert_eq!(log.count(Stage::Impulse, Mark::Repaired), 1);
+        }
+    }
+}
+
+#[test]
+fn impulse_suppression_recovers_an_impulse_train() {
+    let clean = series_scene(12.0, 1);
+    let want = found_calls(&clean, &decode(&clean.samples, &bypass()));
+    let mut scene = series_scene(12.0, 1);
+    // 10 impulses a second of amplitude 30 (600 times the noise rms) for
+    // 29 s: amplitude 10 left bypass whole, 30 cost it 9 of 10 stations.
+    let train = impulse_train(10.0, DURATION_S - 1.0, Complex32::new(30.0, 0.0));
+    add_impulses(&mut scene.samples, &train);
+    let b = found(&scene, &decode(&scene.samples, &bypass()));
+    let applied = found_calls(&scene, &decode(&scene.samples, &impulse_apply()));
+    let log = condition_log(&scene.samples, &impulse_apply().conditioning);
+    eprintln!(
+        "{} impulses of 30: clean {} of 10, bypass {b}, impulse_suppress apply {}",
+        train.len(),
+        want.len(),
+        applied.len()
+    );
+    assert!(
+        b < want.len(),
+        "the train should cost bypass a station ({b})"
+    );
+    assert_eq!(
+        applied, want,
+        "suppression should find what the clean scene finds"
+    );
+    assert_eq!(
+        log.count(Stage::Impulse, Mark::Repaired),
+        train.len() as u64
+    );
+}
+
+#[test]
+fn impulse_suppression_leaves_clean_scenes_alone() {
+    for snr_db in [12.0, 45.0] {
+        for trial in TRIALS {
+            let scene = series_scene(snr_db, trial);
+            let log = condition_log(&scene.samples, &impulse_apply().conditioning);
+            let touched = log.count(Stage::Impulse, Mark::Repaired)
+                + log.count(Stage::Impulse, Mark::Flagged);
+            eprintln!("clean {snr_db} dB, trial {trial}: impulse stage touched {touched} samples");
+            assert!(
+                touched <= 16,
+                "{touched} samples touched at {snr_db} dB, trial {trial}"
+            );
+            assert_eq!(
+                log.count(Stage::Impulse, Mark::Uncertain),
+                0,
+                "the stage paused at {snr_db} dB, trial {trial}"
+            );
+        }
+    }
+    for (snr_db, trials) in [(12.0, 1..=1), (45.0, TRIALS)] {
+        for trial in trials {
+            let scene = series_scene(snr_db, trial);
+            let b = found_calls(&scene, &decode(&scene.samples, &bypass()));
+            let applied = found_calls(&scene, &decode(&scene.samples, &impulse_apply()));
+            eprintln!(
+                "clean {snr_db} dB, trial {trial}: bypass {} of 10, impulse_suppress apply {}",
+                b.len(),
+                applied.len()
+            );
+            assert_eq!(
+                applied, b,
+                "suppression changed the calls at {snr_db} dB, trial {trial}"
+            );
+        }
+    }
 }

@@ -90,15 +90,30 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    stage runs, so output is bit-identical to an unconditioned
    channelizer), `observe` (measures, never writes a sample) or `apply`
    (corrects, and records each corrected run of samples as a span with a
-   per-stage counter). The DC stage is a first-order blocker with corner
+   per-stage counter). The stages run in the order impulse, then DC. The
+   impulse stage flags a sample whose power exceeds `12² = 144` times the
+   reference power of the 33 samples centred on it (fewer at the stream
+   start): their mean power once the 8 strongest are left out. A zero
+   reference never flags. It repairs a flagged run of at most 4
+   samples by linear interpolation between its unflagged neighbours,
+   keeping the originals so the repair reverts bit for bit, and never
+   writes a longer run. When more than `1e-3` of a one-second block
+   (`round(fs)` samples) is flagged, the next block repairs nothing and is
+   marked uncertain. Applying, it releases each sample 21 samples late
+   (16 + 4 + 1), and windows (step 1) are formed only from released
+   samples, so indices do not move and at most the final `ceil(21/hop)`
+   hops of a stream are never formed (one hop from 12 kS/s up); observing,
+   it holds nothing back. The last 16 samples of a stream are never judged. The DC stage is a
+   first-order blocker with corner
    `DC_CORNER_HZ = 5.0`: `y[n] = x[n] − dc[n]`, then
    `dc[n+1] = dc[n] + a_n·clamp(y[n])` with `a_n = max(2π·5/fs, 1/(n+1))`,
    `dc[0] = 0`, f64 state, and the update's magnitude clamped to 1.0
    (full scale); exact-zero samples before the first nonzero one (the
    lead-in padding) leave the state untouched, so `n` counts from the
    first real sample. It reads only `y`, so `x[n] = y[n] + dc[n]` inverts
-   it exactly. Every stage is causal and per-sample, so the hops do not
-   depend on how the input is split into `process` calls. `check` runs
+   it exactly. Every stage is a per-sample state machine with a fixed
+   release delay, so the hops do not depend on how the input is split into
+   `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
 1. **Window & fold:** `u[n] = x[n] · h[LN−1−n]` for `n = 0..LN`, then fold to
    `N` points: `v[j] = Σ_{p=0..L-1} u[j + pN]`, `j = 0..N`.
