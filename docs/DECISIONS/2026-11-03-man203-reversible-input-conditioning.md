@@ -149,12 +149,22 @@ output changes, and no operator surface changes in this slice.
 | +60 and +150 Hz, DC 0.01 | **0 of 8** | **8 of 8** |
 | +60 and +150 Hz, no DC (control) | 8 of 8 | 8 of 8, same calls |
 | +900 Hz, DC 0.01 | (not run) | 4 of 4 |
-| +150 Hz, DC 0.005: false tracks within 100 Hz of the centre | **5** | **0** |
+| +150 Hz, DC 0.005: false tracks within 100 Hz of the centre | **5** | **0** (gate dropped; see below) |
 | ten 12 dB stations plus one 1e8 impulse at 5 s | 0 of 10 | 0 of 10 |
 
 The last row is the impulse stage's baseline: DC removal alone neither
 helps nor hurts there (its update clamp keeps the impulse from moving the
 estimate).
+
+The false-DC-track row was measured before this branch merged main. Since
+MAN-112 (0f3b046e, close-pair track resolution) the tracker no longer grows
+that track in bypass: 0 false tracks with and without `dc = Apply`, so the
+row no longer shows anything DC removal does. Its two tests
+(`bypass_grows_a_false_dc_track_at_a_small_offset` and
+`dc_removal_removes_the_false_dc_track`) were dropped. A one-step bisect
+confirmed it: both pass with MAN-203 merged onto `0f3b046e^` and fail with
+it merged onto `0f3b046e`. The DC 0.01 recall gates (0 of 8 under bypass,
+8 of 8 with `dc = Apply`) carry the DC evidence.
 
 ## Measured: impulse suppression beats bypass
 
@@ -183,11 +193,9 @@ unit tests; and the channelizer's `impulse_apply_is_chunk_invariant`,
 `impulse_observe_never_changes_a_hop`.
 
 Tests: `bypass_loses_a_station_near_a_dc_offset`,
-`bypass_grows_a_false_dc_track_at_a_small_offset`,
 `bypass_is_silenced_by_one_huge_impulse`,
 `dc_removal_recovers_a_station_near_a_dc_offset`,
-`dc_removal_does_not_regress_the_clean_control`,
-`dc_removal_removes_the_false_dc_track` and
+`dc_removal_does_not_regress_the_clean_control` and
 `dc_apply_alone_is_no_worse_than_bypass_on_a_huge_impulse` in
 `crates/manta-engine/tests/man203_conditioners.rs`; the channelizer's
 `all_off_conditioning_is_bit_identical_to_new`, `observe_never_changes_a_hop`,

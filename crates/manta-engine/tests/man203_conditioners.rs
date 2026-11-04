@@ -81,17 +81,6 @@ fn bypass_loses_a_station_near_a_dc_offset() {
 }
 
 #[test]
-fn bypass_grows_a_false_dc_track_at_a_small_offset() {
-    let mut tracks = 0;
-    for trial in TRIALS {
-        let scene = near_centre_scene(150.0, NEAR_SNR_DB, 0.005, trial);
-        tracks += false_dc_tracks(&scene, &decode(&scene.samples, &bypass()));
-    }
-    eprintln!("bypass, DC 0.005 at +150 Hz: {tracks} false DC tracks");
-    assert!(tracks >= 3, "bypass grew only {tracks} false DC tracks");
-}
-
-#[test]
 fn bypass_is_silenced_by_one_huge_impulse() {
     let mut scene = series_scene(12.0, 1);
     add_impulses(
@@ -143,22 +132,6 @@ fn dc_removal_does_not_regress_the_clean_control() {
     }
     eprintln!("+900 Hz, DC {DC}, dc_block apply: {far} of 4");
     assert_eq!(far, 4);
-}
-
-#[test]
-fn dc_removal_removes_the_false_dc_track() {
-    let (mut bypass_tracks, mut applied_tracks) = (0, 0);
-    for trial in TRIALS {
-        let scene = near_centre_scene(150.0, NEAR_SNR_DB, 0.005, trial);
-        bypass_tracks += false_dc_tracks(&scene, &decode(&scene.samples, &bypass()));
-        applied_tracks += false_dc_tracks(&scene, &decode(&scene.samples, &dc_apply()));
-    }
-    eprintln!("DC 0.005: false DC tracks bypass {bypass_tracks}, dc_block apply {applied_tracks}");
-    assert!(
-        bypass_tracks >= 3,
-        "the fixture lost its false DC track ({bypass_tracks})"
-    );
-    assert_eq!(applied_tracks, 0);
 }
 
 #[test]

@@ -6,7 +6,6 @@
 //! A-prefix calls that never spot, MAN-203 D13).
 #![allow(dead_code)]
 
-use manta_decode::events::DecoderEvent;
 use manta_engine::{decode_samples, PipelineConfig};
 use manta_testkit::scene::SignalSpec;
 use manta_testkit::sensitivity::{
@@ -120,12 +119,10 @@ pub fn series_scene(snr_db: f64, trial: u32) -> Scene {
     Scene { samples, stations }
 }
 
-/// The decode result a scorer reads: spots as `(call, freq)` and the
-/// frequencies of every promoted track. "No signal found" is an empty
-/// result, not an error.
+/// The decode result a scorer reads: spots as `(call, freq)`. "No signal
+/// found" is an empty result, not an error.
 pub struct Outcome {
     pub spots: Vec<(String, f64)>,
-    pub promoted_hz: Vec<f64>,
 }
 
 /// Decodes `x` with `cfg`.
@@ -137,19 +134,8 @@ pub fn decode(x: &[Complex32], cfg: &PipelineConfig) -> Outcome {
                 .iter()
                 .map(|s| (s.callsign.clone(), s.freq_hz))
                 .collect(),
-            promoted_hz: r
-                .events
-                .iter()
-                .filter_map(|e| match e {
-                    DecoderEvent::TrackPromoted { freq_hz, .. } => Some(*freq_hz),
-                    _ => None,
-                })
-                .collect(),
         },
-        Err(e) if e.to_string().contains("no signal found") => Outcome {
-            spots: Vec::new(),
-            promoted_hz: Vec::new(),
-        },
+        Err(e) if e.to_string().contains("no signal found") => Outcome { spots: Vec::new() },
         Err(e) => panic!("decode failed: {e:#}"),
     }
 }
@@ -181,19 +167,4 @@ pub fn found_calls(scene: &Scene, out: &Outcome) -> Vec<String> {
         .collect();
     calls.sort();
     calls
-}
-
-/// Promoted tracks within 100 Hz of the centre and more than 100 Hz from
-/// every station: tracks a DC offset grew.
-pub fn false_dc_tracks(scene: &Scene, out: &Outcome) -> usize {
-    out.promoted_hz
-        .iter()
-        .filter(|&&f| {
-            (f - CENTER_FREQ_HZ).abs() <= 100.0
-                && scene
-                    .stations
-                    .iter()
-                    .all(|st| (f - st.freq_hz).abs() > 100.0)
-        })
-        .count()
 }
