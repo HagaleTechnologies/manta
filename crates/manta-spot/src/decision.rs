@@ -130,6 +130,27 @@ const _: () = {
     }
 };
 
+/// How a spotted call met its repetition requirement (MAN-200 D12). Set on
+/// `Spotted` decisions whose spot is `EmissionState::Confirmed` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Enough separate decodes read the call exactly.
+    ExactRepeat,
+    /// `[spot] repetition_fusion` combined damaged copies of one station's
+    /// self-ID into the call (`lattice::EvidenceLattice`).
+    Fused,
+}
+
+impl Confirmation {
+    /// The live-state spelling: `"exactRepeat"` or `"fused"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRepeat => "exactRepeat",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rival {
@@ -159,6 +180,9 @@ pub struct Decision {
     pub rival: Option<Rival>,
     /// The emitted spot, `Verdict::Spotted` only.
     pub spot: Option<Spot>,
+    /// MAN-200: how a `Spotted`, confirmed call met its repetition
+    /// requirement. `None` for any other decision and for a tentative spot.
+    pub confirmation: Option<Confirmation>,
 }
 
 impl Decision {
@@ -187,11 +211,12 @@ impl Decision {
             pattern_tier: None,
             rival: None,
             spot: None,
+            confirmation: None,
         }
     }
 
     /// The `Spotted` decision for `spot`.
-    pub(crate) fn spotted(spot: &Spot, reps: u32) -> Self {
+    pub(crate) fn spotted(spot: &Spot, reps: u32, confirmation: Option<Confirmation>) -> Self {
         Self {
             track_id: spot.track_id,
             sample_ts: spot.sample_ts,
@@ -206,6 +231,7 @@ impl Decision {
             pattern_tier: None,
             rival: None,
             spot: Some(spot.clone()),
+            confirmation,
         }
     }
 

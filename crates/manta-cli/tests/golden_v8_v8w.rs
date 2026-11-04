@@ -578,3 +578,67 @@ fn v8_and_v8w_with_prior_on_stay_at_zero_bogus() {
         }
     }
 }
+
+/// MAN-200: the opt-in repetition fusion must preserve the existing
+/// precision and recall bars on the same pinned scenes, including the VC3
+/// crash realization. The validated counts go in the decision record.
+#[test]
+fn v8_v8w_and_vc3_with_repetition_fusion_on_stay_at_zero_bogus() {
+    for scene in ["V8", "V8w", "VC3"] {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = match scene {
+            "V8" => manta_testkit::vectors::v8(),
+            "V8w" => manta_testkit::vectors::v8w(),
+            _ => manta_testkit::crash::vc3().0,
+        };
+        let manifest = if scene == "VC3" {
+            let (_, crashes) = manta_testkit::crash::vc3();
+            manta_testkit::crash::write_crash_fixture_set(&spec, &crashes, dir.path()).unwrap()
+        } else {
+            manta_testkit::vectors::write_fixture_set(&spec, dir.path()).unwrap()
+        };
+        let wav = dir.path().join(format!("{}.wav", spec.name));
+        let config = dir.path().join("fusion.toml");
+        std::fs::write(&config, "[spot]\nrepetition_fusion = true\n").unwrap();
+        let mut validated_by_mode = Vec::new();
+        for fusion in [false, true] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+            cmd.args(["decode", "--json"]);
+            if fusion {
+                cmd.arg("--config").arg(&config);
+            }
+            let out = cmd.arg(&wav).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let report = serde_json::from_slice(&out.stdout).unwrap();
+            let (bogus, validated, _) = bogus_and_validated(&report, &manifest, scene);
+            eprintln!(
+                "MAN-200 {scene} repetition_fusion={fusion}: bogus={}, validated={validated}",
+                bogus.len()
+            );
+            assert!(bogus.is_empty(), "{scene} fusion {fusion}: {bogus:?}");
+            let floor = if scene == "V8" { 45 } else { MIN_V8W_VALIDATED };
+            assert!(
+                validated >= floor,
+                "{scene} fusion {fusion}: {validated} < {floor}"
+            );
+            if scene == "VC3" {
+                let promoted = report["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| e["event"] == "TrackPromoted")
+                    .count();
+                assert!(promoted <= MAX_VC3_PROMOTED);
+            }
+            validated_by_mode.push(validated);
+        }
+        eprintln!(
+            "MAN-200 {scene}: validated off={} on={}",
+            validated_by_mode[0], validated_by_mode[1]
+        );
+    }
+}

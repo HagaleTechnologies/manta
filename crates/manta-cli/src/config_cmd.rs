@@ -596,7 +596,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     lines.push(format!(
         "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
          cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
-         validation_level={} pattern_path={}",
+         validation_level={} pattern_path={} repetition_fusion={}",
         if spot.allowlist.is_empty() {
             "none".to_string()
         } else {
@@ -620,6 +620,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         spot.pattern_path
             .as_ref()
             .map_or("bundled".to_string(), |p| p.display().to_string()),
+        if spot.repetition_fusion { "on" } else { "off" },
     ));
 
     if let Some(path) = &spot.calls_heard_path {
@@ -1464,7 +1465,7 @@ mod tests {
              scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off \
              list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat \
              scp_url=http://www.supercheckpartial.com/MASTER.SCP \
-             validation_level=normal pattern_path=bundled"
+             validation_level=normal pattern_path=bundled repetition_fusion=off"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1477,7 +1478,8 @@ mod tests {
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
                  notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n\
                  cty_sha256 = '{}'\nrefresh_lists = true\nlist_cache_dir = 'cache'\n\
-                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n",
+                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n\
+                 repetition_fusion = true\n",
                 notch.display(),
                 PIN.to_ascii_uppercase()
             ),
@@ -1491,7 +1493,7 @@ mod tests {
                  scp_path={} cty_sha256={PIN} scp_sha256=none refresh_lists=on \
                  list_cache_dir={} cty_url=http://www.country-files.com/cty/cty.dat \
                  scp_url=http://mirror.lan/MASTER.SCP \
-                 validation_level={} pattern_path={}",
+                 validation_level={} pattern_path={} repetition_fusion=on",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),

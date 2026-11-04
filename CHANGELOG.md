@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-200: a decode whose samples overlap a decode the repetition gate
+  already counted, such as a replay or a second track on the same signal,
+  no longer counts as another repetition, even when it arrives a whole
+  message later on the same track.
 - MAN-112: frequency-anchored association keeps independently keyed close
   pairs on separate tracks. V7 returns to its specified 150 Hz spacing.
   Close-pair track identities, decoded text and spot frequencies change.
@@ -140,6 +144,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
+  copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
+  `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
+  records gain `confirmation` (`exactRepeat`, `fused` or `null`). With the
+  key off, decoder output is unchanged.
 - MAN-207: each validator keeps a bounded, local observation record of why
   each callsign candidate was or was not spotted (`manta_spot::observation`):
   counters by default, opt-in records with evidence links and append-only

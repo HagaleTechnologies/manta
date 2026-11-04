@@ -1598,6 +1598,43 @@ not tightened further: any time-gap threshold low enough to rescue it would
 also treat a single corrupted message's own doubled utterance as two
 distinct messages, reopening the hole this rule exists to close.
 
+**The same samples count once (MAN-200).** Every candidate word carries a
+sample span: its first character's `sample_ts` to its `WordBoundary`
+`sample_ts`, closed at both ends. A decode whose span overlaps one the
+repetition gate (or the variant ledger, for its own `(track, text)` entry)
+already holds for the same call on the same channel is the same samples
+decoded again — a replay, a second track on one signal — and adds no
+repetition, whatever its word number or track. Two separate utterances
+never overlap: a word's boundary is its last character's time and the next
+word's first character comes strictly later. Overlap is checked only
+within one call's entry, never across different calls: two stations keying
+at once on one channel overlap and are both real (V59).
+
+**Fused confirmation (MAN-200, opt-in: `[spot] repetition_fusion`).** With
+the key on, CQ/DE/UP self-ID copies from one input, within one channel
+(`SAME_SIGNAL_MAX_HZ`) and the 90 s window, each at most 2 edits from every
+other copy in its episode, are aligned character by character (insertions
+and deletions allowed) and vote per position. Votes count copies, not
+confidence: each copy votes 1 for its top glyph, 1 for "nothing here" where
+the alignment gives it a gap, and 1 for unknown where its character is the
+`?` placeholder; an alternative `(g, a)` adds `min(a / top_confidence, 1)`
+for `g`. A position is decided when one candidate has the unique highest
+vote, more than half the copies, and a lead of at least 0.5 over every
+other candidate, unknown included; "nothing here" winning drops the
+position. Any undecided position makes the explicit unknown hypothesis win
+and nothing is confirmed, so no character is ever used that no copy read or
+listed. The winner must be at least 3 characters and supported by at least
+as many message-distinct copies within 2 edits of it as its pattern tier
+requires; copies of overlapping samples are one observation. The fused call
+then passes the same blocklist, notch, grammar, cty, zero-evidence, variant
+(this episode's own copy texts aside), dedupe and lookup checks as any
+candidate. A fusion is refused outright when any copy that disagrees with
+the winner has itself already spotted on this channel: a copy that spotted
+is a station, not damage. Fusion only ever adds a spot the exact path did
+not confirm (after a grammar, cty or repetition withhold); it never
+withholds one. Addressee and mention copies (MAN-201) never feed it. V60
+to V65.
+
 **Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
 Before a candidate spots, it is checked against every other decoded,
 spottable-shaped word observed on the same track within the same 90 s
@@ -1951,7 +1988,11 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 (non-gating RST/QRL? spot annotations, MAN-272) in
 `crates/manta-spot/tests/golden_v32_v33.rs`; V53-V57 (exchange roles, MAN-201)
 in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
-`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`.
+`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`; V59-V65
+(repetition evidence, MAN-200) in
+`crates/manta-spot/tests/golden_v59_v65_repetition_evidence.rs`. V60-V65
+run with `repetition_fusion` on and repeat with it off, where the off run
+gives today's spots.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
@@ -1997,6 +2038,13 @@ in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
 | V56 | allowlist-skips-plausibility-not-role (MAN-201) | W1AW listed, `W1AW DE K1ABC K` and `DE K1ABC K1ABC OP W1AW K`; lone `W1AW`; K5ARH listed, `K5ARH T` | No W1AW spot; one `Unknown` at close; one `Beacon` at K5ARH's boundary |
 | V57 | decided-once-settled (MAN-201) | `DE K5ARH`, K5ARH listed, then each of: next word, `K`, `<AR>`, a character or `TrackMeta` 5 s later, `TrackClosed` of either kind | No spot while K5ARH is the newest word; one spot at its own timestamp on each. 4.35 s settles nothing; `<ERR>` retracts a word; an older held occurrence behind a newer spot is withheld `dedupe`; a settled mention stays one after its framing scrolls out |
 | V58 | beacon-evidence (MAN-201) | `K5ARH T` and similar unlisted, listed and guarded; `V V V K5ARH` | Unlisted: no spot, one `BeaconNoEvidence` per occurrence. Listed: one `Beacon`. Guarded: neither. `V V V` keeps V18's deferred path |
+| V59 | same-samples-count-once (MAN-200) | `CQ W1AW K` with W1AW at 100/200/300/350, boundary 400; then a replay `CQ W1AW K` on the same track with W1AW at 150/250/350/400, boundary 420, then close; control: the same second message 100 000 samples later | No spot; both W1AW decisions are `Repetition` with reps 1. Control: W1AW `Cq` `confirmed` with reps 2 |
+| V60 | complementary-copies-fuse (MAN-200) | `CQ W1AV K`, then `CQ W1AQ K` 100 000 samples later on one track; the 4th character is V or Q at 0.45 with alternative W at 0.40, every other character 0.95; no decode of W1AW | On: one spot, W1AW `Cq` `confirmed` at the W1AQ word's boundary; decisions W1AV withheld `Repetition` reps 1, W1AQ withheld `Repetition` reps 1, W1AW spotted reps 2 `confirmation: Fused`. Off: no spot |
+| V61 | top1-majority-and-indels (MAN-200) | `CQ W1AV K`, `CQ W1EW K`, `CQ M1AW K` (top-1 only); `CQ W1A K`, `CQ W1AWE K`, `CQ W1AW K` | No spot after two; W1AW `Cq` `Fused` after the third (M1AW's own decision is withheld `Cty` and it still feeds the lattice). Indels: W1AW spotted `Fused` at the third, with no `Repetition` decision for that word |
+| V62 | fusion-abstains (MAN-200) | W1AV + W1AQ with no alternatives; `CQ W1A? K` + `CQ W1AV K`; `CQ W1AV K` twice | No spot and no decision names W1AW; no spot; W1AV spots exactly as with fusion off, `confirmation: ExactRepeat` |
+| V63 | only-self-ids-fuse (MAN-200) | `W1AV DE K1ABC K`, `W1AQ DE K1ABC K` with V60's alternatives; `DE K1ABC OP W1AV K` then `CQ W1AQ K` | K1ABC spots `De` (exact); no decision names W1AW in either |
+| V64 | same-samples-one-observation (MAN-200) | Tracks 1 and 2 decode one transmission as `CQ W1AV K` and `CQ W1AQ K` with overlapping spans (V60 alternatives), at the same frequency and 60 Hz apart; a third track 300 Hz away with its own W1AQ; a same-track overlapping replay | No W1AW in any case |
+| V65 | tier-bar-and-spotted-copy (MAN-200) | Unlisted AB2KLK: 3 exact + AB2KLX, then 4 exact + AB2KLX; K1AV twice 70 s apart spots, then `CQ W1AW K` at 140 s and `CQ W1AV K` at 141 s | No spot at 3 + 1; AB2KLK spotted `Fused` reps 5 at AB2KLX's boundary at 4 + 1. The majority reads W1AV but K1AV, a disagreeing copy, already spotted on this channel: no W1AV and no W1AW spot |
 
 ### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
 
@@ -2253,6 +2301,8 @@ allowlist = []
 # Pattern tier counts: normal = common 2 / listed 3 / unlisted 5; minimal = 2 for all.
 # Allowlisted calls and beacons stay exempt.
 validation_level = "normal"
+# MAN-200: damaged self-ID copies may jointly confirm a call (opt-in).
+repetition_fusion = false
 # Independent list derived from MASTER.SCP. One [+]PATTERN per line, e.g. +K5@@@.
 # Leading # comments; @ for later letters, # for later digits. Same path rule.
 # Unset: bundled. --patterns overrides it.
