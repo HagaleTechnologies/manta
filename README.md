@@ -157,6 +157,11 @@ SoapySDR module yourself, and getting the SDRplay one can too
 (SoapySDRPlay3 also needs SDRplay's API); running this manta binary still
 needs no Rust toolchain.
 
+On an SDRplay, `--soapy-gain` (and `[input] gain_db`) is an attenuation
+scale: a higher value makes the receiver less sensitive, and `0` is the
+most sensitive setting. Leave it unset to use the receiver's AGC, or
+compare settings on a signal you know is present.
+
 `./manta devices` lists a selector string for each receiver it finds; pass
 it to `--soapy-driver`. Choose a frequency and a sample rate your receiver
 supports: the rate rules and the remaining flags are in [Inputs](#inputs).

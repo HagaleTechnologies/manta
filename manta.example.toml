@@ -251,6 +251,7 @@ station_callsign = "N0CALL"
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):
 #driver = "driver=rtlsdr"            # required: SoapySDR device arguments
 #gain_db = 30.0                      # no default: the device's automatic gain
+# On an SDRplay, gain_db is an attenuation scale: a higher value is less sensitive; 0 is the most sensitive.
 
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required unless bands is set: the receiver's centre frequency, Hz

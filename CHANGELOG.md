@@ -347,6 +347,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-180: the `--soapy-gain` help, the `manta config init` scaffold,
+  `docs/CONFIG.md` and the README warn that on an SDRplay a higher value
+  means more attenuation, not more gain, and that `0` is the most sensitive
+  setting. How manta applies the gain is unchanged.
 - HPSDR network-radio input and its hardware-free tests are included in
   every build. The `hpsdr` Cargo feature remains an accepted no-op for
   compatibility; SoapySDR still needs `--features soapy` (MAN-239).
