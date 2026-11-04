@@ -161,7 +161,7 @@ fn v4_passes_end_to_end_from_wav() {
 /// Its "callsign validated within 90 s" check below now uses the real
 /// `manta-spot::Validator` (`report["spots"]`, M3 engine-wiring
 /// sub-project) instead of the earlier running-decoded-text substring scan
-/// -- see docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md.
+/// -- see docs/archive/plans/specs/2026-07-26-m3-engine-wiring-design.md.
 #[test]
 #[ignore]
 fn v5_passes_end_to_end_from_wav() {

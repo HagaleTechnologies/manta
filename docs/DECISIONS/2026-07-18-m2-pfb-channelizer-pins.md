@@ -1,8 +1,8 @@
 # M2 sub-project 1 (PFB channelizer) implementation pins
 
 This is the M2 sub-project 1
-(`docs/superpowers/plans/2026-07-18-m2-pfb-channelizer.md`, design:
-`docs/superpowers/specs/2026-07-18-m2-pfb-channelizer-design.md`)
+(`docs/archive/plans/plans/2026-07-18-m2-pfb-channelizer.md`, design:
+`docs/archive/plans/specs/2026-07-18-m2-pfb-channelizer-design.md`)
 implementation's pinned-decision record. Treat every numbered item below as
 decided; SPEC and docs/ still win on anything not listed here.
 

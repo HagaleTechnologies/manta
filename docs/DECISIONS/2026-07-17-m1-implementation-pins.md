@@ -1,6 +1,6 @@
 # M1 implementation pins
 
-This is the M1 (`docs/superpowers/plans/2026-07-17-m1-live-audio-decode.md`)
+This is the M1 (`docs/archive/plans/plans/2026-07-17-m1-live-audio-decode.md`)
 implementation's pinned-decision record. Treat every numbered item below as
 decided; SPEC and docs/ still win on anything not listed here.
 

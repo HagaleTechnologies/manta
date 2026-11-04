@@ -102,6 +102,9 @@ pub(crate) struct ServerSetup {
     pub rbn_compare: Option<manta_server::config::RbnCompareConfig>,
     /// MAN-320: the relay blocks, run like the single-input path's.
     pub relays: crate::RelayConfigs,
+    /// MAN-142: `[pskreporter]` and `[[wsjtx_output]]`, run like the
+    /// single-input path's.
+    pub outputs: crate::spot_outputs::SpotOutputs,
     pub replay_epoch: Option<i64>,
 }
 
@@ -723,6 +726,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 lists.clone(),
                 m.cfg,
                 setup.relays,
+                setup.outputs,
             )?;
             // MAN-324: one `bandState` per input per stream second, each
             // naming its input; track and decision records as with one.

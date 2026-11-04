@@ -831,6 +831,43 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-142 (D1): every `[pskreporter]` key is restart-only.
+    #[test]
+    fn pskreporter_changes_need_a_restart() {
+        let old = table("[pskreporter]\nenabled = false\nhost = 'report.pskreporter.info'\n");
+        let new = table("[pskreporter]\nenabled = true\nhost = '127.0.0.1'\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["pskreporter.enabled", "pskreporter.host"]
+        );
+        let none = table("");
+        assert_eq!(
+            restart_only_changes(&none, &table("[pskreporter]\nenabled = true\n")),
+            vec!["pskreporter.enabled"]
+        );
+    }
+
+    /// MAN-142 (D1): every `[[wsjtx_output]]` key is restart-only; a
+    /// second block is reported whole.
+    #[test]
+    fn wsjtx_output_changes_need_a_restart() {
+        let old = table("[[wsjtx_output]]\ndestination = '127.0.0.1:2237'\n");
+        let new = table("[[wsjtx_output]]\ndestination = '192.168.1.255:2237'\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["wsjtx_output[0].destination"]
+        );
+        let added = table(
+            "[[wsjtx_output]]\ndestination = '127.0.0.1:2237'\n\
+             [[wsjtx_output]]\ndestination = '224.0.0.1:2237'\n",
+        );
+        let changes = restart_only_changes(&old, &added);
+        assert!(
+            !changes.is_empty() && changes.iter().all(|p| p.starts_with("wsjtx_output")),
+            "{changes:?}"
+        );
+    }
+
     /// MAN-320: `dry_run_skipped` looks only at `rbn_uplink*` paths, so a
     /// relay edit in the same reload does not hold back a dry-run flip.
     #[test]
