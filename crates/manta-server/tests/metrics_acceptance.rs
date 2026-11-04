@@ -32,10 +32,13 @@ fn sample_spot() -> Spot {
         wpm: 28.0,
         spot_type: SpotType::Cq,
         confidence: 0.9,
+        emission_state: manta_spot::EmissionState::Confirmed,
         track_id: 1,
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     }
 }
 

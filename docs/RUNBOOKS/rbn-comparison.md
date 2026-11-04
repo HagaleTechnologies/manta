@@ -294,6 +294,294 @@ Live and offline grades can differ in one known way: a live RBN report is
 timed by when it arrived, an archived one by RBN's own timestamp. That
 matters only for a report within a few seconds of a window edge.
 
+## Paired report against a co-located skimmer (MAN-97)
+
+`manta grade --paired` compares one node's spots with one reference skimmer
+on the same antenna, both ways, and prints one report:
+
+- **recall**: the reference's reports that manta also spotted;
+- **missed**: the reference's reports manta did not spot;
+- **candidate false spots**: manta's spots the reference did not report.
+
+Use it with a CW Skimmer Server (SkimSrv) on the same antenna, through
+`--reference` and a saved copy of its telnet output, or with an RBN
+skimmer's daily-archive rows, through `--rbn` and `--spotter`. It is the
+offline mechanism behind a nightly report: run it from cron over the
+night's files. No recorder or scheduler ships with manta.
+
+### The reference transcript
+
+`--reference` reads a skimmer's `DX de` lines saved to files, or
+directories of them (their `*.txt` and `*.log` files, sorted). Both layouts
+a skimmer's telnet port sends are read, by the same parser the skimmer
+relay uses:
+
+```text
+DX de W3XYZ-#:  14025.0  W1AW           CW    21 dB  25 WPM  CQ      0005Z
+DX de W3XYZ-#:  14030.0  DL1ABC         19 dB  28 WPM  CQ      0110Z
+```
+
+- A line may start with its UTC arrival time, then a space:
+  `2026-10-31T00:05:00Z DX de ...`. That stamp is the report's time, and the
+  line's own `HHMMZ` is ignored, as the live path uses arrival time. A
+  stamp that is not a UTC time is an error naming the file and line.
+- A line without a stamp takes its UTC day from the file name (the last
+  real `YYYY-MM-DD` in it, as in `reference-2026-10-31.txt`) and its minute
+  from its `HHMMZ`, at the minute's middle (30 s in), so its time is at most
+  30 s off either way. A minute more than 12 hours before the previous
+  date-less line's starts the next UTC day (`2358Z` then `0003Z`). Without
+  a day in the file name such a line is an error naming the file and line.
+  Keep one file per UTC day, or stamp every line.
+- RTTY and other non-CW spot lines are counted and skipped, and so is any
+  other line: a banner, a login prompt, a torn last line. Blank lines and
+  CRLF endings are ignored.
+- Each file covers only the span from its first to its last CW report, as
+  each RBN CSV does, and spans join when at most 60 s apart. With
+  `--paired`, only reports from an admitted spotter count toward the span.
+- The node's own calls are not excluded: the transcript holds only that
+  skimmer's spots, and a SkimSrv usually runs under the node's base call
+  (manta `W3XYZ-1` beside SkimSrv `W3XYZ`). `--spotter W3XYZ` is accepted.
+  With `--rbn`, own calls stay excluded as before.
+
+`--reference` also works without `--paired`, giving the one-way table above
+against a transcript.
+
+This layout and the capture recipe below have not been checked against a
+live SkimSrv's output. SkimSrv's own `spots.txt` file is not read: its
+format has not been seen.
+
+### Running it
+
+```console
+$ manta grade --paired --spots spots-2026-10-31.jsonl --reference reference-2026-10-31.txt \
+    --passband-khz 14000-14070 --start 2026-10-31T00:00:00Z --end 2026-10-31T06:00:00Z
+spots: 8 from 1 file (0 grade records skipped, 0 torn lines)
+reference: 8 CW reports from 1 file (1 non-CW line, 1 other line skipped), 2026-10-31 00:05:00Z to 06:02:00Z
+spotters: all
+own calls are not excluded from a --reference transcript
+window: 600 s; frequency disagreement over 500 Hz; speed disagreement over 3 WPM and 20% of RBN's median
+paired: node W3XYZ-1, 2026-10-31 00:00:00Z to 06:00:00Z, passband 14000-14070 kHz
+manta spots: 6 counted (1 out of passband, 1 out of window)
+reference reports: 5 counted (0 other spotters, 1 out of passband, 1 out of window, 1 not a plausible callsign)
+reference silence: longest 3:50:00 from 2026-10-31 02:00:00Z
+
+recall: 3 / 5 reference reports that manta also spotted (60.0%)
+missed: 2 reference reports (1 of them spotted by manta on another band)
+confirmed: 3 manta spots the reference also reported (match 2, disagree 1)
+candidate false: 2 / 5 manta spots the reference's span covered (40.0%): none 1, elsewhere 1
+unknown: 1 manta spot whose window the reference's span did not cover
+
+band   reports  found  missed  recall  spots  confirmed  none  elsewhere  unknown
+20m          5      3       2   60.0%      6          3     1          1        1
+total        5      3       2   60.0%      6          3     1          1        1
+
+missed by manta (no manta spot of the call on the report's band within 600 s):
+time                  call        freq kHz  dB  WPM  manta heard it on
+2026-10-31 00:20:00Z  N4RV         14021.0  18   24  -
+2026-10-31 01:10:00Z  DL1ABC       14030.0  19   28  40m
+
+candidate false spots (no reference report of the call on the spot's band within 600 s):
+time                  call        freq kHz  snr  conf  grade      reference heard it on
+2026-10-31 01:25:00Z  K5XYZ        14012.3   15  0.71  elsewhere  40m
+2026-10-31 03:00:00Z  W9ZZZ        14018.0    9  0.55  none       -
+
+dB is the reference's own figure (500 Hz); snr is manta's stream snr (2500 Hz).
+```
+
+- `--passband-khz LO-HI` is required: count only spots and reports inside
+  this range, in kHz. Repeatable. A SkimSrv often covers bands manta does
+  not, and its reports there are not misses.
+- `--start` and `--end` (UTC, `2026-10-31T00:00:00Z`) count only spots and
+  reports at or after `--start` and before `--end`. Without them everything
+  loaded counts.
+- Filters choose what is counted, never what can match. A report just
+  after `--end` can confirm a spot just before it, and manta's 40m spot can
+  make a 20m report `elsewhere`.
+- A reference report also needs a plausible callsign (`TEST` is not one:
+  manta can never spot it, so it is not a miss) and a spotter the spotter
+  filter admits.
+- With `--rbn`, `--paired` needs `--spotter`, the co-located skimmer:
+  against every RBN skimmer, each call heard anywhere would count as a miss.
+- `--paired` grades one node: spots from two `deCall`s are refused.
+- `--json` prints the report as one JSON object. Exit status is 0 whenever
+  the report is printed: it makes no pass or fail judgement.
+- `--passband-khz`, `--start` and `--end` need `--paired`.
+
+| Metric | Definition |
+|---|---|
+| recall | found / counted reference reports. A report is *found* when manta has a spot of the same call on the same band within the window either side of it. |
+| missed | counted reference reports that are not found. Of them, `missedElsewhere` were spotted by manta within the window on another band only. |
+| confirmed | counted manta spots graded `match` or `disagree`: a same-call, same-band reference report within the window (`disagree` when the frequency or speed is outside the tolerances). |
+| candidate false rate | (`none` + `elsewhere`) / (counted manta spots - `unknown`). `none`: the reference reported the call nowhere in the window, and its span covered the window. `elsewhere`: it reported the call only on another band. |
+| unknown | counted manta spots with no match whose window reaches outside the reference files' spans. Left out of every rate. |
+| reference silence | the longest gap between consecutive CW reports from an admitted spotter, on any band and with any call, inside `--start`/`--end`. |
+
+found + missed always equals the counted reference reports, and match +
+disagree + elsewhere + none + unknown the counted manta spots.
+
+### Outages, the window and the silence line
+
+- manta is taken to be up all night, so a manta outage shows as misses: an
+  operator must see it. The reference is trusted only between each file's
+  first and last report from an admitted spotter, so manta's unmatched
+  spots outside that span are `unknown`, not false: a reference outage is
+  not manta's fault. Another skimmer's reports in the same file, as in an
+  RBN CSV, cover nothing. So two daily RBN CSVs join at midnight only when
+  the selected skimmer's last report in the first and first report in the
+  second lie at most 60 s apart; otherwise spots whose window reaches into
+  that gap are `unknown`.
+- Inside a file a reference outage shows only on the `reference silence`
+  line. It is a hint to read the night's numbers with care, never used to
+  grade.
+- The window defaults to 600 s, manta's re-spot suppression interval, so a
+  station both skimmers hear all night always has a reference report within
+  the window of each manta spot. With the live comparator's 180 s, such a
+  station grades `none` whenever the two skimmers' re-spots fall out of
+  phase. `--window-secs` changes it; `--config`'s `window_secs` is not used
+  (its other tolerances are).
+
+### The paired report's JSON
+
+One object per run, on one line. `recall`, `candidateFalseRate` and
+`referenceSpan` are `null` when there is nothing to divide by or no CW
+report; `start` and `end` are `null` when not given; `snrDb`, `wpm`, `snr`
+and `decodeConfidence` are `null` when the source line lacks them. Times
+are Unix seconds. It has all 65 keys below, in wire order (`a.b` is key `b`
+of object `a`; `a[].b` is key `b` of each object in array `a`):
+
+- `kind` (always `pairedReport`)
+- `node` (the spots' `deCall`, empty when they carry none)
+- `referenceSource` (`transcript` for `--reference`, `rbn` for `--rbn`)
+- `spotters` (the spotter filter; empty means every spotter)
+- `start` (`--start`, or `null`)
+- `end` (`--end`, or `null`)
+- `passbandsKhz` (each `--passband-khz` as `[lo, hi]` in kHz)
+- `windowS` (the window either side of a spot or report, in seconds)
+- `mantaSpots` (manta's side)
+- `mantaSpots.loaded` (every spot read)
+- `mantaSpots.outOfPassband` (spots outside every passband)
+- `mantaSpots.outOfWindow` (spots inside a passband but outside `--start`/`--end`)
+- `mantaSpots.counted` (spots inside both)
+- `mantaSpots.match` (counted spots graded `match`)
+- `mantaSpots.disagree` (counted spots graded `disagree`)
+- `mantaSpots.elsewhere` (counted spots graded `elsewhere`)
+- `mantaSpots.none` (counted spots graded `none`)
+- `mantaSpots.unknown` (counted spots graded `unknown`)
+- `referenceReports` (the reference's side)
+- `referenceReports.loaded` (every CW report read)
+- `referenceReports.otherSpotter` (reports from a spotter the filter rejects)
+- `referenceReports.outOfPassband` (reports outside every passband)
+- `referenceReports.outOfWindow` (reports outside `--start`/`--end`)
+- `referenceReports.implausibleCall` (reports of a call manta could never spot)
+- `referenceReports.counted` (the recall denominator)
+- `referenceReports.found` (counted reports manta also spotted)
+- `referenceReports.missed` (counted reports manta did not spot)
+- `referenceReports.missedElsewhere` (missed reports manta spotted on another band)
+- `recall` (found / counted, or `null`)
+- `candidateFalseRate` ((none + elsewhere) / (counted - unknown), or `null`)
+- `referenceSpan` (the admitted reports' span, or `null`)
+- `referenceSpan.from` (the first admitted report's time)
+- `referenceSpan.to` (the last admitted report's time)
+- `referenceSpan.longestSilenceS` (the longest gap inside the window, or `null` with fewer than two reports there)
+- `referenceSpan.longestSilenceFrom` (when that gap began)
+- `bands` (one row per band, highest band first)
+- `bands[].band` (the band name, `unknown` outside every band)
+- `bands[].referenceReports` (counted reference reports on the band)
+- `bands[].found` (of them, found)
+- `bands[].missed` (of them, missed)
+- `bands[].mantaSpots` (counted manta spots on the band)
+- `bands[].match` (of them, `match`)
+- `bands[].disagree` (of them, `disagree`)
+- `bands[].elsewhere` (of them, `elsewhere`)
+- `bands[].none` (of them, `none`)
+- `bands[].unknown` (of them, `unknown`)
+- `missed` (the missed reports, by time, call and frequency)
+- `missed[].time` (the report's time)
+- `missed[].call` (the reported call)
+- `missed[].band` (the report's band)
+- `missed[].freqHz` (the report's frequency, whole Hz)
+- `missed[].snrDb` (the reference's own SNR figure, 500 Hz convention)
+- `missed[].wpm` (the reference's speed)
+- `missed[].spotter` (the reporting skimmer)
+- `missed[].mantaBands` (bands manta spotted the call on within the window)
+- `candidateFalse` (the candidate false spots, by time and spot id)
+- `candidateFalse[].spotId` (the SpotMessage `id`)
+- `candidateFalse[].time` (the spot's time)
+- `candidateFalse[].call` (the spotted call)
+- `candidateFalse[].band` (the spot's band)
+- `candidateFalse[].freqHz` (the spot's frequency in Hz)
+- `candidateFalse[].snr` (manta's stream SNR, 2500 Hz convention)
+- `candidateFalse[].decodeConfidence` (manta's decode confidence)
+- `candidateFalse[].grade` (`none` or `elsewhere`)
+- `candidateFalse[].referenceBands` (bands the reference reported the call on within the window)
+
+### A nightly run
+
+An example capture and cron line, not run against a live SkimSrv. Save the
+skimmer's telnet output with each line stamped by its arrival time, for
+example with `nc` and `ts` from moreutils (log in with the node's call when
+SkimSrv asks):
+
+```sh
+# Example only: stamp each DX de line with its UTC arrival time.
+nc skimsrv.local 7310 | TZ=UTC ts '%Y-%m-%dT%H:%M:%SZ' >> /var/lib/skimsrv-capture/reference-$(date -u +%F).txt
+```
+
+Then grade the night once it is over:
+
+```sh
+# 06:15 UTC daily: the night 00:00-06:00Z (example; not run against a live SkimSrv)
+15 6 * * * manta grade --paired --spots /var/lib/manta-field/spots --reference /var/lib/skimsrv-capture --passband-khz 14000-14070 --start "$(date -u +\%Y-\%m-\%dT00:00:00Z)" --end "$(date -u +\%Y-\%m-\%dT06:00:00Z)" > /var/lib/manta-field/paired-$(date -u +\%F).txt
+```
+
+The rules and their reasons are in
+[docs/DECISIONS/2026-11-01-man97-paired-skimmer-report.md](../DECISIONS/2026-11-01-man97-paired-skimmer-report.md).
+
+## Grading with the language prior enabled (MAN-317)
+
+The prior ships off. Passing synthetic vectors alone does not authorize a
+default flip. Collect a complete, paired seven-day live comparison before
+proposing that change. No recorded node log for this experiment ships in the
+repository, and this ticket does not claim that the live week passed.
+
+Run the same binary on the same recorded IQ or simultaneous identical SDR
+streams, once with `[decode] prior = "off"` and once with `prior = "on"`.
+Keep every other setting fixed, including the SCP/cty versions, calls-heard
+file, validation level, receiver frequencies and RBN tolerances. Save the
+configs and list hashes with both sets of node logs. Use separate output
+directories and listener ports for parallel nodes. Prior-enabled config:
+
+```toml
+[decode]
+prior = "on"
+prior_weight = 2.0
+reading_margin = 3.0
+held_readings = 4
+```
+
+Grade both sets against the same complete daily RBN archives and the same
+reference skimmer and exclusions:
+
+```sh
+scripts/score-against-rbn.py --node-log prior-off/ --rbn rbn-week/ --spotter K5TR
+scripts/score-against-rbn.py --node-log prior-on/ --rbn rbn-week/ --spotter K5TR
+```
+
+The script grades already-produced logs; the prior config belongs to the
+node that produced them. It cannot apply a different decoder to a spot log.
+Compare `manta grade`'s `band, spots, match, disagree, elsewhere, none,
+unknown` summaries. Compute the `none` rate as `none / (spots - unknown)`
+on each paired band and over all bands with covered observations. Require
+at least one covered spot in each compared population and require the
+prior-on rate not to exceed the prior-off rate. Report raw counts, missing
+coverage and every band alongside the aggregate; do not count `unknown`
+as evidence that the prior is correct.
+
+Attach those summaries and the archived inputs to the separate default-flip
+change. It must also show zero bogus calls on prior-on V8, V8w and VC3 with
+the existing validation floors intact. A failed precision or live-rate bar
+keeps the default off.
+
 ## Secondary skimmers and your own spots
 
 Reports from your own callsign, with and without SSID, never count:

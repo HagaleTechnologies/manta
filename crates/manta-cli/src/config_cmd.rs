@@ -263,7 +263,7 @@ fn reject_duplicate_ports(loaded: &Loaded) -> Result<()> {
 /// MAN-132: telnet and JSON share `bind_addr`, metrics has its own
 /// `metrics_bind_addr`.
 pub(crate) struct Listener {
-    /// `telnet`, `json` or `metrics`.
+    /// `telnet`, `json`, `metrics`, `live` or `rtty_telnet`.
     pub name: &'static str,
     pub port_key: &'static str,
     pub addr_key: &'static str,
@@ -272,7 +272,8 @@ pub(crate) struct Listener {
 }
 
 /// `[server]`'s listeners, in the order `run` binds them: telnet, JSON,
-/// metrics, then (MAN-324) the live-state listener when `live_port` is set.
+/// metrics, then (MAN-324) the live-state listener when `live_port` is set,
+/// then (MAN-322) the RTTY telnet listener when `rtty_telnet_port` is set.
 pub(crate) fn server_listeners(server: &ServerConfig) -> Vec<Listener> {
     let listener = |name, port_key, addr_key, addr: &str, port| Listener {
         name,
@@ -311,6 +312,15 @@ pub(crate) fn server_listeners(server: &ServerConfig) -> Vec<Listener> {
             "live_bind_addr",
             &server.live_bind_addr,
             live_port,
+        ));
+    }
+    if let Some(rtty_telnet_port) = server.rtty_telnet_port {
+        listeners.push(listener(
+            "rtty_telnet",
+            "rtty_telnet_port",
+            "bind_addr",
+            &server.bind_addr,
+            rtty_telnet_port,
         ));
     }
     listeners
@@ -448,6 +458,10 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
                     " live_port={live_port} live_bind_addr={}",
                     s.live_bind_addr
                 ));
+            }
+            // MAN-322: likewise only when the RTTY telnet listener is on.
+            if let Some(rtty_telnet_port) = s.rtty_telnet_port {
+                l.push_str(&format!(" rtty_telnet_port={rtty_telnet_port}"));
             }
             let optional = [
                 ("status_interval_secs", s.status_interval_secs),
@@ -608,6 +622,12 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             .map_or("bundled".to_string(), |p| p.display().to_string()),
     ));
 
+    if let Some(path) = &spot.calls_heard_path {
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" calls_heard_path={}", path.display()));
+        }
+    }
+
     let detector = set_keys(loaded, "detector", &[]);
     lines.push(if detector.is_empty() {
         "detector: defaults".to_string()
@@ -730,6 +750,19 @@ fn input_summary(file: &crate::config::InputFile) -> String {
         (
             "record_iq",
             shared.record_iq.as_ref().map(|p| p.display().to_string()),
+        ),
+        // MAN-141: only when set, so every existing summary is unchanged.
+        (
+            "spectrum_udp",
+            shared.spectrum.as_ref().map(|s| s.dest.to_string()),
+        ),
+        (
+            "spectrum_name",
+            shared
+                .spectrum
+                .as_ref()
+                .and_then(|s| s.name.as_deref())
+                .map(crate::fmt::quoted),
         ),
     ] {
         if let Some(v) = value {
@@ -1014,6 +1047,71 @@ mod tests {
     }
 
     #[test]
+    fn server_listeners_includes_rtty_telnet_only_when_set() {
+        let without =
+            load_text("[server]\nstation_callsign = \"W1AW\"\nlive_port = 7303\n").unwrap();
+        let names: Vec<&str> = server_listeners(without.server.as_ref().unwrap())
+            .iter()
+            .map(|l| l.name)
+            .collect();
+        assert_eq!(names, ["telnet", "json", "metrics", "live"]);
+        let with = load_text(
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             rtty_telnet_port = 7304\n",
+        )
+        .unwrap();
+        let listeners = server_listeners(with.server.as_ref().unwrap());
+        let rtty = listeners.last().unwrap();
+        assert_eq!(
+            (
+                rtty.name,
+                rtty.port_key,
+                rtty.addr_key,
+                rtty.addr.as_str(),
+                rtty.port
+            ),
+            (
+                "rtty_telnet",
+                "rtty_telnet_port",
+                "bind_addr",
+                "127.0.0.1",
+                7304
+            )
+        );
+    }
+
+    #[test]
+    fn an_rtty_telnet_port_equal_to_telnet_port_is_refused() {
+        let err = load_text("[server]\nstation_callsign = \"W1AW\"\nrtty_telnet_port = 7300\n")
+            .and_then(|loaded| reject_duplicate_ports(&loaded))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "[server]: rtty_telnet_port 7300 is the same as telnet_port; \
+                 each server needs its own port"
+            ),
+            "{err}"
+        );
+        let ok =
+            load_text("[server]\nstation_callsign = \"W1AW\"\nrtty_telnet_port = 7304\n").unwrap();
+        assert!(reject_duplicate_ports(&ok).is_ok());
+    }
+
+    #[test]
+    fn summary_names_rtty_telnet_port_only_when_set() {
+        let without = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
+        let server = without.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(!server.contains("rtty_telnet"), "{server}");
+        let with = lines_of("[server]\nstation_callsign = \"W1AW\"\nrtty_telnet_port = 7304\n");
+        let server = with.iter().find(|l| l.starts_with("server:")).unwrap();
+        assert!(
+            server.ends_with("line_format=rbn rtty_telnet_port=7304"),
+            "{server}"
+        );
+    }
+
+    #[test]
     fn summary_names_live_port_and_bind_addr_only_when_set() {
         let without = lines_of("[server]\nstation_callsign = \"W1AW\"\n");
         let server = without.iter().find(|l| l.starts_with("server:")).unwrap();
@@ -1154,6 +1252,30 @@ mod tests {
             line(&lines_of(&body), "input:"),
             "input: type=hpsdr host=192.0.2.10 port=1024 protocol=2 freq_hz=7030000 \
              rate_hz=192000 auto_attenuation=true"
+        );
+    }
+
+    #[test]
+    fn config_check_prints_the_spectrum_feed_only_when_set() {
+        // MAN-141: design section 1's input line.
+        let body = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.20\"\nport = 1024\n\
+                    freq_hz = 14050000.0\nrate_hz = 192000.0\n";
+        assert_eq!(
+            line(&lines_of(body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000"
+        );
+        let body = format!("{body}spectrum_udp = \"127.0.0.1:13064\"\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000 spectrum_udp=127.0.0.1:13064"
+        );
+        let body = format!("{body}spectrum_name = \"Rig 2\"\n");
+        assert_eq!(
+            line(&lines_of(&body), "input:"),
+            "input: type=hpsdr host=192.168.1.20 port=1024 protocol=auto freq_hz=14050000 \
+             rate_hz=192000 spectrum_udp=127.0.0.1:13064 spectrum_name=\"Rig 2\""
         );
     }
 
@@ -1887,6 +2009,7 @@ mod tests {
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
         ("server", "live_port"),
+        ("server", "rtty_telnet_port"),
         ("server", "station_callsign"),
         ("server", "operator_name"),
         ("server", "operator_qth"),
@@ -1920,12 +2043,15 @@ mod tests {
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
+        ("input", "spectrum_udp"),
+        ("input", "spectrum_name"),
         ("input", "iq_format"),
         ("input", "sample_rate_hz"),
         ("spot", "blocklist_path"),
         ("spot", "notch_path"),
         ("spot", "cty_path"),
         ("spot", "scp_path"),
+        ("spot", "calls_heard_path"),
         ("spot", "list_cache_dir"),
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),

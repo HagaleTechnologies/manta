@@ -33,6 +33,8 @@ mod devices;
 mod doctor_checks;
 mod fmt;
 mod grade_cmd;
+mod grade_paired;
+mod grade_transcript;
 mod health_cmd;
 mod hpsdr_group;
 mod list_cache;
@@ -47,6 +49,7 @@ mod relay_socket;
 mod reload;
 mod silent;
 mod source_check;
+mod spectrum_feed;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -152,6 +155,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         #[command(flatten)]
         filters: FilterOpts,
     },
@@ -205,6 +211,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         /// Write one JSON object per reference spot to this file. The
         /// summary always goes to stdout as well.
         #[arg(long)]
@@ -522,6 +531,9 @@ enum Command {
         // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
         #[arg(long, value_parser = parse_engine)]
         engine: Option<Engine>,
+        /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+        #[arg(long, value_parser = parse_prior)]
+        prior: Option<manta_decode::config_file::PriorSwitch>,
         #[command(flatten)]
         filters: FilterOpts,
         #[command(flatten)]
@@ -1254,8 +1266,11 @@ enum Command {
     /// archive) and RBN daily-dump CSVs, and grades every spot the way
     /// `[rbn_compare]` grades it live: match, disagree, elsewhere, none or
     /// unknown. Prints a per-band summary, or the grade records with
-    /// --json. Never reads MANTA_* variables: the output depends only on
-    /// the inputs and flags.
+    /// --json. --reference grades against a skimmer's saved `DX de` lines
+    /// (a co-located CW Skimmer Server) instead of RBN CSVs, and --paired
+    /// grades both ways: recall, the reports manta missed and its candidate
+    /// false spots. Never reads MANTA_* variables: the output depends only
+    /// on the inputs and flags.
     Grade {
         #[command(flatten)]
         args: grade_cmd::Args,
@@ -2049,6 +2064,17 @@ impl IqSource for FixedCenterFreqSource {
         self.inner.take_missing_samples()
     }
 
+    /// MAN-202: forwarded as `take_discontinuity` is (a SoapySDR overflow
+    /// reaches `listen()` through this wrapper).
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
+    }
+
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
     /// end an outage where acquisition began.
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -2461,7 +2487,38 @@ fn start_input_recording(
 /// adds nothing to the stop budget the service manager allows
 /// (`TimeoutStopSec=60` against the 50 s `SHUTDOWN_DRAIN_DEADLINE` plus
 /// 2 s of runtime shutdown) beyond this bound when the drain is shorter.
+/// With `RECORDING_PUBLICATION_GRACE` after it, it still ends inside that
+/// drain (MAN-453).
 const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// MAN-453: how long after `RECORDING_FINISH_TIMEOUT` a writer that has
+/// already begun publishing may take to finish. One window for every
+/// recording of the run, as the timeout is one deadline, so recording's
+/// part of a stop ends 7 s after `close_recordings`, inside the drain.
+const RECORDING_PUBLICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// MAN-453: what `finish` gets at `now` for a recording closed with
+/// `deadline`: the rest of the timeout, then the rest of the shared grace.
+fn recording_finish_budget(
+    deadline: std::time::Instant,
+    now: std::time::Instant,
+) -> (std::time::Duration, std::time::Duration) {
+    let grace_end = deadline + RECORDING_PUBLICATION_GRACE;
+    (
+        deadline.saturating_duration_since(now),
+        grace_end.saturating_duration_since(deadline.max(now)),
+    )
+}
+
+/// MAN-453: finishes one recording with what is left of `deadline` and of
+/// the publication grace after it.
+fn finish_by(
+    handle: manta_input::RecordingHandle,
+    deadline: std::time::Instant,
+) -> manta_input::RecordingOutcome {
+    let (timeout, grace) = recording_finish_budget(deadline, std::time::Instant::now());
+    handle.finish(timeout, grace)
+}
 
 /// MAN-309: closes every recording's queue once decoding has ended, so
 /// each writer finalizes during the client drain. Returns the one deadline
@@ -2498,7 +2555,7 @@ fn finish_recording(
     deadline: std::time::Instant,
 ) -> Result<()> {
     let recorded = handle.path().to_path_buf();
-    let outcome = handle.finish(deadline.saturating_duration_since(std::time::Instant::now()));
+    let outcome = finish_by(handle, deadline);
     report_recording(&recorded, outcome)
 }
 
@@ -2509,7 +2566,7 @@ fn finish_recording(
 /// reports it; the run is failing already, so nothing is returned.
 fn discard_empty_recording(handle: manta_input::RecordingHandle, deadline: std::time::Instant) {
     let recorded = handle.path().to_path_buf();
-    match handle.finish(deadline.saturating_duration_since(std::time::Instant::now())) {
+    match finish_by(handle, deadline) {
         manta_input::RecordingOutcome::Finished { samples: 0, .. } => {
             let removed = std::fs::remove_file(manta_input::metadata_path(&recorded))
                 .and_then(|()| std::fs::remove_file(&recorded));
@@ -3126,6 +3183,34 @@ fn build_pipeline_config(
     Ok((cfg, [cty_in_use, scp_in_use]))
 }
 
+/// Shares live country/SCP cells with the running validator. No list generates text.
+fn attach_language_prior(
+    cfg: &mut PipelineConfig,
+    spot: &SpotResolved,
+    lists: Option<std::sync::Arc<manta_engine::ReferenceLists>>,
+) -> Result<()> {
+    if !cfg.decode.prior_enabled {
+        return Ok(());
+    }
+    let heard = match &spot.calls_heard_path {
+        Some(path) => manta_spot::prior::CallsHeard::load(path)
+            .with_context(|| format!("reading calls-heard file {}", path.display()))?,
+        None => manta_spot::prior::CallsHeard::default(),
+    };
+    let lists = lists.unwrap_or_else(|| {
+        std::sync::Arc::new(manta_engine::ReferenceLists::new(
+            cfg.cty_table(),
+            cfg.scp_set(),
+        ))
+    });
+    cfg.decode.prior = Some(std::sync::Arc::new(manta_spot::prior::LanguagePrior::new(
+        lists,
+        heard,
+        cfg.decode.prior_weight,
+    )));
+    Ok(())
+}
+
 /// MAN-316 D3 steps 1 and 2 for one list: the text an explicit path or a
 /// hash pin chooses, or `None` for the built-in copy (no path and no pin).
 /// A pin matching the built-in copy returns the built-in text, reported as
@@ -3225,6 +3310,15 @@ fn validate_decode_config(
     cfg: manta_decode::decoder::DecodeConfig,
     origin: &str,
 ) -> Result<manta_decode::decoder::DecodeConfig> {
+    if !cfg.prior_weight.is_finite() || cfg.prior_weight < 0.0 {
+        bail!("[decode] prior_weight must be finite and >= 0 in {origin}");
+    }
+    if !cfg.reading_margin.is_finite() || cfg.reading_margin < 0.1 {
+        bail!("[decode] reading_margin must be finite and >= 0.1 in {origin}");
+    }
+    if !(1..=16).contains(&cfg.held_readings) {
+        bail!("[decode] held_readings must be in 1..=16 in {origin}");
+    }
     // Codex review, PR #161: `fallback_hops = 0` deserializes successfully (it's a
     // plain u32 with no serde-level range check) but Evidence::push's anchor
     // computation divides by it (`self.hop_out % self.cfg.fallback_hops as u64`),
@@ -3640,6 +3734,28 @@ fn validate_decode_config(
 #[cfg(test)]
 fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
     Ok(config::load(config, config::Env::Ignore)?.decode)
+}
+
+fn parse_prior(value: &str) -> std::result::Result<manta_decode::config_file::PriorSwitch, String> {
+    match value {
+        "on" => Ok(manta_decode::config_file::PriorSwitch::On),
+        "off" => Ok(manta_decode::config_file::PriorSwitch::Off),
+        _ => Err("prior must be on or off".into()),
+    }
+}
+
+fn merge_cli_prior(
+    prior: Option<manta_decode::config_file::PriorSwitch>,
+    mut cfg: manta_decode::decoder::DecodeConfig,
+    origin: &str,
+) -> Result<manta_decode::decoder::DecodeConfig> {
+    if let Some(prior) = prior {
+        cfg.prior_enabled = prior == manta_decode::config_file::PriorSwitch::On;
+    }
+    if cfg.prior_enabled && cfg.engine == Engine::Hsmm {
+        bail!("[decode] prior requires legacy or edge-legacy in {origin}");
+    }
+    Ok(cfg)
 }
 
 /// SPEC v2 §7: an explicit `--engine` flag overrides the `[decode]` table's
@@ -4285,6 +4401,9 @@ const LISTENER_METRICS: &str = "metrics";
 /// MAN-324: the live-state listener, registered only when
 /// `[server].live_port` is set.
 const LISTENER_LIVE: &str = "live";
+/// MAN-322: the RTTY-only telnet listener, registered only when
+/// `[server].rtty_telnet_port` is set.
+const LISTENER_RTTY_TELNET: &str = "rtty_telnet";
 
 /// Spawns `fut` as a tracked listener task: `metrics` reports `name` down
 /// the moment that task ends, whether by panic or by returning (the
@@ -4576,6 +4695,28 @@ fn start_spot_server(
                 .as_ref()
                 .map(tokio::net::TcpListener::local_addr)
                 .transpose()?;
+            // MAN-322 D5: the RTTY-only telnet listener, only when
+            // `rtty_telnet_port` is set. It binds `bind_addr`, like
+            // `telnet_port`.
+            let rtty_telnet_listener = match cfg.rtty_telnet_port {
+                Some(rtty_telnet_port) => Some(
+                    tokio::net::TcpListener::bind((cfg.bind_addr.as_str(), rtty_telnet_port))
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "binding the RTTY telnet server (bind_addr = {}, \
+                                 rtty_telnet_port = {})",
+                                fmt::quoted(&cfg.bind_addr),
+                                rtty_telnet_port
+                            )
+                        })?,
+                ),
+                None => None,
+            };
+            let rtty_telnet_addr = rtty_telnet_listener
+                .as_ref()
+                .map(tokio::net::TcpListener::local_addr)
+                .transpose()?;
 
             // MAN-122 scenario 1. Emitted after every bind succeeds (so a bind
             // failure never produces a banner at all) but BEFORE any listener task is
@@ -4603,6 +4744,7 @@ fn start_spot_server(
                     json_addr: json_listener.local_addr()?,
                     metrics_addr: metrics_listener.local_addr()?,
                     live_addr,
+                    rtty_telnet_addr,
                     inputs: source.inputs,
                 })
             );
@@ -4617,6 +4759,9 @@ fn start_spot_server(
             if live_listener.is_some() {
                 metrics.enable_live();
                 metrics.set_listener_up(LISTENER_LIVE, true);
+            }
+            if rtty_telnet_listener.is_some() {
+                metrics.set_listener_up(LISTENER_RTTY_TELNET, true);
             }
 
             let telnet_ip_command_limiter =
@@ -4656,6 +4801,44 @@ fn start_spot_server(
                 profile.sett.segments = manta_server::sett::segments_for_inputs(source.coverage);
             }
             let profile = std::sync::Arc::new(profile);
+            // MAN-322 D5: an RTTY telnet listener speaks the CW listener's
+            // protocol and serves RTTY spots only, with its own client cap,
+            // per-IP quota and command budget (built from the same
+            // `telnet_*` keys).
+            if let Some(rtty_telnet_listener) = rtty_telnet_listener {
+                let rtty_telnet_ip_command_limiter =
+                    manta_server::rate_limit::IpRateLimiter::new_with_override(
+                        manta_server::telnet::MAX_TELNET_COMMANDS,
+                        manta_server::telnet::COMMAND_RATE_WINDOW,
+                        cfg.telnet_max_commands_per_ip,
+                    );
+                manta_server::rate_limit::spawn_stale_entry_reaper(
+                    rtty_telnet_ip_command_limiter.clone(),
+                );
+                spawn_tracked_listener(
+                    LISTENER_RTTY_TELNET,
+                    metrics.clone(),
+                    manta_server::telnet::serve(
+                        rtty_telnet_listener,
+                        bus.clone(),
+                        metrics.clone(),
+                        profile.clone(),
+                        shutdown_rx.clone(),
+                        tasks.clone(),
+                        manta_server::tasks::new_connection_limiter(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS,
+                        ),
+                        manta_server::tasks::IpQuota::new_with_override(
+                            manta_server::telnet::MAX_TELNET_CONNECTIONS_PER_IP,
+                            cfg.telnet_max_connections_per_ip,
+                        ),
+                        rtty_telnet_ip_command_limiter,
+                        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+                        cfg.line_format,
+                        manta_spot::SpotMode::Rtty,
+                    ),
+                );
+            }
             spawn_tracked_listener(
                 LISTENER_TELNET,
                 metrics.clone(),
@@ -4676,6 +4859,7 @@ fn start_spot_server(
                     telnet_ip_command_limiter,
                     manta_server::tasks::CLIENT_DRAIN_DEADLINE,
                     cfg.line_format,
+                    manta_spot::SpotMode::Cw,
                 ),
             );
             let json_ip_ping_limiter = manta_server::rate_limit::IpRateLimiter::new_with_override(
@@ -4976,6 +5160,7 @@ fn start_spot_server(
 /// `Clone` so a SIGHUP reload (MAN-78) re-resolves with the same flags.
 #[derive(Clone)]
 struct CliOverrides {
+    prior: Option<manta_decode::config_file::PriorSwitch>,
     device: Option<String>,
     source: Option<PathBuf>,
     source_iq: bool,
@@ -5009,6 +5194,7 @@ impl CliOverrides {
     /// so it validates exactly what the file and environment give `run`.
     fn none() -> Self {
         CliOverrides {
+            prior: None,
             device: None,
             source: None,
             source_iq: false,
@@ -5115,6 +5301,7 @@ struct SpotResolved {
     notch: Option<PathBuf>,
     cty: Option<PathBuf>,
     scp: Option<PathBuf>,
+    calls_heard_path: Option<PathBuf>,
     /// MAN-316: hash pins, CLI > `MANTA_SPOT_*_SHA256` > file.
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
@@ -5181,6 +5368,7 @@ fn resolve_spot_pinned(
         notch: cli_notch.or_else(|| spot.notch_path.clone()),
         cty: cli_cty.or_else(|| spot.cty_path.clone()),
         scp: cli_scp.or_else(|| spot.scp_path.clone()),
+        calls_heard_path: spot.calls_heard_path.clone(),
         cty_sha256: pins.cty_sha256.or_else(|| spot.cty_sha256.clone()),
         scp_sha256: pins.scp_sha256.or_else(|| spot.scp_sha256.clone()),
         refresh_lists: spot.refresh_lists,
@@ -5250,6 +5438,8 @@ struct ResolvedInput {
     capture_rate_hz: Option<f64>,
     /// MAN-309: `run` records this input's IQ here (`record_iq`).
     record_iq: Option<PathBuf>,
+    /// MAN-141: `run` sends this input's spectrum here (`spectrum_udp`).
+    spectrum: Option<config::SpectrumOut>,
     /// MAN-310: this stream's share of a split band plan.
     spawn_band_hz: Option<(f64, f64)>,
 }
@@ -5448,6 +5638,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
                     record_iq: n.input.shared.record_iq.clone(),
+                    spectrum: n.input.shared.spectrum.clone(),
                     spawn_band_hz: n.spawn_band_hz,
                 })
             })
@@ -5643,12 +5834,14 @@ fn record_iq_ignored_note(command: &str, loaded: &config::Loaded) -> Option<Stri
 
 /// Wraps an opened file replay for `mode` (MAN-269 D8): the loop sits inside
 /// the pacing, so one clock spans every pass. `reopen` opens each later pass.
-/// The default mode returns `first` unchanged.
+/// The default mode returns `first` unchanged. `stop` ends a pacing wait
+/// early (MAN-453).
 fn wrap_file_replay(
     first: Box<dyn IqSource>,
     mode: ReplayMode,
     label: String,
     reopen: manta_input::Reopen,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Box<dyn IqSource>> {
     let src: Box<dyn IqSource> = if mode.looped {
         Box::new(manta_input::LoopingSource::new(label, first, reopen))
@@ -5656,7 +5849,7 @@ fn wrap_file_replay(
         first
     };
     Ok(if mode.paced {
-        Box::new(manta_input::PacedSource::new(src)?)
+        Box::new(manta_input::PacedSource::new(src)?.with_stop_flag(stop))
     } else {
         src
     })
@@ -5667,6 +5860,25 @@ fn wrap_file_replay(
 /// offset. Shared with `manta doctor`'s `config` check (MAN-126).
 fn needs_dial_freq(has_server: bool, rf_aware: bool, dial_freq_hz: Option<f64>) -> bool {
     has_server && !rf_aware && dial_freq_hz.is_none()
+}
+
+/// MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's sidecar by
+/// opening it and maps any open error to "no RF frequency". For a file
+/// that exists, that error (an unsupported sample rate, a malformed
+/// header) is the real problem, so a dial guard calls this first to
+/// report it rather than ask for a dial frequency that would not help.
+fn report_iq_open_error(spec: &LiveSourceSpec, dial_freq_hz: Option<f64>) -> Result<()> {
+    if let LiveSourceSpec::File {
+        path,
+        source_iq: true,
+        raw,
+    } = spec
+    {
+        if path.exists() {
+            open_iq_source_file(path, *raw, dial_freq_hz)?;
+        }
+    }
+    Ok(())
 }
 
 /// How `manta doctor` names the configured receiver. Never includes the
@@ -5870,10 +6082,15 @@ fn prepare_config_for(
     if let Some(one) = one.filter(|one| needs_input_selection(&cli, *one)) {
         select_input(&mut loaded, one.name, one.command)?;
     }
+    let cli_prior = cli.prior;
     let rbn_opts = cli.rbn.clone();
     let resolved = resolve(cli, &loaded)?;
     check_rbn_compare(&rbn_opts, &loaded, &resolved)?;
-    let decode = merge_cli_engine(cli_engine, loaded.decode.clone());
+    let decode = merge_cli_prior(
+        cli_prior,
+        merge_cli_engine(cli_engine, loaded.decode.clone()),
+        &loaded.origin,
+    )?;
     let (mut pipeline, lists_in_use) = build_pipeline_config(
         resolved.freq_correction_ppm,
         &resolved.spot,
@@ -5881,6 +6098,7 @@ fn prepare_config_for(
         decode.engine,
     )?;
     pipeline.decode = decode;
+    attach_language_prior(&mut pipeline, &resolved.spot, None)?;
     Ok(Prepared {
         config_path,
         loaded,
@@ -6544,6 +6762,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             filters,
             config,
             engine,
+            prior,
         } => {
             let FilterOpts {
                 freq_correction_ppm,
@@ -6614,7 +6833,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                 patterns,
                 &loaded.spot,
             );
-            let decode_cfg = merge_cli_engine(engine, loaded.decode.clone());
+            let decode_cfg = merge_cli_prior(
+                prior,
+                merge_cli_engine(engine, loaded.decode.clone()),
+                &loaded.origin,
+            )?;
             let (mut cfg, lists_in_use) = build_pipeline_config(
                 freq_correction_ppm
                     .or(loaded.input.shared.freq_correction_ppm)
@@ -6625,6 +6848,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             )?;
             note_pinned_lists(&spot, &lists_in_use);
             cfg.decode = decode_cfg;
+            attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-131: say so before decoding when the reported frequencies
             // will be baseband offsets. Only for an existing file, so a
             // missing WAV still fails with just its `open WAV` error.
@@ -6679,6 +6903,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 if !report.rtty.is_empty() {
                     errln!("{}", rtty_line(&report.rtty, report.sample_rate_hz));
                 }
+                for event in &report.events {
+                    if let manta_decode::events::DecoderEvent::ReadingsHeld { readings, .. } = event
+                    {
+                        errln!("{}", text_lines::readings_line(readings));
+                    }
+                }
                 // MAN-315: the primary track's learned sender timing, on
                 // request only, so the default stderr stays the summary.
                 if timing {
@@ -6704,10 +6934,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             window_s,
             config,
             engine,
+            prior,
             jsonl,
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
-            note_ignored_tables(&loaded, "oracle", &["decode"]);
+            note_ignored_tables(&loaded, "oracle", &["decode", "spot"]);
             // MAN-309: a manta IQ recording opens through the same reader as
             // `decode`; the oracle reads one continuous capture, so a
             // recording with gaps is refused rather than spliced.
@@ -6723,7 +6954,26 @@ fn run_command() -> Result<std::process::ExitCode> {
             let (fs, center) = (src.sample_rate(), src.center_freq_hz());
             let iq = manta_input::read_all(src.as_mut())?;
             let spots = manta_testkit::oracle::parse_rbn_spots(&rbn_csv, &spotter, capture_start)?;
-            let cfg = merge_cli_engine(engine, loaded.decode);
+            let decode = merge_cli_prior(
+                prior,
+                merge_cli_engine(engine, loaded.decode.clone()),
+                &loaded.origin,
+            )?;
+            let spot = resolve_spot_pinned(
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                CliPins::default(),
+                None,
+                &loaded.spot,
+            );
+            let (mut pipeline, _) =
+                build_pipeline_config(0.0, &spot, loaded.detector, decode.engine)?;
+            pipeline.decode = decode;
+            attach_language_prior(&mut pipeline, &spot, None)?;
+            let cfg = pipeline.decode;
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -6812,6 +7062,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             dial_freq_hz,
             replay_epoch,
             engine,
+            prior,
             rbn,
             logging: log_opts,
         } => {
@@ -6830,6 +7081,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 patterns,
             } = filters;
             let cli = CliOverrides {
+                prior,
                 device,
                 source,
                 source_iq,
@@ -6908,6 +7160,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 Some(_) => None,
                 None => loaded.input.shared.record_iq.clone(),
             });
+            // MAN-141: `input.spectrum_udp`, dropped with the rest of the
+            // file's input when a source flag replaced it.
+            let spectrum_out = match resolved.replaced_file_source {
+                Some(_) => None,
+                None => loaded.input.shared.spectrum.clone(),
+            };
             // An existing --source is an existing destination too.
             if let Some(path) = &record_iq {
                 check_record_destination(path)?;
@@ -6944,6 +7202,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 let live = resolved.inputs.iter().any(|i| i.spec.is_reconnectable());
                 let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
                 let mut cfg = cfg;
+                attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
                 if run_lists.refresh.is_some() {
                     cfg.cty = Some(run_lists.lists.cty.load());
                     cfg.scp = Some(run_lists.lists.scp.load());
@@ -7005,22 +7264,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             // Servers start iff the resolved config has a [server] table
             // (D7); the guard runs after the load and before any source I/O.
             if needs_dial_freq(loaded.server.is_some(), has_rf_aware_source, dial_freq_hz) {
-                // MAN-269 review (P2): `is_rf_aware()` reads an IQ WAV's
-                // sidecar by opening it and maps any open error to "no RF
-                // frequency". For a file that exists, that error (an
-                // unsupported sample rate, a malformed header) is the real
-                // problem, so report it rather than asking for a dial
-                // frequency that would not help.
-                if let LiveSourceSpec::File {
-                    path,
-                    source_iq: true,
-                    raw,
-                } = spec
-                {
-                    if path.exists() {
-                        open_iq_source_file(path, *raw, dial_freq_hz)?;
-                    }
-                }
+                report_iq_open_error(spec, dial_freq_hz)?;
                 bail!(
                     "--dial-freq-hz is required with --config when using a plain \
                      audio device or --source WAV file -- neither reports a real RF \
@@ -7029,6 +7273,22 @@ fn run_command() -> Result<std::process::ExitCode> {
                      MANTA_INPUT_CENTER_FREQ_HZ, or input.center_freq_hz"
                 );
             }
+            // MAN-141: a spectrum feed needs a real RF frequency too, with
+            // or without [server], and its socket is bound before any
+            // source I/O (as `[[wsjtx_relay]]` sockets are).
+            if spectrum_out.is_some() && needs_dial_freq(true, has_rf_aware_source, dial_freq_hz) {
+                report_iq_open_error(spec, dial_freq_hz)?;
+                bail!(spectrum_feed::NEEDS_RF_MESSAGE);
+            }
+            // The input's name: its `name` key, else its type (MAN-13).
+            let spectrum_input = loaded
+                .inputs
+                .first()
+                .map_or(source_name, |n| n.name.as_str());
+            let spectrum_bound = spectrum_out
+                .as_ref()
+                .map(|out| spectrum_feed::bind(spectrum_input, out))
+                .transpose()?;
             if config_path.is_some() && loaded.server.is_none() {
                 logging::note(&format!(
                     "note: {} has no [server] table; the telnet/JSON/metrics servers are not \
@@ -7086,7 +7346,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // filled); it processes only what it has already read and
             // returns `Ok` without reading again. A reconnect's backoff or
             // reopen in flight ends within ~100 ms (MAN-252: the reopen runs
-            // on its own thread, which a stop abandons). A read already in
+            // on its own thread, which a stop abandons). A paced replay's
+            // wait, including one through a recorded gap, ends within
+            // ~100 ms too (MAN-453). A read already in
             // flight is not interrupted: it returns with whatever the source
             // yields next, or fails after that source's own stall bound, and
             // the shutdown sequence below runs on both the `Ok` and the error
@@ -7124,6 +7386,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             let run_lists =
                 prepare_run_lists(spec.is_reconnectable(), &resolved.spot, lists_in_use, &cfg)?;
             let mut cfg = cfg;
+            attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
             if run_lists.refresh.is_some() {
                 cfg.cty = Some(run_lists.lists.cty.load());
                 cfg.scp = Some(run_lists.lists.scp.load());
@@ -7414,6 +7677,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     Box::new(move || {
                         Ok(reopen_spec.open(capture_rate_hz, dial_freq_hz)? as Box<dyn IqSource>)
                     }),
+                    stop.clone(),
                 )?
             };
 
@@ -7569,6 +7833,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // copied into `manta_rtty_signals` from the per-batch callback.
             let rtty_observer = std::sync::Arc::new(manta_engine::RttyObserver::default());
             let mut rtty_log = RttyLogState::new(source_sample_rate_hz);
+            // MAN-141: the feed's span comes from the opened source, the
+            // same numbers the engine's tap uses.
+            let (spectrum_sink, spectrum_thread) = match spectrum_bound {
+                Some(feed) => spectrum_feed::open(
+                    feed,
+                    src.sample_rate(),
+                    src.center_freq_hz(),
+                    src.rf_passband_hz(),
+                    resolved.freq_correction_ppm,
+                    spot_server.as_ref().map(|server| server.metrics.as_ref()),
+                )?
+                .unzip(),
+                None => (None, None),
+            };
             let listen_result = manta_engine::listen_with_observers(
                 src,
                 &cfg,
@@ -7597,6 +7875,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                         }),
                     detector_confirmations: None,
                     track_lifecycle: None,
+                    spectrum: spectrum_sink,
                 },
                 |ev| {
                     if json {
@@ -7734,6 +8013,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-309: the source is gone, so the queue is closed; the
             // writer finalizes during the drain and is collected after it.
             let recording_deadline = close_recordings(recording.as_slice());
+            // MAN-141: the engine dropped its sink, so the sender thread has
+            // sent what was queued and ends.
+            if let Some(thread) = spectrum_thread {
+                let _ = thread.join();
+            }
             // MAN-234: the run's total, only when it grew past the count
             // the first-sample line reported (success and error alike).
             let bad_total = bad_samples.load(std::sync::atomic::Ordering::Relaxed);
@@ -7906,6 +8190,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 ..
             } = prepare_live(
                 CliOverrides {
+                    prior: None,
                     device,
                     source,
                     source_iq,
@@ -7969,6 +8254,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 );
             }
             if let Some(note) = replay_mode_ignored_note("soak", resolved.replay, &loaded.origin) {
+                errln!("{note}");
+            }
+            if let Some(note) = spectrum_feed::ignored_note("soak", &loaded) {
                 errln!("{note}");
             }
             if let Some(note) = record_iq_ignored_note("soak", &loaded) {
@@ -8111,6 +8399,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 lists_in_use,
             } = prepare_live(
                 CliOverrides {
+                    prior: None,
                     device,
                     source,
                     source_iq,
@@ -8170,6 +8459,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             if let Some(note) = replay_mode_ignored_note("doctor", resolved.replay, &loaded.origin)
             {
+                errln!("{note}");
+            }
+            if let Some(note) = spectrum_feed::ignored_note("doctor", &loaded) {
                 errln!("{note}");
             }
             if let Some(note) = record_iq_ignored_note("doctor", &loaded) {
@@ -8327,6 +8619,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             json,
             config,
             cli: CliOverrides {
+                prior: None,
                 device,
                 source,
                 source_iq,
@@ -8587,6 +8880,7 @@ mod tests {
             space_hz: 14_079_832.6,
             shift_hz: 170.0,
             measured_shift_hz: 169.8,
+            decoded_text: String::new(),
             marked_sample_ts: 2_016_000,
             cleared_sample_ts: None,
             id: 1,
@@ -9546,6 +9840,33 @@ mod tests {
         );
     }
 
+    /// MAN-453: every recording waits out the rest of one 5 s deadline, then
+    /// the rest of one 2 s publication grace after it, not a grace each.
+    #[test]
+    fn recording_finish_budget_shares_one_grace_after_the_deadline() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let s = std::time::Duration::from_secs;
+        assert_eq!(
+            recording_finish_budget(deadline, deadline - s(3)),
+            (s(3), RECORDING_PUBLICATION_GRACE)
+        );
+        assert_eq!(
+            recording_finish_budget(deadline, deadline + s(1)),
+            (s(0), RECORDING_PUBLICATION_GRACE - s(1))
+        );
+        assert_eq!(
+            recording_finish_budget(deadline, deadline + s(9)),
+            (s(0), s(0))
+        );
+    }
+
+    /// MAN-453: recordings finish inside the client drain, so the grace adds
+    /// nothing to the stop budget `TimeoutStopSec=60` covers.
+    #[test]
+    fn recording_finalization_ends_inside_the_client_drain() {
+        assert!(RECORDING_FINISH_TIMEOUT + RECORDING_PUBLICATION_GRACE <= SHUTDOWN_DRAIN_DEADLINE);
+    }
+
     /// MAN-45 (PR #63 round-16 finding): the outer registry-wide deadline
     /// must never fire before a handler's own drain deadline, or
     /// `shutdown_timeout` aborts a drain that was still inside its budget
@@ -9839,6 +10160,86 @@ mod tests {
         // candidate.
         let f = write_temp_file(b"[decode]\ntiming_sigma = 1e-30\n");
         assert!(load_decode_config_file(Some(f.path())).is_err());
+    }
+
+    #[test]
+    fn prior_cli_override_wins_and_rejects_hsmm() {
+        use manta_decode::config_file::PriorSwitch;
+        let cfg = manta_decode::decoder::DecodeConfig {
+            prior_enabled: true,
+            ..Default::default()
+        };
+        let cfg = merge_cli_prior(Some(PriorSwitch::Off), cfg, "test").unwrap();
+        assert!(!cfg.prior_enabled);
+        let cfg = merge_cli_prior(Some(PriorSwitch::On), cfg, "test").unwrap();
+        assert!(cfg.prior_enabled);
+        let mut cfg = cfg;
+        cfg.engine = Engine::Hsmm;
+        assert!(merge_cli_prior(None, cfg, "test").is_err());
+        assert!(Cli::try_parse_from(["manta", "decode", "test.wav", "--prior", "on"]).is_ok());
+        assert!(Cli::try_parse_from(["manta", "run", "--prior", "off"]).is_ok());
+        assert!(Cli::try_parse_from(["manta", "decode", "test.wav", "--prior", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn config_defaults_and_validation() {
+        let defaults = load_decode_config_file(None).unwrap();
+        assert!(!defaults.prior_enabled);
+        assert_eq!(defaults.prior_weight, 2.0);
+        assert_eq!(defaults.reading_margin, 3.0);
+        assert_eq!(defaults.held_readings, 4);
+        let file = write_temp_file(b"[decode]\nprior = 'on'\nprior_weight = 1.5\nreading_margin = 2.0\nheld_readings = 8\n");
+        let cfg = load_decode_config_file(Some(file.path())).unwrap();
+        assert!(cfg.prior_enabled);
+        assert_eq!(
+            (cfg.prior_weight, cfg.reading_margin, cfg.held_readings),
+            (1.5, 2.0, 8)
+        );
+        for invalid in [
+            "prior = 'maybe'",
+            "prior_weight = -0.1",
+            "prior_weight = nan",
+            "reading_margin = 0.01",
+            "reading_margin = inf",
+            "held_readings = 0",
+            "held_readings = 17",
+        ] {
+            let file = write_temp_file(format!("[decode]\n{invalid}\n").as_bytes());
+            assert!(
+                load_decode_config_file(Some(file.path())).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn prior_pipeline_loads_local_calls_heard_file() {
+        let file = write_temp_file(b"W1AW 12\nK1ABC 3\nAB2KLK\n");
+        let spot = resolve_spot(
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            &config::SpotFile {
+                calls_heard_path: Some(file.path().into()),
+                ..Default::default()
+            },
+        );
+        let (mut pipeline, _) =
+            build_pipeline_config(0.0, &spot, Default::default(), Engine::Legacy).unwrap();
+        pipeline.decode.prior_enabled = true;
+        attach_language_prior(&mut pipeline, &spot, None).unwrap();
+        assert!(
+            pipeline
+                .decode
+                .prior
+                .as_ref()
+                .unwrap()
+                .reading_bonus("W1AW")
+                > 0.0
+        );
     }
 
     #[test]
@@ -10371,6 +10772,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spectrum_needs_an_rf_reference_like_a_server_does() {
+        // MAN-141: `run`'s feed guard is MAN-34's rule with a server
+        // assumed: plain audio without a dial is refused, with one is not.
+        let audio = LiveSourceSpec::AudioDevice(None);
+        assert!(needs_dial_freq(true, audio.is_rf_aware(), None));
+        assert!(!needs_dial_freq(
+            true,
+            audio.is_rf_aware(),
+            Some(14_000_000.0)
+        ));
+        assert!(spectrum_feed::NEEDS_RF_MESSAGE.contains("set input.center_freq_hz"));
+    }
+
+    #[test]
+    fn soak_and_doctor_say_they_ignore_spectrum_udp() {
+        let loaded = loaded_from("[input]\ntype = \"audio\"\nspectrum_udp = \"127.0.0.1:13064\"\n");
+        let note = spectrum_feed::ignored_note("soak", &loaded).unwrap();
+        assert!(
+            note.starts_with(
+                "note: soak does not send spectrum; ignoring input.spectrum_udp from "
+            ),
+            "{note}"
+        );
+        assert_eq!(
+            spectrum_feed::ignored_note("doctor", &loaded_from("[input]\ntype = \"audio\"\n")),
+            None
+        );
+    }
+
     /// MAN-309: a manta IQ recording pair in `dir`, `gap` its one gap.
     fn native_pair(dir: &Path, name: &str, start_secs: i64, gap: u64) -> PathBuf {
         use manta_input::recording_format::MetadataRecord;
@@ -10848,10 +11279,13 @@ mod tests {
                 wpm: 28.0,
                 spot_type: manta_spot::SpotType::Cq,
                 confidence: 0.9,
+                emission_state: manta_spot::EmissionState::Confirmed,
                 track_id: 7,
                 sample_ts: 12_345,
                 rst: None,
                 qrl_query: false,
+                mode: manta_spot::SpotMode::Cw,
+                baud: None,
             });
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 loop {
@@ -11794,6 +12228,44 @@ mod tests {
         assert_eq!(src.take_discontinuity(), None);
     }
 
+    /// MAN-202: the inner source's unknown-length loss reaches `listen()`,
+    /// once, beside the counted hooks.
+    #[test]
+    fn fixed_center_freq_source_forwards_take_unknown_gap() {
+        struct UnknownProbeSource {
+            unknown: bool,
+            missing: Option<u64>,
+        }
+        impl IqSource for UnknownProbeSource {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, _buf: &mut [num_complex::Complex32]) -> Result<usize> {
+                Ok(0)
+            }
+            fn take_missing_samples(&mut self) -> Option<u64> {
+                self.missing.take()
+            }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
+        }
+        let mut src = FixedCenterFreqSource {
+            inner: Box::new(UnknownProbeSource {
+                unknown: true,
+                missing: Some(5),
+            }),
+            freq_hz: 14_000_000.0,
+        };
+        assert!(src.take_unknown_gap());
+        assert!(!src.take_unknown_gap());
+        assert_eq!(src.take_missing_samples(), Some(5));
+        assert_eq!(src.take_discontinuity(), None);
+    }
+
     /// MAN-259: the reconnect wrapper reads the acquisition-start offset
     /// off the opener's result, which is this wrapper whenever
     /// `--dial-freq-hz` or a fixed centre is in effect.
@@ -12116,6 +12588,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_cli_source_flag_replaces_the_input_list_with_a_note() {
         let loaded = loaded_from(THREE_KA9Q);
         let cli = CliOverrides {
+            prior: None,
             kiwi: KiwiOpts {
                 host: Some("kiwi.example.net".into()),
                 port: 8073,
@@ -12143,6 +12616,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         for (cli, flag, key) in [
             (
                 CliOverrides {
+                    prior: None,
                     freq_correction_ppm: Some(1.0),
                     ..cli_overrides()
                 },
@@ -12151,6 +12625,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ),
             (
                 CliOverrides {
+                    prior: None,
                     dial_freq_hz: Some(7_000_000.0),
                     ..cli_overrides()
                 },
@@ -12159,6 +12634,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ),
             (
                 CliOverrides {
+                    prior: None,
                     capture_rate_hz: Some(48_000.0),
                     ..cli_overrides()
                 },
@@ -12185,6 +12661,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
              [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"/x/b.wav\"\n",
         );
         let cli = CliOverrides {
+            prior: None,
             realtime: true,
             replay_epoch: Some(1_700_000_000),
             ..cli_overrides()
@@ -12296,6 +12773,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(err.contains("is not one of"), "{err}");
         let mut loaded = loaded_from(body);
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12327,6 +12805,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn cli_source_flag_discards_a_typed_input_layer_with_a_note() {
         let loaded = loaded_from(KIWI_INPUT);
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12344,6 +12823,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn untyped_input_shared_keys_survive_a_cli_source() {
         let loaded = loaded_from("[input]\nfreq_correction_ppm = 2.5\n");
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("v1.wav")),
             ..cli_overrides()
         };
@@ -12367,6 +12847,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn cli_ppm_beats_file_ppm() {
         let cli = CliOverrides {
+            prior: None,
             freq_correction_ppm: Some(4.0),
             ..cli_overrides()
         };
@@ -12377,6 +12858,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn explicit_cli_ppm_zero_beats_file_ppm() {
         let cli = CliOverrides {
+            prior: None,
             freq_correction_ppm: Some(0.0),
             ..cli_overrides()
         };
@@ -12387,6 +12869,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn source_iq_flag_sets_iq_on_a_config_file_source() {
         let cli = CliOverrides {
+            prior: None,
             source_iq: true,
             ..cli_overrides()
         };
@@ -12418,6 +12901,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn realtime_flag_paces_a_cli_file_source() {
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("x.wav")),
             realtime: true,
             ..cli_overrides()
@@ -12435,6 +12919,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn loop_flag_implies_pacing() {
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("x.wav")),
             loop_replay: true,
             ..cli_overrides()
@@ -12478,6 +12963,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn cli_realtime_adds_to_a_config_file_source() {
         let cli = CliOverrides {
+            prior: None,
             realtime: true,
             ..cli_overrides()
         };
@@ -12490,6 +12976,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             }
         );
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12507,6 +12994,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_cli_source_selector_discards_the_files_realtime_and_loop() {
         let loaded = loaded_from(&format!("{FILE_INPUT}realtime = true\nloop = true\n"));
         let cli = CliOverrides {
+            prior: None,
             source: Some(PathBuf::from("y.wav")),
             ..cli_overrides()
         };
@@ -12521,6 +13009,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn realtime_with_a_live_source_is_an_error() {
         let cli = CliOverrides {
+            prior: None,
             kiwi: KiwiOpts {
                 host: Some("192.0.2.1".into()),
                 port: 8073,
@@ -12542,6 +13031,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn loop_with_the_default_audio_device_is_an_error() {
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12553,6 +13043,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         // The same for a typed non-file [input] the CLI adds --loop to.
         let cli = CliOverrides {
+            prior: None,
             loop_replay: true,
             ..cli_overrides()
         };
@@ -12619,9 +13110,33 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ReplayMode::default(),
             "x.wav".into(),
             Box::new(|| bail!("the default mode never reopens")),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .unwrap();
         assert_eq!(&*wrapped as *const dyn IqSource as *const (), before);
+    }
+
+    /// MAN-453: the paced wrapper gets the run's stop flag, so a stop ends
+    /// its wait.
+    #[test]
+    fn wrap_file_replay_hands_the_stop_flag_to_the_pacing() {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut src = wrap_file_replay(
+            ramp(16_000, 8000.0),
+            ReplayMode::from_flags(true, false),
+            "x.wav".into(),
+            Box::new(|| bail!("not looped")),
+            stop,
+        )
+        .unwrap();
+        let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 16_000];
+        let start = std::time::Instant::now();
+        assert_eq!(src.read(&mut buf).unwrap(), 16_000);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -12633,6 +13148,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             ReplayMode::from_flags(false, true),
             "x.wav".into(),
             Box::new(|| Ok(ramp(100, 1000.0))),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .unwrap();
         let mut buf = vec![num_complex::Complex32::new(0.0, 0.0); 300];
@@ -12936,6 +13452,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
         let cli = CliOverrides {
+            prior: None,
             ka9q: Ka9qOpts {
                 interface: Some(std::net::Ipv4Addr::new(192, 168, 1, 20)),
                 ..ka9q_opts(Some(14_100_000))
@@ -13217,6 +13734,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         ("scp_sha256", "spot.scp_sha256"),
         ("patterns", "spot.pattern_path"),
         ("engine", "decode.engine"),
+        ("prior", "decode.prior"),
         ("rbn_compare", "rbn_compare.enabled"),
         ("rbn_spotter", "rbn_compare.spotters"),
     ];
@@ -13424,6 +13942,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 "[spot]\npattern_path = 'patterns.lst'\n",
             ),
             ("decode.engine", "[decode]\nengine = \"legacy\"\n"),
+            ("decode.prior", "[decode]\nprior = \"on\"\n"),
             (
                 "rbn_compare.enabled",
                 "[server]\nstation_callsign = \"W1AW\"\n[rbn_compare]\nenabled = true\n",
@@ -14188,6 +14707,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn prepare_rbn(body: &str, rbn: RbnCompareOpts, source: Option<&str>) -> Result<Prepared> {
         let f = write_temp_file(body.as_bytes());
         let cli = CliOverrides {
+            prior: None,
             source: source.map(PathBuf::from),
             rbn,
             ..CliOverrides::none()

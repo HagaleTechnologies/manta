@@ -15,6 +15,13 @@ fn one() -> f32 {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "event", rename_all_fields = "camelCase")]
 pub enum DecoderEvent {
+    /// Acoustically viable word readings and gaps to the combined-score leader.
+    ReadingsHeld {
+        track_id: u32,
+        sample_ts: u64,
+        readings: Vec<(String, f32)>,
+        settled: bool,
+    },
     CharDecoded {
         track_id: u32,
         sample_ts: u64,
@@ -65,6 +72,14 @@ pub enum DecoderEvent {
         /// `frequency` in JSON (MAN-139).
         #[serde(rename = "frequency")]
         freq_hz: f64,
+        /// MAN-201: the newest character this track's decoder has decoded,
+        /// released or still held back by the MAN-317 prior; `0` with none.
+        /// `sample_ts` runs ahead of held words, so a silence bound measured
+        /// from a released word alone would read a word still in hand as
+        /// silence. Serialized so a replayed report decides as the live run
+        /// did; `#[serde(default)]` keeps older reports readable.
+        #[serde(default)]
+        last_char_ts: u64,
     },
     /// The track's learned sender timing (MAN-315 D8): dot, dash,
     /// element-gap, char-gap and word-gap durations, mean and variance in
@@ -240,6 +255,29 @@ mod tests {
     use super::*;
     use crate::tree::{Glyph, Prosign};
 
+    #[test]
+    fn readings_held_json_shape_and_additivity() {
+        let event = DecoderEvent::ReadingsHeld {
+            track_id: 17,
+            sample_ts: 7123400,
+            readings: vec![("W1AW".into(), 0.0), ("R1AW".into(), 1.24)],
+            settled: false,
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&event).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"event":"ReadingsHeld", "trackId":17,
+            "sampleTs":7123400, "readings":[["W1AW",0.0],["R1AW",1.24]], "settled":false})
+        );
+        assert_eq!(serde_json::from_value::<DecoderEvent>(json).unwrap(), event);
+        let old = r#"{"event":"WordBoundary","trackId":17,"sampleTs":7123400}"#;
+        assert!(matches!(
+            serde_json::from_str::<DecoderEvent>(old).unwrap(),
+            DecoderEvent::WordBoundary { .. }
+        ));
+    }
+
     /// The additive fields still take their defaults when absent, now
     /// under the MAN-139 camelCase names.
     #[test]
@@ -330,9 +368,10 @@ mod tests {
                     sample_ts: 102_656,
                     snr_2500_db: 22.5,
                     freq_hz: 14_012_341.5,
+                    last_char_ts: 0,
                 },
                 Some(
-                    r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5}"#,
+                    r#"{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.5,"frequency":14012341.5,"lastCharTs":0}"#,
                 ),
             ),
             (timing_update(), None),

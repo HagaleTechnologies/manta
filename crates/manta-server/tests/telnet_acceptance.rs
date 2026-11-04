@@ -6,7 +6,7 @@
 use manta_server::bus::SpotBus;
 use manta_server::metrics::Metrics;
 use manta_server::rbn;
-use manta_spot::{Spot, SpotType};
+use manta_spot::{Spot, SpotMode, SpotType};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -47,6 +47,7 @@ async fn spawn_server_with_format(
         line_format,
         fixed_epoch(),
         None,
+        SpotMode::Cw,
     )
     .await
 }
@@ -67,6 +68,7 @@ async fn spawn_server_with_epoch(
         rbn::LineFormat::Rbn,
         epoch,
         None,
+        SpotMode::Cw,
     )
     .await
 }
@@ -84,17 +86,25 @@ async fn spawn_server_with_drain_deadline(
     tokio::sync::watch::Sender<bool>,
     manta_server::tasks::ClientTasks,
 ) {
-    spawn_server_with(drain_deadline, rbn::LineFormat::Rbn, fixed_epoch(), None).await
+    spawn_server_with(
+        drain_deadline,
+        rbn::LineFormat::Rbn,
+        fixed_epoch(),
+        None,
+        SpotMode::Cw,
+    )
+    .await
 }
 
 /// The single spawn body the helpers above delegate to -- MAN-45's drain
-/// deadline, MAN-88's line format and MAN-92's session epoch are
-/// independent knobs on the same server.
+/// deadline, MAN-88's line format, MAN-92's session epoch and MAN-322's
+/// listener mode are independent knobs on the same server.
 async fn spawn_server_with(
     drain_deadline: Duration,
     line_format: rbn::LineFormat,
     epoch: SystemTime,
     history_minutes: Option<u32>,
+    mode: SpotMode,
 ) -> (
     std::net::SocketAddr,
     Arc<SpotBus>,
@@ -108,11 +118,6 @@ async fn spawn_server_with(
     }
     let bus = Arc::new(bus);
     let metrics = Arc::new(Metrics::new());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let bus2 = bus.clone();
-    let metrics2 = metrics.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let tasks = manta_server::tasks::new_client_tasks();
     // Kept alongside the clone moved into `serve()` (PR #75 review, round
@@ -121,6 +126,33 @@ async fn spawn_server_with(
     // the socket close alone can't distinguish a clean disconnect from a
     // handler panic.
     let tasks_handle = tasks.clone();
+    let addr = spawn_listener_on(
+        bus.clone(),
+        metrics.clone(),
+        shutdown_rx,
+        tasks,
+        drain_deadline,
+        line_format,
+        mode,
+    )
+    .await;
+
+    (addr, bus, metrics, shutdown_tx, tasks_handle)
+}
+
+/// One telnet listener serving `mode` on an existing bus (MAN-322: the CW
+/// and RTTY listeners of one daemon share its bus).
+async fn spawn_listener_on(
+    bus: Arc<SpotBus>,
+    metrics: Arc<Metrics>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    tasks: manta_server::tasks::ClientTasks,
+    drain_deadline: Duration,
+    line_format: rbn::LineFormat,
+    mode: SpotMode,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     let limiter =
         manta_server::tasks::new_connection_limiter(manta_server::telnet::MAX_TELNET_CONNECTIONS);
     // MAN-86: 96 kS/s centred on 14.040 MHz -> a live passband of
@@ -145,8 +177,8 @@ async fn spawn_server_with(
     tokio::spawn(async move {
         manta_server::telnet::serve(
             listener,
-            bus2,
-            metrics2,
+            bus,
+            metrics,
             profile,
             shutdown_rx,
             tasks,
@@ -158,11 +190,11 @@ async fn spawn_server_with(
             ),
             drain_deadline,
             line_format,
+            mode,
         )
         .await;
     });
-
-    (addr, bus, metrics, shutdown_tx, tasks_handle)
+    addr
 }
 
 fn sample_spot() -> Spot {
@@ -173,10 +205,13 @@ fn sample_spot() -> Spot {
         wpm: 28.0,
         spot_type: SpotType::Cq,
         confidence: 0.9,
+        emission_state: manta_spot::EmissionState::Confirmed,
         track_id: 1,
         sample_ts: 0,
         rst: None,
         qrl_query: false,
+        mode: manta_spot::SpotMode::Cw,
+        baud: None,
     }
 }
 
@@ -1927,6 +1962,7 @@ async fn spawn_server_with_history(
         rbn::LineFormat::Rbn,
         epoch,
         Some(minutes),
+        SpotMode::Cw,
     )
     .await
 }
@@ -2004,4 +2040,202 @@ async fn blank_keepalive_lines_cost_one_command_each_and_a_window_later_the_budg
         .expect("spots must still flow after the keepalives")
         .unwrap();
     assert!(line.contains("DX de"), "line was: {line:?}");
+}
+
+// ---- MAN-322: each telnet listener serves one mode
+
+/// An RTTY spot at 45.45 baud in the 20m RTTY segment.
+fn rtty_spot(callsign: &str, freq_hz: f64) -> Spot {
+    Spot {
+        callsign: callsign.to_string(),
+        freq_hz,
+        snr_db: 20.0,
+        wpm: 0.0,
+        mode: SpotMode::Rtty,
+        baud: Some(45.45),
+        ..sample_spot()
+    }
+}
+
+/// MAN-322 D5 on the shutdown path: the drain that flushes a client's
+/// queued spots at shutdown serves the listener's own mode only, as the
+/// live arm does. Spots published right before shutdown are drained, not
+/// read live, so a CW listener must still never write the RTTY one.
+#[tokio::test]
+async fn the_shutdown_drain_serves_only_the_listeners_mode() {
+    let (addr, bus, _metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, _wr) = connect_and_login(addr).await;
+
+    let cw = sample_spot();
+    bus.publish(rtty_spot("W1AW", 14_080_170.0));
+    bus.publish(cw.clone());
+    bus.publish(rtty_spot("W2BBB", 14_085_000.0));
+    let _ = shutdown_tx.send(true);
+
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("connection never closed after the shutdown drain")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    assert_eq!(lines, [rbn_row(&bus, &cw)], "got {lines:?}");
+}
+
+/// Reads the next line, bounded so a missing spot fails instead of hanging.
+async fn next_line(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    expecting: &str,
+) -> String {
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expecting}"))
+        .unwrap();
+    line.trim_end().to_string()
+}
+
+/// Ticket scenario 1: Given manta is spotting both CW and RTTY, When a
+/// logger connects to the RTTY spot port, Then it receives only RTTY spots
+/// with speed shown in baud. The CW port, on the same bus, receives only
+/// the CW ones. Spots go out in publish order, so a leaked other-mode spot
+/// would arrive between the two own-mode ones.
+#[tokio::test]
+async fn rtty_port_receives_only_rtty_spots_with_speed_in_baud() {
+    let (cw_addr, bus, metrics, shutdown_tx, tasks) = spawn_server().await;
+    let rtty_addr = spawn_listener_on(
+        bus.clone(),
+        metrics.clone(),
+        shutdown_tx.subscribe(),
+        tasks.clone(),
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        SpotMode::Rtty,
+    )
+    .await;
+    let (mut rtty_reader, _rtty_wr) = connect_and_login(rtty_addr).await;
+    let (mut cw_reader, _cw_wr) = connect_and_login(cw_addr).await;
+
+    let cw_first = sample_spot();
+    let rtty_first = rtty_spot("W1AW", 14_080_170.0);
+    let cw_second = spot_on("K1AAA", 14_025_000.0);
+    let rtty_second = rtty_spot("W2BBB", 14_085_000.0);
+    for spot in [&cw_first, &rtty_first, &cw_second, &rtty_second] {
+        bus.publish(spot.clone());
+    }
+
+    let rtty_line = next_line(&mut rtty_reader, "the first RTTY spot").await;
+    assert_eq!(
+        rtty_line,
+        "DX de W3XYZ-#:  14080.17  W1AW           RTTY  27 dB  45 BPS  CQ      2213Z"
+    );
+    assert_eq!(rtty_line, rbn_row(&bus, &rtty_first));
+    assert_eq!(
+        next_line(&mut rtty_reader, "the second RTTY spot").await,
+        rbn_row(&bus, &rtty_second)
+    );
+    assert_eq!(
+        next_line(&mut cw_reader, "the first CW spot").await,
+        rbn_row(&bus, &cw_first)
+    );
+    assert_eq!(
+        next_line(&mut cw_reader, "the second CW spot").await,
+        rbn_row(&bus, &cw_second)
+    );
+    assert!(rbn_row(&bus, &cw_first).contains(" CW    "));
+    assert!(rbn_row(&bus, &cw_first).contains(" WPM "));
+    // A spot of the other mode is not this listener's to serve; no
+    // client filter withheld it.
+    assert_eq!(
+        metric(&metrics, "manta_spots_suppressed_by_filter_total"),
+        0
+    );
+}
+
+/// MAN-322 D5: `sh/dx` replays only the listener's own mode, and a mode
+/// word naming the other mode selects nothing.
+#[tokio::test]
+async fn sh_dx_on_each_port_returns_only_its_own_mode() {
+    let (cw_addr, bus, metrics, shutdown_tx, tasks) = spawn_server().await;
+    let rtty_addr = spawn_listener_on(
+        bus.clone(),
+        metrics,
+        shutdown_tx.subscribe(),
+        tasks.clone(),
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        SpotMode::Rtty,
+    )
+    .await;
+    let cw = sample_spot();
+    let rtty = rtty_spot("W1AW", 14_080_170.0);
+    let cw_row = rbn_row(&bus, &cw);
+    let rtty_row = rbn_row(&bus, &rtty);
+    bus.publish(cw);
+    bus.publish(rtty);
+
+    let (mut reader, mut wr) = connect_and_login(rtty_addr).await;
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx").await,
+        std::slice::from_ref(&rtty_row)
+    );
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx CW").await.is_empty());
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx RTTY").await,
+        [rtty_row]
+    );
+
+    let (mut reader, mut wr) = connect_and_login(cw_addr).await;
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx RTTY")
+        .await
+        .is_empty());
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx CW").await,
+        std::slice::from_ref(&cw_row)
+    );
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx").await, [cw_row]);
+}
+
+/// MAN-322 D9: occurrence counts are per mode. W1AW spotted twice on CW
+/// does not lift its first RTTY spot over `unique > 1` on the RTTY port.
+#[tokio::test]
+async fn the_unique_filter_counts_each_mode_separately() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server_with(
+        manta_server::tasks::CLIENT_DRAIN_DEADLINE,
+        rbn::LineFormat::Rbn,
+        fixed_epoch(),
+        None,
+        SpotMode::Rtty,
+    )
+    .await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let ack = next_line(&mut reader, "the filter ack").await;
+    assert!(ack.to_lowercase().contains("filter"), "ack was: {ack:?}");
+
+    let mut cw = sample_spot();
+    cw.callsign = "W1AW".to_string();
+    let first_rtty = rtty_spot("W1AW", 14_080_170.0);
+    let second_rtty = rtty_spot("W1AW", 14_081_000.0);
+    bus.publish(cw.clone());
+    bus.publish(cw);
+    bus.publish(first_rtty);
+    bus.publish(second_rtty.clone());
+
+    // RTTY occurrence 1 is withheld; occurrence 2 is the first line.
+    assert_eq!(
+        next_line(&mut reader, "the second RTTY spot").await,
+        rbn_row(&bus, &second_rtty)
+    );
+    // Only the first RTTY spot counts as a filter suppression; the CW
+    // spots were never this listener's.
+    assert_eq!(
+        metric(&metrics, "manta_spots_suppressed_by_filter_total"),
+        1
+    );
 }

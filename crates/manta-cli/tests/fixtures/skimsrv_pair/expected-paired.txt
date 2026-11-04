@@ -1,0 +1,31 @@
+spots: 8 from 1 file (0 grade records skipped, 0 torn lines)
+reference: 8 CW reports from 1 file (1 non-CW line, 1 other line skipped), 2026-10-31 00:05:00Z to 06:02:00Z
+spotters: all
+own calls are not excluded from a --reference transcript
+window: 600 s; frequency disagreement over 500 Hz; speed disagreement over 3 WPM and 20% of RBN's median
+paired: node W3XYZ-1, 2026-10-31 00:00:00Z to 06:00:00Z, passband 14000-14070 kHz
+manta spots: 6 counted (1 out of passband, 1 out of window)
+reference reports: 5 counted (0 other spotters, 1 out of passband, 1 out of window, 1 not a plausible callsign)
+reference silence: longest 3:50:00 from 2026-10-31 02:00:00Z
+
+recall: 3 / 5 reference reports that manta also spotted (60.0%)
+missed: 2 reference reports (1 of them spotted by manta on another band)
+confirmed: 3 manta spots the reference also reported (match 2, disagree 1)
+candidate false: 2 / 5 manta spots the reference's span covered (40.0%): none 1, elsewhere 1
+unknown: 1 manta spot whose window the reference's span did not cover
+
+band   reports  found  missed  recall  spots  confirmed  none  elsewhere  unknown
+20m          5      3       2   60.0%      6          3     1          1        1
+total        5      3       2   60.0%      6          3     1          1        1
+
+missed by manta (no manta spot of the call on the report's band within 600 s):
+time                  call        freq kHz  dB  WPM  manta heard it on
+2026-10-31 00:20:00Z  N4RV         14021.0  18   24  -
+2026-10-31 01:10:00Z  DL1ABC       14030.0  19   28  40m
+
+candidate false spots (no reference report of the call on the spot's band within 600 s):
+time                  call        freq kHz  snr  conf  grade      reference heard it on
+2026-10-31 01:25:00Z  K5XYZ        14012.3   15  0.71  elsewhere  40m
+2026-10-31 03:00:00Z  W9ZZZ        14018.0    9  0.55  none       -
+
+dB is the reference's own figure (500 Hz); snr is manta's stream snr (2500 Hz).

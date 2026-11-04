@@ -1240,6 +1240,162 @@ fn a_stop_signal_finalizes_the_recording() {
     assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
 }
 
+/// MAN-453, scenario 3: a stop during a long recorded outage in a
+/// real-time replay ends the run within 2 s, and the recording it was
+/// making is finalized. The replayed recording holds 3 s of samples, a
+/// 600 s gap, then 2 s more; SIGTERM lands about 2 s into the gap. Single
+/// input and a two-input daemon, as both hand the stop flag to the pacing.
+#[cfg(unix)]
+#[test]
+fn a_stop_signal_during_a_recorded_gap_ends_a_realtime_replay_promptly() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = dir.path().join("fixture");
+    std::fs::create_dir_all(&fixture).unwrap();
+    let spec = manta_testkit::vectors::VectorSpec {
+        duration_s: 5.0,
+        ..manta_testkit::vectors::v1()
+    };
+    let manifest = manta_testkit::vectors::write_fixture_set(&spec, &fixture).unwrap();
+    let samples = wav_samples(&fixture.join("v1.wav"));
+    let fs = manifest.fs as u64;
+    let gap = MetadataRecord::Gap {
+        before_sample: 3 * fs,
+        missing_samples: 600 * fs,
+    };
+    let header = RecordingHeader {
+        schema: "manta-iq.v1".into(),
+        sample_format: "cf32_le".into(),
+        sample_rate_hz: manifest.fs,
+        center_freq_hz: manifest.center_freq_hz,
+        start_unix_seconds: 1_792_407_600,
+        start_nanoseconds: 0,
+        rf_passband_hz: [-manifest.fs / 2.0, manifest.fs / 2.0],
+        trusted_band_hz: None,
+        analytic_guard_hz: 0.0,
+    };
+    let gapped = dir.path().join("gapped.cf32");
+    std::fs::write(&gapped, cf32_bytes(&samples)).unwrap();
+    let meta = MetadataRecord::Header(header).to_line()
+        + &gap.to_line()
+        + &MetadataRecord::End {
+            sample_count: samples.len() as u64,
+            reason: EndReason::Stopped,
+        }
+        .to_line();
+    std::fs::write(metadata_path(&gapped), meta).unwrap();
+
+    let single_rec = dir.path().join("rec.cf32");
+    let single: Vec<std::ffi::OsString> = vec![
+        "run".into(),
+        "--source".into(),
+        gapped.clone().into(),
+        "--source-iq".into(),
+        "--realtime".into(),
+        "--json".into(),
+        "--record-iq".into(),
+        single_rec.clone().into(),
+    ];
+    let entry = |name: &str, rec: &str| {
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"file\"\npath = {}\niq = true\n\
+             realtime = true\nrecord_iq = \"{rec}\"\n\n",
+            toml_str(&gapped)
+        )
+    };
+    let toml = dir.path().join("multi.toml");
+    std::fs::write(&toml, entry("a", "a.cf32") + &entry("b", "b.cf32")).unwrap();
+    let multi: Vec<std::ffi::OsString> = vec![
+        "run".into(),
+        "--json".into(),
+        "--config".into(),
+        toml.clone().into(),
+    ];
+    let cases = [
+        (single, vec![single_rec]),
+        (
+            multi,
+            vec![dir.path().join("a.cf32"), dir.path().join("b.cf32")],
+        ),
+    ];
+    for (args, recordings) in cases {
+        let mut child = manta()
+            .args(&args)
+            .current_dir(dir.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut all = String::new();
+            for line in std::io::BufReader::new(stderr).lines() {
+                let line = line.unwrap();
+                let _ = tx.send(line.clone());
+                all.push_str(&line);
+                all.push('\n');
+            }
+            all
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let Ok(line) =
+                rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            else {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{args:?} never started listening: {}",
+                    reader.join().unwrap()
+                );
+            };
+            if line.contains("manta: listening") {
+                break;
+            }
+        }
+        // The pacing clock starts at the first read: 3 s of samples, then
+        // the gap runs until 603 s.
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        let signalled = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if signalled.elapsed() > std::time::Duration::from_secs(2) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{args:?} did not stop within 2 s of SIGTERM: {}",
+                    reader.join().unwrap()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let stderr = reader.join().unwrap();
+        assert!(status.success(), "{args:?}: {status:?}: {stderr}");
+        for rec in &recordings {
+            assert!(
+                stderr.contains(&format!("recording finished: {}", rec.display())),
+                "{args:?}: {stderr}"
+            );
+            let records = records(rec);
+            assert!(records.contains(&gap), "{records:?}");
+            let Some(MetadataRecord::End {
+                sample_count,
+                reason,
+            }) = records.last()
+            else {
+                panic!("no end record: {records:?}");
+            };
+            assert_eq!(*reason, EndReason::Stopped);
+            assert!(*sample_count > 3 * fs, "{records:?}");
+            assert_eq!(std::fs::metadata(rec).unwrap().len(), sample_count * 8);
+        }
+    }
+}
+
 /// The live path: a (fake) KiwiSDR drops its connection and comes back.
 /// `run` keeps decoding through the reconnect, and its recording holds the
 /// receiver's rate, centre and passband and the outage as a gap record at

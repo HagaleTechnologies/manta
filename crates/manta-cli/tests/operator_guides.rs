@@ -11,6 +11,7 @@ const GUIDES: &[&str] = &[
     "docs/GUIDES/kiwisdr.md",
     "docs/GUIDES/raspberry-pi.md",
     "docs/GUIDES/ka9q-radio.md",
+    "docs/GUIDES/n1mm-spectrum.md",
 ];
 
 fn repo_root() -> PathBuf {

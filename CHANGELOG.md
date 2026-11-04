@@ -24,6 +24,40 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-201: manta now reads each decoded callsign as the sending station,
+  the station called, a station mentioned, or uncertain, and spots only a
+  sending station. `DE W1AW DE K1ABC K` spots K1ABC, not W1AW. A `CQ` types
+  a `DE <call>` as CQ only when it leads straight into it (`CQ CQ DE`,
+  `CQ TEST DE`), not from anywhere in the window. Every CQ/DE call in the
+  window is considered, not only the first. A call is decided when its next
+  word, a turn end (`K`, `KN`, `BK`, `AR`, `SK`, 5 s with no character) or
+  the track's end shows its role, so a spot can arrive one word later; it
+  keeps the call's own timestamp. A run of one bare call waits for a
+  different word. An input that stalls or fails closes its tracks, which
+  settles their last calls. A call followed by a lone `T` spots as `BEACON`
+  only when it is on `[spot].allowlist`; other such decodes are withheld as
+  `beaconNoEvidence`. An allowlisted call heard only as the station called
+  or mentioned is no longer spotted. `decode --json` `TrackMeta` events gain
+  `lastCharTs`. See
+  [docs/DECISIONS/2026-11-02-man201-callsign-roles.md](docs/DECISIONS/2026-11-02-man201-callsign-roles.md).
+- MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
+  gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
+  spot is still CW, so `mode` is `"CW"` and `baud` is `null` on every spot
+  today. RTTY spots, once the engine produces them, reach telnet only
+  through the new opt-in `[server].rtty_telnet_port` (`telnet_port` stays
+  CW-only), and carry `RTTY` and `<baud> BPS` on the telnet and uplink
+  line. With that port set, `/metrics` adds
+  `manta_listener_up{listener="rtty_telnet"}`. See
+  docs/DECISIONS/2026-11-01-man322-rtty-spot-outputs.md.
+- MAN-109: add rise from two disjoint power windows alongside the 12 dB EMA rise; keep the 19-hop confirmation and the EMA for drop and SNR.
+- MAN-106 first slice: candidates with no finite positive character
+  confidence are withheld as `noEvidence`. CLI JSON spots gain
+  `emissionState`, based on whether the pattern tier's repetition
+  requirement is met. The character confidence multiplier `q` now uses
+  the engine-supplied floor-based SNR, with the rail estimate as standalone
+  fallback. Confidence remains an uncalibrated score; bench reporting and
+  fitted calibration are deferred to the next slice. See
+  docs/DECISIONS/2026-10-30-man106-q-snr-input.md.
 - MAN-402: looped dah-heavy text keyed at 25-40 WPM (`MO`, `OO`, `0000`,
   `T0M`) now decodes as its own words. The speed tracker read five equal
   dahs of 90-150 ms as dits, so `MO` at 33 WPM printed `H5555...` and `0000`
@@ -97,6 +131,27 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
+  power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
+  "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
+  a second, each the mean of 125 channelizer hops over the passband in
+  93.75 Hz bins. `spectrum_name` sets the source name N1MM+ lists (default
+  `manta <input name>`). `manta run` only; with `[server]`, `/metrics` gains
+  `manta_spectrum_datagrams_total` and `manta_spectrum_dropped_total`. Spots
+  are unchanged. Tested against a fake N1MM+ listener; a real N1MM+ render
+  is still to be checked. See
+  [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md).
+- MAN-97: `manta grade --paired` compares one node's spots with a
+  co-located reference skimmer both ways and prints recall, the reports
+  manta missed and its candidate false spots, as text or one JSON object
+  (`--json`), over `--passband-khz` and an optional `--start`/`--end`. The
+  reference is a skimmer's saved `DX de` telnet output (`--reference`, for
+  example CW Skimmer Server's) or RBN CSVs with `--spotter`. `--reference`
+  also works for the one-way table. See
+  `docs/RUNBOOKS/rbn-comparison.md`.
+- MAN-202: Rust API: `IqSource::take_unknown_gap()` and
+  `manta_input::ReadContinuity`; wrappers must forward the new hook. See
+  docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
 - MAN-308: `[input].auto_attenuation` (default `false`) lets manta set a
   protocol-2 openHPSDR radio's ADC0 step attenuator: 2 s of reported ADC
   overload adds 6 dB (up to 30 dB) and 10 minutes without removes 6 dB.
@@ -285,6 +340,17 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-202: with a SoapySDR input, a driver overflow no longer decodes the
+  dropped span as Morse timing. A wrong character (for example `K` read as
+  `T`) becomes a dropped character, and the word the overflow cut ends
+  there. Spot timestamps after an overflow are still early by the lost
+  time. File decodes cannot report such a gap, so this is not a
+  `### Decoder output` change under the rule above. See
+  docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md.
+- MAN-413: configs now reject duplicate `[[input]]` entry names even when
+  an earlier entry's `bands` expand into labelled streams such as
+  `x-60m-1` and `x-60m-2`. The error names the duplicate base name, avoiding
+  ambiguous `--input` selection and calibration saves to the wrong receiver.
 - MAN-343: `manta grade` reads each `--spots`/`--rbn` file once, however it
   is named (directly and through its directory, with `./` or `..`, or
   through a symlink). Before, a file named twice was graded twice, and a

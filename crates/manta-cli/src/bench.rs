@@ -110,6 +110,9 @@ pub(crate) struct SensitivityArgs {
     /// When --config also names an engine, this flag wins.
     #[arg(long, value_parser = crate::parse_engine)]
     pub engine: Option<Engine>,
+    /// Reweight acoustically viable word readings: on or off. Overrides [decode].
+    #[arg(long, value_parser = crate::parse_prior)]
+    pub prior: Option<manta_decode::config_file::PriorSwitch>,
     /// TOML config file. Its [decode] and [detector] settings apply; every
     /// other table is ignored, and the environment is never read
     #[arg(long)]
@@ -457,16 +460,31 @@ pub(crate) fn pipeline_config(
 ) -> Result<(PipelineConfig, Settings, Option<String>)> {
     let loaded = crate::config::load(args.config.as_deref(), crate::config::Env::Ignore)?;
     let note = crate::ignored_tables_note(&loaded, "bench sensitivity", &["decode", "detector"]);
-    let decode = crate::merge_cli_engine(args.engine, loaded.decode.clone());
+    let decode = crate::merge_cli_prior(
+        args.prior,
+        crate::merge_cli_engine(args.engine, loaded.decode.clone()),
+        &loaded.origin,
+    )?;
     let settings = Settings {
         engine: decode.engine,
         config: args.config.as_ref().map(|p| p.display().to_string()),
     };
-    let cfg = PipelineConfig {
+    let mut cfg = PipelineConfig {
         decode,
         detector: loaded.detector,
         ..PipelineConfig::default()
     };
+    let spot = crate::resolve_spot_pinned(
+        vec![],
+        None,
+        None,
+        None,
+        None,
+        crate::CliPins::default(),
+        None,
+        &crate::config::SpotFile::default(),
+    );
+    crate::attach_language_prior(&mut cfg, &spot, None)?;
     Ok((cfg, settings, note))
 }
 
@@ -601,6 +619,7 @@ fn event_track_id(e: &DecoderEvent) -> u32 {
         | DecoderEvent::WordBoundary { track_id, .. }
         | DecoderEvent::SpeedUpdate { track_id, .. }
         | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::ReadingsHeld { track_id, .. }
         | DecoderEvent::TimingUpdate { track_id, .. }
         | DecoderEvent::TrackPromoted { track_id, .. }
         | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
@@ -1025,6 +1044,15 @@ pub(crate) fn regenerate(args: &SensitivityArgs) -> String {
     if let Some(engine) = args.engine {
         parts.push(format!("--engine {}", engine_name(engine)));
     }
+    if let Some(prior) = args.prior {
+        parts.push(format!(
+            "--prior {}",
+            match prior {
+                manta_decode::config_file::PriorSwitch::On => "on",
+                manta_decode::config_file::PriorSwitch::Off => "off",
+            }
+        ));
+    }
     if let Some(path) = &args.config {
         parts.push(format!(
             "--config {}",
@@ -1161,10 +1189,13 @@ mod tests {
             wpm: 25.0,
             spot_type: SpotType::Cq,
             confidence: 1.0,
+            emission_state: manta_spot::EmissionState::Confirmed,
             track_id: 0,
             sample_ts,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1187,6 +1218,7 @@ mod tests {
             sample_ts: 0,
             snr_2500_db: 10.0,
             freq_hz,
+            last_char_ts: 0,
         }
     }
 
@@ -1469,6 +1501,17 @@ Regenerate: manta bench sensitivity --conditions awgn,good --wpm 25 --snr-db 4.5
             t.contains("30 stations per point, 30 s recordings, 3 trials, seed 7"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn prior_switch_wires_bundled_evidence_and_regenerates() {
+        let args = parse(&["--prior", "on"]).unwrap();
+        let (cfg, _, _) = pipeline_config(&args).unwrap();
+        assert!(cfg.decode.prior_enabled);
+        assert!(cfg.decode.prior.as_ref().unwrap().reading_bonus("W1AW") > 0.0);
+        assert!(regenerate(&args).contains("--prior on"));
+        let args = parse(&["--prior", "on", "--engine", "hsmm"]).unwrap();
+        assert!(pipeline_config(&args).is_err());
     }
 
     #[test]

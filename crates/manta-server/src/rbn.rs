@@ -8,7 +8,7 @@
 //! `docs/DECISIONS/2026-09-06-man88-ak1a-column-layout.md`).
 
 use crate::relay::{RelayMode, RelaySpot};
-use manta_spot::{Spot, SpotType};
+use manta_spot::{Spot, SpotMode, SpotType};
 
 /// MAN-102 / decision D3 (2026-09-06 broad review): RBN and CW Skimmer
 /// quote spot SNR in a 500 Hz reference bandwidth; manta's detector
@@ -129,8 +129,9 @@ const MODE_START_COL: usize = 42;
 /// SNR is right-justified so its last char lands 2 columns past the mode
 /// field (RBN column 49), then a literal ` dB`.
 const SNR_END_OFFSET: usize = 2;
-/// WPM is right-justified so its last char lands 9 columns past the mode
-/// field (RBN column 56), then a literal ` WPM`.
+/// The speed is right-justified so its last char lands 9 columns past the
+/// mode field (RBN column 56), then its unit: ` WPM` for CW, ` BPS` for
+/// RTTY (MAN-322).
 const WPM_END_OFFSET: usize = 9;
 /// The left-justified spot-type field, 6 columns at minimum, starts 16
 /// columns past the mode field (RBN columns 63-68). MAN-94's 7-character
@@ -142,6 +143,12 @@ const TIME_START_OFFSET: usize = 24;
 
 /// Renders one spot as a fixed-column AK1A `DX de` cluster line, e.g.
 /// `DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      0312Z`.
+///
+/// MAN-322: the mode column is the spot's own mode (`CW` or `RTTY`), and
+/// an RTTY spot quotes its baud rounded to an integer with the unit `BPS`
+/// (`RTTY  27 dB  45 BPS`). ` BPS` and ` WPM` are the same width, so the
+/// type and time fields keep columns 63 and 71. An RTTY spot without a
+/// baud leaves the speed field blank, as a relayed FT8 spot does.
 ///
 /// `unix_ts_secs` is the spot's wall-clock time (UTC); converting from the
 /// decoder's sample-count timestamp happens at the caller, not here (see
@@ -177,11 +184,14 @@ pub fn format_line(
         freq_hz: spot.freq_hz,
         callsign: &spot.callsign,
         mode: match line_format {
-            LineFormat::Rbn => "CW",
+            LineFormat::Rbn => spot.mode.label(),
             LineFormat::Skimmer => "",
         },
         snr_db: (spot.snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32,
-        wpm: Some(spot.wpm.round() as i32),
+        speed: match spot.mode {
+            SpotMode::Cw => Some((spot.wpm.round() as i32, "WPM")),
+            SpotMode::Rtty => spot.baud.map(|b| (b.round() as i32, "BPS")),
+        },
         type_label: spot_type_label(spot.spot_type, &spot.callsign),
         unix_ts_secs,
     })
@@ -194,8 +204,8 @@ pub fn format_line(
 /// leaves the speed field blank; the type and time fields keep their RBN
 /// columns 63 and 71 (MAN-90 claim C13, unverified).
 pub fn format_relay_line(spot: &RelaySpot) -> String {
-    let (mode, wpm) = match spot.mode {
-        RelayMode::Cw { wpm } => ("CW", Some(i32::try_from(wpm).unwrap_or(i32::MAX))),
+    let (mode, speed) = match spot.mode {
+        RelayMode::Cw { wpm } => ("CW", Some((i32::try_from(wpm).unwrap_or(i32::MAX), "WPM"))),
         RelayMode::Ft8 => ("FT8", None),
         RelayMode::Ft4 => ("FT4", None),
     };
@@ -205,16 +215,17 @@ pub fn format_relay_line(spot: &RelaySpot) -> String {
         callsign: &spot.callsign,
         mode,
         snr_db: spot.snr_db,
-        wpm,
+        speed,
         type_label: spot_type_label(spot.spot_type, &spot.callsign),
         unix_ts_secs: spot.unix_ts,
     })
 }
 
 /// The fields one AK1A line carries, already converted to their wire
-/// values. `mode` is the mode column's text: `"CW"`, `"FT8"` or `"FT4"`
-/// in the RBN layout (padded to its 6 columns), or `""` for the Skimmer
-/// layout's 2-wide field. `wpm` is `None` for a digital spot, which leaves
+/// values. `mode` is the mode column's text: `"CW"`, `"RTTY"`, `"FT8"` or
+/// `"FT4"` in the RBN layout (padded to its 6 columns), or `""` for the
+/// Skimmer layout's 2-wide field. `speed` is the value and its unit
+/// (`"WPM"` or `"BPS"`), or `None` for a spot with no speed, which leaves
 /// the speed field blank.
 struct LineFields<'a> {
     spotter_call: &'a str,
@@ -222,7 +233,7 @@ struct LineFields<'a> {
     callsign: &'a str,
     mode: &'a str,
     snr_db: i32,
-    wpm: Option<i32>,
+    speed: Option<(i32, &'static str)>,
     type_label: &'static str,
     unix_ts_secs: i64,
 }
@@ -298,17 +309,18 @@ fn render(fields: &LineFields<'_>) -> String {
     // MAN-320: a digital spot has no speed; its field is left blank and the
     // type gap below is computed from the end of ` dB`, so the type and
     // time fields keep their anchors.
-    let (wpm_field, wpm_unit_end_col) = match fields.wpm {
-        Some(wpm) => {
-            let wpm = format!("{wpm}");
+    let (wpm_field, wpm_unit_end_col) = match fields.speed {
+        Some((value, unit)) => {
+            let value = format!("{value}");
             let wpm_gap = (mode_end_col + WPM_END_OFFSET)
-                .saturating_sub(db_end_col + wpm.chars().count())
+                .saturating_sub(db_end_col + value.chars().count())
                 .max(1);
-            let wpm_end_col = db_end_col + wpm_gap + wpm.chars().count();
-            // ` WPM` is part of the WPM field, not a separator.
+            let value_end_col = db_end_col + wpm_gap + value.chars().count();
+            // The ` WPM`/` BPS` unit is part of the speed field, not a
+            // separator.
             (
-                format!("{:wpm_gap$}{wpm} WPM", ""),
-                wpm_end_col + " WPM".len(),
+                format!("{:wpm_gap$}{value} {unit}", ""),
+                value_end_col + 1 + unit.len(),
             )
         }
         None => (String::new(), db_end_col),
@@ -369,10 +381,13 @@ mod tests {
             wpm: 25.0,
             spot_type: SpotType::Cq,
             confidence: 0.9,
+            emission_state: manta_spot::EmissionState::Confirmed,
             track_id: 1,
             sample_ts: 0,
             rst: None,
             qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
         }
     }
 
@@ -1004,5 +1019,73 @@ mod tests {
             format_relay_line(&spot),
             "DX de W3XYZ-2-#: 14027.10 JA1ABC         CW    30 dB  28 WPM  CQ      0312Z"
         );
+    }
+    /// MAN-322: an RTTY spot at 14 080.17 kHz, 20 dB(2500), 45.45 baud.
+    fn rtty_spot() -> Spot {
+        Spot {
+            callsign: "W1AW".to_string(),
+            freq_hz: 14_080_170.0,
+            snr_db: 20.0,
+            wpm: 0.0,
+            mode: manta_spot::SpotMode::Rtty,
+            baud: Some(45.45),
+            ..capture_spot()
+        }
+    }
+
+    /// MAN-322 D6: `RTTY` in the mode column and the baud with ` BPS`; the
+    /// type and time keep RBN's columns 63 and 71.
+    #[test]
+    fn an_rtty_spot_renders_rtty_and_bps_on_the_rbn_columns() {
+        let line = format_line(&rtty_spot(), "W3XYZ", 1_700_000_000, LineFormat::Rbn);
+        assert_eq!(
+            line,
+            "DX de W3XYZ-#:  14080.17  W1AW           RTTY  27 dB  45 BPS  CQ      2213Z"
+        );
+        assert_eq!(col_of(&line, "RTTY"), 42);
+        assert_eq!(col_of(&line, "CQ"), 63);
+        assert_eq!(col_of(&line, "2213Z"), 71);
+        // Same columns as the CW line of the same spot, but the mode and unit.
+        let cw = format_line(
+            &Spot {
+                wpm: 45.0,
+                mode: manta_spot::SpotMode::Cw,
+                baud: None,
+                ..rtty_spot()
+            },
+            "W3XYZ",
+            1_700_000_000,
+            LineFormat::Rbn,
+        );
+        assert_eq!(cw.replace("CW  ", "RTTY").replace("WPM", "BPS"), line);
+    }
+
+    #[test]
+    fn an_rtty_spot_in_the_skimmer_layout_has_no_mode_column() {
+        let line = format_line(&rtty_spot(), "W3XYZ", 1_700_000_000, LineFormat::Skimmer);
+        assert_eq!(
+            line,
+            "DX de W3XYZ-#:  14080.17  W1AW             27 dB  45 BPS  CQ      2213Z"
+        );
+        assert!(!line.contains("RTTY"), "{line}");
+        assert_eq!(col_of(&line, "2213Z"), 67);
+    }
+
+    /// MAN-322 D6: an RTTY spot with no baud leaves the speed blank, like a
+    /// relayed FT8 spot, and keeps the type and time columns.
+    #[test]
+    fn an_rtty_spot_without_baud_leaves_the_speed_blank() {
+        let spot = Spot {
+            baud: None,
+            ..rtty_spot()
+        };
+        let line = format_line(&spot, "W3XYZ", 1_700_000_000, LineFormat::Rbn);
+        assert_eq!(
+            line,
+            "DX de W3XYZ-#:  14080.17  W1AW           RTTY  27 dB          CQ      2213Z"
+        );
+        assert!(!line.contains("BPS") && !line.contains("WPM"), "{line}");
+        assert_eq!(col_of(&line, "CQ"), 63);
+        assert_eq!(col_of(&line, "2213Z"), 71);
     }
 }

@@ -1304,6 +1304,7 @@ fn write_rtty_wav(dir: &Path) -> PathBuf {
         &mut iq,
         fs,
         &manta_testkit::fsk::FskSpec {
+            mark_below_space: false,
             mark_offset_hz: 15_000.0,
             shift_hz: 170.0,
             baud: 45.45,
@@ -3275,6 +3276,41 @@ fn daemon_run_reports_the_rate_error_not_the_dial_guard() {
     assert_rate_bomb_is_refused(&out);
     assert!(
         !String::from_utf8_lossy(&out.stderr).contains("--dial-freq-hz is required"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// MAN-141 validate (code review): the `spectrum_udp` feed's RF guard runs
+/// without `[server]` too, and must report an existing IQ WAV's open error
+/// as the server guard above does, not ask for `input.center_freq_hz`.
+#[test]
+fn spectrum_feed_run_reports_the_rate_error_not_the_rf_guard() {
+    let dir = tempfile::tempdir().unwrap();
+    let wav = dir.path().join("bomb.wav");
+    header_only_iq_wav(&wav, 393_216_000);
+    std::fs::write(
+        dir.path().join("bomb.json"),
+        "{\"center_freq_hz\": 14030000.0}",
+    )
+    .unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "spectrum.toml",
+        &format!(
+            "[input]\ntype = \"file\"\npath = {:?}\niq = true\n\
+             spectrum_udp = \"127.0.0.1:13064\"\n",
+            wav.to_str().unwrap()
+        ),
+    );
+    let out = manta()
+        .args(["run", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_rate_bomb_is_refused(&out);
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("needs a real RF frequency"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

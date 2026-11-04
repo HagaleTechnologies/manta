@@ -173,6 +173,7 @@ impl LiveTap {
                 sample_ts,
                 snr_2500_db,
                 freq_hz,
+                ..
             } => {
                 self.now_ts = self.now_ts.max(*sample_ts);
                 let t = self.tracks.entry(*track_id).or_default();
@@ -211,7 +212,7 @@ impl LiveTap {
             }
             // MAN-315: the live-state stream carries no sender timing; it
             // stays on the event stream and `decode --json`.
-            DecoderEvent::TimingUpdate { .. } => {}
+            DecoderEvent::ReadingsHeld { .. } | DecoderEvent::TimingUpdate { .. } => {}
             DecoderEvent::TrackClosed { track_id, .. } => {
                 if self.dirty.remove(track_id) {
                     self.publish_track(*track_id, validator);
@@ -586,6 +587,7 @@ pub(crate) mod tests {
                 sample_ts: 20,
                 snr_2500_db: 12.0,
                 freq_hz: 14_010_050.0,
+                last_char_ts: 0,
             },
             &v,
         );

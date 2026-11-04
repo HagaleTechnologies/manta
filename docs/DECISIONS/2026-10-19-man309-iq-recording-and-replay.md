@@ -43,6 +43,11 @@ described on the command line. Operator guide:
   (a drain shorter than 5 s waits out the rest). A timeout cancels
   publication if it has not begun. A live recording's start time is the
   spot servers' session epoch, one value for both.
+  **Amended (MAN-453):** a writer that has begun publishing at the
+  deadline gets up to 2 s more and is reported as it ended, so a recording
+  reported unconfirmed is never published later; a writer thread that
+  cannot start fails `run` with exit 1 and no files left. See
+  [MAN-453](2026-11-01-man453-recording-and-replay-edge-cases.md).
 - **D3a — configuration.** `record_iq` is a shared `[input]` key (and
   `MANTA_INPUT_RECORD_IQ`), resolved against the config file's directory
   like `path` (the input path resolver now takes the key name). Each
@@ -78,6 +83,9 @@ described on the command line. Operator guide:
   guards differ. A gap-free loop still splices without a discontinuity. A
   recording with any gap is refused by a rate-changing
   `--capture-rate-hz` (the decimator does not carry gaps).
+  **Amended (MAN-453):** a stop ends `PacedSource`'s wait within 100 ms,
+  including a recorded gap's, so a long outage no longer holds up
+  shutdown.
 - **D7 — gap-aware `decode`.** `manta_engine::decode_source` checks
   `take_discontinuity` after every read and at EOF. At a gap it processes
   the pre-gap partial chunk, closes the segment with

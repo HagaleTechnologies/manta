@@ -1042,16 +1042,7 @@ mod tests {
 
     /// FNV-1a over the f32 bit patterns of `samples` (re, then im).
     fn digest(samples: &[Complex32]) -> u64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for c in samples {
-            for v in [c.re, c.im] {
-                for b in v.to_bits().to_le_bytes() {
-                    h ^= u64::from(b);
-                    h = h.wrapping_mul(0x0100_0000_01b3);
-                }
-            }
-        }
-        h
+        crate::repro::samples_digest(samples)
     }
 
     /// MAN-315 D9: the keyer's new `dit_units`/`element_gap_units` (1.0 for
