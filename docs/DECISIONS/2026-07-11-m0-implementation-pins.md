@@ -1,6 +1,6 @@
 # M0 implementation pins
 
-This is the M0 (`docs/superpowers/plans/2026-07-11-m0-single-signal-decode.md`)
+This is the M0 (`docs/archive/plans/plans/2026-07-11-m0-single-signal-decode.md`)
 implementation's pinned-decision record: the deviations and pins the plan made
 where SPEC-decode-core.md / ROADMAP.md were silent or conflicting, plus the
 concrete artifacts (dependency rev, filter tap snapshot, assertion margins)
