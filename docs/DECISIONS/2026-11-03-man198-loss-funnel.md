@@ -25,13 +25,13 @@ opportunity is never counted twice.
 | Stage (`lostAt`) | Evidence that it passed | Failure `detail` |
 |---|---|---|
 | `inputCoverage` | the acoustic window [first - W/2, last + W/2] overlaps the recording, the frequency is inside the RF passband less half a channel, and not every rise near it was refused by a source mask | `outsideRecording`, `outsidePassband`, `sourceMask:<trustedBand\|analyticGuard\|digitalWindow\|mirrorImage>` |
-| `detectableEnergy` | a candidate track was born within `trackTolHz` plus half a channel and was alive in the acoustic window | `noRise`, `refusedRise:<warmup\|staticCrash\|ownedByTrack\|coolingDown\|notLocalPeak\|rtty\|coModulated>` |
+| `detectableEnergy` | a candidate track was born within `trackTolHz` plus half a channel and was alive in the acoustic window | `noRise`, `refusedRise:<warmup\|staticCrash\|ownedByTrack\|sidelobePosition\|coolingDown\|notLocalPeak\|rtty\|coModulated>` |
 | `admittedTrack` | one of those candidates leased a decoder (`TrackPromoted`) | `closed:<closeReason>` or `openAtEnd`, for the most advanced candidate (confirmed first, then the latest) |
 | `usableTiming` | a leased candidate's speed came within max(3 WPM, 20%) of the RBN speed, or RBN gave none and the track has any estimate | `noSpeedUpdate`, `speedOff` |
 | `textContainsCall` | a leased track within `spotTolHz` decoded the call as a whole word, or held it as a reading, inside the spot window (the word's first-to-last character, or the reading's run of consecutive holdings, overlaps it; text from elsewhere in the track's life does not count) | `substringOnly` (the words decoded in the spot window, spaces removed, contain the call), `noCall` |
-| `selfIdRecognized` | a validator decision for the call that grammar, cty, the power-step guard and the beacon-evidence check did not reject | `rejected:<reason>`, `noDecision` |
+| `selfIdRecognized` | a validator decision for the call that grammar, cty, the power-step guard and the beacon-evidence check did not reject, other than a blocklist or notch withhold (checked before every gate, so it proves none) | `rejected:<reason>`, `policy:blocklist`, `policy:notch`, `noDecision` |
 | `sufficientEvidence` | a decision that cleared the repetition, variant, zero-evidence and beacon gates | `<reason> <reps>/<required>` |
-| `emitted` | a spot for the call within the spot tolerances, or a `dedupe` withhold | `policy:blocklist`, `policy:notch`, `lookupPending`, `lookupNotFound`, `notEmitted` |
+| `emitted` | a spot for the call within the spot tolerances | `policy:blocklist`, `policy:notch` (lists replaced after a held capture), `lookupPending`, `lookupNotFound`, `dedupeOutsideWindow`, `notEmitted` |
 | `delivered` | as `emitted`: offline, `SpotBus::publish` drops nothing (`deliveredMeans` in the header) | none offline |
 
 The `Reason` mapping is an exhaustive `match` (`funnel/attribute.rs`
@@ -39,9 +39,16 @@ The `Reason` mapping is an exhaustive `match` (`funnel/attribute.rs`
 Grammar, cty, power-step guard and MAN-201's `beaconNoEvidence` lose at
 `selfIdRecognized`; repetition,
 variant, no-evidence and the four beacon reasons at `sufficientEvidence`;
-blocklist, notch and the two lookup reasons at `emitted`. `dedupe` is
-evidence of delivery: the validator withholds a duplicate only after
-delivering the same call within 600 s, shorter than the episode gap.
+the two lookup reasons at `emitted`. Blocklist and notch prove only that the
+call reached the validator: it checks them ahead of grammar, cty, acoustic
+evidence, repetition and variant (MAN-31), so they credit none of those
+gates and a policy-only call loses at `selfIdRecognized` as
+`policy:<blocklist|notch>`. `dedupe` passes `sufficientEvidence` but is not
+evidence of emission: its 600 s window outlasts the spot window, so the
+original spot can sit outside the opportunity (a spot at 10 s suppresses a
+copy at 400 s, whose spot window is 310-490 s). Only a spot that itself
+matches the opportunity credits emission; otherwise the loss is
+`emitted` / `dedupeOutsideWindow`.
 
 The summary keeps candidate births, confirmations and leased (active) track
 births apart in `births`, as the ticket asks, and counts closes by reason plus

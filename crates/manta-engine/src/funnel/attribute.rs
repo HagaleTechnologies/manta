@@ -281,10 +281,16 @@ enum ReasonEffect {
     RejectsSelfId,
     /// Passes self-ID, lost at sufficient evidence.
     LacksEvidence,
+    /// An operator blocklist or notch: checked ahead of every validation
+    /// gate (`manta-spot` validator, MAN-31), so it proves the call reached
+    /// the validator and nothing about self-ID or evidence.
+    PolicyGate,
     /// Passes evidence, lost at emission.
     Withholds,
-    /// A duplicate of a spot already delivered: evidence of delivery.
-    DeliveredEarlier,
+    /// A duplicate of an earlier spot: passes evidence. It credits emission
+    /// only through a spot that itself matches the opportunity, since the
+    /// dedupe window outlasts the opportunity's spot window.
+    Duplicate,
 }
 
 fn reason_effect(r: Reason) -> ReasonEffect {
@@ -299,10 +305,9 @@ fn reason_effect(r: Reason) -> ReasonEffect {
         | Reason::BeaconSpeed
         | Reason::BeaconOverflow
         | Reason::BeaconDiscarded => ReasonEffect::LacksEvidence,
-        Reason::Blocklist | Reason::Notch | Reason::LookupPending | Reason::LookupNotFound => {
-            ReasonEffect::Withholds
-        }
-        Reason::Dedupe => ReasonEffect::DeliveredEarlier,
+        Reason::Blocklist | Reason::Notch => ReasonEffect::PolicyGate,
+        Reason::LookupPending | Reason::LookupNotFound => ReasonEffect::Withholds,
+        Reason::Dedupe => ReasonEffect::Duplicate,
     }
 }
 
@@ -473,19 +478,21 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
         })
         .collect();
     let effect = |d: &&DecisionFact| d.reason.map(reason_effect);
-    let self_id_ok = decisions
-        .iter()
-        .any(|d| effect(d) != Some(ReasonEffect::RejectsSelfId));
+    let self_id_ok = decisions.iter().any(|d| {
+        !matches!(
+            effect(d),
+            Some(ReasonEffect::RejectsSelfId | ReasonEffect::PolicyGate)
+        )
+    });
     let evidence_ok = decisions.iter().any(|d| {
         matches!(
             effect(d),
-            None | Some(ReasonEffect::Withholds) | Some(ReasonEffect::DeliveredEarlier)
+            None | Some(ReasonEffect::Withholds | ReasonEffect::Duplicate)
         )
     });
-    let emitted_ok = !spots.is_empty()
-        || decisions
-            .iter()
-            .any(|d| effect(d) == Some(ReasonEffect::DeliveredEarlier));
+    // Only a spot inside the opportunity's own tolerances proves emission:
+    // a dedupe withhold's original may lie outside them.
+    let emitted_ok = !spots.is_empty();
 
     let evidence = [
         true,
@@ -561,6 +568,7 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
             }
         }
         Stage::SelfIdRecognized => match decisions.last().and_then(|d| d.reason) {
+            Some(r @ (Reason::Blocklist | Reason::Notch)) => format!("policy:{}", r.label()),
             Some(r) => format!("rejected:{}", r.label()),
             None => "noDecision".to_string(),
         },
@@ -581,6 +589,7 @@ pub fn attribute(op: &Opportunity, ev: &Evidence, geo: &Geometry, tol: &Toleranc
                 Some(Reason::Notch) => Some("policy:notch"),
                 Some(Reason::LookupPending) => Some("lookupPending"),
                 Some(Reason::LookupNotFound) => Some("lookupNotFound"),
+                Some(Reason::Dedupe) => Some("dedupeOutsideWindow"),
                 _ => None,
             })
             .unwrap_or("notEmitted")
@@ -1137,16 +1146,113 @@ mod tests {
         );
         assert_eq!(
             at(decision("JA1ZZZ", Some(Reason::Blocklist), 2)),
-            (Some(Stage::Emitted), Some("policy:blocklist".into()))
+            (
+                Some(Stage::SelfIdRecognized),
+                Some("policy:blocklist".into())
+            )
         );
         assert_eq!(
             at(decision("JA1ZZZ", Some(Reason::LookupNotFound), 2)),
             (Some(Stage::Emitted), Some("lookupNotFound".into()))
         );
+        // No spot of its own inside the windows: dedupe proves evidence,
+        // not emission (the PR #493 P1).
         assert_eq!(
             at(decision("JA1ZZZ", Some(Reason::Dedupe), 2)),
-            (None, None)
+            (Some(Stage::Emitted), Some("dedupeOutsideWindow".into()))
         );
+    }
+
+    /// PR #493 P1: the validator checks blocklist and notch before grammar,
+    /// cty, acoustic evidence, repetition and variant (MAN-31), so a policy
+    /// withhold credits none of those gates.
+    #[test]
+    fn policy_rejection_credits_no_unexecuted_gate() {
+        let mut t = track(1, F);
+        says(&mut t, "CQ DE JA1ZZZ K", 30.0);
+        let run_with = |decisions: Vec<DecisionFact>| {
+            let ev = Evidence {
+                tracks: vec![t.clone()],
+                decisions,
+                ..Default::default()
+            };
+            let r = run(&op("JA1ZZZ", F, 30.0), &ev);
+            (r.reached, r.lost_at, r.detail)
+        };
+        // A blocklisted call decoded once, needing two repetitions: neither
+        // self-ID nor evidence was ever checked.
+        for (reason, detail) in [
+            (Reason::Blocklist, "policy:blocklist"),
+            (Reason::Notch, "policy:notch"),
+        ] {
+            assert_eq!(
+                run_with(vec![decision("JA1ZZZ", Some(reason), 1)]),
+                (
+                    Some(Stage::TextContainsCall),
+                    Some(Stage::SelfIdRecognized),
+                    Some(detail.into())
+                ),
+                "{reason:?}"
+            );
+        }
+        // A gate that did run still places the loss.
+        assert_eq!(
+            run_with(vec![
+                decision("JA1ZZZ", Some(Reason::Repetition), 1),
+                decision("JA1ZZZ", Some(Reason::Blocklist), 1),
+            ]),
+            (
+                Some(Stage::SelfIdRecognized),
+                Some(Stage::SufficientEvidence),
+                Some("repetition 1/2".into())
+            )
+        );
+    }
+
+    /// PR #493 P1: the dedupe window (600 s) outlasts the spot window, so a
+    /// dedupe withhold inside the window can point at an original spot
+    /// outside it. Only a spot that itself matches the opportunity credits
+    /// emission and delivery.
+    #[test]
+    fn dedupe_credits_delivery_only_through_a_matching_spot() {
+        let geo = Geometry {
+            duration_s: 600.0,
+            ..geo()
+        };
+        let mut t = track(1, F);
+        says(&mut t, "CQ DE JA1ZZZ K", 400.0);
+        let dup = DecisionFact {
+            t_s: 400.0,
+            ..decision("JA1ZZZ", Some(Reason::Dedupe), 2)
+        };
+        let original_at = |t_s: f64| SpotFact {
+            t_s,
+            ..spot("JA1ZZZ", F)
+        };
+        let run_with = |spots: Vec<SpotFact>| {
+            let ev = Evidence {
+                tracks: vec![t.clone()],
+                decisions: vec![dup.clone()],
+                spots,
+                ..Default::default()
+            };
+            attribute(&op("JA1ZZZ", F, 400.0), &ev, &geo, &Tolerances::default())
+        };
+        // The original spot at 10 s, outside [310, 490].
+        let r = run_with(vec![original_at(10.0)]);
+        assert_eq!(r.spot_window_s, [310.0, 490.0]);
+        assert_eq!(
+            (r.reached, r.lost_at, r.detail.as_deref()),
+            (
+                Some(Stage::SufficientEvidence),
+                Some(Stage::Emitted),
+                Some("dedupeOutsideWindow")
+            )
+        );
+        assert!(r.spots.is_empty());
+        // The original inside the window: delivered.
+        let r = run_with(vec![original_at(350.0)]);
+        assert_eq!((r.lost_at, r.reached), (None, Some(Stage::Delivered)));
     }
 
     #[test]
@@ -1182,11 +1288,9 @@ mod tests {
                 | Reason::BeaconSpeed
                 | Reason::BeaconOverflow
                 | Reason::BeaconDiscarded => ReasonEffect::LacksEvidence,
-                Reason::Blocklist
-                | Reason::Notch
-                | Reason::LookupPending
-                | Reason::LookupNotFound => ReasonEffect::Withholds,
-                Reason::Dedupe => ReasonEffect::DeliveredEarlier,
+                Reason::Blocklist | Reason::Notch => ReasonEffect::PolicyGate,
+                Reason::LookupPending | Reason::LookupNotFound => ReasonEffect::Withholds,
+                Reason::Dedupe => ReasonEffect::Duplicate,
             };
             assert_eq!(reason_effect(r), expected, "{r:?}");
         }
