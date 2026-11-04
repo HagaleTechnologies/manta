@@ -26,6 +26,8 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-11-03 | MAN-206 | [MAN-206: an independent synthetic generator checks the testkit, and failing scenes shrink to synthetic repros](2026-11-03-man206-independent-generator-and-scene-minimizer.md) |
 | 2026-11-03 | MAN-205 | [MAN-205: legacy and HSMM rarely recover a call the other misses; fusion is not worth building on the bench](2026-11-03-man205-legacy-hsmm-engine-overlap.md) |
 | 2026-11-03 | MAN-204 | [MAN-204: guarded two-stage cancellation recovers a weak CW station beside a strong one (offline experiment)](2026-11-03-man204-guarded-two-stage-cancellation.md) |
+| 2026-11-03 | MAN-200 | [MAN-200: damaged repetitions of one self-ID can confirm the call](2026-11-03-man200-repetition-evidence-fusion.md) |
+| 2026-11-03 | MAN-180 | [MAN-180: `--soapy-gain` help warns that an SDRplay reads it as attenuation](2026-11-03-man180-soapy-gain-help-warning.md) |
 | 2026-11-02 | MAN-459 | [MAN-459: the protocol-2 acceptance fake follows manta across a reconnect, and every live-run failure explains itself](2026-11-02-man459-protocol2-fake-follows-reconnects.md) |
 | 2026-11-02 | MAN-201 | [MAN-201: who sent a callsign, not only which callsign](2026-11-02-man201-callsign-roles.md) |
 | 2026-11-01 | MAN-453 | [MAN-453: raw IQ recording reports its true outcome, and a stop ends a paced replay's wait](2026-11-01-man453-recording-and-replay-edge-cases.md) |
