@@ -70,7 +70,8 @@ decided; SPEC and docs/ still win on anything not listed here.
    `owned()`/`select_channel()` and the alpha constant itself are
    byte-for-byte unchanged, confirmed by the Task 9 review.
 
-4. **V7 golden vector: SPEC §7's literal 150 Hz separation (10,000/10,150
+4. Superseded by [MAN-112](2026-11-01-man112-close-pair-resolution.md).
+   **Historical V7 golden vector: SPEC §7's literal 150 Hz separation (10,000/10,150
    Hz) deviated to a grid-aligned, 4-channel pair.** `crates/manta-testkit/
    src/vectors.rs` places V7's two signals at channel 107 (10,031.25 Hz)
    and channel 111 (10,406.25 Hz), both bin-centered (zero fractional

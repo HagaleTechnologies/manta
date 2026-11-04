@@ -259,6 +259,17 @@ pub trait IqSource {
         false
     }
 
+    /// MAN-201: `true` once for a live stream that has just stopped and may
+    /// come back. `read` returns `Ok(0)` with this set, and the `0` is not an
+    /// end of stream: the caller settles what it holds and reads again. A
+    /// stalled stream delivers no hops, so nothing else would end a track
+    /// and settle its last call before the stream recovers.
+    ///
+    /// **Wrapper types must forward this**, as they forward the gap hooks.
+    fn take_stalled(&mut self) -> bool {
+        false
+    }
+
     /// MAN-259: how far into this connection's `open()` call the stream
     /// `read()` returns began -- the offset from the call starting to
     /// immediately before the call that told the hardware to start
@@ -266,9 +277,12 @@ pub trait IqSource {
     /// command, cpal's `start`, ka9q's data-group join), or, when the
     /// driver cannot return everything captured since its trigger, to the
     /// first sample it can still return (ka9q's startup stash evicts its
-    /// oldest packets past a byte cap). Everything before it was
-    /// certainly signal-silent; samples captured from it on are returned
-    /// by `read()`.
+    /// oldest packets past a byte cap). A driver that cannot time that
+    /// sample exactly reports an instant no later than it (ka9q stamps the
+    /// last read that found its socket empty, MAN-407), because a later
+    /// one counts the delay as both outage and returned samples.
+    /// Everything before it was certainly signal-silent; samples captured
+    /// from it on are returned by `read()`.
     /// `manta-cli`'s `ReconnectingSource` ends a reconnect's outage there
     /// rather than where `open()` returned, so the open call's remaining
     /// runtime is not counted both as outage and as returned samples,

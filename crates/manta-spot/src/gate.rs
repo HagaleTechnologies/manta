@@ -190,7 +190,7 @@ pub(crate) fn message_distinct_indices(
 ///    message-distinct occurrence overall, same/cross-track rule based on
 ///    its track_id -- a legitimate new real-time comparison, unaffected
 ///    by round 6's constraint since it's evaluated fresh, once, right now.
-fn classify_new_occurrence(
+pub(crate) fn classify_new_occurrence(
     accepted: &[(u64, u64, u32, bool, u64)],
     own_last_seen: Option<(u64, u64, u64)>,
     seq: u64,
@@ -199,6 +199,21 @@ fn classify_new_occurrence(
     time_gap_samples: u64,
     is_track_active: &impl Fn(u32) -> bool,
 ) -> (bool, u64) {
+    // MAN-201: this track's newest touch, once it is a full message behind
+    // this occurrence. A touch that deferred to another track's message
+    // then says this word is a later message than that one, however long
+    // the other track's identity stays active: a dead input's closed track
+    // (the "conservatively active" no-survivor alias) would otherwise hold
+    // every repeat here until the time gap.
+    let own_last = accepted
+        .iter()
+        .rev()
+        .find(|&&(_, _, t, ..)| t == tid)
+        .map(|&(t_ts, t_seq, ..)| (t_ts, t_seq))
+        .or(own_last_seen.map(|(t_ts, t_seq, _)| (t_ts, t_seq)));
+    let past_own_touch = |prev_ts: u64| {
+        own_last.is_some_and(|(t_ts, t_seq)| prev_ts <= t_ts && seq >= t_seq + MIN_MESSAGE_WORD_GAP)
+    };
     let own_anchor = accepted
         .iter()
         .rev()
@@ -228,7 +243,7 @@ fn classify_new_occurrence(
         Some(&(prev_ts, prev_seq, prev_tid, _, _)) => {
             let gap = ts.saturating_sub(prev_ts);
             let distinct = if tid != prev_tid {
-                !is_track_active(prev_tid) || gap >= time_gap_samples
+                !is_track_active(prev_tid) || gap >= time_gap_samples || past_own_touch(prev_ts)
             } else {
                 seq >= prev_seq + MIN_MESSAGE_WORD_GAP || gap >= time_gap_samples
             };
@@ -271,7 +286,7 @@ fn classify_new_occurrence(
 /// redo: it depends only on whether an entry still EXISTS in the window
 /// -- a monotonic, purely time-based fact for a given `now_ts` that never
 /// flickers, not on any external mutable state like `is_track_active`.
-fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool, u64)]) {
+pub(crate) fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool, u64)]) {
     let present: std::collections::BTreeSet<u64> = accepted.iter().map(|&(ts, ..)| ts).collect();
     let mut orphan_groups: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
     for (i, &(_, _, _, counted, anchor_ts)) in accepted.iter().enumerate() {
@@ -299,6 +314,14 @@ fn promote_orphaned_leader(accepted: &mut [(u64, u64, u32, bool, u64)]) {
 /// Width of a frequency bucket, in Hz (MAN-166). See `RepetitionGate`'s
 /// doc for why bucketing exists at all, and `record`'s doc for why a
 /// bucket alone isn't sufficient identity.
+/// MAN-200 D2: whether two closed sample spans `(start, end)` share a
+/// sample. A span runs from a word's first character's `sample_ts` to its
+/// `WordBoundary`'s; two decodes of the same keying (a replay, a second
+/// track on one signal) overlap, two separate utterances never do.
+pub(crate) fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
+    a.0 <= b.1 && b.0 <= a.1
+}
+
 const FREQ_BUCKET_HZ: f64 = 100.0;
 
 /// Furthest, in Hz, a decode may sit from a neighbor bucket's entry's
@@ -411,6 +434,13 @@ struct GateEntry {
     /// rejected as a duplicate of -- see `classify_new_occurrence`'s tier
     /// 3 doc.
     last_seen_by_track: BTreeMap<u32, (u64, u64, u64)>,
+    /// MAN-200 D2/D3: `(start, end, anchor_ts)` of every touch made through
+    /// `RepetitionGate::record_span`, counted or not, pruned with
+    /// `accepted` (`end >= cutoff`). A new touch whose span overlaps one of
+    /// these decodes the same samples, so it is never another repetition.
+    /// Checked within this one (bucket, callsign) entry only: two stations
+    /// keying at once on one channel are different calls, both real.
+    spans: Vec<(u64, u64, u64)>,
 }
 
 impl GateEntry {
@@ -419,6 +449,7 @@ impl GateEntry {
             anchor_freq_hz,
             accepted: Vec::new(),
             last_seen_by_track: BTreeMap::new(),
+            spans: Vec::new(),
         }
     }
 
@@ -451,6 +482,17 @@ impl GateEntry {
             .chain(self.last_seen_by_track.values().map(|&(ts, _, _)| ts))
             .max()
     }
+}
+
+/// One occurrence the gate holds for a call within its window
+/// (`RepetitionGate::record_traced`, MAN-207). Only the `message_distinct`
+/// ones count toward the call's repetitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateOccurrence {
+    pub track_id: u32,
+    pub word_seq: u64,
+    pub sample_ts: u64,
+    pub message_distinct: bool,
 }
 
 pub struct RepetitionGate {
@@ -608,11 +650,12 @@ impl RepetitionGate {
         word_seq: u64,
         is_track_active: impl Fn(u32) -> bool,
     ) -> usize {
-        let reps = self.record_inner(
+        let (reps, _) = self.record_inner(
             track_id,
             freq_hz,
             callsign,
             sample_ts,
+            None,
             word_seq,
             is_track_active,
         );
@@ -620,9 +663,40 @@ impl RepetitionGate {
         reps
     }
 
-    /// `record`'s body; split out so its several early returns all pass
-    /// through `record`'s MAN-118 counting.
-    fn record_inner(
+    /// `record` for a decode whose sample span `(start, end)` is known
+    /// (MAN-200 D2): `end` is its `WordBoundary` `sample_ts`. A span that
+    /// overlaps a span this entry already holds is the same samples
+    /// decoded again (a replay, a second track on one signal): it is not
+    /// counted, even a whole message later in word numbers, and its
+    /// track's watermark takes the overlapped touch's anchor under the
+    /// never-regress rule. Overlap is checked within one entry only (D3).
+    pub fn record_span(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        span: (u64, u64),
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> usize {
+        let span = (span.0.min(span.1), span.1);
+        let (reps, _) = self.record_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            span.1,
+            Some(span.0),
+            word_seq,
+            is_track_active,
+        );
+        self.repetitions.observe(reps);
+        reps
+    }
+
+    /// `record`, plus the occurrences the entry holds after it, counted or
+    /// not (MAN-207's evidence links). Same effects as `record`; the
+    /// occurrences are read after the update.
+    pub fn record_traced(
         &mut self,
         track_id: u32,
         freq_hz: f64,
@@ -630,10 +704,100 @@ impl RepetitionGate {
         sample_ts: u64,
         word_seq: u64,
         is_track_active: impl Fn(u32) -> bool,
-    ) -> usize {
+    ) -> (usize, Vec<GateOccurrence>) {
+        self.record_traced_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            sample_ts,
+            None,
+            word_seq,
+            is_track_active,
+        )
+    }
+
+    /// `record_span`, plus the occurrences the entry holds after it, as
+    /// `record_traced` reads them (MAN-200 with MAN-207). Same effects as
+    /// `record_span`.
+    pub fn record_span_traced(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        span: (u64, u64),
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Vec<GateOccurrence>) {
+        let span = (span.0.min(span.1), span.1);
+        self.record_traced_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            span.1,
+            Some(span.0),
+            word_seq,
+            is_track_active,
+        )
+    }
+
+    /// `record_traced` and `record_span_traced`'s shared body.
+    #[allow(clippy::too_many_arguments)]
+    fn record_traced_inner(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        span_start: Option<u64>,
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Vec<GateOccurrence>) {
+        let (reps, key) = self.record_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            sample_ts,
+            span_start,
+            word_seq,
+            is_track_active,
+        );
+        self.repetitions.observe(reps);
+        let counted = key
+            .and_then(|key| self.seen.get(&key))
+            .map(|entry| {
+                entry
+                    .accepted
+                    .iter()
+                    .map(
+                        |&(sample_ts, word_seq, track_id, message_distinct, _)| GateOccurrence {
+                            track_id,
+                            word_seq,
+                            sample_ts,
+                            message_distinct,
+                        },
+                    )
+                    .collect()
+            })
+            .unwrap_or_default();
+        (reps, counted)
+    }
+
+    /// `record`'s body; split out so its several early returns all pass
+    /// through `record`'s MAN-118 counting.
+    #[allow(clippy::too_many_arguments)]
+    fn record_inner(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        span_start: Option<u64>,
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Option<(i64, String)>) {
         self.records_total += 1;
         if !freq_hz.is_finite() {
-            return 0;
+            return (0, None);
         }
         let b = bucket(freq_hz);
         let home_key = (b, callsign.to_string());
@@ -701,7 +865,7 @@ impl RepetitionGate {
         }
         let entry = self
             .seen
-            .entry(entry_key)
+            .entry(entry_key.clone())
             .or_insert_with(|| GateEntry::new(freq_hz));
         // MAN-175: the anchor follows this call only when it is the
         // entry's latest touch (Codex review, PR #255) -- see
@@ -709,6 +873,39 @@ impl RepetitionGate {
         // entry below.
         if entry.most_recent().is_none_or(|latest| sample_ts >= latest) {
             entry.anchor_freq_hz = freq_hz;
+        }
+        // MAN-200 D2: the same samples decoded again count once.
+        let span = span_start.map(|start| (start, sample_ts));
+        if let Some(span) = span {
+            let overlapped = entry
+                .spans
+                .iter()
+                .find(|&&(s, e, _)| overlaps((s, e), span))
+                .map(|&(.., anchor)| anchor);
+            if let Some(anchor_ts) = overlapped {
+                entry
+                    .last_seen_by_track
+                    .entry(track_id)
+                    .and_modify(|existing| {
+                        if sample_ts >= existing.0 {
+                            *existing = (sample_ts, word_seq, anchor_ts);
+                        }
+                    })
+                    .or_insert((sample_ts, word_seq, anchor_ts));
+                entry.spans.push((span.0, span.1, anchor_ts));
+                entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
+                entry
+                    .last_seen_by_track
+                    .retain(|_, &mut (ts, _, _)| ts >= cutoff);
+                entry.spans.retain(|&(_, e, _)| e >= cutoff);
+                promote_orphaned_leader(&mut entry.accepted);
+                let reps = entry
+                    .accepted
+                    .iter()
+                    .filter(|&&(_, _, _, counted, _)| counted)
+                    .count();
+                return (reps, Some(entry_key));
+            }
         }
         // Codex review, PR #152, round 8: a track's own previous touch
         // only exempts a NEW touch from the cross-track near-duplicate
@@ -793,6 +990,10 @@ impl RepetitionGate {
                 .accepted
                 .push((sample_ts, word_seq, track_id, message_distinct, anchor_ts));
         }
+        if let Some(span) = span {
+            entry.spans.push((span.0, span.1, anchor_ts));
+        }
+        entry.spans.retain(|&(_, e, _)| e >= cutoff);
         entry.accepted.retain(|&(ts, ..)| ts >= cutoff);
         entry
             .last_seen_by_track
@@ -800,11 +1001,13 @@ impl RepetitionGate {
         promote_orphaned_leader(&mut entry.accepted);
         // Tally the frozen per-occurrence verdicts still inside the
         // window -- never re-derive them (see `accepted`'s own doc).
-        entry
+        let reps = entry
             .accepted
             .iter()
             .filter(|&&(_, _, _, counted, _)| counted)
-            .count()
+            .count();
+        // MAN-207: the entry key, for `record_traced` to read it back.
+        (reps, Some(entry_key))
     }
 
     /// See `records_total`'s doc.
@@ -852,6 +1055,7 @@ impl RepetitionGate {
             entry
                 .last_seen_by_track
                 .retain(|_, &mut (ts, _, _)| ts >= cutoff);
+            entry.spans.retain(|&(_, e, _)| e >= cutoff);
             promote_orphaned_leader(&mut entry.accepted);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
@@ -870,6 +1074,143 @@ mod tests {
     /// e.g. the near-duplicate-time rejection) passes this.
     fn always_active(_: u32) -> bool {
         true
+    }
+
+    /// MAN-207: the traced record names the occurrences it holds.
+    #[test]
+    fn record_traced_returns_the_counted_occurrences() {
+        let mut gate = RepetitionGate::new(FS);
+        let (first, _) = gate.record_traced(1, 7_080_000.0, "K5ARH", 0, 2, always_active);
+        assert_eq!(first, 1);
+        let (reps, counted) =
+            gate.record_traced(1, 7_080_000.0, "K5ARH", 300_000, 9, always_active);
+        assert_eq!(reps, 2);
+        assert_eq!(
+            counted,
+            vec![
+                GateOccurrence {
+                    track_id: 1,
+                    word_seq: 2,
+                    sample_ts: 0,
+                    message_distinct: true,
+                },
+                GateOccurrence {
+                    track_id: 1,
+                    word_seq: 9,
+                    sample_ts: 300_000,
+                    message_distinct: true,
+                },
+            ]
+        );
+    }
+
+    /// MAN-207: tracing changes nothing the gate decides or counts.
+    #[test]
+    fn record_traced_has_the_same_effects_as_record() {
+        let calls: [(u32, f64, &str, u64, u64); 6] = [
+            (1, 7_080_000.0, "K5ARH", 0, 0),
+            (1, 7_080_000.0, "K5ARH", 1_000, 1),
+            (2, 7_080_010.0, "K5ARH", 300_000, 0),
+            (1, 7_080_000.0, "K5ARH", 600_000, 4),
+            (3, 14_020_000.0, "W1AW", 0, 0),
+            (4, f64::NAN, "N0CALL", 0, 0),
+        ];
+        let mut plain = RepetitionGate::new(FS);
+        let mut traced = RepetitionGate::new(FS);
+        for (t, f, c, ts, seq) in calls {
+            let a = plain.record(t, f, c, ts, seq, always_active);
+            let (b, counted) = traced.record_traced(t, f, c, ts, seq, always_active);
+            assert_eq!(a, b);
+            assert_eq!(counted.iter().filter(|o| o.message_distinct).count(), b);
+        }
+        assert_eq!(plain.records_total(), traced.records_total());
+        assert_eq!(plain.repetition_counts(), traced.repetition_counts());
+        assert_eq!(plain.len(), traced.len());
+    }
+
+    /// MAN-200 with MAN-207: tracing a span-aware record changes nothing it
+    /// decides, including an overlapping replay counted once.
+    #[test]
+    fn record_span_traced_has_the_same_effects_as_record_span() {
+        let calls = [
+            (1, 7_080_000.0, "W1AW", (100, 400), 0),
+            (1, 7_080_000.0, "W1AW", (150, 420), 9),
+            (2, 7_080_010.0, "W1AW", (300_000, 300_400), 0),
+            (3, 14_020_000.0, "K5ARH", (0, 50), 0),
+            (4, f64::NAN, "N0CALL", (0, 50), 0),
+        ];
+        let mut plain = RepetitionGate::new(FS);
+        let mut traced = RepetitionGate::new(FS);
+        let mut reps = Vec::new();
+        for (t, f, c, span, seq) in calls {
+            let a = plain.record_span(t, f, c, span, seq, always_active);
+            let (b, counted) = traced.record_span_traced(t, f, c, span, seq, always_active);
+            assert_eq!(a, b);
+            assert_eq!(counted.iter().filter(|o| o.message_distinct).count(), b);
+            reps.push(b);
+        }
+        // [150, 420] overlaps [100, 400]: the same samples, still one.
+        assert_eq!(reps[..2], [1, 1]);
+        assert_eq!(plain.records_total(), traced.records_total());
+        assert_eq!(plain.repetition_counts(), traced.repetition_counts());
+        assert_eq!(plain.len(), traced.len());
+    }
+
+    #[test]
+    fn an_overlapping_replay_on_one_track_counts_once() {
+        // MAN-200 ticket scenario 2: [100, 400] then [150, 420], a whole
+        // message later in word numbers. `record` returns 1 then 2.
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (100, 400), 1, always_active),
+            1
+        );
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (150, 420), 4, always_active),
+            1
+        );
+    }
+
+    #[test]
+    fn an_overlapping_decode_by_a_closed_tracks_successor_counts_once() {
+        let mut gate = RepetitionGate::new(FS);
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (100, 400), 1, |_| false),
+            1
+        );
+        assert_eq!(
+            gate.record_span(2, 14_000_000.0, "W1AW", (150, 420), 1, |_| false),
+            1
+        );
+    }
+
+    #[test]
+    fn separate_spans_still_count_as_separate_messages() {
+        let mut gate = RepetitionGate::new(FS);
+        gate.record_span(1, 14_000_000.0, "W1AW", (100, 400), 1, always_active);
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (500, 800), 4, always_active),
+            2
+        );
+    }
+
+    #[test]
+    fn a_duplicate_does_not_move_its_tracks_anchor_backwards() {
+        // A replay of an older span after a newer message keeps the
+        // track's watermark at the newer message: a third message still
+        // needs its own word gap from it.
+        let mut gate = RepetitionGate::new(FS);
+        gate.record_span(1, 14_000_000.0, "W1AW", (100, 400), 1, always_active);
+        gate.record_span(1, 14_000_000.0, "W1AW", (500, 800), 4, always_active);
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (150, 420), 5, always_active),
+            2
+        );
+        assert_eq!(
+            gate.record_span(1, 14_000_000.0, "W1AW", (900, 1_200), 6, always_active),
+            2,
+            "seq 6 is one word past the counted seq 4's message"
+        );
     }
 
     #[test]
@@ -1968,6 +2309,18 @@ mod tests {
     /// timestamp, but C is only 0.2s after B's rejected touch. Must
     /// compare against the entry's most recent activity overall, not just
     /// the last accepted occurrence.
+    /// MAN-201: a track that deferred to another track's message is its own
+    /// later message once it is a full message past that touch, even while
+    /// the other track's identity stays active (a dead input's closed track).
+    #[test]
+    fn a_repeat_past_its_deferred_touch_counts_while_the_other_track_stays_active() {
+        let mut g = RepetitionGate::new(FS);
+        assert_eq!(g.record(2, 14_012_340.0, "K5ARH", 1_000, 3, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 1_000, 3, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 2_000, 4, |_| true), 1);
+        assert_eq!(g.record(1, 14_012_340.0, "K5ARH", 9_000, 9, |_| true), 2);
+    }
+
     #[test]
     fn near_duplicate_gap_is_measured_from_the_latest_touch_not_just_the_last_accepted() {
         let mut gate = RepetitionGate::new(FS);

@@ -123,6 +123,9 @@ pub struct RecordingSource<S: ?Sized> {
     inner: Box<S>,
     shared: Arc<Shared>,
     pending_gap: Option<u64>,
+    /// MAN-201: the inner source reported a stall, pending for
+    /// `take_stalled()`.
+    stalled: bool,
     stop: Option<Arc<AtomicBool>>,
 }
 
@@ -302,6 +305,7 @@ fn start_with_sinks<S: IqSource + ?Sized>(
             inner,
             shared: shared.clone(),
             pending_gap: None,
+            stalled: false,
             stop: None,
         },
         RecordingHandle {
@@ -508,7 +512,14 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
         let gap = self.inner.take_discontinuity();
         self.pending_gap = gap;
         self.enqueue(gap, &buf[..n]);
-        if n == 0 {
+        // MAN-201: a stalled stream's `0` is not an end of input. The engine
+        // closes its tracks here, so a replay must too: a zero-length `gap`
+        // record, in the existing format, has that effect.
+        self.stalled = n == 0 && self.inner.take_stalled();
+        if self.stalled {
+            self.enqueue(Some(0), &[]);
+        }
+        if n == 0 && !self.stalled {
             // A live source answers a stop request with EOF: that is a
             // stopped session, not an input that ended.
             let stopping = self
@@ -542,6 +553,10 @@ impl<S: IqSource + ?Sized> IqSource for RecordingSource<S> {
     // so a replay runs the samples on either side of it together.
     fn take_unknown_gap(&mut self) -> bool {
         self.inner.take_unknown_gap()
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -1305,6 +1320,72 @@ mod tests {
                     .into()
             ))
         );
+    }
+
+    /// MAN-201: a stall closes the live engine's tracks, so it is recorded
+    /// as a zero-length gap that closes a replay's too.
+    #[test]
+    fn a_stall_keeps_recording_and_leaves_a_zero_length_gap() {
+        struct Stalling {
+            reads: usize,
+            stalled: bool,
+        }
+        impl IqSource for Stalling {
+            fn sample_rate(&self) -> f64 {
+                48_000.0
+            }
+            fn center_freq_hz(&self) -> f64 {
+                14_000_000.0
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                self.reads += 1;
+                match self.reads {
+                    2 => {
+                        self.stalled = true;
+                        Ok(0)
+                    }
+                    1 | 3 => Ok(buf.len()),
+                    _ => Ok(0),
+                }
+            }
+            fn take_stalled(&mut self) -> bool {
+                std::mem::take(&mut self.stalled)
+            }
+        }
+        let (payload, _, _) = kept_sink(None, false, false);
+        let (meta, _, meta_kept) = kept_sink(None, false, false);
+        let src = Stalling {
+            reads: 0,
+            stalled: false,
+        };
+        let header = RecordingHeader::for_source(&src, std::time::UNIX_EPOCH);
+        let (mut rec, handle) = start_with_sinks(
+            Box::new(src),
+            Path::new("stall.cf32"),
+            header,
+            Box::new(payload),
+            Box::new(meta),
+            Box::new(|| Ok(())),
+            None,
+            spawn_writer,
+        )
+        .unwrap();
+        let mut one = vec![Complex32::new(0.0, 0.0); RECORDING_BLOCK_FRAMES];
+        assert_eq!(rec.read(&mut one).unwrap(), one.len());
+        assert_eq!(rec.read(&mut one).unwrap(), 0);
+        assert!(rec.take_stalled());
+        assert!(!rec.take_stalled());
+        assert_eq!(rec.read(&mut one).unwrap(), one.len());
+        drop(rec);
+        match handle.finish(Duration::from_secs(10), Duration::ZERO) {
+            RecordingOutcome::Finished { samples, .. } => {
+                assert_eq!(samples, 2 * RECORDING_BLOCK_FRAMES as u64);
+            }
+            other => panic!("{other:?}"),
+        }
+        let meta = String::from_utf8(meta_kept.lock().unwrap().clone()).unwrap();
+        assert!(meta.contains("\"gap\""), "{meta}");
+        assert_eq!(meta.lines().count(), 3, "header, gap and end: {meta}");
     }
 
     /// MAN-202: an unknown gap reaches the engine on the read it precedes,

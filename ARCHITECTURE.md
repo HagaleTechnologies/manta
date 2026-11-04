@@ -344,6 +344,14 @@ tracks on its tones close. The marked set is reported in `decode --json`,
 the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
 §2.6 is normative.
 
+**Guarded cancellation (MAN-204, offline experiment).** `manta-dsp::cancel`
+estimates a strong keyed station's received waveform from raw IQ and checks
+whether subtracting it would uncover a neighbour; `manta-engine::cancel`
+runs it around an unchanged `decode_samples` and decodes the residual with a
+separate validator. It sits outside the data flow above: nothing in `decode`,
+`run` or `listen` calls it, and no recovered identity reaches any output. See
+[the decision record](docs/DECISIONS/2026-11-03-man204-guarded-two-stage-cancellation.md).
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
@@ -413,22 +421,40 @@ A candidate held back by this gate is retried the moment `TrackMeta` arrives
 (not left waiting on a `WordBoundary` that a short, already-finished
 transmission may never produce again).
 
-1. **CQ/DE context parse**: regex-level scan for `CQ <call>`, `CQ TEST <call>`,
-   contest framing `CQ <contest> <call>` (an enumerated filler set, e.g.
-   `CQ WPX`) and a bare `TEST <call>` (MAN-104; a bare `TEST` between two
-   different callsigns, or after a sign-off such as `TU`, is ambiguous and
-   yields no candidate),
-   `DE <call>`, `<call> UP`, beacon patterns (`V V V <call>`, and `<call> T`
-   for NCDXF-style power-step beacons the decoder can't resolve past a
-   single trailing dash, MAN-37 — suppressed whenever a bare `CQ`/`TEST`/`DE`
-   token appears anywhere in the window at all (the token must be a
-   complete decoded word, not a substring glued to punctuation inside
-   one), a deliberately coarse guard against mistagging an ordinary,
-   unrecognized CQ/DE call as Beacon — each occurrence it actually costs
+1. **Exchange grammar** (`manta_spot::exchange`, MAN-201): a finite-state
+   read of the decoded window gives every callsign occurrence one role:
+   `self_id` (the sending station), `addressee`, `relayed_mention` or
+   `uncertain`. It recognizes `CQ`, `TEST` and contest fillers (an enumerated
+   set, e.g. `CQ WPX`, MAN-104), `DE`, `UP`, sign-offs, RST and serials,
+   queries, corrections and `V V V`. A `CQ` or `TEST` types a call only when
+   it leads straight into it; a bare `TEST` after a sign-off such as `TU`, or
+   between two different callsigns, is ambiguous. Only a `self_id` occurrence
+   with a spot form is a candidate, so `DE W1AW DE K1ABC K` spots K1ABC.
+
+   A turn ends at `K`, `KN`, `BK`, `AR` or `SK`, and after 5 s with no decoded
+   character; frames and mentions never cross a turn end. A call is decided
+   once it is settled: another word follows its run, its turn ends, or the
+   track ends. An input that stalls or fails closes its tracks, so it settles
+   their last calls too. A settled role is latched on its word, and a spot
+   keeps the call's own timestamp. Silence is measured from the decoder's
+   newest character, held or released, so a word the MAN-317 prior still
+   holds is not silence.
+
+   `<call> T` is the decoded shape of an NCDXF-style power-step beacon the
+   decoder can't resolve past a single trailing dash (MAN-37). A lone `T` is
+   the most common noise decode in CW, so the shape alone is not beacon
+   evidence: it is a `BEACON` candidate only for an allowlisted call, and any
+   other plausible call records `beaconNoEvidence` (MAN-201). It is also
+   suppressed whenever a bare `CQ`/`TEST`/`DE` token appears anywhere in the
+   window (a complete decoded word, not a substring glued to punctuation
+   inside one), a deliberately coarse guard. Each occurrence that guard costs
    is counted once, as `SuppressionCounts::power_step_guard` (§8); an
-   occurrence already evaluated as a Beacon before the guard appeared is
-   not a loss and is not counted). Context
-   determines spot type (CQ / DE / BEACON) — RBN spots carry this flag.
+   occurrence already evaluated as a Beacon before the guard appeared is not
+   a loss and is not counted. Role and context determine spot type (CQ / DE /
+   BEACON) — RBN spots carry this flag. The allowlist skips plausibility and
+   repetition, not role: a listed call heard only as the station called or
+   mentioned is not spotted. See
+   `docs/DECISIONS/2026-11-02-man201-callsign-roles.md`.
 
    **Spot annotations (MAN-272).** Each completed word is also scanned for
    an RST (the cut number `N` read as `9`, so `5NN` is `599`) and for
@@ -484,7 +510,14 @@ transmission may never produce again).
    satisfy the gate; without the time-gap half, a short ID (e.g.
    "DE `<CALL>`") puts even two genuinely separate transmissions only 2
    words apart, which a word-gap-only rule cannot tell apart from one
-   message's double utterance.
+   message's double utterance. A decode whose sample span overlaps one the gate already
+   counted for that call (a replay, a second track on one signal) adds no
+   repetition (MAN-200). With `[spot] repetition_fusion` on (default off),
+   damaged copies of one station's CQ/DE/UP self-ID are aligned character
+   by character and can together confirm the call a clear per-position
+   majority reads, from as many separate messages as its tier needs
+   (`crates/manta-spot/src/lattice.rs`,
+   `docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md`).
 4b. **Cross-candidate variant arbitration** (MAN-100): before a candidate
    spots, it's checked against every other decoded, spottable-shaped word
    (one that itself passes steps 1's grammar/cty check) observed on the same
@@ -559,6 +592,20 @@ never introduces a *newer* word, only removes an old one. Legacy
 precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
 exists specifically for calls that wouldn't otherwise pass automatic
 validation (MAN-28). Dedupe (step 5) still applies.
+
+**Observation record (MAN-207).** Every decision passes one boundary,
+`Validator::decide`, which counts it by reason in the validator's
+`ObservationLog` (`manta_spot::observation`); a settled call occurrence its
+MAN-201 role kept from ever becoming a candidate (an addressee, say) is
+counted by role. By default the log keeps those counters only;
+`Validator::with_observations` can make it keep records (call, reason,
+role, turn, scores, sample and frequency spans, and links to the
+occurrences the repetition gate counted, plus a `notCandidate` record per
+role-skipped occurrence) or records plus each word's text trace. A later decision about the same occurrence (reclassification, a
+settled beacon or lookup, a refinement) appends a record that supersedes
+the earlier one and never rewrites it. Records are capped and expire by
+sample time. See
+[MAN-207](docs/DECISIONS/2026-11-03-man207-observation-record.md).
 
 ## 7. Output layer (`manta-server`)
 
@@ -715,6 +762,23 @@ validation (MAN-28). Dedupe (step 5) still applies.
   Relayed spots skip manta's validator, keep the source's SNR verbatim and
   are timed by arrival. `docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md`
   records the design.
+- **Spot outputs to PSKReporter and LAN loggers (MAN-142).** Two opt-in
+  `SpotBus::subscribe()` readers, each one tokio task in the tracked
+  `ClientTasks` set, so the shutdown drain awaits its final send.
+  `pskreporter::run` (`[pskreporter]`) batches validated spots into IPFIX
+  datagrams for `report.pskreporter.info:4739` (`pskreporter::ipfix` writes
+  the bytes, `pskreporter::batch` applies PSKReporter's pacing rules: one
+  report per call per band per 300 s, one datagram per 300 s unless it
+  fills). `wsjtx_output::run` (`[[wsjtx_output]]`) sends each spot to a LAN
+  address as WSJT-X `Heartbeat`/`Status`/`Decode`/`Close` datagrams, one
+  instance per band (`manta-<band>`); `relay::wsjtx` drops datagrams with
+  that `Id` prefix as `own_output`. Neither blocks `publish`: a reader that
+  falls behind counts the spots it lost as `lagged` and carries on, and
+  every other loss is counted by reason too. `manta-cli` binds both sockets
+  before anything is spawned (`spot_outputs.rs`), and a file replay reports
+  to PSKReporter only at a loopback host.
+  `docs/DECISIONS/2026-11-03-man142-pskreporter-and-wsjtx-udp-outputs.md`
+  records the design.
 - Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -755,7 +819,7 @@ validation (MAN-28). Dedupe (step 5) still applies.
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with eight
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with twelve
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
@@ -763,7 +827,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
   feed; needs `[server]`), `[[skimmer_relay]]` and `[[wsjtx_relay]]`
   (MAN-320: relay a local skimmer's or WSJT-X's spots through an enabled
-  `[[rbn_uplink]]`), `[input]` (source type and its keys, dial frequency,
+  `[[rbn_uplink]]`), `[pskreporter]` and `[[wsjtx_output]]` (MAN-142:
+  spots to PSKReporter and to WSJT-X-aware LAN loggers), `[callsign_lookup]`
+  (MAN-318: withhold calls QRZ.com does not list), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
@@ -925,6 +991,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   per second) and `manta_candidate_repetitions` (the repetition gate's
   count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
   [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  **MAN-207** adds `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`, the validator's
+  decision and role-skip counts, on the same path.
   **MAN-13** (several `[[input]]` entries) adds no family: the `{source}`
   label of `manta_source_health` and the other per-source families is each
   input's `name`; `manta_active_tracks` and `manta_static_crashes_total`
@@ -1101,6 +1170,21 @@ truth with realistic HF impairment already exists.**
   recording, AWGN or Watterson good/poor) and reports recall/CER vs SNR in
   500 Hz; same build and flags, same bytes
   (`docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md`).
+- Independent generator gate (MAN-206): `manta_testkit::baseband` renders
+  keyed CW straight to complex baseband with its own Morse table, timeline,
+  carrier, fader and noise (no code shared with `keyer`/`scene`/`noise`,
+  `manta-decode` or `manta-dsp`), and `crosscheck` compares it with the
+  production routes through the independent `measure` estimators on envelope
+  durations, spectra, total power, 2500 Hz SNR, noise whiteness and fading
+  autocorrelation. Only `crosscheck::verified()` hands out the `Verified`
+  token that `independent_scene` requires, so no decoded-text comparison
+  can run on an unchecked generator
+  (`docs/DECISIONS/2026-11-03-man206-independent-generator-and-scene-minimizer.md`).
+- Failure minimizer (MAN-206): `manta_testkit::minimize` shrinks a failing
+  `scenespec::SceneSpec` (synthetic only, exact-float JSON) by duration,
+  signals, text and impairments while the probe's failure signature holds;
+  `repro` stores the result. `crates/manta-engine/tests/repros/` holds the
+  committed repros, replayed and linted by `synthetic_repros.rs`.
 
 ## 10. Concurrency model
 
@@ -1143,15 +1227,16 @@ non-blocking send plus shared atomics and short locks between them.
   entries, the oldest are dropped back down to `MAX_UNQUALIFIED_BACKLOG`
   (SPEC §2.8; at the default cap of 7500, a 9375-entry high-water mark).
 - **tokio.** `start_spot_server` builds its own multi-thread runtime for
-  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink and
-  the `[rbn_compare]` feed. Only `manta-cli` and `manta-server` depend on
+  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink,
+  the `[rbn_compare]` feed, the relays and the MAN-142 spot outputs
+  (`[pskreporter]`, `[[wsjtx_output]]`). Only `manta-cli` and `manta-server` depend on
   tokio.
 - **Bridge.** The decode thread never awaits. Spots and live-state records
   cross through `SpotBus` (§7): a short `std::sync::Mutex` section and a
   `tokio::sync::broadcast` send, which does not block, so no subscriber
   back-pressures the loop. A lagging telnet, JSON Lines or WebSocket client
-  is disconnected; the internal subscribers (the RBN uplink's forward loop
-  and `[rbn_compare]`) count the missed records and carry on. Counters and
+  is disconnected; the internal subscribers (the RBN uplink's forward loop,
+  `[rbn_compare]` and the MAN-142 spot outputs) count the missed records and carry on. Counters and
   gauges are atomics, plus short `Mutex` sections for RTTY marks and
   per-band maps, that the decode thread writes: server tasks poll
   `ListenObservers` every `ACTIVE_TRACKS_POLL_INTERVAL` (MAN-118 D6), and

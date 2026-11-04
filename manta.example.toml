@@ -195,6 +195,37 @@ station_callsign = "N0CALL"
 #enabled = true                       # false keeps the block but does not listen
 
 
+# --- Report spots to PSKReporter ----------------------------------------------
+# Sends validated spots to PSKReporter (pskreporter.info), where anyone can
+# see them on the public map under [server].station_callsign at its
+# operator_grid. Each call is reported at most once per band every 5 minutes,
+# in at most one datagram every 5 minutes. Needs [server] with operator_grid
+# (or operator_lat/operator_lon). A file replay reports only to a loopback
+# host. Do not also report the same call from WSJT-X, JTDX or CW Skimmer.
+# Restart-only.
+
+#[pskreporter]
+
+#enabled = false                      # true reports spots publicly to PSKReporter
+#host = "report.pskreporter.info"     # PSKReporter's collector, or a local test listener's IPv4 address
+#port = 4739                          # 14739 is PSKReporter's packet-analysis test listener
+#antenna = ""                         # shown on PSKReporter's map, e.g. "Inverted V at 12 m"; at most 254 bytes
+#spot_types = "cq_beacon"             # cq_beacon or all, as for [[rbn_uplink]]
+
+
+# --- Send spots to LAN loggers as WSJT-X UDP ------------------------------------
+# Sends every validated spot as WSJT-X UDP messages (Status, Decode) for
+# loggers that listen for WSJT-X, such as GridTracker or JTAlert. Each band
+# appears as its own WSJT-X instance, "manta-20m" and so on. Anyone on the
+# network who can receive `destination` can read the spots. Needs [server].
+# Restart-only.
+
+#[[wsjtx_output]]
+
+#destination = "127.0.0.1:2237"       # no default: a logger's UDP port, a broadcast such as 192.168.1.255:2237, or a multicast group such as 224.0.0.1:2237
+#enabled = true                       # false keeps the block but sends nothing
+
+
 # --- Callsign lookup (QRZ.com) ------------------------------------------------
 # Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
 # spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
@@ -251,6 +282,7 @@ station_callsign = "N0CALL"
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):
 #driver = "driver=rtlsdr"            # required: SoapySDR device arguments
 #gain_db = 30.0                      # no default: the device's automatic gain
+# On an SDRplay, gain_db is an attenuation scale: a higher value is less sensitive; 0 is the most sensitive.
 
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required unless bands is set: the receiver's centre frequency, Hz
@@ -306,8 +338,16 @@ station_callsign = "N0CALL"
 
 [spot]
 
-# Callsigns always spotted, skipping the plausibility checks, for example
-# ["W1AW", "K1ABC"]. A non-empty --allowlist replaces this list.
+# Callsigns that skip the plausibility checks (grammar, country allocation,
+# repetition), for example ["W1AW", "K1ABC"]. A listed call is still not
+# spotted where the decoded exchange shows it was only called or mentioned:
+# "W1AW DE K1ABC" spots K1ABC, never W1AW. A call followed by a lone "T" (a
+# beacon ID ending in long power-step dashes) spots as BEACON only when it is
+# listed here. The 18 NCDXF/IARU beacons are:
+# ["4U1UN", "VE8AT", "W6WX", "KH6RS", "ZL6B", "VK6RBP", "JA2IGY", "RR9O",
+#  "VR2B", "4S7B", "ZS6DN", "5Z4B", "4X6TU", "OH2B", "CS3B", "LU4AA",
+#  "OA4B", "YV5B"]
+# A non-empty --allowlist replaces this list.
 #allowlist = []
 
 # File of callsigns never to spot, one per line; `#` starts a comment.
@@ -374,6 +414,15 @@ station_callsign = "N0CALL"
 # 2 for every call (manta before 0.2). Allowlisted calls and beacons are
 # exempt either way. Changes need a restart.
 #validation_level = "normal"
+
+# Let damaged copies of one station's CQ, DE or UP self-ID count toward its
+# repetition requirement. The copies are lined up character by character;
+# a call is confirmed when every character has a clear majority of copies
+# from enough separate messages (2, 3 or 5 by pattern, as validation_level
+# sets). Copies of the same samples count once, and no character is used
+# that no copy read. Off by default until recorded and live RBN regression
+# gates pass. Changes need a restart.
+#repetition_fusion = false
 
 # Callsign-pattern list used in place of the copy built into manta (derived
 # from MASTER.SCP). One pattern per line, a leading + marks a common one, `#`

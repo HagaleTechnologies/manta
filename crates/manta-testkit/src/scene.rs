@@ -74,8 +74,180 @@ pub struct WattersonFade {
 /// peaks well under 1.0 for i16 export later).
 pub const MASTER_SCALE: f32 = 0.05;
 
+/// Which generation route a signal takes. `render_signal` picks
+/// `RealPassband` exactly when the signal has a Watterson fade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Complex NCO placement (V1-V3, V6).
+    Direct,
+    /// Real passband tone, optional Watterson fade, 129-tap Hilbert back to
+    /// complex baseband (64-sample group delay).
+    RealPassband,
+}
+
+/// One signal's unscaled contribution (no noise, no `MASTER_SCALE`) and its
+/// keyed text, on the route `render_scene` uses for it. MAN-206.
+pub fn render_signal(
+    sig: &SignalSpec,
+    fs: f64,
+    duration_s: f64,
+) -> Result<(Vec<Complex32>, String)> {
+    let route = if sig.watterson.is_some() {
+        Route::RealPassband
+    } else {
+        Route::Direct
+    };
+    render_signal_with_route(sig, fs, duration_s, route)
+}
+
+/// `render_signal` on an explicit route. `RealPassband` with
+/// `watterson: None` skips only the fader, so the cross-check can measure
+/// the Hilbert route on its own. Only the direct route applies `qsb`, so
+/// `qsb` on the real route is an error (no shipped vector combines QSB with
+/// fading).
+pub fn render_signal_with_route(
+    sig: &SignalSpec,
+    fs: f64,
+    duration_s: f64,
+    route: Route,
+) -> Result<(Vec<Complex32>, String)> {
+    if route == Route::RealPassband && sig.qsb.is_some() {
+        anyhow::bail!("QSB on the real-passband (faded) route is not implemented");
+    }
+    let n = (duration_s * fs).round() as usize;
+    let mut acc = vec![Complex32::new(0.0, 0.0); n];
+    let spec = KeyerSpec {
+        wpm: sig.wpm,
+        char_wpm: sig.char_wpm,
+        rise_ms: sig.rise_ms,
+        jitter: sig.jitter,
+        weight: sig.weight,
+        char_gap_units: sig.char_gap_units,
+        word_gap_units: sig.word_gap_units,
+        dit_units: sig.dit_units,
+        element_gap_units: sig.element_gap_units,
+    };
+    let (env, text) = if sig.loop_text {
+        key_text_loop(&sig.text, &spec, fs, duration_s)?
+    } else {
+        key_text(&sig.text, &spec, fs)?
+    };
+    let amp = amplitude_for_snr_2500(sig.snr_2500_db, fs);
+
+    if route == Route::RealPassband {
+        // Real-domain path: build a real passband tone at this
+        // signal's offset, fade it with coppa's model, then
+        // Hilbert-convert back to complex baseband and add directly.
+        //
+        // `cos` is even, so a phase accumulator driven by a *negative*
+        // offset_hz produces a bit-identical real waveform to the same
+        // positive offset -- sign information cannot survive a
+        // real-valued tone. And the Hilbert transform of any real tone
+        // always yields a positive-frequency analytic signal (the
+        // negative-frequency half is exactly what the transform
+        // discards). So build the tone from the offset's magnitude,
+        // then conjugate the analytic result for negative offsets:
+        // conj(e^{+jwt}) = e^{-jwt}, which is exactly the negative-
+        // frequency tone the (possibly negative) offset asked for.
+        let mut real = vec![0.0f32; n];
+        let dphi = std::f64::consts::TAU * sig.offset_hz.abs() / fs;
+        let mut phi = 0.0f64;
+        for (i, r) in real.iter_mut().enumerate() {
+            let e = env.get(i).copied().unwrap_or(0.0) * amp;
+            *r = e * phi.cos() as f32;
+            phi += dphi;
+            if phi > std::f64::consts::PI {
+                phi -= std::f64::consts::TAU;
+            } else if phi < -std::f64::consts::PI {
+                phi += std::f64::consts::TAU;
+            }
+        }
+        let faded = match sig.watterson {
+            Some(fade) => {
+                coppa_channel::watterson::watterson_preset(&real, fs as f32, fade.preset, fade.seed)
+            }
+            None => real,
+        };
+        // MAN-273 D4: fixture synthesis stays on the M1 129-tap design so
+        // widening the live-decode default cannot move a golden-vector
+        // byte. This route's verified domain is |offset| >= 2 kHz at
+        // 96 kS/s (image about -80 dBc at 2 kHz, -12.8 dBc at 600 Hz;
+        // MAN-206). V8w's `s09` sits at -324.6 Hz, outside it, and leaves a
+        // mirror image the decoder promotes; `crosscheck` pins that one
+        // exception so a new near-DC faded signal fails loudly.
+        let mut analytic = manta_dsp::hilbert::HilbertTransformer::with_taps(
+            manta_dsp::hilbert::HILBERT_TAPS_M1_LEGACY,
+        )
+        .process(&faded);
+        if sig.offset_hz < 0.0 {
+            for a in &mut analytic {
+                *a = a.conj();
+            }
+        }
+        for (out, a) in acc.iter_mut().zip(analytic.iter()) {
+            *out += a;
+        }
+        return Ok((acc, text));
+    }
+
+    // AWGN-only path (V1-V3, V6): complex NCO placement.
+    let dphi = std::f64::consts::TAU * sig.offset_hz / fs;
+    let mut phi = 0.0f64;
+    for (i, out) in acc.iter_mut().enumerate() {
+        let mut e = env.get(i).copied().unwrap_or(0.0) * amp;
+        if let Some(q) = sig.qsb {
+            let t = i as f64 / fs;
+            let mul = 0.55 + 0.45 * (std::f64::consts::TAU * q.rate_hz as f64 * t).sin();
+            e *= mul as f32;
+        }
+        if e != 0.0 {
+            let (s, c) = phi.sin_cos();
+            out.re += e * c as f32;
+            out.im += e * s as f32;
+        }
+        phi += dphi;
+        if phi > std::f64::consts::PI {
+            phi -= std::f64::consts::TAU;
+        } else if phi < -std::f64::consts::PI {
+            phi += std::f64::consts::TAU;
+        }
+    }
+    Ok((acc, text))
+}
+
+/// Sum contributions in slice order into a zeroed buffer of `n` samples,
+/// add unit AWGN when `noise_seed` is set, then apply `MASTER_SCALE`.
+pub fn mix(contributions: &[&[Complex32]], n: usize, noise_seed: Option<u64>) -> Vec<Complex32> {
+    let mut acc = vec![Complex32::new(0.0, 0.0); n];
+    for c in contributions {
+        accumulate(&mut acc, c);
+    }
+    finish(&mut acc, noise_seed);
+    acc
+}
+
+/// `acc += contribution`, sample by sample (the order `mix` sums in).
+pub(crate) fn accumulate(acc: &mut [Complex32], contribution: &[Complex32]) {
+    for (out, a) in acc.iter_mut().zip(contribution.iter()) {
+        *out += a;
+    }
+}
+
+/// Noise, then `MASTER_SCALE`: the tail of `mix`.
+pub(crate) fn finish(acc: &mut [Complex32], noise_seed: Option<u64>) {
+    if let Some(seed) = noise_seed {
+        add_unit_awgn(acc, seed);
+    }
+    for s in acc.iter_mut() {
+        *s *= MASTER_SCALE;
+    }
+}
+
 /// Render signals (slice order) + optional noise, then MASTER_SCALE.
 /// Returns the scene and the keyed text of each signal. ARCHITECTURE §9.
+/// Same arithmetic as `mix` over every `render_signal`, but each
+/// contribution is added and dropped in turn, so a 50-signal scene holds
+/// one contribution at a time.
 pub fn render_scene(
     signals: &[SignalSpec],
     fs: f64,
@@ -86,113 +258,97 @@ pub fn render_scene(
     let mut acc = vec![Complex32::new(0.0, 0.0); n];
     let mut texts = Vec::with_capacity(signals.len());
     for sig in signals {
-        let spec = KeyerSpec {
-            wpm: sig.wpm,
-            char_wpm: sig.char_wpm,
-            rise_ms: sig.rise_ms,
-            jitter: sig.jitter,
-            weight: sig.weight,
-            char_gap_units: sig.char_gap_units,
-            word_gap_units: sig.word_gap_units,
-            dit_units: sig.dit_units,
-            element_gap_units: sig.element_gap_units,
-        };
-        let (env, text) = if sig.loop_text {
-            key_text_loop(&sig.text, &spec, fs, duration_s)?
-        } else {
-            key_text(&sig.text, &spec, fs)?
-        };
+        let (c, text) = render_signal(sig, fs, duration_s)?;
+        accumulate(&mut acc, &c);
         texts.push(text);
-        let amp = amplitude_for_snr_2500(sig.snr_2500_db, fs);
-
-        if let Some(fade) = sig.watterson {
-            // Real-domain path: build a real passband tone at this
-            // signal's offset, fade it with coppa's model, then
-            // Hilbert-convert back to complex baseband and add directly.
-            //
-            // `cos` is even, so a phase accumulator driven by a *negative*
-            // offset_hz produces a bit-identical real waveform to the same
-            // positive offset -- sign information cannot survive a
-            // real-valued tone. And the Hilbert transform of any real tone
-            // always yields a positive-frequency analytic signal (the
-            // negative-frequency half is exactly what the transform
-            // discards). So build the tone from the offset's magnitude,
-            // then conjugate the analytic result for negative offsets:
-            // conj(e^{+jwt}) = e^{-jwt}, which is exactly the negative-
-            // frequency tone the (possibly negative) offset asked for.
-            let mut real = vec![0.0f32; n];
-            let dphi = std::f64::consts::TAU * sig.offset_hz.abs() / fs;
-            let mut phi = 0.0f64;
-            for (i, r) in real.iter_mut().enumerate() {
-                let e = env.get(i).copied().unwrap_or(0.0) * amp;
-                *r = e * phi.cos() as f32;
-                phi += dphi;
-                if phi > std::f64::consts::PI {
-                    phi -= std::f64::consts::TAU;
-                } else if phi < -std::f64::consts::PI {
-                    phi += std::f64::consts::TAU;
-                }
-            }
-            let faded = coppa_channel::watterson::watterson_preset(
-                &real,
-                fs as f32,
-                fade.preset,
-                fade.seed,
-            );
-            // MAN-273 D4: fixture synthesis stays on the M1 129-tap design so
-            // widening the live-decode default cannot move a golden-vector
-            // byte; every vector reaching this branch sits at >= 5.6 kHz
-            // offsets, where 129 taps already gives >= 94 dB image rejection.
-            let mut analytic = manta_dsp::hilbert::HilbertTransformer::with_taps(
-                manta_dsp::hilbert::HILBERT_TAPS_M1_LEGACY,
-            )
-            .process(&faded);
-            if sig.offset_hz < 0.0 {
-                for a in &mut analytic {
-                    *a = a.conj();
-                }
-            }
-            for (out, a) in acc.iter_mut().zip(analytic.iter()) {
-                *out += a;
-            }
-            continue;
-        }
-
-        // AWGN-only path (V1-V3, V6): complex NCO placement.
-        let dphi = std::f64::consts::TAU * sig.offset_hz / fs;
-        let mut phi = 0.0f64;
-        for (i, out) in acc.iter_mut().enumerate() {
-            let mut e = env.get(i).copied().unwrap_or(0.0) * amp;
-            if let Some(q) = sig.qsb {
-                let t = i as f64 / fs;
-                let mul = 0.55 + 0.45 * (std::f64::consts::TAU * q.rate_hz as f64 * t).sin();
-                e *= mul as f32;
-            }
-            if e != 0.0 {
-                let (s, c) = phi.sin_cos();
-                out.re += e * c as f32;
-                out.im += e * s as f32;
-            }
-            phi += dphi;
-            if phi > std::f64::consts::PI {
-                phi -= std::f64::consts::TAU;
-            } else if phi < -std::f64::consts::PI {
-                phi += std::f64::consts::TAU;
-            }
-        }
     }
-    if let Some(seed) = noise_seed {
-        add_unit_awgn(&mut acc, seed);
-    }
-    for s in &mut acc {
-        *s *= MASTER_SCALE;
-    }
+    finish(&mut acc, noise_seed);
     Ok((acc, texts))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vectors;
+
+    /// MAN-206: digests of `render_scene(&spec.signals, spec.fs, d,
+    /// Some(spec.noise_seed))`, computed at d1ddf99 before the per-signal
+    /// split.
+    #[test]
+    fn render_scene_split_keeps_direct_route_bytes() {
+        // MAN-112 moved V7 to 10,000/10,150 Hz after this digest was
+        // pinned; render the scene it was pinned on (channels 107 and 111).
+        let mut v7_pinned = vectors::v7();
+        v7_pinned.signals[0].offset_hz = 107.0 * 93.75;
+        v7_pinned.signals[1].offset_hz = 111.0 * 93.75;
+        for (spec, want) in [
+            (vectors::v1(), 0xb689_3351_782c_1da3u64),
+            (vectors::v6(), 0x912c_6564_8c14_91c1),
+            (v7_pinned, 0xe9c4_7623_22c3_0d1a),
+            (vectors::v8(), 0x6fac_e2d0_35cf_5a59),
+            (vectors::vr4(), 0x44ce_2d62_f984_63c2),
+            (vectors::vw3(), 0x10d1_2485_40b3_f7d0),
+        ] {
+            let (s, _) = render_scene(&spec.signals, spec.fs, 20.0, Some(spec.noise_seed)).unwrap();
+            assert_eq!(crate::repro::samples_digest(&s), want, "{}", spec.name);
+        }
+    }
+
+    /// Faded route: coppa's FFT is SIMD-dispatched, so these are pinned on
+    /// the target they were measured on only (MAN-206 D13).
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[test]
+    fn render_scene_split_keeps_faded_route_bytes() {
+        let v4 = vectors::v4();
+        let (s, _) = render_scene(&v4.signals, v4.fs, 5.0, Some(v4.noise_seed)).unwrap();
+        assert_eq!(
+            crate::repro::samples_digest(&s),
+            0x4488_7052_75d1_ff00,
+            "v4"
+        );
+        let v8w = vectors::v8w();
+        let (s, _) = render_scene(&v8w.signals[..3], v8w.fs, 5.0, Some(v8w.noise_seed)).unwrap();
+        assert_eq!(
+            crate::repro::samples_digest(&s),
+            0xa4c7_276f_77c1_22a2,
+            "v8w first 3"
+        );
+    }
+
+    #[test]
+    fn render_signal_contributions_sum_to_render_scene() {
+        let v8 = vectors::v8();
+        let parts: Vec<Vec<Complex32>> = v8
+            .signals
+            .iter()
+            .map(|s| render_signal(s, v8.fs, 5.0).unwrap().0)
+            .collect();
+        let refs: Vec<&[Complex32]> = parts.iter().map(|p| p.as_slice()).collect();
+        let n = (5.0 * v8.fs).round() as usize;
+        let mixed = mix(&refs, n, Some(v8.noise_seed));
+        let (want, _) = render_scene(&v8.signals, v8.fs, 5.0, Some(v8.noise_seed)).unwrap();
+        assert_eq!(mixed, want);
+    }
+
+    #[test]
+    fn real_passband_route_without_fade_is_a_delayed_tone() {
+        let sig = vectors::v1().signals[0].clone();
+        let (d, _) = render_signal_with_route(&sig, 96_000.0, 2.0, Route::Direct).unwrap();
+        let (r, _) = render_signal_with_route(&sig, 96_000.0, 2.0, Route::RealPassband).unwrap();
+        let first = |x: &[Complex32]| {
+            let peak = x.iter().map(|c| c.norm()).fold(0.0f32, f32::max);
+            x.iter().position(|c| c.norm() >= 0.5 * peak).unwrap()
+        };
+        assert_eq!(first(&r) - first(&d), 64);
+    }
+
+    #[test]
+    fn render_signal_with_route_direct_matches_render_signal_for_unfaded() {
+        let sig = vectors::v2().signals[0].clone();
+        let a = render_signal(&sig, 96_000.0, 3.0).unwrap();
+        let b = render_signal_with_route(&sig, 96_000.0, 3.0, Route::Direct).unwrap();
+        assert_eq!(a, b);
+    }
 
     #[test]
     fn achieved_snr_matches_request() {

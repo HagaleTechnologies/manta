@@ -2,7 +2,8 @@
 //! datagrams. Each is a Qt `QDataStream` in big-endian order: magic
 //! `0xadbccbda`, schema, message type, then the sender's `Id` and the
 //! type's fields. Only `Status` (type 1) and `Decode` (type 2) are read;
-//! every other type comes back as [`Message::Other`].
+//! every other type comes back as [`Message::Other`], with its `Id`, so
+//! the relay can tell manta's own `[[wsjtx_output]]` apart (MAN-142).
 //!
 //! The bytes are untrusted: every length is checked against what is left
 //! of the datagram, strings decode as lossy UTF-8, and no input panics.
@@ -19,8 +20,23 @@ const NULL_LEN: u32 = 0xffff_ffff;
 pub enum Message {
     Status(Status),
     Decode(Decode),
-    /// Any other message type (heartbeat, clear, QSO logged ...), by number.
-    Other(u32),
+    /// Any other message type (heartbeat, clear, QSO logged ...), by
+    /// number, with the sender's `Id`.
+    Other {
+        kind: u32,
+        id: String,
+    },
+}
+
+impl Message {
+    /// The sender's instance `Id`, which every message type carries.
+    pub fn id(&self) -> &str {
+        match self {
+            Message::Status(s) => &s.id,
+            Message::Decode(d) => &d.id,
+            Message::Other { id, .. } => id,
+        }
+    }
 }
 
 /// The leading fields of a `Status` (type 1); the rest are not needed.
@@ -194,8 +210,8 @@ pub fn parse(datagram: &[u8]) -> Result<Message, ProtoError> {
         }
         other => {
             // Every message carries the Id; a truncated one is still bad.
-            r.utf8()?;
-            Ok(Message::Other(other))
+            let id = r.utf8()?;
+            Ok(Message::Other { kind: other, id })
         }
     }
 }
@@ -383,11 +399,20 @@ mod tests {
     }
 
     #[test]
-    fn other_message_types_are_skipped() {
-        for kind in [0, 3, 5, 10, 99] {
+    fn other_types_keep_their_id() {
+        for kind in [0, 3, 5, 6, 10, 99] {
             let mut w = Writer::header(3, kind);
             w.utf8("WSJT-X").u32(3).utf8("2.6.1");
-            assert_eq!(parse(&w.0).unwrap(), Message::Other(kind), "type {kind}");
+            let msg = parse(&w.0).unwrap();
+            assert_eq!(
+                msg,
+                Message::Other {
+                    kind,
+                    id: "WSJT-X".to_string()
+                },
+                "type {kind}"
+            );
+            assert_eq!(msg.id(), "WSJT-X");
         }
     }
 

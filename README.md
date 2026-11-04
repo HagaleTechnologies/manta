@@ -157,6 +157,11 @@ SoapySDR module yourself, and getting the SDRplay one can too
 (SoapySDRPlay3 also needs SDRplay's API); running this manta binary still
 needs no Rust toolchain.
 
+On an SDRplay, `--soapy-gain` (and `[input] gain_db`) is an attenuation
+scale: a higher value makes the receiver less sensitive, and `0` is the
+most sensitive setting. Leave it unset to use the receiver's AGC, or
+compare settings on a signal you know is present.
+
 `./manta devices` lists a selector string for each receiver it finds; pass
 it to `--soapy-driver`. Choose a frequency and a sample rate your receiver
 supports: the rate rules and the remaining flags are in [Inputs](#inputs).
@@ -749,6 +754,14 @@ the live-state stream only if it sets `[server].live_port`.
   publishes nothing about what its ingest accepts, so the login and line
   format are manta's assumption, and the uplink ships in dry-run. To reach
   RBN today, let an RBN Aggregator read the telnet server above.
+- **PSKReporter (opt-in, public)** — with `[pskreporter] enabled = true`,
+  manta reports CQ and beacon spots to pskreporter.info's public map, each
+  call at most once per band every 5 minutes. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
+- **WSJT-X UDP for LAN loggers (opt-in)** — a `[[wsjtx_output]]` block sends
+  every spot to a LAN address as WSJT-X `Status` and `Decode` messages, so
+  loggers that listen for WSJT-X, such as GridTracker, can read them. Same
+  [guide](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
@@ -929,6 +942,8 @@ researchers each start, and lists every runbook.
 (a ka9q-radio (radiod) channel over multicast) ·
 [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md)
 (a receiver's spectrum in N1MM+'s Spectrum Display) ·
+[docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md)
+(spots to PSKReporter and to WSJT-X-aware LAN loggers) ·
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what

@@ -28,8 +28,13 @@ Then:
 - [GUIDES/iq-recording.md](GUIDES/iq-recording.md): recording a session's
   IQ with `run --record-iq`, replaying it, and reading headerless cf32/ci16
   files (MAN-309).
+- [OBSERVATIONS.md](OBSERVATIONS.md): why each callsign candidate was or
+  was not spotted, written by `decode --observations` (MAN-207).
 - [GUIDES/n1mm-spectrum.md](GUIDES/n1mm-spectrum.md): sending a receiver's
   spectrum to N1MM+'s Spectrum Display, as CW Skimmer does (MAN-141).
+- [GUIDES/pskreporter-and-lan-loggers.md](GUIDES/pskreporter-and-lan-loggers.md):
+  reporting spots to PSKReporter, and sending them to LAN loggers such as
+  GridTracker as WSJT-X UDP (MAN-142).
 - The [runbooks](#runbooks) below.
 - `manta <command> --help` for every flag, or `man manta` once the man
   pages are installed

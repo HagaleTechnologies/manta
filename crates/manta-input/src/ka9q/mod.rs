@@ -33,6 +33,11 @@ use wire::{ChannelStatus, Encoding, SeqObservation, SeqTracker};
 /// feature-gated and must not become a dependency of this module.
 const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// MAN-201: how long a delivering stream may stop before `read` reports
+/// `take_stalled`: the validator's 5 s silence turn end, which a stream
+/// delivering no hops cannot reach on its own.
+const SETTLE_AFTER: Duration = Duration::from_secs(5);
+
 /// The status socket's receive timeout while `open` waits for status. The
 /// data socket is drained (one `DRAIN_BATCH` per pass) between status
 /// receives, so this bounds how long RTP queues unread in the kernel and how
@@ -225,9 +230,12 @@ fn check_joins(
 
 /// Builds and joins one group socket, returning it with the instant of
 /// its first successful `join_multicast_v4` (MAN-259 review round): the
-/// kernel queues a group's RTP only from a landed membership, so an
-/// anchor must not predate it -- socket creation, the bind and the
-/// failed interface attempts before it are signal-silent outage.
+/// kernel queues a group's RTP only from this socket's own membership,
+/// unless another socket on the host already holds one (Linux), so the
+/// join stays `open`'s fallback anchor -- socket creation, the bind and
+/// the failed interface attempts before it are signal-silent outage.
+/// That exception is why the stash's first lower bound on arrival is
+/// taken before the socket exists, not at the join (MAN-407).
 fn join_socket(
     group: Ipv4Addr,
     port: u16,
@@ -376,11 +384,18 @@ pub struct Ka9qIqSource {
     recv_buf: Vec<u8>,
     last_accepted: Instant,
     stall_timeout: Duration,
+    /// MAN-201: `SETTLE_AFTER`, a field so a test need not wait it out.
+    settle_after: Duration,
+    /// MAN-201: samples have been returned since the last stall report.
+    delivering: bool,
+    /// MAN-201: pending for `take_stalled`.
+    stalled: bool,
     confirmed_live: Arc<AtomicBool>,
     counters: Arc<InputHealthCounters>,
     /// MAN-259: `open`'s runtime up to where the replayed stream starts
     /// -- the first stashed packet of the chosen channel that the replay
-    /// would accept, or the data socket's first landed group membership
+    /// would accept (stamped with a lower bound on its arrival, MAN-407),
+    /// or the data socket's first landed group membership
     /// when the stash retained nothing replayable of it; surfaced by
     /// `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
@@ -396,6 +411,11 @@ impl Ka9qIqSource {
         // join -- but the stash below keeps only its newest RCVBUF_BYTES,
         // so when the wait overflows it, the replay starts at the first
         // packet the stash still holds (the anchor computed below).
+        // MAN-407: the stash's first lower bound on arrival. The data
+        // socket cannot hold a datagram from before it existed. The join is
+        // not a bound: on Linux a socket bound to the group receives it
+        // from the bind whenever another socket on the host is a member.
+        let data_floor = Instant::now();
         let (data, data_joined_at) = join_socket(group, cfg.port, cfg.interface)?;
         let (status_sock, _) = join_socket(group, cfg.status_port, cfg.interface)?;
         // The data socket is non-blocking for the wait: `wait_for_status`
@@ -405,14 +425,15 @@ impl Ka9qIqSource {
         // the join exists for is not lost to an overflow.
         data.set_nonblocking(true)
             .context("ka9q-radio: set data socket non-blocking")?;
-        let (status, stash) = wait_for_status(&status_sock, &data, &cfg)?;
+        let (status, stash) = wait_for_status(&status_sock, &data, &cfg, data_floor)?;
         let enc = validate(&status, cfg.port)?;
         let ssrc = status.ssrc.unwrap_or(0);
         // MAN-259 (validate round 1): the startup stash evicts its oldest
         // packets past RCVBUF_BYTES, so on a channel fast enough to
         // overflow it during the wait the replay below starts well after
         // the join. Anchor where the replay starts: the first stashed
-        // packet of the chosen channel that the replay would accept (the
+        // packet of the chosen channel that the replay would accept,
+        // stamped with a lower bound on its arrival (MAN-407) (the
         // review round made "retained" mean replayable -- a packet
         // `accept_rtp` rejects cannot end the outage before the first
         // sample `read` can return). An evicted opening never reaches
@@ -421,13 +442,9 @@ impl Ka9qIqSource {
         // f32le with no SSRC the stash holds ~0.32 s of a >= 1.5 s wait,
         // so >= 1.18 s early). With nothing replayable retained, the
         // data socket's first landed group membership remains the anchor.
-        let acquisition_start_offset = stash
-            .iter()
-            .find(|(_, pkt)| packet_yields_samples(pkt, ssrc, status.rtp_pt, enc))
-            .map_or(
-                data_joined_at.saturating_duration_since(entered),
-                |(arrived, _)| arrived.saturating_duration_since(entered),
-            );
+        let acquisition_start_offset =
+            acquisition_anchor(&stash, data_joined_at, ssrc, status.rtp_pt, enc)
+                .saturating_duration_since(entered);
         data.set_nonblocking(false)
             .context("ka9q-radio: restore data socket blocking mode")?;
         status_sock
@@ -448,6 +465,9 @@ impl Ka9qIqSource {
             recv_buf: vec![0u8; RECV_BUF_LEN],
             last_accepted: Instant::now(),
             stall_timeout: cfg.stall_timeout,
+            settle_after: SETTLE_AFTER,
+            delivering: false,
+            stalled: false,
             confirmed_live: Arc::new(AtomicBool::new(false)),
             counters: Arc::new(InputHealthCounters::new()),
             acquisition_start_offset,
@@ -626,9 +646,10 @@ impl Ka9qIqSource {
     }
 }
 
-/// The startup stash: each retained packet and the `Instant` it was
-/// received, which `open` anchors acquisition at when the cap evicts the
-/// opening (MAN-259).
+/// The startup stash: each retained packet and a lower bound on when it
+/// reached the socket (MAN-407): the instant before the last read that
+/// found the socket empty, or before the socket existed. `open` anchors
+/// acquisition at it when the cap evicts the opening (MAN-259).
 type Stash = VecDeque<(Instant, Vec<u8>)>;
 
 /// Drains the data socket into `stash` while `open` waits for status, so
@@ -641,10 +662,16 @@ type Stash = VecDeque<(Instant, Vec<u8>)>;
 /// length plus `STASH_PACKET_OVERHEAD`, so empty datagrams count too),
 /// dropping its own oldest packets past that, so a fast
 /// channel never overflows the kernel and the replay in `open` runs
-/// straight into the socket's next packet with no gap. Each packet keeps
-/// its arrival `Instant`, so `open` can anchor acquisition at the first
-/// packet of the chosen channel the stash still holds when the cap evicts
-/// the opening (MAN-259). `open` replays the
+/// straight into the socket's next packet with no gap. Each packet is
+/// stamped with `*floor`, a lower bound on its arrival (MAN-407): the
+/// instant before the last `recv` that found the socket empty, or the
+/// caller's starting floor before any did. A packet read after an empty
+/// read arrived after that read began. A stamp taken after `recv`
+/// returned counted any delay between arrival and the drain (the opener
+/// descheduled before it) both as outage and as replayed data, which
+/// moved post-reconnect spots late by it. `open` anchors acquisition at
+/// the first packet of the chosen channel the stash still holds when the
+/// cap evicts the opening (MAN-259). `open` replays the
 /// stash through `accept_rtp` once the channel is chosen.
 fn stash_data(
     sock: &UdpSocket,
@@ -652,8 +679,9 @@ fn stash_data(
     stash: &mut Stash,
     stashed: &mut usize,
     cap: usize,
+    floor: &mut Instant,
 ) -> Result<()> {
-    stash_data_up_to(sock, buf, stash, stashed, cap, DRAIN_BATCH)
+    stash_data_up_to(sock, buf, stash, stashed, cap, DRAIN_BATCH, floor)
 }
 
 /// `stash_data` with the per-call datagram limit as a parameter, so tests
@@ -666,11 +694,17 @@ fn stash_data_up_to(
     stashed: &mut usize,
     cap: usize,
     limit: usize,
+    floor: &mut Instant,
 ) -> Result<()> {
     for _ in 0..limit {
+        // MAN-407: taken before the `recv`. If that `recv` finds the
+        // socket empty, every packet read after it arrived after this
+        // instant. A pass cut off by `limit` never saw the socket empty,
+        // so it leaves `*floor` where it was.
+        let before = Instant::now();
         match sock.recv(buf) {
             Ok(n) => {
-                stash.push_back((Instant::now(), buf[..n].to_vec()));
+                stash.push_back((*floor, buf[..n].to_vec()));
                 *stashed += n + STASH_PACKET_OVERHEAD;
                 while *stashed > cap && stash.len() > 1 {
                     let (_, old) = stash.pop_front().expect("len > 1");
@@ -678,7 +712,8 @@ fn stash_data_up_to(
                 }
             }
             Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Ok(())
+                *floor = before;
+                return Ok(());
             }
             Err(e) => return Err(e).context("ka9q-radio: data socket"),
         }
@@ -708,10 +743,31 @@ fn packet_yields_samples(pkt: &[u8], ssrc: u32, rtp_pt: Option<u8>, enc: Encodin
     wire::decode_iq(enc, payload, &mut scratch).is_ok_and(|got| got >= 1)
 }
 
+/// MAN-259/MAN-407: where the stream `open` replays begins -- the stamp
+/// of the first stashed packet the replay would accept, a lower bound on
+/// its arrival, or the data join when the stash retained nothing
+/// replayable.
+fn acquisition_anchor(
+    stash: &Stash,
+    joined_at: Instant,
+    ssrc: u32,
+    rtp_pt: Option<u8>,
+    enc: Encoding,
+) -> Instant {
+    stash
+        .iter()
+        .find(|(_, pkt)| packet_yields_samples(pkt, ssrc, rtp_pt, enc))
+        .map_or(joined_at, |(arrived, _)| *arrived)
+}
+
+/// Waits for the channel's status while draining the data socket into the
+/// startup stash. `floor` is the stash's starting lower bound on arrival
+/// (MAN-407): an instant taken before the data socket existed.
 fn wait_for_status(
     sock: &UdpSocket,
     data: &UdpSocket,
     cfg: &Ka9qConfig,
+    mut floor: Instant,
 ) -> Result<(ChannelStatus, Stash)> {
     let start = Instant::now();
     sock.set_read_timeout(Some(WAIT_POLL))
@@ -731,7 +787,14 @@ fn wait_for_status(
         if start.elapsed() >= cfg.open_timeout {
             break;
         }
-        stash_data(data, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES)?;
+        stash_data(
+            data,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            &mut floor,
+        )?;
         match sock.recv(&mut buf) {
             Ok(n) => {
                 let Ok(Some(s)) = wire::parse_status_packet(&buf[..n]) else {
@@ -840,7 +903,19 @@ impl IqSource for Ka9qIqSource {
                 for (dst, src) in buf.iter_mut().zip(self.queue.drain(..n)) {
                     *dst = src;
                 }
+                self.delivering = true;
                 return Ok(n);
+            }
+            // MAN-201: stopped but within the stall bound. The engine
+            // settles each track's last call now; a channel can stay in
+            // radiod's status for as long as it likes with no RTP.
+            if self.delivering
+                && self.stall_timeout > self.settle_after
+                && self.last_accepted.elapsed() >= self.settle_after
+            {
+                self.delivering = false;
+                self.stalled = true;
+                return Ok(0);
             }
             if self.last_accepted.elapsed() >= self.stall_timeout {
                 bail!(
@@ -857,6 +932,10 @@ impl IqSource for Ka9qIqSource {
                 Err(e) => return Err(e).context("ka9q-radio: data socket"),
             }
         }
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -928,7 +1007,15 @@ mod tests {
         let mut stash = VecDeque::new();
         let mut stashed = 0;
         let cap = 3 * (100 + STASH_PACKET_OVERHEAD);
-        stash_data(&rx, &mut buf, &mut stash, &mut stashed, cap).unwrap();
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            cap,
+            &mut Instant::now(),
+        )
+        .unwrap();
         let kept: Vec<u8> = stash.iter().map(|(_, p)| p[0]).collect();
         assert_eq!(kept, vec![7, 8, 9]);
         assert_eq!(stashed, cap);
@@ -984,6 +1071,7 @@ mod tests {
             &mut stashed,
             RCVBUF_BYTES,
             TEST_LIMIT,
+            &mut Instant::now(),
         )
         .unwrap();
         assert_eq!(stash.len(), TEST_LIMIT);
@@ -994,6 +1082,7 @@ mod tests {
             &mut stashed,
             RCVBUF_BYTES,
             TEST_LIMIT,
+            &mut Instant::now(),
         )
         .unwrap();
         assert_eq!(
@@ -1018,7 +1107,15 @@ mod tests {
         let mut buf = vec![0u8; RECV_BUF_LEN];
         let mut stash = VecDeque::new();
         let mut stashed = 0;
-        stash_data(&rx, &mut buf, &mut stash, &mut stashed, RCVBUF_BYTES).unwrap();
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            &mut Instant::now(),
+        )
+        .unwrap();
         assert_eq!(stash.len(), TEST_FLOOD);
     }
 
@@ -1037,9 +1134,139 @@ mod tests {
         let mut stash = VecDeque::new();
         let mut stashed = 0;
         let cap = 4 * STASH_PACKET_OVERHEAD;
-        stash_data(&rx, &mut buf, &mut stash, &mut stashed, cap).unwrap();
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            cap,
+            &mut Instant::now(),
+        )
+        .unwrap();
         assert_eq!(stash.len(), 4);
         assert!(stashed <= cap);
+    }
+
+    /// MAN-407: a delay between a packet's arrival and the drain that
+    /// reads it (the opener descheduled after the join) must not move its
+    /// stamp. A stamp taken at dequeue counted that delay both as outage
+    /// and as replayed data, so post-reconnect spots ran late by it.
+    #[test]
+    fn a_stashed_packet_is_stamped_no_later_than_its_arrival() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let floor0 = Instant::now();
+        let mut floor = floor0;
+        tx.send_to(&[7; 8], rx.local_addr().unwrap()).unwrap();
+        let sent = Instant::now();
+        std::thread::sleep(Duration::from_millis(300));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            &mut floor,
+        )
+        .unwrap();
+        assert_eq!(stash.len(), 1);
+        let stamp = stash[0].0;
+        assert!(
+            stamp <= sent,
+            "stamped {:?} after the send returned",
+            stamp - sent
+        );
+        assert!(stamp >= floor0);
+    }
+
+    /// MAN-407: the floor rises to each read that finds the socket empty,
+    /// so a packet that arrives late in the wait is not stamped back at
+    /// the start of it.
+    #[test]
+    fn the_stash_floor_advances_when_the_socket_is_seen_empty() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut floor = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        let empty_from = Instant::now();
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            &mut floor,
+        )
+        .unwrap();
+        assert!(stash.is_empty());
+        assert!(floor >= empty_from, "an empty read must raise the floor");
+        tx.send_to(&[7; 8], rx.local_addr().unwrap()).unwrap();
+        let sent = Instant::now();
+        std::thread::sleep(Duration::from_millis(50));
+        stash_data(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            &mut floor,
+        )
+        .unwrap();
+        assert_eq!(stash.len(), 1);
+        assert!(stash[0].0 >= empty_from && stash[0].0 <= sent);
+    }
+
+    /// MAN-407: a pass cut off by the batch limit never saw the socket
+    /// empty, so it leaves the floor where it was, and every packet of the
+    /// backlog keeps the bound from before it.
+    #[test]
+    fn a_pass_cut_off_by_the_batch_limit_keeps_the_floor() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let _ = socket2::SockRef::from(&rx).set_recv_buffer_size(RCVBUF_BYTES);
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let floor0 = Instant::now();
+        let mut floor = floor0;
+        for _ in 0..TEST_FLOOD {
+            tx.send_to(&[1; 8], rx.local_addr().unwrap()).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let mut buf = vec![0u8; RECV_BUF_LEN];
+        let mut stash = VecDeque::new();
+        let mut stashed = 0;
+        stash_data_up_to(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            TEST_LIMIT,
+            &mut floor,
+        )
+        .unwrap();
+        assert_eq!(stash.len(), TEST_LIMIT);
+        assert_eq!(floor, floor0, "the socket was never seen empty");
+        stash_data_up_to(
+            &rx,
+            &mut buf,
+            &mut stash,
+            &mut stashed,
+            RCVBUF_BYTES,
+            TEST_LIMIT,
+            &mut floor,
+        )
+        .unwrap();
+        assert_eq!(stash.len(), TEST_FLOOD);
+        assert!(stash.iter().all(|(t, _)| *t == floor0));
+        assert!(floor > floor0);
     }
 
     #[test]
@@ -1460,6 +1687,39 @@ mod tests {
             assert!(offset < open_elapsed, "{offset:?} vs {open_elapsed:?}");
         }
 
+        /// MAN-407: the opener is descheduled after the data-group join and
+        /// before the first drain. The first replayable stashed packet
+        /// becomes the anchor, which must be no later than that packet's
+        /// arrival and must not carry the stall, or every post-reconnect
+        /// spot is stamped late by it.
+        #[test]
+        fn a_stall_after_the_data_join_does_not_move_the_acquisition_anchor() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let cfg = f.config(Some(SSRC));
+            let group: Ipv4Addr = cfg.group.parse().unwrap();
+            let floor = Instant::now();
+            let (data, joined_at) = join_socket(group, cfg.port, cfg.interface).unwrap();
+            let (status_sock, _) = join_socket(group, cfg.status_port, cfg.interface).unwrap();
+            data.set_nonblocking(true).unwrap();
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            let sent = Instant::now();
+            const STALL: Duration = Duration::from_millis(300);
+            std::thread::sleep(STALL);
+            let (status, stash) = wait_for_status(&status_sock, &data, &cfg, floor).unwrap();
+            let enc = validate(&status, cfg.port).unwrap();
+            let anchor = acquisition_anchor(&stash, joined_at, SSRC, status.rtp_pt, enc);
+            assert!(
+                anchor <= sent,
+                "anchor {:?} after the packet was sent",
+                anchor - sent
+            );
+            assert!(anchor >= floor, "the anchor cannot predate the socket");
+            assert!(
+                anchor.duration_since(floor) < STALL / 2,
+                "the stall leaked into the anchor"
+            );
+        }
+
         #[test]
         fn open_refuses_a_group_with_several_channels_and_lists_them() {
             let f = FakeRadiod::start(vec![
@@ -1735,6 +1995,24 @@ mod tests {
             f.send_rtp(SSRC, 6, Encoding::F32Le, &good);
             assert_eq!(read_n(&mut src, 180), good);
             assert_eq!(src.counters.malformed_packets(), 6);
+        }
+
+        /// MAN-201: a delivering stream that stops reports one stall inside
+        /// the stall bound, then still fails at the bound.
+        #[test]
+        fn a_stopped_stream_reports_a_stall_once_before_the_stall_timeout() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            src.settle_after = Duration::from_millis(200);
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(64, 0));
+            let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+            assert!(src.read(&mut buf).unwrap() > 0);
+            assert!(!src.take_stalled());
+            assert_eq!(src.read(&mut buf).unwrap(), 0);
+            assert!(src.take_stalled());
+            assert!(!src.take_stalled());
+            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            assert!(e.contains("stream stalled"), "{e}");
         }
 
         #[test]

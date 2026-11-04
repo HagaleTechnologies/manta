@@ -10,8 +10,10 @@
 //! `manta_source_down_seconds_total`; MAN-96).
 
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
+use crate::pskreporter::PskDrop;
 use crate::spectrum::{SpectrumDrop, SpectrumStats};
 use crate::spot_message::FtxMode;
+use crate::wsjtx_output::WsjtxOutputDrop;
 use manta_spot::SpotType;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
@@ -393,6 +395,12 @@ pub struct DecodeQuality {
     pub garbles_total: u64,
     pub rail_ratio: ValueHistogram,
     pub repetitions: ValueHistogram,
+    /// MAN-207: `(decision, reason, count)` for every valid pair, `reason`
+    /// `"none"` on a spot, in a fixed order.
+    pub decisions: Vec<(&'static str, &'static str, u64)>,
+    /// MAN-207: `(role, count)` for every role a role-skipped call
+    /// occurrence can have, in a fixed order.
+    pub not_candidates: Vec<(&'static str, u64)>,
 }
 
 /// Writes `h` as Prometheus histogram samples under `name`: cumulative
@@ -717,11 +725,14 @@ pub enum DropReason {
     NoCall,
     /// WSJT-X: the same call, mode and band within 600 s.
     Duplicate,
+    /// WSJT-X (MAN-142): a datagram from manta's own `[[wsjtx_output]]`
+    /// (an `Id` starting `manta-`); not counted as heard.
+    OwnOutput,
 }
 
 impl DropReason {
     /// Every reason, in render order (the `dropped` array's index order).
-    pub const ALL: [DropReason; 12] = [
+    pub const ALL: [DropReason; 13] = [
         DropReason::OtherSpotter,
         DropReason::NotCw,
         DropReason::BadCall,
@@ -734,6 +745,7 @@ impl DropReason {
         DropReason::NotCq,
         DropReason::NoCall,
         DropReason::Duplicate,
+        DropReason::OwnOutput,
     ];
 
     /// The `reason` label value.
@@ -751,6 +763,7 @@ impl DropReason {
             DropReason::NotCq => "not_cq",
             DropReason::NoCall => "no_call",
             DropReason::Duplicate => "duplicate",
+            DropReason::OwnOutput => "own_output",
         }
     }
 
@@ -772,6 +785,98 @@ impl DropReason {
     }
 }
 
+/// MAN-142: `[pskreporter]`'s counters, registered by
+/// [`Metrics::register_pskreporter`] and recorded by its worker.
+#[derive(Debug, Default)]
+pub struct PskReporterStats {
+    reports: AtomicU64,
+    datagrams: AtomicU64,
+    dropped: [AtomicU64; 5],
+}
+
+impl PskReporterStats {
+    /// Spot reports in datagrams handed to the OS.
+    pub fn reports(&self) -> u64 {
+        self.reports.load(Ordering::Relaxed)
+    }
+    /// Datagrams handed to the OS.
+    pub fn datagrams(&self) -> u64 {
+        self.datagrams.load(Ordering::Relaxed)
+    }
+    /// Validated spots not reported for `reason`.
+    pub fn dropped(&self, reason: PskDrop) -> u64 {
+        self.dropped[Self::index(reason)].load(Ordering::Relaxed)
+    }
+    /// One datagram carrying `reports` reports was handed to the OS.
+    pub fn record_datagram(&self, reports: u64) {
+        self.datagrams.fetch_add(1, Ordering::Relaxed);
+        self.reports.fetch_add(reports, Ordering::Relaxed);
+    }
+    /// `n` spots were not reported for `reason`.
+    pub fn record_dropped(&self, reason: PskDrop, n: u64) {
+        self.dropped[Self::index(reason)].fetch_add(n, Ordering::Relaxed);
+    }
+    fn index(reason: PskDrop) -> usize {
+        PskDrop::ALL.iter().position(|r| *r == reason).unwrap_or(0)
+    }
+}
+
+/// MAN-142: one `[[wsjtx_output]]` block's counters, registered by
+/// [`Metrics::register_wsjtx_output`] and recorded by its worker.
+#[derive(Debug)]
+pub struct WsjtxOutputStats {
+    label: String,
+    spots: AtomicU64,
+    datagrams: AtomicU64,
+    dropped: [AtomicU64; 2],
+}
+
+impl WsjtxOutputStats {
+    /// A handle with every counter at 0, for `label` (the destination).
+    pub fn new(label: String) -> Self {
+        Self {
+            label,
+            spots: AtomicU64::new(0),
+            datagrams: AtomicU64::new(0),
+            dropped: Default::default(),
+        }
+    }
+    /// The `destination` label.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+    /// Spots sent as a `Decode`.
+    pub fn spots(&self) -> u64 {
+        self.spots.load(Ordering::Relaxed)
+    }
+    /// Datagrams of every type handed to the OS.
+    pub fn datagrams(&self) -> u64 {
+        self.datagrams.load(Ordering::Relaxed)
+    }
+    /// Spots not sent for `reason`.
+    pub fn dropped(&self, reason: WsjtxOutputDrop) -> u64 {
+        self.dropped[Self::index(reason)].load(Ordering::Relaxed)
+    }
+    /// One spot went out as a `Decode`.
+    pub fn record_spot(&self) {
+        self.spots.fetch_add(1, Ordering::Relaxed);
+    }
+    /// One datagram (of any type) was handed to the OS.
+    pub fn record_datagram(&self) {
+        self.datagrams.fetch_add(1, Ordering::Relaxed);
+    }
+    /// `n` spots were not sent for `reason`.
+    pub fn record_dropped(&self, reason: WsjtxOutputDrop, n: u64) {
+        self.dropped[Self::index(reason)].fetch_add(n, Ordering::Relaxed);
+    }
+    fn index(reason: WsjtxOutputDrop) -> usize {
+        WsjtxOutputDrop::ALL
+            .iter()
+            .position(|r| *r == reason)
+            .unwrap_or(0)
+    }
+}
+
 /// MAN-320: one relay block's counters, registered by
 /// [`Metrics::register_relay`] and recorded by its worker.
 #[derive(Debug)]
@@ -780,7 +885,7 @@ pub struct RelayStats {
     kind: RelayKind,
     up: AtomicBool,
     spots: AtomicU64,
-    dropped: [AtomicU64; 12],
+    dropped: [AtomicU64; 13],
 }
 
 impl RelayStats {
@@ -1011,6 +1116,11 @@ pub struct Metrics {
     /// MAN-141: one handle per input with `spectrum_udp`, keyed by the
     /// `input` label, in registration order.
     spectrum_feeds: RwLock<Vec<(String, Arc<SpectrumStats>)>>,
+    /// MAN-142: `[pskreporter]`'s counters, once the table is configured.
+    pskreporter: RwLock<Option<Arc<PskReporterStats>>>,
+    /// MAN-142: one handle per configured `[[wsjtx_output]]` block,
+    /// disabled ones included, in registration order.
+    wsjtx_outputs: RwLock<Vec<Arc<WsjtxOutputStats>>>,
     /// MAN-323: the `manta_ftx_` families, one series per attempted window.
     ftx: Mutex<FtxStats>,
     /// MAN-128: captured once at construction -- see `StartedAt`'s doc
@@ -1983,6 +2093,27 @@ impl Metrics {
         stats
     }
 
+    /// MAN-142: registers `[pskreporter]` and returns its counters. Call it
+    /// before the metrics listener starts, for a configured table enabled
+    /// or not: registration is what makes the families appear, at 0.
+    pub fn register_pskreporter(&self) -> Arc<PskReporterStats> {
+        let stats = Arc::new(PskReporterStats::default());
+        *self.pskreporter.write().expect("pskreporter lock poisoned") = Some(stats.clone());
+        stats
+    }
+
+    /// MAN-142: registers one `[[wsjtx_output]]` block (`label` = its
+    /// destination) and returns its counters. Call it before the metrics
+    /// listener starts, for every configured block, disabled ones included.
+    pub fn register_wsjtx_output(&self, label: String) -> Arc<WsjtxOutputStats> {
+        let stats = Arc::new(WsjtxOutputStats::new(label));
+        self.wsjtx_outputs
+            .write()
+            .expect("wsjtx_outputs lock poisoned")
+            .push(stats.clone());
+        stats
+    }
+
     /// MAN-323: makes one input's series for `mode` appear, at 0. Call it at
     /// startup for every window an input attempts; a repeat call for the same
     /// `(input, mode)`, such as a second window of that mode, is ignored.
@@ -2895,6 +3026,8 @@ impl Metrics {
 
         self.render_relays(&mut out);
         self.render_spectrum_feeds(&mut out);
+        self.render_pskreporter(&mut out);
+        self.render_wsjtx_outputs(&mut out);
         self.render_ftx(&mut out);
 
         // MAN-128: process uptime/build-info.
@@ -2997,6 +3130,28 @@ impl Metrics {
         out.push_str("# TYPE manta_candidate_repetitions histogram\n");
         if let Some(q) = &quality {
             push_histogram_samples(&mut out, "manta_candidate_repetitions", &q.repetitions);
+        }
+        out.push_str(
+            "# HELP manta_candidate_decisions_total Validation decisions about callsign candidates, by decision and reason (docs/LIVE-STATE.md). A candidate withheld for repetition and spotted later counts once in each series.\n",
+        );
+        out.push_str("# TYPE manta_candidate_decisions_total counter\n");
+        if let Some(q) = &quality {
+            for (decision, reason, n) in &q.decisions {
+                out.push_str(&format!(
+                    "manta_candidate_decisions_total{{decision=\"{decision}\",reason=\"{reason}\"}} {n}\n"
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP manta_call_occurrences_not_candidate_total Decoded callsign occurrences that never became a spot candidate because of their role in the exchange.\n",
+        );
+        out.push_str("# TYPE manta_call_occurrences_not_candidate_total counter\n");
+        if let Some(q) = &quality {
+            for (role, n) in &q.not_candidates {
+                out.push_str(&format!(
+                    "manta_call_occurrences_not_candidate_total{{role=\"{role}\"}} {n}\n"
+                ));
+            }
         }
 
         // MAN-128: health gauges, computed from the SAME `health_at` that
@@ -3153,6 +3308,80 @@ impl Metrics {
                 out.push_str(&format!(
                     "manta_spectrum_dropped_total{{input=\"{}\",reason=\"{}\"}} {}\n",
                     escape_label_value(input),
+                    reason.label(),
+                    s.dropped(reason)
+                ));
+            }
+        }
+    }
+}
+
+impl Metrics {
+    /// MAN-142: the three `manta_pskreporter_` families; nothing at all
+    /// without a `[pskreporter]` table.
+    fn render_pskreporter(&self, out: &mut String) {
+        let guard = self.pskreporter.read().expect("pskreporter lock poisoned");
+        let Some(s) = guard.as_ref() else {
+            return;
+        };
+        out.push_str("# HELP manta_pskreporter_reports_total Spot reports in datagrams handed to the OS for PSKReporter.\n");
+        out.push_str("# TYPE manta_pskreporter_reports_total counter\n");
+        out.push_str(&format!(
+            "manta_pskreporter_reports_total {}\n",
+            s.reports()
+        ));
+        out.push_str("# HELP manta_pskreporter_datagrams_total IPFIX datagrams handed to the OS for PSKReporter.\n");
+        out.push_str("# TYPE manta_pskreporter_datagrams_total counter\n");
+        out.push_str(&format!(
+            "manta_pskreporter_datagrams_total {}\n",
+            s.datagrams()
+        ));
+        out.push_str("# HELP manta_pskreporter_dropped_total Validated spots not reported to PSKReporter, by reason.\n");
+        out.push_str("# TYPE manta_pskreporter_dropped_total counter\n");
+        for reason in PskDrop::ALL {
+            out.push_str(&format!(
+                "manta_pskreporter_dropped_total{{reason=\"{}\"}} {}\n",
+                reason.label(),
+                s.dropped(reason)
+            ));
+        }
+    }
+
+    /// MAN-142: the three `manta_wsjtx_output_` families, one set of series
+    /// per registered block; nothing at all without a block.
+    fn render_wsjtx_outputs(&self, out: &mut String) {
+        let outputs = self
+            .wsjtx_outputs
+            .read()
+            .expect("wsjtx_outputs lock poisoned");
+        if outputs.is_empty() {
+            return;
+        }
+        out.push_str("# HELP manta_wsjtx_output_spots_total Spots sent to this destination as a WSJT-X Decode.\n");
+        out.push_str("# TYPE manta_wsjtx_output_spots_total counter\n");
+        for s in outputs.iter() {
+            out.push_str(&format!(
+                "manta_wsjtx_output_spots_total{{destination=\"{}\"}} {}\n",
+                escape_label_value(s.label()),
+                s.spots()
+            ));
+        }
+        out.push_str("# HELP manta_wsjtx_output_datagrams_total WSJT-X datagrams handed to the OS for this destination.\n");
+        out.push_str("# TYPE manta_wsjtx_output_datagrams_total counter\n");
+        for s in outputs.iter() {
+            out.push_str(&format!(
+                "manta_wsjtx_output_datagrams_total{{destination=\"{}\"}} {}\n",
+                escape_label_value(s.label()),
+                s.datagrams()
+            ));
+        }
+        out.push_str("# HELP manta_wsjtx_output_dropped_total Spots not sent to this destination, by reason.\n");
+        out.push_str("# TYPE manta_wsjtx_output_dropped_total counter\n");
+        for s in outputs.iter() {
+            for reason in WsjtxOutputDrop::ALL {
+                out.push_str(&format!(
+                    "manta_wsjtx_output_dropped_total{{destination=\"{}\",reason=\"{}\"}} {}\n",
+                    escape_label_value(s.label()),
                     reason.label(),
                     s.dropped(reason)
                 ));
@@ -4145,7 +4374,53 @@ mod tests {
                 bucket_counts: vec![116, 38, 120],
                 sum: 899.0,
             },
+            decisions: vec![
+                ("spotted", "none", 49),
+                ("withheld", "repetition", 211),
+                ("deferred", "lookupPending", 0),
+            ],
+            not_candidates: vec![
+                ("addressee", 12),
+                ("relayed_mention", 0),
+                ("self_id", 3),
+                ("uncertain", 7),
+            ],
         }
+    }
+
+    /// MAN-207: one series per pair, zeros included, in the given order.
+    #[test]
+    fn decision_counts_render_every_valid_series() {
+        let m = Metrics::new();
+        m.set_decode_quality(sample_decode_quality());
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_candidate_decisions_total counter\n"));
+        let series: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_candidate_decisions_total{"))
+            .collect();
+        assert_eq!(
+            series,
+            vec![
+                r#"manta_candidate_decisions_total{decision="spotted",reason="none"} 49"#,
+                r#"manta_candidate_decisions_total{decision="withheld",reason="repetition"} 211"#,
+                r#"manta_candidate_decisions_total{decision="deferred",reason="lookupPending"} 0"#,
+            ]
+        );
+        assert!(text.contains("# TYPE manta_call_occurrences_not_candidate_total counter\n"));
+        let roles: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_call_occurrences_not_candidate_total{"))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                r#"manta_call_occurrences_not_candidate_total{role="addressee"} 12"#,
+                r#"manta_call_occurrences_not_candidate_total{role="relayed_mention"} 0"#,
+                r#"manta_call_occurrences_not_candidate_total{role="self_id"} 3"#,
+                r#"manta_call_occurrences_not_candidate_total{role="uncertain"} 7"#,
+            ]
+        );
     }
 
     #[test]
@@ -4162,6 +4437,8 @@ mod tests {
             ("manta_decode_garbles_total", "counter"),
             ("manta_track_rail_ratio", "histogram"),
             ("manta_candidate_repetitions", "histogram"),
+            ("manta_candidate_decisions_total", "counter"),
+            ("manta_call_occurrences_not_candidate_total", "counter"),
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
             assert!(
@@ -5235,7 +5512,7 @@ mod tests {
         );
         assert_eq!(
             count("manta_relay_dropped_total{relay=\"127.0.0.1:2237\",kind=\"wsjtx\""),
-            9
+            10
         );
     }
 
@@ -5287,6 +5564,92 @@ mod tests {
              manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"rate_limit\"} 0\n\
              manta_spectrum_dropped_total{input=\"hpsdr\",reason=\"send_error\"} 0\n";
         assert!(text.contains(expected), "{text}");
+    }
+
+    /// MAN-142 (D15): no `manta_pskreporter_` line without the table;
+    /// every series at 0 once it is registered, then the recorded counts.
+    #[test]
+    fn pskreporter_families_render_at_zero_once_registered_and_not_at_all_without_the_table() {
+        let none = Metrics::new().render_prometheus_text();
+        assert!(!none.contains("manta_pskreporter_"), "{none}");
+
+        let m = Metrics::new();
+        let stats = m.register_pskreporter();
+        let text = m.render_prometheus_text();
+        let expected = "# HELP manta_pskreporter_reports_total Spot reports in datagrams handed to the OS for PSKReporter.\n\
+             # TYPE manta_pskreporter_reports_total counter\n\
+             manta_pskreporter_reports_total 0\n\
+             # HELP manta_pskreporter_datagrams_total IPFIX datagrams handed to the OS for PSKReporter.\n\
+             # TYPE manta_pskreporter_datagrams_total counter\n\
+             manta_pskreporter_datagrams_total 0\n\
+             # HELP manta_pskreporter_dropped_total Validated spots not reported to PSKReporter, by reason.\n\
+             # TYPE manta_pskreporter_dropped_total counter\n\
+             manta_pskreporter_dropped_total{reason=\"spot_type\"} 0\n\
+             manta_pskreporter_dropped_total{reason=\"rate_gate\"} 0\n\
+             manta_pskreporter_dropped_total{reason=\"lagged\"} 0\n\
+             manta_pskreporter_dropped_total{reason=\"resolve_error\"} 0\n\
+             manta_pskreporter_dropped_total{reason=\"send_error\"} 0\n";
+        assert!(text.contains(expected), "{text}");
+
+        stats.record_datagram(3);
+        stats.record_datagram(2);
+        stats.record_dropped(PskDrop::RateGate, 4);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains("manta_pskreporter_reports_total 5\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("manta_pskreporter_datagrams_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("manta_pskreporter_dropped_total{reason=\"rate_gate\"} 4\n"),
+            "{text}"
+        );
+    }
+
+    /// MAN-142 (D15): no `manta_wsjtx_output_` line without a block; one
+    /// set of series per registered destination, at 0.
+    #[test]
+    fn wsjtx_output_families_render_per_destination_at_zero_and_not_at_all_without_a_block() {
+        let none = Metrics::new().render_prometheus_text();
+        assert!(!none.contains("manta_wsjtx_output_"), "{none}");
+
+        let m = Metrics::new();
+        let stats = m.register_wsjtx_output("192.168.1.255:2237".to_string());
+        let text = m.render_prometheus_text();
+        let expected = "# HELP manta_wsjtx_output_spots_total Spots sent to this destination as a WSJT-X Decode.\n\
+             # TYPE manta_wsjtx_output_spots_total counter\n\
+             manta_wsjtx_output_spots_total{destination=\"192.168.1.255:2237\"} 0\n\
+             # HELP manta_wsjtx_output_datagrams_total WSJT-X datagrams handed to the OS for this destination.\n\
+             # TYPE manta_wsjtx_output_datagrams_total counter\n\
+             manta_wsjtx_output_datagrams_total{destination=\"192.168.1.255:2237\"} 0\n\
+             # HELP manta_wsjtx_output_dropped_total Spots not sent to this destination, by reason.\n\
+             # TYPE manta_wsjtx_output_dropped_total counter\n\
+             manta_wsjtx_output_dropped_total{destination=\"192.168.1.255:2237\",reason=\"lagged\"} 0\n\
+             manta_wsjtx_output_dropped_total{destination=\"192.168.1.255:2237\",reason=\"send_error\"} 0\n";
+        assert!(text.contains(expected), "{text}");
+
+        m.register_wsjtx_output("224.0.0.1:2237".to_string());
+        stats.record_spot();
+        stats.record_datagram();
+        stats.record_datagram();
+        stats.record_dropped(WsjtxOutputDrop::SendError, 1);
+        let text = m.render_prometheus_text();
+        for line in [
+            "manta_wsjtx_output_spots_total{destination=\"192.168.1.255:2237\"} 1\n",
+            "manta_wsjtx_output_datagrams_total{destination=\"192.168.1.255:2237\"} 2\n",
+            "manta_wsjtx_output_dropped_total{destination=\"192.168.1.255:2237\",reason=\"send_error\"} 1\n",
+            "manta_wsjtx_output_spots_total{destination=\"224.0.0.1:2237\"} 0\n",
+        ] {
+            assert!(text.contains(line), "{line}: {text}");
+        }
+        assert_eq!(
+            text.matches("# TYPE manta_wsjtx_output_spots_total")
+                .count(),
+            1
+        );
     }
 
     /// MAN-323: no `manta_ftx_` line until a window registers; then its

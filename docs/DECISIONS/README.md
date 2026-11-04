@@ -21,13 +21,35 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-11-03 | MAN-407 | [MAN-407: the ka9q startup stash stamps each packet no later than its arrival](2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md) |
+| 2026-11-03 | MAN-207 | [MAN-207: a bounded, local record of why each callsign candidate was or was not spotted](2026-11-03-man207-observation-record.md) |
+| 2026-11-03 | MAN-206 | [MAN-206: an independent synthetic generator checks the testkit, and failing scenes shrink to synthetic repros](2026-11-03-man206-independent-generator-and-scene-minimizer.md) |
+| 2026-11-03 | MAN-205 | [MAN-205: legacy and HSMM rarely recover a call the other misses; fusion is not worth building on the bench](2026-11-03-man205-legacy-hsmm-engine-overlap.md) |
+| 2026-11-03 | MAN-204 | [MAN-204: guarded two-stage cancellation recovers a weak CW station beside a strong one (offline experiment)](2026-11-03-man204-guarded-two-stage-cancellation.md) |
+| 2026-11-03 | MAN-200 | [MAN-200: damaged repetitions of one self-ID can confirm the call](2026-11-03-man200-repetition-evidence-fusion.md) |
+| 2026-11-03 | MAN-180 | [MAN-180: `--soapy-gain` help warns that an SDRplay reads it as attenuation](2026-11-03-man180-soapy-gain-help-warning.md) |
+| 2026-11-02 | MAN-459 | [MAN-459: the protocol-2 acceptance fake follows manta across a reconnect, and every live-run failure explains itself](2026-11-02-man459-protocol2-fake-follows-reconnects.md) |
+| 2026-11-02 | MAN-201 | [MAN-201: who sent a callsign, not only which callsign](2026-11-02-man201-callsign-roles.md) |
+| 2026-11-01 | MAN-453 | [MAN-453: raw IQ recording reports its true outcome, and a stop ends a paced replay's wait](2026-11-01-man453-recording-and-replay-edge-cases.md) |
+| 2026-11-01 | MAN-449 | [MAN-449: the keepalive-cadence test counts what the source issued and re-observes only a lost datagram](2026-11-01-man449-keepalive-test-counts-what-the-source-issued.md) |
+| 2026-11-01 | MAN-323 | [MAN-323: FT8 and FT4 spots from the band streams manta already receives](2026-11-01-man323-ft8-ft4-from-band-streams.md) |
+| 2026-11-01 | MAN-322 | [MAN-322: RTTY spots reach telnet, the JSON stream and the RBN uplink labelled RTTY](2026-11-01-man322-rtty-spot-outputs.md) |
+| 2026-11-01 | MAN-202 | [MAN-202: an input gap of unknown length drops the character it cut instead of decoding through it](2026-11-01-man202-unknown-length-input-gaps.md) |
+| 2026-11-01 | MAN-141 | [MAN-141: manta sends its channelizer power spectrum to N1MM+'s Spectrum Display over UDP, as CW Skimmer does](2026-11-01-man141-n1mm-spectrum-feed.md) |
+| 2026-11-01 | MAN-112 | [MAN-112: frequency-anchored close-pair resolution](2026-11-01-man112-close-pair-resolution.md) |
+| 2026-11-01 | MAN-97 | [MAN-97: `manta grade --paired` grades a node against a co-located skimmer both ways](2026-11-01-man97-paired-skimmer-report.md) |
+| 2026-11-01 | MAN-54 | [MAN-54: on-device decode on a Red Pitaya is a no-go; the CPU, not the link, is the limit](2026-11-01-man54-on-device-decode-feasibility.md) |
+| 2026-10-30 | MAN-321 | [MAN-321 first slice: diagnostic ITA2 text](2026-10-30-man321-rtty-decoding.md) |
+| 2026-10-30 | MAN-317 | [MAN-317: bounded language priors for ambiguous word readings](2026-10-30-man317-language-prior-readings.md) |
 | 2026-10-30 | MAN-109 | [MAN-109: two disjoint power windows for detector rise](2026-10-30-man109-dit-scale-two-look-detector.md) |
+| 2026-10-30 | MAN-106 | [MAN-106: the confidence multiplier `q` reads the engine-supplied floor-based SNR, not the keying rail](2026-10-30-man106-q-snr-input.md) |
 | 2026-10-29 | MAN-414 | [MAN-414: environment overrides switch between frequency and bands](2026-10-29-man414-environment-tuning-mode.md) |
 | 2026-10-28 | MAN-374 | [MAN-374: the startup calibration fill runs through `process_hops` in read-sized chunks, so a short unkeyed timeout keeps its callsign](2026-10-28-man374-chunked-calibration-fill.md) |
 | 2026-10-27 | MAN-440 | [MAN-440: the decision-record index is generated; record PRs add only their file](2026-10-27-man440-generated-decisions-index.md) |
 | 2026-10-27 | MAN-353 | [MAN-353: a reading live client is dropped only past the lag allowance; the stall test runs a slow reader on every leg](2026-10-27-man353-slow-reading-live-client.md) |
 | 2026-10-27 | MAN-343 | [MAN-343: `manta grade` reads each input file once, however it is named](2026-10-27-man343-grade-reads-each-file-once.md) |
 | 2026-10-27 | MAN-320 | [MAN-320: manta relays a local skimmer's own spots and WSJT-X's FT8/FT4 CQs through the uplink](2026-10-27-man320-relay-local-skimmers-and-wsjtx.md) |
+| 2026-10-27 | MAN-318 | [MAN-318: withhold a spot until QRZ.com confirms its callsign exists](2026-10-27-man318-callsign-lookup.md) |
 | 2026-10-27 | MAN-308 | [MAN-308: automatic step attenuation on a protocol-2 openHPSDR radio's ADC overload](2026-10-27-man308-hpsdr-auto-attenuation.md) |
 | 2026-10-27 | MAN-304 | [MAN-304: manta as an UberSDR add-on; the receiver's add-on contract, and packaging waits on the UberSDR input](2026-10-27-man304-ubersdr-addon-gate.md) |
 | 2026-10-26 | MAN-436 | [MAN-436: same-input dedupe decides against the station's newest spot across a bucket edge](2026-10-26-man436-dedupe-edge-newest-spot.md) |

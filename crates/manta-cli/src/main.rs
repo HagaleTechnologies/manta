@@ -15,7 +15,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;
-use manta_engine::{decode_wav, PipelineConfig};
+use manta_engine::PipelineConfig;
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +43,7 @@ mod list_refresh;
 mod live_state;
 mod logging;
 mod multi_run;
+mod observations;
 mod qrz;
 mod reconnect;
 mod relay_socket;
@@ -50,6 +51,7 @@ mod reload;
 mod silent;
 mod source_check;
 mod spectrum_feed;
+mod spot_outputs;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -134,6 +136,17 @@ enum Command {
         /// (in dits) on stderr. `--json` always includes them.
         #[arg(long, help_heading = "Output")]
         timing: bool,
+        /// Write why each callsign candidate was or was not spotted to PATH as
+        /// JSON Lines (schema manta-observations.v1, see docs/OBSERVATIONS.md).
+        ///
+        /// PATH must not exist. Holds callsigns, reasons and scores, not the
+        /// decoded text; add --observation-text for that.
+        #[arg(long, value_name = "PATH", help_heading = "Output")]
+        observations: Option<PathBuf>,
+        /// Also write each candidate's characters, confidences, erasures and
+        /// decoder alternatives. Requires --observations.
+        #[arg(long, requires = "observations", help_heading = "Output")]
+        observation_text: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -318,7 +331,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -629,7 +648,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -886,7 +911,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -1136,7 +1167,13 @@ enum Command {
             help_heading = "SoapySDR source"
         )]
         soapy_rate_hz: Option<f64>,
-        /// Receiver gain, in dB. Omit to let the device use AGC.
+        /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
+        /// gain. Omit to let the device use AGC.
+        ///
+        /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
+        /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
+        /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
+        /// signal you know is present.
         #[cfg(feature = "soapy")]
         #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
         soapy_gain: Option<f64>,
@@ -2068,6 +2105,11 @@ impl IqSource for FixedCenterFreqSource {
     /// reaches `listen()` through this wrapper).
     fn take_unknown_gap(&mut self) -> bool {
         self.inner.take_unknown_gap()
+    }
+
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
     }
 
     /// MAN-259: `ReconnectingSource` reads this off the opener's result to
@@ -3116,6 +3158,7 @@ fn build_pipeline_config(
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
         validation_level: spot.validation_level,
+        repetition_fusion: spot.repetition_fusion,
         detector,
         ..Default::default()
     };
@@ -4248,6 +4291,76 @@ fn latency_histogram_of(
     }
 }
 
+/// `manta decode`'s decode: a manta IQ recording or headerless IQ through
+/// `decode_source_observed` (MAN-309), a WAV otherwise. MAN-131: says so
+/// before decoding when the reported frequencies will be baseband offsets,
+/// only for an existing file, so a missing WAV still fails with just its
+/// `open WAV` error.
+fn decode_for_cli(
+    path: &Path,
+    mut center_freq_hz: Option<f64>,
+    iq_format: Option<manta_input::RawIqFormat>,
+    sample_rate_hz: Option<f64>,
+    cfg: &PipelineConfig,
+    policy: manta_engine::ObservationPolicy,
+) -> Result<(manta_engine::DecodeReport, manta_engine::ObservedRun)> {
+    let native = manta_input::is_native_recording(path);
+    if native || iq_format.is_some() {
+        if !native && (sample_rate_hz.is_none() || center_freq_hz.is_none()) {
+            bail!("headerless IQ requires --sample-rate-hz and --center-freq-hz");
+        }
+        let mut src = manta_input::open_iq_file(
+            path,
+            manta_input::IqFileOptions {
+                raw_format: iq_format,
+                sample_rate_hz,
+                center_freq_hz,
+            },
+        )?;
+        if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
+            errln!(
+                "warning: IQ recording {} has no RF centre frequency in its \
+                 metadata -- reported frequencies are baseband offsets from the \
+                 recording's centre, not absolute RF frequencies. Pass the centre \
+                 frequency, e.g. --center-freq-hz 14000000.",
+                path.display()
+            );
+        }
+        // `decode_source` segments the decode at each recorded gap.
+        manta_engine::decode_source_observed(src.as_mut(), cfg, policy)
+    } else {
+        if center_freq_hz.is_none() && path.is_file() {
+            let sidecar = manta_input::read_sidecar(path)?;
+            if let Some(warning) =
+                recording_center_warning(path, sidecar.map(|sc| sc.center_freq_hz))
+            {
+                errln!("{warning}");
+                // Keep the warning true: a negative sidecar centre
+                // decodes at 0.0, not shifted by itself.
+                center_freq_hz = Some(0.0);
+            }
+        }
+        manta_engine::decode_wav_observed(path, center_freq_hz, cfg, policy)
+    }
+}
+
+/// MAN-207: creates `--observations PATH`, refusing an existing path so a
+/// typo can never truncate the recording itself.
+fn create_observation_file(path: &Path) -> Result<std::fs::File> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "--observations {} already exists; remove it or choose another path",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("create --observations {}", path.display())),
+    }
+}
+
 /// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
 /// bounds and the repetition gate's bucket bounds to their snapshots.
 fn decode_quality_of(
@@ -4269,6 +4382,24 @@ fn decode_quality_of(
             bucket_counts: s.repetition_bucket_counts.clone(),
             sum: s.repetition_sum as f64,
         },
+        // MAN-207: the live-state stream's labels, `none` for a spot.
+        decisions: s
+            .decisions
+            .iter()
+            .map(|&(verdict, reason, n)| {
+                (
+                    manta_server::live_state::decision_label(verdict),
+                    reason.map_or("none", manta_server::live_state::reason_label),
+                    n,
+                )
+            })
+            .collect(),
+        // MAN-207: the MAN-201 role labels.
+        not_candidates: s
+            .not_candidates
+            .iter()
+            .map(|&(role, n)| (role.as_str(), n))
+            .collect(),
     }
 }
 
@@ -4583,6 +4714,7 @@ fn start_spot_server(
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
     pipeline: &PipelineConfig,
     relays: RelayConfigs,
+    outputs: spot_outputs::SpotOutputs,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let validation_level = pipeline.validation_level;
     // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
@@ -4594,6 +4726,22 @@ fn start_spot_server(
         .map(|r| {
             r.enabled
                 .then(|| relay_socket::bind_wsjtx_socket(r.listen))
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
+    // MAN-142 (D9, D13): the spot outputs' sockets are bound here too, for
+    // the same reason.
+    let pskreporter_socket = outputs
+        .pskreporter
+        .as_ref()
+        .map(|p| spot_outputs::bind_pskreporter_socket(&p.host))
+        .transpose()?;
+    let wsjtx_output_sockets = outputs
+        .wsjtx
+        .iter()
+        .map(|w| {
+            w.enabled
+                .then(|| spot_outputs::bind_wsjtx_output_socket(w.destination))
                 .transpose()
         })
         .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
@@ -4612,6 +4760,12 @@ fn start_spot_server(
     let station_location = cfg
         .station_location()
         .map_err(|e| anyhow!("[server]: {e}"))?;
+    // MAN-142: the grid the spot outputs name the station at (empty
+    // without a location).
+    let station_grid = station_location
+        .as_ref()
+        .map(|l| l.grid.clone())
+        .unwrap_or_default();
     let bus = std::sync::Arc::new(spot_bus_for(
         &cfg,
         source.sample_rate_hz,
@@ -4997,6 +5151,18 @@ fn start_spot_server(
                     (r, socket, stats)
                 })
                 .collect();
+            // MAN-142 (D15): the spot outputs' series, registered before the
+            // metrics endpoint spawns for MAN-44's reason: a configured
+            // table shows its zeros, enabled or not.
+            let pskreporter_stats = outputs
+                .pskreporter_registered
+                .then(|| metrics.register_pskreporter());
+            let wsjtx_outputs: Vec<_> = outputs
+                .wsjtx
+                .iter()
+                .zip(wsjtx_output_sockets)
+                .map(|(w, socket)| (w.clone(), socket, metrics.register_wsjtx_output(w.label())))
+                .collect();
             let metrics_ip_request_limiter =
                 manta_server::rate_limit::IpRateLimiter::new_with_override(
                     manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
@@ -5081,6 +5247,66 @@ fn start_spot_server(
                     stats,
                     shutdown_rx.clone(),
                 ));
+            }
+            // MAN-142 (D3): the spot outputs read the bus the uplinks read.
+            // Each receiver is subscribed here, before the decoder starts
+            // publishing, and each worker runs in the tracked task set, so
+            // the shutdown drain awaits its final flush.
+            if let (Some(p), Some(socket), Some(stats)) =
+                (outputs.pskreporter, pskreporter_socket, pskreporter_stats)
+            {
+                // `config::load` refused an enabled table without a grid.
+                let grid = station_grid.clone();
+                let call =
+                    manta_server::config::strip_ssid(&cfg.station_callsign).to_ascii_uppercase();
+                logging::note(&spot_outputs::pskreporter_startup_line(&p, &call, &grid));
+                let nonce = bus.session_nonce();
+                let worker = manta_server::pskreporter::run(
+                    manta_server::pskreporter::PskReporter {
+                        host: p.host.clone(),
+                        port: p.port,
+                        receiver: manta_server::pskreporter::ipfix::Receiver {
+                            callsign: call,
+                            locator: grid,
+                            software: format!("manta {}", build_info::VERSION),
+                            antenna: p.antenna.clone(),
+                        },
+                        spot_types: p.spot_types,
+                        flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        observation_domain: manta_server::pskreporter::observation_domain(nonce),
+                    },
+                    socket,
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
+            }
+            for (w, socket, stats) in wsjtx_outputs {
+                let Some(socket) = socket else {
+                    continue;
+                };
+                logging::note(&spot_outputs::wsjtx_output_startup_line(w.destination));
+                let worker = manta_server::wsjtx_output::run(
+                    manta_server::wsjtx_output::WsjtxOutput {
+                        label: w.label(),
+                        destination: w.destination,
+                        de_call: manta_server::config::strip_ssid(&cfg.station_callsign)
+                            .to_ascii_uppercase(),
+                        de_grid: station_grid.clone(),
+                        version: build_info::VERSION.to_string(),
+                        revision: build_info::GIT_SHA.to_string(),
+                        off_air: outputs.replay,
+                    },
+                    socket,
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
             }
             // MAN-301: the live comparator reads the same bus the uplinks do
             // and publishes grades back onto it. Its metric families were
@@ -5306,6 +5532,9 @@ struct SpotResolved {
     cty_url: String,
     scp_url: String,
     patterns: Option<PathBuf>,
+    /// MAN-200: `[spot] repetition_fusion`; no flag, so straight from the
+    /// file/env layer.
+    repetition_fusion: bool,
 }
 
 /// MAN-316: `--cty-sha256`/`--scp-sha256`, the only list flags beyond
@@ -5372,6 +5601,7 @@ fn resolve_spot_pinned(
         scp_url: spot.scp_url().to_string(),
         patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
         validation_level: spot.validation_level,
+        repetition_fusion: spot.repetition_fusion,
     }
 }
 
@@ -6754,6 +6984,8 @@ fn run_command() -> Result<std::process::ExitCode> {
             sample_rate_hz,
             json,
             timing,
+            observations,
+            observation_text,
             filters,
             config,
             engine,
@@ -6844,49 +7076,53 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&spot, &lists_in_use);
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
-            // MAN-131: say so before decoding when the reported frequencies
-            // will be baseband offsets. Only for an existing file, so a
-            // missing WAV still fails with just its `open WAV` error.
-            let mut center_freq_hz = center_freq_hz;
-            // MAN-309: a manta IQ recording or headerless IQ; a WAV
-            // otherwise, exactly as before.
-            let native = manta_input::is_native_recording(&path);
-            let report = if native || iq_format.is_some() {
-                if !native && (sample_rate_hz.is_none() || center_freq_hz.is_none()) {
-                    bail!("headerless IQ requires --sample-rate-hz and --center-freq-hz");
+            // MAN-207: the observation file is created before decoding, so an
+            // existing path fails fast and is never truncated.
+            let policy = match (&observations, observation_text) {
+                (None, _) => manta_engine::ObservationPolicy::summary(),
+                (Some(_), false) => manta_engine::ObservationPolicy::records(),
+                (Some(_), true) => manta_engine::ObservationPolicy::text(),
+            };
+            let observation_file = match &observations {
+                Some(obs_path) => Some(create_observation_file(obs_path)?),
+                None => None,
+            };
+            let decoded = decode_for_cli(
+                &path,
+                center_freq_hz,
+                iq_format,
+                sample_rate_hz,
+                &cfg,
+                policy,
+            );
+            let (report, observed) = match decoded {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    if let Some(obs_path) = &observations {
+                        // Best effort: the empty file must not look like a record.
+                        let _ = std::fs::remove_file(obs_path);
+                    }
+                    return Err(e);
                 }
-                let mut src = manta_input::open_iq_file(
-                    &path,
-                    manta_input::IqFileOptions {
-                        raw_format: iq_format,
-                        sample_rate_hz,
-                        center_freq_hz,
-                    },
-                )?;
-                if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
-                    errln!(
-                        "warning: IQ recording {} has no RF centre frequency in its \
-                         metadata -- reported frequencies are baseband offsets from the \
-                         recording's centre, not absolute RF frequencies. Pass the centre \
-                         frequency, e.g. --center-freq-hz 14000000.",
-                        path.display()
-                    );
-                }
-                // `decode_source` segments the decode at each recorded gap.
-                manta_engine::decode_source(src.as_mut(), &cfg)?
-            } else {
-                if center_freq_hz.is_none() && path.is_file() {
-                    let sidecar = manta_input::read_sidecar(&path)?;
-                    if let Some(warning) =
-                        recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
+            };
+            // Written before any output, so a failed stdout write cannot
+            // leave the file empty.
+            let written = match (&observations, observation_file) {
+                (Some(obs_path), Some(file)) => {
+                    match observations::write(file, policy.detail, report.sample_rate_hz, &observed)
                     {
-                        errln!("{warning}");
-                        // Keep the warning true: a negative sidecar centre
-                        // decodes at 0.0, not shifted by itself.
-                        center_freq_hz = Some(0.0);
+                        Ok(n) => Some((obs_path, n)),
+                        Err(e) => {
+                            // Best effort: a file cut short has no summary
+                            // trailer and must not look like a record.
+                            let _ = std::fs::remove_file(obs_path);
+                            return Err(e).with_context(|| {
+                                format!("write --observations {}", obs_path.display())
+                            });
+                        }
                     }
                 }
-                decode_wav(&path, center_freq_hz, &cfg)?
+                _ => None,
             };
             if json {
                 outln!("{}", serde_json::to_string(&report)?)?;
@@ -6919,6 +7155,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     &path.display().to_string(),
                     report.bad_samples,
                 ));
+            }
+            if let Some((obs_path, n)) = written {
+                errln!(
+                    "observations: {n} record{} written to {}",
+                    if n == 1 { "" } else { "s" },
+                    obs_path.display()
+                );
             }
         }
         Command::Oracle {
@@ -7211,6 +7454,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        // MAN-142 (D10): a run counts as a replay when any
+                        // input is a file.
+                        outputs: spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            resolved.inputs.iter().any(|i| !i.spec.is_reconnectable()),
+                        ),
                         rbn_compare: resolved.rbn_compare.clone(),
                         replay_epoch: resolved.replay_epoch,
                     }),
@@ -7483,6 +7733,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            replay_path.is_some(),
+                        ),
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -9042,6 +9297,20 @@ mod tests {
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 
     #[test]
+    fn repetition_fusion_reaches_the_pipeline_config() {
+        for on in [false, true] {
+            let spot = config::SpotFile {
+                repetition_fusion: on,
+                ..Default::default()
+            };
+            let r = resolve_spot(vec![], None, None, None, None, None, &spot);
+            let (cfg, _) =
+                build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
+            assert_eq!(cfg.repetition_fusion, on);
+        }
+    }
+
+    #[test]
     fn cli_patterns_override_file_and_preserve_validation_level() {
         let spot = config::SpotFile {
             pattern_path: Some("file.lst".into()),
@@ -9423,6 +9692,7 @@ mod tests {
                 ..Default::default()
             },
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -9469,6 +9739,7 @@ mod tests {
             lists.clone(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -9930,6 +10201,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -9993,6 +10265,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11091,6 +11364,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11155,6 +11429,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11217,6 +11492,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         );
         assert!(
             result.is_ok(),
@@ -11255,6 +11531,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11371,6 +11648,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -11404,6 +11682,7 @@ mod tests {
                 skimmer: loaded.skimmer_relay,
                 wsjtx: loaded.wsjtx_relay,
             },
+            spot_outputs::SpotOutputs::default(),
         )
     }
 
@@ -11508,6 +11787,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -12428,6 +12708,34 @@ mod tests {
         assert_eq!(
             q.repetitions.bucket_counts.len(),
             q.repetitions.bounds.len() + 1
+        );
+    }
+
+    /// MAN-207: every valid decision/reason pair, labelled as LIVE-STATE.md.
+    #[test]
+    fn decode_quality_of_carries_the_decision_counts() {
+        let obs = manta_engine::DecodeQualityObserver::new();
+        let q = decode_quality_of(&obs.snapshot());
+        assert_eq!(q.decisions.len(), 1 + manta_spot::Reason::ALL.len());
+        assert_eq!(q.decisions[0], ("spotted", "none", 0));
+        assert!(q.decisions.contains(&("withheld", "repetition", 0)));
+        assert!(q.decisions.contains(&("deferred", "beaconPending", 0)));
+        assert!(q.decisions.contains(&("deferred", "lookupPending", 0)));
+        assert_eq!(
+            q.decisions
+                .iter()
+                .filter(|&&(d, _, _)| d == "spotted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            q.not_candidates,
+            vec![
+                ("addressee", 0),
+                ("relayed_mention", 0),
+                ("self_id", 0),
+                ("uncertain", 0),
+            ]
         );
     }
 
@@ -13745,6 +14053,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         // `decode --timing` (MAN-315): an output choice, like `json`.
         "timing",
+        // `decode --observations`/`--observation-text` (MAN-207): an output
+        // choice, like `json`.
+        "observations",
+        "observation_text",
         "help",
         "version",
         "reference_hz",
@@ -14137,6 +14449,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -14189,6 +14502,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 

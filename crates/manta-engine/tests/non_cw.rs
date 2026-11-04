@@ -167,9 +167,12 @@ fn ssb_voice_at_14040_starts_far_fewer_cw_tracks() {
     let (p, _) = promotions_and_spots(&iq, CENTER, &off());
     let off_n = within(&p, lo, hi).len();
     println!("SSB +30 dB: {on} TrackPromoted in band filter on, {off_n} off; spots {spots:?}");
-    // 81 with this generator and voice seed (other seeds give 88-117; the
-    // MAN-313 prototype's voice measured 122): tens of spurious tracks.
-    assert!(off_n > 50, "the scene no longer exercises the bug: {off_n}");
+    // 81 with this generator and voice seed before MAN-112 (other seeds
+    // gave 88-117; the MAN-313 prototype's voice measured 122). MAN-112's
+    // frequency-anchored association fragments the voice less: 29 here.
+    // Still tens of spurious tracks; see
+    // docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md.
+    assert!(off_n > 25, "the scene no longer exercises the bug: {off_n}");
     assert!(on * 5 <= off_n, "filter on {on} vs off {off_n}");
     assert!(spots.is_empty(), "{spots:?}");
 }

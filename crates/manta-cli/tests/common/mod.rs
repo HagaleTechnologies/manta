@@ -12,6 +12,12 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ka9q;
 
+/// MAN-142 (D16): fake-listener readers for `[pskreporter]` (IPFIX) and
+/// `[[wsjtx_output]]` (WSJT-X `NetworkMessage`), written from the published
+/// formats.
+pub mod ipfix;
+pub mod wsjtx;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -423,3 +429,5 @@ pub fn http_reply(status: &str, body: &str) -> Vec<u8> {
     )
     .into_bytes()
 }
+
+pub mod decode;

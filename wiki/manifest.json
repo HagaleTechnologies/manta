@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-30T15:36:30Z",
-  "head_commit": "d144e36",
+  "generated_at": "2026-11-03T06:45:00Z",
+  "head_commit": "212fa51",
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -267,7 +267,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2f70653964690d4021916b031dbe1f44ab8791ce21270eaced01bef17b7a85ca",
+      "hash": "sha256:dc3a854d09bdb2746d51c39aa97997bad16975bc92f426fb4d3b885cac79a53c",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -279,6 +279,7 @@
       "sources": [
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
         "docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md",
+        "docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
@@ -292,8 +293,8 @@
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "d144e36",
-      "verified_date": "2026-11-01",
+      "verified_commit": "efa79c4",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {
@@ -325,7 +326,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:5ca169108ae1274e462ef60bd00032eb7c4e0bcfdf6b7b262f9185b03a8d9e60",
+      "hash": "sha256:f16a9caad035f19d9045edacdd8ca5e54febe3f7ff2719ee7b6d513e3da8c7db",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -343,12 +344,14 @@
         "docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md",
         "docs/DECISIONS/2026-10-14-man174-deferred-beacon-merge-bookkeeping.md",
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
-        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
+        "docs/DECISIONS/2026-11-02-man201-callsign-roles.md",
+        "docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
-      "verified_commit": "799379d",
-      "verified_date": "2026-10-16",
+      "verified_commit": "212fa51",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {

@@ -24,6 +24,35 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-200: a decode whose samples overlap a decode the repetition gate
+  already counted, such as a replay or a second track on the same signal,
+  no longer counts as another repetition, even when it arrives a whole
+  message later on the same track.
+- MAN-112: frequency-anchored association keeps independently keyed close
+  pairs on separate tracks. V7 returns to its specified 150 Hz spacing.
+  Close-pair track identities, decoded text and spot frequencies change.
+  See docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md for the
+  measured separation limits and the experimental frontend verdict.
+  With the non-CW filter on, key-down evidence ignores a channel that a
+  louder carrier within two channels dominates or that sits 30 dB under
+  the track's own key-down, so swept carriers still start no CW track.
+
+- MAN-201: manta now reads each decoded callsign as the sending station,
+  the station called, a station mentioned, or uncertain, and spots only a
+  sending station. `DE W1AW DE K1ABC K` spots K1ABC, not W1AW. A `CQ` types
+  a `DE <call>` as CQ only when it leads straight into it (`CQ CQ DE`,
+  `CQ TEST DE`), not from anywhere in the window. Every CQ/DE call in the
+  window is considered, not only the first. A call is decided when its next
+  word, a turn end (`K`, `KN`, `BK`, `AR`, `SK`, 5 s with no character) or
+  the track's end shows its role, so a spot can arrive one word later; it
+  keeps the call's own timestamp. A run of one bare call waits for a
+  different word. An input that stalls or fails closes its tracks, which
+  settles their last calls. A call followed by a lone `T` spots as `BEACON`
+  only when it is on `[spot].allowlist`; other such decodes are withheld as
+  `beaconNoEvidence`. An allowlisted call heard only as the station called
+  or mentioned is no longer spotted. `decode --json` `TrackMeta` events gain
+  `lastCharTs`. See
+  [docs/DECISIONS/2026-11-02-man201-callsign-roles.md](docs/DECISIONS/2026-11-02-man201-callsign-roles.md).
 - MAN-322: CLI JSON spots gain `mode` and `baud`; the `:7301` stream
   gains `baud` (30 keys) and sends `wpm` as `null` on an RTTY spot. Every
   spot is still CW, so `mode` is `"CW"` and `baud` is `null` on every spot
@@ -115,6 +144,41 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
+  by default) reports validated CQ and beacon spots (`spot_types = "all"`
+  for every type) to PSKReporter's public map at
+  `report.pskreporter.info:4739` as IPFIX over UDP, each call at most once
+  per band every 5 minutes, in at most one datagram every 5 minutes. It
+  needs `[server]` with a grid, and a file replay reports only to a loopback
+  host. `[[wsjtx_output]]` sends every validated spot to a LAN address
+  (unicast, broadcast or multicast) as WSJT-X `Heartbeat`, `Status`,
+  `Decode` and `Close` messages, one instance per band (`manta-20m`), with
+  `Off air` set on a file replay. `[[wsjtx_relay]]` now ignores datagrams
+  from manta's own output (`manta_relay_dropped_total{reason="own_output"}`).
+  With `[server]`, `/metrics` gains `manta_pskreporter_reports_total`,
+  `manta_pskreporter_datagrams_total`, `manta_pskreporter_dropped_total`,
+  `manta_wsjtx_output_spots_total`, `manta_wsjtx_output_datagrams_total`
+  and `manta_wsjtx_output_dropped_total`. Spots are unchanged. Tested
+  against fake local listeners; a live PSKReporter report and a real
+  logger are still to be checked. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
+- MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
+  copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
+  `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
+  records gain `confirmation` (`exactRepeat`, `fused` or `null`). With the
+  key off, decoder output is unchanged.
+- MAN-207: each validator keeps a bounded, local observation record of why
+  each callsign candidate was or was not spotted (`manta_spot::observation`):
+  counters by default, opt-in records with evidence links and append-only
+  revisions. `manta decode FILE --observations PATH` writes it as JSON Lines
+  (`manta-observations.v1`, docs/OBSERVATIONS.md), and `--observation-text`
+  adds each word's characters. Each record carries the call's MAN-201 role
+  and turn, and a call heard only as the station being called is recorded
+  as `notCandidate`. `/metrics` gains
+  `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
+  stdout and every wire format are unchanged. See
+  [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -310,6 +374,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-180: the `--soapy-gain` help, the `manta config init` scaffold,
+  `docs/CONFIG.md` and the README warn that on an SDRplay a higher value
+  means more attenuation, not more gain, and that `0` is the most sensitive
+  setting. How manta applies the gain is unchanged.
 - HPSDR network-radio input and its hardware-free tests are included in
   every build. The `hpsdr` Cargo feature remains an accepted no-op for
   compatibility; SoapySDR still needs `--features soapy` (MAN-239).
@@ -324,6 +392,15 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
+  longer stamped late when the reopen thread stalls before it drains the
+  data socket. The startup stash now stamps each packet with the last
+  instant it saw the socket empty, not the instant it read the packet, so
+  the outage ends no later than the first replayed packet's arrival. A
+  400 ms stall had moved every later spot about 400 ms late. The stamp can
+  now read early instead: by up to the stall when the stream starts inside
+  it or the stash evicts its backlog. See
+  docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md.
 - MAN-202: with a SoapySDR input, a driver overflow no longer decodes the
   dropped span as Morse timing. A wrong character (for example `K` read as
   `T`) becomes a dropped character, and the word the overflow cut ends

@@ -1363,6 +1363,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "scp_sha256",
                 "pattern_path",
                 "validation_level",
+                "repetition_fusion",
             ],
         ),
     ];
@@ -3193,6 +3194,24 @@ fn id_rows(body: &str, prefix: char) -> impl Iterator<Item = &str> {
     })
 }
 
+/// MAN-207: operators find the observation record from the docs index.
+#[test]
+fn docs_index_links_the_observation_record() {
+    let targets = link_targets(&doc(DOCS_INDEX));
+    assert!(
+        targets.iter().any(|t| t == "OBSERVATIONS.md"),
+        "{DOCS_INDEX} must link OBSERVATIONS.md"
+    );
+}
+
+/// MAN-207: the IQ recording guide says how to explain a missed spot.
+#[test]
+fn iq_recording_guide_explains_a_missed_spot() {
+    let guide = doc("docs/GUIDES/iq-recording.md");
+    assert!(guide.contains("--observations"));
+    assert!(guide.contains("](../OBSERVATIONS.md)"));
+}
+
 #[test]
 fn docs_index_links_every_runbook() {
     let targets = link_targets(&doc(DOCS_INDEX));
@@ -3470,6 +3489,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
             sample_ts: 102_656,
             snr_2500_db: 22.6,
             freq_hz: 14_012_341.5,
+            last_char_ts: 0,
         },
         DecoderEvent::TimingUpdate {
             track_id: 1,

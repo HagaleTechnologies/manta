@@ -273,6 +273,11 @@ impl IqSource for DecimatingSource {
         std::mem::take(&mut self.unknown_gap)
     }
 
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
+    }
+
     fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
         self.inner.health_counters()
     }
