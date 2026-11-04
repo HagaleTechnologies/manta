@@ -1799,18 +1799,41 @@ impl Track {
         (amp, raw_power)
     }
 
+    /// MAN-199 x MAN-112: the channel a lead-in hop replays -- the live
+    /// feed's decoder-channel chain (`select_exclusive`, `select_straddle_channel`,
+    /// `decoder_channel`, `select_straddle_channel`) against this hop's
+    /// track `centers`, so a close neighbour's stronger channel is no more
+    /// replayed into this decoder than it is fed live. The live feed's
+    /// phase-lag outlier check needs the complex hop, which `HopHistory`
+    /// does not keep, so it is not applied here. With no other track this
+    /// is `select_live_channel`.
+    fn lead_in_channel(
+        &self,
+        power: &[f32],
+        centers: &[(u32, f64)],
+        cooldown: &[u64],
+        now: u64,
+        n: usize,
+    ) -> usize {
+        let k = self.select_exclusive(centers, power, cooldown, now, n);
+        let k = self.select_straddle_channel(k, centers, cooldown, now, n);
+        let k = self.decoder_channel(k, centers, cooldown, now, n);
+        self.select_straddle_channel(k, centers, cooldown, now, n)
+    }
+
     /// MAN-199: build this track's lead-in from `history`: the last `depth`
     /// recorded hops before `m`, minus any hop a decoder on this track's
     /// channels already consumed (`last_fed_hop`, so a DORMANT wake or an
     /// eviction respawn never re-reads input), each on the owned channel the
-    /// live feed would select (`select_live_channel`: max power, skipping a
-    /// channel serving a MAN-197 cooldown) and through the crash hold.
+    /// live decoder feed would select (`lead_in_channel`) and through the
+    /// crash hold.
     /// Recorded hops only: nothing synthetic is ever replayed, and the
     /// shortfall keeps its reason.
     #[allow(clippy::too_many_arguments)]
     fn build_lead_in(
         &mut self,
         history: &HopHistory,
+        centers: &[(u32, f64)],
         last_fed_hop: &[Option<u64>],
         channel_cooldown_until: &[u64],
         hop_counter: u64,
@@ -1844,7 +1867,7 @@ impl Track {
                 self.lead_in_cut = LeadInCut::AlreadyFed(fed.unwrap_or(0));
                 continue;
             }
-            let k = self.select_live_channel(&h.power, n, channel_cooldown_until, hop_counter);
+            let k = self.lead_in_channel(&h.power, centers, channel_cooldown_until, hop_counter, n);
             let raw_power = h.power[k];
             let (amp, raw_power) = self.hold_crash(raw_power.sqrt(), raw_power, h.hold);
             self.lead_in.push((amp, raw_power, h.sample_ts));
@@ -3283,6 +3306,7 @@ impl TrackManager {
                     // since its released decoder's last input.
                     track.build_lead_in(
                         &self.history,
+                        &centers,
                         &self.last_fed_hop,
                         &self.channel_cooldown_until,
                         self.hop_counter,
@@ -3388,6 +3412,7 @@ impl TrackManager {
                     // ahead of its queued input.
                     track.build_lead_in(
                         &self.history,
+                        &centers,
                         &self.last_fed_hop,
                         &self.channel_cooldown_until,
                         self.hop_counter,
@@ -11148,6 +11173,7 @@ mod tests {
         let track = tm.tracks.get_mut(&id).unwrap();
         track.build_lead_in(
             &tm.history,
+            &[],
             &tm.last_fed_hop,
             &tm.channel_cooldown_until,
             tm.hop_counter,
@@ -11164,6 +11190,44 @@ mod tests {
             .lead_in
             .iter()
             .all(|&(a, p, _)| p == keyed[10] && a == p.sqrt()));
+    }
+
+    /// MAN-199 x MAN-112: a lead-in replays the channel the live decoder
+    /// feed would select, so a close neighbour's stronger channel inside
+    /// this track's window is not replayed into its decoder. Fails if
+    /// `build_lead_in` goes back to plain max-power selection (it would
+    /// read channel 11).
+    #[test]
+    fn lead_in_skips_a_close_neighbours_channel() {
+        let n = 64;
+        let mut tm = TrackManager::new(n, 96_000.0, 14_000_000.0, cfg(), DecodeConfig::default());
+        let mut power = quiet_power(n);
+        power[10] *= 50.0;
+        power[11] *= 400.0;
+        for m in 0..20u64 {
+            tm.history.record(m, m, &power, false);
+        }
+        tm.spawn(10);
+        let id = *tm.tracks.keys().next().unwrap();
+        let neighbour = id + 1_000;
+        let centers = [(id, 10.0), (neighbour, 11.2)];
+        let track = tm.tracks.get_mut(&id).unwrap();
+        assert!(track.owned(n).contains(&11));
+        track.build_lead_in(
+            &tm.history,
+            &centers,
+            &tm.last_fed_hop,
+            &tm.channel_cooldown_until,
+            tm.hop_counter,
+            20,
+            LEAD_IN_HOPS,
+            n,
+        );
+        assert_eq!(track.lead_in.len(), 20);
+        assert!(
+            track.lead_in.iter().all(|&(_, p, _)| p == power[10]),
+            "lead-in read the neighbour's channel"
+        );
     }
 
     /// MAN-199: an unknown input gap cuts the lead-in; every entry is
@@ -11184,6 +11248,7 @@ mod tests {
         let track = tm.tracks.get_mut(&id).unwrap();
         track.build_lead_in(
             &tm.history,
+            &[],
             &tm.last_fed_hop,
             &tm.channel_cooldown_until,
             tm.hop_counter,
@@ -11214,6 +11279,7 @@ mod tests {
         let track = tm.tracks.get_mut(&id).unwrap();
         track.build_lead_in(
             &tm.history,
+            &[],
             &tm.last_fed_hop,
             &tm.channel_cooldown_until,
             tm.hop_counter,
@@ -11271,6 +11337,7 @@ mod tests {
         let track = tm.tracks.get_mut(&id).unwrap();
         track.build_lead_in(
             &tm.history,
+            &[],
             &tm.last_fed_hop,
             &tm.channel_cooldown_until,
             tm.hop_counter,
@@ -11329,6 +11396,7 @@ mod tests {
         track.refiner_hops_since_reset = 3;
         track.build_lead_in(
             &tm.history,
+            &[],
             &tm.last_fed_hop,
             &tm.channel_cooldown_until,
             tm.hop_counter,

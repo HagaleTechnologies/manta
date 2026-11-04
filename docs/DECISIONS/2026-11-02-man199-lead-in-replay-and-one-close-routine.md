@@ -36,8 +36,8 @@ read error without closing its tracks at all.
 - **Lead-in.** At promotion, and at a DORMANT wake, `Track::build_lead_in`
   takes the recorded hops before that hop, minus any hop a decoder on the
   same channels already consumed (`last_fed_hop`). Each entry is the
-  max-power owned channel's power and its square root, through the MAN-312
-  crash hold. The track keeps the lead-in in its own queue, which the drain
+  power on the channel the live decoder feed would select (D7) and its
+  square root, through the MAN-312 crash hold. The track keeps the lead-in in its own queue, which the drain
   pushes through `TrackDecoder::push_lead_in_hop` ahead of `pending`.
 - **Decoder.** `push_lead_in_hop` feeds a hop exactly as `push_hop` does but
   does not count it in `hop_count`, so `TrackMeta`/`TimingUpdate` and the
@@ -142,9 +142,12 @@ window, and a fast all-dit `5` is longer than the lead-in.
   is replayed and no padding is counted as received silence.
 - **D7.** A lead-in never re-reads a hop a decoder on the same channels
   consumed (`last_fed_hop`), which covers a DORMANT wake and an eviction
-  respawn. Each lead-in hop takes the channel the live feed would select
-  (`select_live_channel`, so a MAN-197 cooldown channel is skipped there
-  too). When MAN-313's unqualified-backlog trim drops the front of
+  respawn. Each lead-in hop takes the channel the live decoder feed would
+  select (`Track::lead_in_channel`: MAN-112's exclusive, straddle and
+  decoder-channel chain against the promotion hop's track centres, so a
+  close neighbour's channel and a MAN-197 cooldown channel are skipped
+  there too; the live feed's phase-lag outlier check is not applied, since
+  `HopHistory` keeps power only). When MAN-313's unqualified-backlog trim drops the front of
   `pending`, the lead-in is dropped with it: it is no longer contiguous
   with the queue.
 - **D8.** One close routine, with the `has_emitted` gate after the flush.

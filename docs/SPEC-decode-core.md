@@ -383,12 +383,13 @@ channels. `non_cw_filter = false` leases at promotion, as before.
 **Lead-in (MAN-199).** The detector keeps the power spectrum of the last
 64 hops it stepped (171 ms), indexed by hop and stamped with each hop's
 original `sample_ts`. When a track is promoted, or a DORMANT track wakes,
-it takes a *lead-in*: the recorded hops before that hop, on the max-power
-owned channel and through the §2.7 crash hold, minus every hop a decoder
-on the same channels already consumed. A lead-in never reaches back past
-the segment's first recorded hop (stream start, pre-roll, a
-discontinuity) or an unknown-length input gap, and it never contains a
-synthetic hop: a hop that was not recorded is absent, with its reason,
+it takes a *lead-in*: the recorded hops before that hop, on the owned
+channel the live decoder feed would select (excluding a close
+neighbour's channel, MAN-112) and through the §2.7 crash hold, minus
+every hop a decoder on the same channels already consumed. A lead-in
+never reaches back past the segment's first recorded hop (stream start,
+pre-roll, a discontinuity) or an unknown-length input gap, and it never
+contains a synthetic hop: a hop that was not recorded is absent, with its reason,
 and one that has not arrived is "not yet known". The decoder replays the
 lead-in ahead of its queued input, when it is leased. Lead-in hops do not
 count toward the §5 report cadence or the SNR peak-hold window, and §2.8

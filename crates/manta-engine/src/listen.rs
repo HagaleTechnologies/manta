@@ -1045,6 +1045,7 @@ pub fn listen_with_observers(
                     obs.publish_counts(
                         close_base + seg.tm.close_counts(),
                         validator.gate_records_total(),
+                        spawn_base + seg.tm.total_spawns(),
                     );
                     obs.clear_active();
                 }
