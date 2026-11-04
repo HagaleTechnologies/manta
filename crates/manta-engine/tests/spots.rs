@@ -1,6 +1,6 @@
 //! `decode_samples`'s new `spots` field: a real `manta-spot::Validator`
 //! run over the full multi-track event stream. M3 engine-wiring sub-
-//! project, docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md.
+//! project, docs/archive/plans/specs/2026-07-26-m3-engine-wiring-design.md.
 
 use manta_decode::events::DecoderEvent;
 use manta_engine::SpotType;

@@ -3,7 +3,7 @@
 //! as written by `scripts/diagnostics/man166/probe2.py`) straight into
 //! `TrackDecoder`, bypassing the detector/track manager, and print what the
 //! decode core alone makes of it. Superseded by the real oracle harness in
-//! `docs/superpowers/plans/2026-09-09-decode-core-v2.md` Task 6.
+//! `docs/archive/plans/plans/2026-09-09-decode-core-v2.md` Task 6.
 //!
 //! Usage: cargo run -p manta-decode --example envelope_oracle -- <file.f32>...
 use manta_decode::decoder::{events_to_text, DecodeConfig, TrackDecoder};
