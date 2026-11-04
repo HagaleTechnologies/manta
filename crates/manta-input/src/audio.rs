@@ -370,7 +370,8 @@ impl IqSource for AudioIqSource {
         Ok(got)
     }
 
-    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    /// MAN-489: consumed once per sample outage; see the private
+    /// `StallEpisode` episode state.
     /// Only the live path reports: a file's `Ok(0)` stays ordinary EOF.
     fn take_stalled(&mut self) -> bool {
         self.live.as_mut().is_some_and(|live| live.stall.take())
