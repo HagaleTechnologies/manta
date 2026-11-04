@@ -39,7 +39,7 @@ Other commands' `--json` (`bench`, `check`, `calibrate`, `devices`,
 For example, one `TrackMeta` event:
 
 ```json
-{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.639294,"frequency":14012341.459738266}
+{"event":"TrackMeta","trackId":1,"sampleTs":102656,"snr":22.639294,"frequency":14012341.459738266,"lastCharTs":101376}
 ```
 
 `sampleTs` is the input-stream sample counter (SPEC §5): divide it by the
@@ -120,6 +120,7 @@ emitted. Every event has `event` and `trackId`.
 | `sampleTs` | integer | never | Input sample counter at the hop this measurement is from. |
 | `snr` | number | never | The track's SNR in dB, 2500 Hz reference (SPEC §2.3). |
 | `frequency` | number | never | The track's frequency at that hop, in Hz. Absolute only when the source has an RF reference. |
+| `lastCharTs` | integer | never | Sample counter of the newest character decoded, including one `[decode] prior = "on"` still holds; `0` with none (MAN-201). Older reports without it read as `0`. |
 
 ### `ReadingsHeld`
 

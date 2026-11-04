@@ -248,6 +248,12 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     /// MAN-202: the current inner source's unknown-length loss, pending for
     /// `take_unknown_gap()`.
     unknown_gap: bool,
+    /// MAN-201: a stream that was delivering has just been lost, pending
+    /// for `take_stalled()`.
+    stalled: bool,
+    /// MAN-201: return from `read` to report a stall. Off only for tests of
+    /// the outage itself, which read straight through it.
+    report_stalls: bool,
     /// MAN-228: `None` when the first source counts nothing (MAN-56's
     /// "absent means not measured").
     input_health: Option<Arc<InputHealthTotals>>,
@@ -262,7 +268,7 @@ impl ReconnectingSource<RealEnv> {
         initial_healthy: bool,
         on_health: HealthSink,
     ) -> Self {
-        Self::with_env(
+        let mut source = Self::with_env(
             name,
             first,
             opener,
@@ -270,7 +276,9 @@ impl ReconnectingSource<RealEnv> {
             initial_healthy,
             on_health,
             RealEnv,
-        )
+        );
+        source.report_stalls = true;
+        source
     }
 }
 
@@ -314,6 +322,8 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             discontinuity: None,
             missing: None,
             unknown_gap: false,
+            stalled: false,
+            report_stalls: false,
             input_health,
         }
     }
@@ -576,6 +586,8 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
             let inner = self.inner.as_mut().expect("checked Some above");
             match inner.read(buf) {
                 Ok(0) => {
+                    // MAN-201: a stall is not an end of stream.
+                    self.stalled = inner.take_stalled();
                     // An inner end of stream may leave a gap pending too
                     // (MAN-258).
                     self.absorb_inner_gaps();
@@ -625,9 +637,20 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         self.backoff.as_secs()
                     ));
                     self.report_health(false);
+                    // MAN-201: an outage delivers no hops, so report it now:
+                    // the engine settles each track's last call rather than
+                    // holding it for however long the outage lasts.
+                    if self.report_stalls && outcome == AttemptOutcome::Disconnected {
+                        self.stalled = true;
+                        return Ok(0);
+                    }
                 }
             }
         }
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
@@ -1225,6 +1248,36 @@ mod tests {
         let n = src.read(&mut b).unwrap();
         assert_eq!(n, 8);
         assert_eq!(env_handle.sleeps_secs(), vec![1, 2]);
+    }
+
+    /// MAN-201: losing a delivering stream is reported at once, not an end
+    /// of stream, so the engine settles its tracks before the outage runs.
+    #[test]
+    fn losing_a_delivering_stream_reports_a_stall_once_then_reconnects() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let (opener, _calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        src.report_stalls = true;
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert!(!src.take_stalled());
+        assert_eq!(src.read(&mut b).unwrap(), 0);
+        assert!(src.take_stalled());
+        assert!(!src.take_stalled());
+        assert_eq!(src.read(&mut b).unwrap(), 8);
     }
 
     #[test]

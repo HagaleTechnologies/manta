@@ -174,6 +174,10 @@ fn check_source_with_clock(
         let n = source
             .read(&mut buffer[..request])
             .context("reading source samples")?;
+        // MAN-201: a stall is not an end of stream; the deadline still runs.
+        if n == 0 && source.take_stalled() && elapsed() < deadline {
+            continue;
+        }
         let deadline_reached = elapsed() >= deadline;
         ensure!(n <= request, "source returned more samples than requested");
         if let Some(missed) = source.take_discontinuity() {

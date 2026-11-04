@@ -70,6 +70,9 @@ pub struct DecodeConfig {
     /// `manta-dsp::refine::Refiner` when this is > 0 (MAN-168/MAN-194);
     /// `oracle` does not apply it.
     pub refine_bw_hz: f32,
+    /// MAN-112 experimental Rust-only decoder frontend. Not a TOML option;
+    /// promotion requires the carrier-offset and neighboring-signal gates.
+    pub steered_frontend: bool,
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -89,6 +92,7 @@ impl Default for DecodeConfig {
             noise: NoiseConfig::default(),
             hsmm: HsmmConfig::default(),
             refine_bw_hz: 0.0,
+            steered_frontend: false,
         }
     }
 }
@@ -216,6 +220,9 @@ pub struct TrackDecoder {
     /// MAN-202: a mark has been discarded since the last gap. The first
     /// post-gap mark may be truncated and sets no scale; later ones are whole.
     post_gap_mark_seen: bool,
+    /// MAN-201: the newest character decoded, held or released. See
+    /// `DecoderEvent::TrackMeta::last_char_ts`.
+    last_char_ts: u64,
 }
 
 impl TrackDecoder {
@@ -269,6 +276,7 @@ impl TrackDecoder {
             continuity_epoch: 0,
             warmup_min_mark_ms: None,
             post_gap_mark_seen: false,
+            last_char_ts: 0,
         }
     }
 
@@ -677,6 +685,7 @@ impl TrackDecoder {
                     sample_ts: self.last_ts,
                     snr_2500_db: snr,
                     freq_hz: self.freq_hz,
+                    last_char_ts: self.last_char_ts,
                 });
             }
             self.emit_timing(events);
@@ -1341,6 +1350,7 @@ impl TrackDecoder {
         if self.cur_marks.is_empty() {
             return;
         }
+        self.last_char_ts = self.last_char_ts.max(sample_ts);
         // SPEC §4.5: q = clamp(SNR_2500 / 20 dB, 0.3, 1.0). Legacy prefers
         // the engine-supplied floor-based estimate (§2.3 / MAN-102,
         // pushed down by `set_snr_2500_db` on every queued hop), falling
@@ -2629,6 +2639,35 @@ mod tests {
             chars(&events).len() >= text.len() / 2,
             "a gap before the first mark must not silence the track: {decoded:?}"
         );
+    }
+
+    /// MAN-201: `TrackMeta` names the newest character decoded even while
+    /// the prior holds it, which `sample_ts` and released words cannot say.
+    #[test]
+    fn track_meta_reports_a_character_the_prior_still_holds() {
+        let mut decoder = TrackDecoder::new(
+            7,
+            DecodeConfig {
+                prior_enabled: true,
+                ..Default::default()
+            },
+        );
+        let mut last = 0;
+        let mut released = 0;
+        for (i, value) in rect_envelope(&"PARIS".repeat(6), 23)
+            .into_iter()
+            .enumerate()
+        {
+            for event in decoder.push_envelope(value, i as u64 * 256) {
+                match event {
+                    DecoderEvent::TrackMeta { last_char_ts, .. } => last = last_char_ts,
+                    DecoderEvent::CharDecoded { .. } => released += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(released, 0, "one unbroken word stays held");
+        assert!(last > 0, "the meta names the held characters");
     }
 
     #[test]

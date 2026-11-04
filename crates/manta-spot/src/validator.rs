@@ -7,11 +7,18 @@ use crate::context::{self, SpotType};
 use crate::cty;
 use crate::decision::{CandidateSupport, Decision, Reason, Rival};
 use crate::dedupe::{Dedupe, DedupeOutcome};
-use crate::gate::{RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS};
+use crate::exchange::{self, Basis, ExchangeWord, Frame, Role};
+use crate::gate::{
+    GateOccurrence, RepetitionCounts, RepetitionGate, WINDOW_SECONDS as GATE_WINDOW_SECONDS,
+};
 use crate::grammar;
 use crate::lookup::{CallsignLookup, Existence, LookupStatus};
 use crate::message;
 use crate::notch::NotchList;
+use crate::observation::{
+    Cause, Draft, EvidenceLink, Finding, FreqSpan, ObservationCounts, ObservationId,
+    ObservationLog, ObservationPolicy, RoleEvidence, SampleSpan, Scores, Source, TextTrace,
+};
 use crate::scp;
 use crate::support::SupportLedger;
 use crate::{pattern, ValidationLevel};
@@ -235,7 +242,67 @@ struct Word {
     /// occurrence is a property of the guard alone, so it needs its own
     /// per-occurrence bit.
     power_step_suppressed: bool,
+    /// MAN-201: this word's `<call> T` occurrence has recorded its
+    /// `BeaconNoEvidence` decision; each occurrence counts once.
+    beacon_no_evidence_recorded: bool,
+    /// MAN-207: the first character's `sample_ts`.
+    start_ts: u64,
+    /// MAN-201: the `WordBoundary` `sample_ts` this word completed at. A
+    /// settled occurrence is evaluated -- repetition gate, dedupe, decision
+    /// and spot -- at this time, not at the event that settled it (D5).
+    /// MAN-207 also records it as the observation's sample-span end.
+    end_ts: u64,
+    /// MAN-207: the lowest and highest raw track frequency read while
+    /// this word was decoded (`None` before the track's first `TrackMeta`).
+    freq_lo_hz: Option<f64>,
+    freq_hi_hz: Option<f64>,
+    /// MAN-207: the decoder's competing glyphs per character, kept only at
+    /// `Detail::Text` (empty, unallocated, otherwise).
+    alternatives: Vec<Vec<(Glyph, f32)>>,
+    /// MAN-201: a turn ends after this word -- an `AR`/`SK` prosign glyph,
+    /// or `TURN_SILENCE_SECONDS` with no decoded character after it.
+    ends_turn: bool,
+    /// MAN-201: an `<ERR>` prosign arrived right after this word.
+    corrected: bool,
+    /// MAN-201 D6a: the role and frame `exchange::interpret` gave this word
+    /// the first time its occurrence settled, never overwritten. Without it
+    /// a framing word scrolling out of the window could turn a settled
+    /// `relayed_mention` into `uncertain`.
+    role: Option<(Role, Option<Frame>)>,
+    /// MAN-207: the rule that decided `role`, latched with it.
+    basis: Option<Basis>,
+    /// MAN-207: the first and last `seq` of the words that decided `role`,
+    /// latched with it.
+    context_seqs: Option<(u64, u64)>,
+    /// MAN-207 D6: the MAN-201 turn index on the track, the number of turn
+    /// ends before this word. Set when the word is pushed.
+    episode: u32,
+    /// MAN-207 D10: this word's role-skip has been counted and recorded;
+    /// each occurrence counts once.
+    not_candidate_recorded: bool,
 }
+
+impl Word {
+    /// MAN-207: widens the frequency span with one reading.
+    fn note_freq(&mut self, freq_hz: f64) {
+        self.freq_lo_hz = Some(self.freq_lo_hz.map_or(freq_hz, |lo| lo.min(freq_hz)));
+        self.freq_hi_hz = Some(self.freq_hi_hz.map_or(freq_hz, |hi| hi.max(freq_hz)));
+    }
+}
+
+/// MAN-201: the silence, in seconds with no decoded character, that ends a
+/// turn. The longest character-free stretch inside one transmission at the
+/// slowest supported speed, 8 WPM (dit 150 ms), is a 7-dit word gap plus the
+/// 19-dit `0` plus its 3-dit letter gap, about 4.35 s; rounded out. A turn
+/// end bounds every frame lookup in `exchange` and settles the call before
+/// it.
+const TURN_SILENCE_SECONDS: f64 = 5.0;
+
+/// One candidate from `Validator::candidates`: the call, its spot type, the
+/// highest `Word::seq` involved, the exact word's seq (`None` never comes
+/// from `candidates` since MAN-201; kept for `evaluate_candidate`'s
+/// contract) and that word's own `end_ts`.
+type Candidate = (String, SpotType, u64, Option<u64>, u64);
 
 /// A non-allowlisted Beacon-type candidate that has passed every
 /// permanent, timing-independent check (blocklist/notch/grammar/cty) but
@@ -439,6 +506,12 @@ pub struct SuppressionCounts {
     /// guard destroyed no beacon candidacy there (Codex review on PR #90,
     /// round 10). See `burn_suppressed_power_step_candidate`.
     pub power_step_guard: u64,
+    /// `<call> T` occurrences of a plausible, allocated call that is not on
+    /// the allowlist (MAN-201): a trailing `T` alone is not beacon evidence.
+    /// Counted once per occurrence. The two power-step counts partition the
+    /// shape: `beacon_no_evidence` for an unguarded, unlisted call,
+    /// `power_step_guard` for an allowlisted, guarded one.
+    pub beacon_no_evidence: u64,
     /// Spots withheld by MAN-100's cross-candidate variant arbitration: a
     /// confusable, better-supported rival existed on the same track in the
     /// same window. See `support::SupportLedger`.
@@ -494,6 +567,8 @@ pub struct Validator {
     /// `GATE_WINDOW_SECONDS` in samples, cached at construction -- the
     /// prune cutoff for `merged_into` below.
     gate_window_samples: u64,
+    /// `TURN_SILENCE_SECONDS` in samples, cached at construction (MAN-201).
+    turn_silence_samples: u64,
     /// track_id -> (its current best-known root survivor, `now_ts` at the
     /// moment it was closed via `ClosureKind::Bookkeeping`) -- a merge
     /// survivor exists, so the physical signal's identity continues, it's
@@ -540,12 +615,60 @@ pub struct Validator {
     /// MAN-318: spots held until their base call's lookup settles, keyed by
     /// that base call, in hold order.
     held: BTreeMap<String, Vec<HeldSpot>>,
+    /// MAN-207: the bounded observation record. Counts every decision at
+    /// every detail level; keeps records only when `with_observations`
+    /// asks for them.
+    observations: ObservationLog,
+    /// The sample rate, for `with_observations`.
+    fs: f64,
 }
 
 /// MAN-318: a spot waiting for its callsign lookup.
 struct HeldSpot {
     spot: Spot,
     reps: u32,
+    /// MAN-207: the occurrence the held spot was decoded from.
+    id: ObservationId,
+}
+
+/// MAN-207: which occurrence a decision is about, why it is recorded, and
+/// what the site knows about it beyond the `Decision`.
+#[derive(Clone)]
+struct At {
+    id: ObservationId,
+    cause: Cause,
+    scores: Scores,
+    evidence: Vec<EvidenceLink>,
+}
+
+impl At {
+    fn new(track_id: u32, word_seq: u64, cause: Cause) -> Self {
+        Self {
+            id: ObservationId { track_id, word_seq },
+            cause,
+            scores: Scores::default(),
+            evidence: Vec::new(),
+        }
+    }
+
+    fn with_call_confidence(mut self, confidence: f32) -> Self {
+        self.scores.call_confidence = Some(confidence);
+        self
+    }
+}
+
+fn evidence_links(counted: &[GateOccurrence]) -> Vec<EvidenceLink> {
+    counted
+        .iter()
+        .map(|o| EvidenceLink {
+            observation: ObservationId {
+                track_id: o.track_id,
+                word_seq: o.word_seq,
+            },
+            sample_ts: o.sample_ts,
+            message_distinct: o.message_distinct,
+        })
+        .collect()
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -589,11 +712,14 @@ impl Validator {
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
+            turn_silence_samples: (TURN_SILENCE_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
             decisions: None,
             input_count: 1,
             lookup: None,
             held: BTreeMap::new(),
+            observations: ObservationLog::new(fs, ObservationPolicy::summary()),
+            fs,
         }
     }
 
@@ -607,30 +733,34 @@ impl Validator {
     /// allowlisted, a call the lookup does not list is withheld, and one it
     /// has not answered yet is held until `poll_lookups`/`finish_lookups`.
     /// Dedupe has already stored the spot either way.
-    fn admit(&mut self, spot: Spot, reps: u32, allowlisted: bool) -> Option<Spot> {
+    fn admit(&mut self, spot: Spot, reps: u32, allowlisted: bool, at: At) -> Option<Spot> {
+        let at = at.with_call_confidence(spot.confidence);
         let lookup = match &self.lookup {
             Some(l) if !allowlisted => l.clone(),
             _ => {
-                self.decide(|| Decision::spotted(&spot, reps));
+                self.decide(at, None, || Decision::spotted(&spot, reps));
                 return Some(spot);
             }
         };
         let key = lookup_key(&spot.callsign).to_string();
         match lookup.check(&key) {
             LookupStatus::Known(Existence::NotFound) => {
-                self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
+                let reason = Reason::LookupNotFound;
+                self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 None
             }
             LookupStatus::Known(Existence::Exists | Existence::Unknown) => {
-                self.decide(|| Decision::spotted(&spot, reps));
+                self.decide(at, None, || Decision::spotted(&spot, reps));
                 Some(spot)
             }
             LookupStatus::Pending => {
-                self.decide(|| lookup_decision(&spot, Reason::LookupPending, reps));
+                let id = at.id;
+                let reason = Reason::LookupPending;
+                self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 self.held
                     .entry(key)
                     .or_default()
-                    .push(HeldSpot { spot, reps });
+                    .push(HeldSpot { spot, reps, id });
                 None
             }
         }
@@ -675,15 +805,18 @@ impl Validator {
             let Some(held) = self.held.remove(&key) else {
                 continue;
             };
-            for HeldSpot { spot, reps } in held {
+            for HeldSpot { spot, reps, id } in held {
+                let at = At::new(id.track_id, id.word_seq, Cause::Settled)
+                    .with_call_confidence(spot.confidence);
                 if let Some(reason) = self.held_operator_suppressed(&spot) {
-                    self.decide(|| lookup_decision(&spot, reason, reps));
+                    self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 } else if existence == Existence::NotFound
                     && !self.allowlist.contains(&spot.callsign)
                 {
-                    self.decide(|| lookup_decision(&spot, Reason::LookupNotFound, reps));
+                    let reason = Reason::LookupNotFound;
+                    self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 } else {
-                    self.decide(|| Decision::spotted(&spot, reps));
+                    self.decide(at, None, || Decision::spotted(&spot, reps));
                     spots.push(spot);
                 }
             }
@@ -785,19 +918,120 @@ impl Validator {
             .collect()
     }
 
-    /// Records one decision when the log is on; `build` runs only then.
-    fn decide(&mut self, build: impl FnOnce() -> Decision) {
-        if let Some(log) = self.decisions.as_mut() {
-            let mut decision = build();
-            // One boundary covers early refusals, reclassification and every
-            // deferred-beacon path, without doing pattern lookups when logging is off.
-            if decision.spot_type != SpotType::Beacon && !self.allowlist.contains(&decision.call) {
-                let tier = self.patterns.tier(&decision.call);
-                decision.required_reps = self.level.required_reps(tier);
-                decision.pattern_tier = Some(tier);
-            }
+    /// MAN-207: keep observation records at `policy`'s detail level. The
+    /// default keeps counters only. Never changes which spots are emitted.
+    pub fn with_observations(mut self, policy: ObservationPolicy) -> Self {
+        self.observations = ObservationLog::new(self.fs, policy);
+        self
+    }
+
+    /// MAN-207: the observation record.
+    pub fn observations(&self) -> &ObservationLog {
+        &self.observations
+    }
+
+    /// MAN-207: the observation record, for `ObservationLog::revise`,
+    /// `take_appended` and `note_discontinuity`.
+    pub fn observations_mut(&mut self) -> &mut ObservationLog {
+        &mut self.observations
+    }
+
+    /// MAN-207: decisions so far by verdict and reason, at every detail
+    /// level.
+    pub fn observation_counts(&self) -> ObservationCounts {
+        *self.observations.counts()
+    }
+
+    /// The one boundary every decision passes (MAN-324, MAN-207). Always
+    /// counts it under `reason` (`None` is a spot). Runs `build` only when
+    /// the decision log is on or the observation record keeps records.
+    fn decide(&mut self, at: At, reason: Option<Reason>, build: impl FnOnce() -> Decision) {
+        self.observations.count_decision(reason);
+        let keep = self.observations.keeps_records();
+        if self.decisions.is_none() && !keep {
+            return;
+        }
+        let mut decision = build();
+        debug_assert_eq!(decision.reason, reason, "decide's counted reason drifted");
+        // One boundary covers early refusals, reclassification and every
+        // deferred-beacon path, without doing pattern lookups when logging is off.
+        if decision.spot_type != SpotType::Beacon && !self.allowlist.contains(&decision.call) {
+            let tier = self.patterns.tier(&decision.call);
+            decision.required_reps = self.level.required_reps(tier);
+            decision.pattern_tier = Some(tier);
+        }
+        let for_log = if keep {
+            let for_log = self.decisions.is_some().then(|| decision.clone());
+            let draft = self.observation_draft(at, Finding::Decided(decision));
+            self.observations.append(draft, self.now_ts);
+            for_log
+        } else {
+            Some(decision)
+        };
+        if let (Some(log), Some(decision)) = (self.decisions.as_mut(), for_log) {
             log.push(decision);
         }
+    }
+
+    /// MAN-207: a record of `decision` about `at`, with the occurrence's
+    /// spans, confidence and (at `Detail::Text`) trace while its word is
+    /// still in the track's window.
+    fn observation_draft(&self, at: At, finding: Finding) -> Draft {
+        let source = Source {
+            input: self.input_of(at.id.track_id),
+            epoch: self.observations.epoch(),
+        };
+        let mut draft = Draft::of(at.id, at.cause, source, finding);
+        draft.scores = at.scores;
+        draft.evidence = at.evidence;
+        let track = self.tracks.get(&at.id.track_id);
+        let word = track.and_then(|t| t.words.iter().find(|w| w.seq == at.id.word_seq));
+        if let (Some(track), Some(word)) = (track, word) {
+            draft.span = Some(SampleSpan {
+                start_ts: word.start_ts,
+                end_ts: word.end_ts,
+            });
+            draft.episode = Some(word.episode);
+            draft.role = word.role.map(|(role, frame)| RoleEvidence {
+                role,
+                frame,
+                basis: word.basis,
+            });
+            // MAN-207 D3: a role-skipped word that became a candidate later
+            // is reclassified, not decided for the first time.
+            if draft.cause == Cause::Decided
+                && word.not_candidate_recorded
+                && matches!(draft.finding, Finding::Decided(_))
+            {
+                draft.cause = Cause::Reclassified;
+            }
+            if let (Some(lo), Some(hi)) = (word.freq_lo_hz, word.freq_hi_hz) {
+                draft.freq = Some(FreqSpan {
+                    lo_hz: lo * self.freq_calibration,
+                    hi_hz: hi * self.freq_calibration,
+                });
+            }
+            if !word.confidences.is_empty() {
+                draft.scores.word_confidence = Some(confidence::geo_mean(&word.confidences));
+            }
+            if self.observations.detail() == crate::observation::Detail::Text {
+                let context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
+                    track
+                        .words
+                        .iter()
+                        .filter(|w| (lo..=hi).contains(&w.seq))
+                        .map(|w| w.text.as_str())
+                        .collect()
+                });
+                draft.trace = Some(TextTrace::new(
+                    &word.text,
+                    &word.confidences,
+                    &word.alternatives,
+                    &context,
+                ));
+            }
+        }
+        draft
     }
 
     /// Advances `now_ts` to `sample_ts` (if later), then `maybe_sweep`s.
@@ -819,6 +1053,7 @@ impl Validator {
     fn maybe_sweep(&mut self) {
         if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
             self.gate.sweep(self.now_ts);
+            self.observations.sweep(self.now_ts);
             // `merged_into` bounded the same way, on the same cadence, as
             // a memory-bound backstop for a root that lives past this
             // window without ever closing (its own `SignalEnded` retires
@@ -938,20 +1173,56 @@ impl Validator {
                 glyph,
                 confidence,
                 sample_ts,
-                ..
+                alternatives,
             } => {
                 self.advance_clock(*sample_ts);
+                let keep_text = self.observations.detail() == crate::observation::Detail::Text;
+                let turn_silence_samples = self.turn_silence_samples;
                 let track = self.tracks.entry(*track_id).or_default();
+                let buffer_empty = track.current.text.is_empty();
                 match glyph {
                     Glyph::Char(c) => {
+                        if buffer_empty {
+                            // MAN-207: the word's sample span and frequency
+                            // span start at its first character.
+                            track.current.start_ts = *sample_ts;
+                            if track.has_meta {
+                                track.current.note_freq(track.freq_hz);
+                            }
+                            // MAN-201 D3: a first character arriving after
+                            // `TURN_SILENCE_SECONDS` of silence ends the
+                            // previous word's turn.
+                            if let Some(back) = track.words.back_mut() {
+                                if sample_ts.saturating_sub(back.end_ts) >= turn_silence_samples {
+                                    back.ends_turn = true;
+                                }
+                            }
+                        }
                         track.current.text.push(c.to_ascii_uppercase());
                         track.current.confidences.push(*confidence);
+                        if keep_text {
+                            track.current.alternatives.push(alternatives.clone());
+                        }
                     }
                     Glyph::Prosign(Prosign::Err) => {
                         // SPEC §4.4: operator-error prosign discards the
                         // current word buffer back to the previous
-                        // boundary.
+                        // boundary. With nothing buffered it retracts the
+                        // word just completed (MAN-201).
+                        if buffer_empty {
+                            if let Some(back) = track.words.back_mut() {
+                                back.corrected = true;
+                            }
+                        }
                         track.current = Word::default();
+                    }
+                    // MAN-201 D3: `AR`/`SK` end the turn.
+                    Glyph::Prosign(Prosign::Ar | Prosign::Sk) => {
+                        if !buffer_empty {
+                            track.current.ends_turn = true;
+                        } else if let Some(back) = track.words.back_mut() {
+                            back.ends_turn = true;
+                        }
                     }
                     Glyph::Prosign(_) => {}
                 }
@@ -975,6 +1246,13 @@ impl Validator {
                     }
                     track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
+                    word.end_ts = *sample_ts;
+                    // MAN-207 D6: the previous word's `ends_turn` is final
+                    // once a later word is pushed.
+                    word.episode = track
+                        .words
+                        .back()
+                        .map_or(0, |prev| prev.episode + u32::from(prev.ends_turn));
                     track.next_word_seq += 1;
                     newly_completed = Some((
                         word.text.clone(),
@@ -999,7 +1277,7 @@ impl Validator {
                         self.ledger.observe(*track_id, &text, seq, *sample_ts, geo);
                     }
                 }
-                self.try_spot(*track_id, *sample_ts)
+                self.try_spot(*track_id, *sample_ts, false)
             }
             DecoderEvent::SpeedUpdate { track_id, wpm } => {
                 let track = self.tracks.entry(*track_id).or_default();
@@ -1019,14 +1297,37 @@ impl Validator {
                 track_id,
                 snr_2500_db,
                 freq_hz,
-                ..
+                sample_ts: meta_ts,
+                last_char_ts,
             } => {
+                let turn_silence_samples = self.turn_silence_samples;
                 let track = self.tracks.entry(*track_id).or_default();
                 let had_meta = track.has_meta;
                 track.snr_db = *snr_2500_db;
                 track.freq_hz = *freq_hz;
                 track.has_meta = true;
+                if !track.current.text.is_empty() {
+                    track.current.note_freq(*freq_hz);
+                }
                 let sample_ts = track.last_sample_ts;
+                // MAN-201 D3: `TURN_SILENCE_SECONDS` with no decoded
+                // character after the newest word ends its turn, which
+                // settles that word's role; decide it now. Measured from
+                // the decoder's own newest character, not the newest word
+                // released here: `meta_ts` runs ahead of a word the MAN-317
+                // prior still holds, which is no silence (V8 with
+                // `prior = "on"`).
+                let silent_tail = track.current.text.is_empty()
+                    && track.words.back_mut().is_some_and(|back| {
+                        let quiet_from = back.end_ts.max(*last_char_ts);
+                        let silent = !back.ends_turn
+                            && meta_ts.saturating_sub(quiet_from) >= turn_silence_samples;
+                        back.ends_turn |= silent;
+                        silent
+                    });
+                if silent_tail {
+                    return self.try_spot(*track_id, sample_ts, false);
+                }
                 // Retry: a candidate held back by the has_meta gate is
                 // otherwise only ever re-evaluated by a later
                 // WordBoundary, which a short transmission may never
@@ -1035,7 +1336,7 @@ impl Validator {
                 if had_meta {
                     Vec::new()
                 } else {
-                    self.try_spot(*track_id, sample_ts)
+                    self.try_spot(*track_id, sample_ts, false)
                 }
             }
             // Ground-truth "detector found a candidate" signal for
@@ -1071,7 +1372,13 @@ impl Validator {
                 // pending evidence to the survivor instead (to be judged
                 // by ITS OWN eventual true close), or discards it if there
                 // is none.
-                let spots = match closure {
+                // MAN-201 D5: the track's end settles its last call, so
+                // decide every still-pending occurrence first -- a
+                // deferred beacon it captures is then judged (or migrated)
+                // with the rest below.
+                let close_ts = self.tracks.get(track_id).map_or(0, |t| t.last_sample_ts);
+                let mut spots = self.try_spot(*track_id, close_ts, true);
+                let closure_spots = match closure {
                     ClosureKind::SignalEnded => {
                         // MAN-100 message-distinctness (Codex review, PR
                         // #133 round 4): if OTHER track_ids are known
@@ -1192,6 +1499,7 @@ impl Validator {
                 // still starts over here.
                 self.ledger.forget_track(*track_id);
                 self.maybe_sweep();
+                spots.extend(closure_spots);
                 spots
             }
         }
@@ -1229,14 +1537,53 @@ impl Validator {
     /// `evaluate_candidate` resolves by text instead (see `context::parse`'s
     /// own docs for why the two pattern families need different
     /// resolution strategies; Codex review on PR #65, round 9).
-    fn candidates(&self, track_id: u32) -> Vec<(String, SpotType, u64, Option<u64>)> {
-        let Some(track) = self.tracks.get(&track_id) else {
+    fn candidates(&mut self, track_id: u32, complete: bool) -> Vec<Candidate> {
+        let Some(track) = self.tracks.get_mut(&track_id) else {
             return Vec::new();
         };
         let mut candidates = Vec::new();
 
+        // MAN-201: every callsign occurrence's role, from the exchange
+        // grammar. Only a settled occurrence is decided (D5); its role is
+        // latched on the word at its first settle (D6a).
+        let occurrences = {
+            let words: Vec<ExchangeWord<'_>> = track
+                .words
+                .iter()
+                .map(|w| ExchangeWord {
+                    text: &w.text,
+                    ends_turn: w.ends_turn,
+                    corrected: w.corrected,
+                })
+                .collect();
+            exchange::interpret(&words, complete)
+        };
+        let seqs: Vec<u64> = track.words.iter().map(|w| w.seq).collect();
+        // (role, frame, involved_max_seq) per word index, settled only.
+        let mut roles: Vec<Option<(Role, Option<Frame>, u64)>> = vec![None; seqs.len()];
+        for o in occurrences.iter().filter(|o| o.settled) {
+            let word = &mut track.words[o.index];
+            if word.role.is_none() {
+                // MAN-207: the basis and the deciding words latch with the role.
+                word.basis = Some(o.basis);
+                word.context_seqs =
+                    match (seqs.get(o.span.start), seqs.get(o.span.end.wrapping_sub(1))) {
+                        (Some(&lo), Some(&hi)) if !o.span.is_empty() => Some((lo, hi)),
+                        _ => None,
+                    };
+            }
+            let (role, frame) = *word.role.get_or_insert((o.role, o.frame));
+            let involved = o
+                .span
+                .clone()
+                .filter_map(|i| seqs.get(i).copied())
+                .max()
+                .unwrap_or(seqs[o.index]);
+            roles[o.index] = Some((role, frame, involved));
+        }
+
         // Byte range of each word within `joined`, in the same order as
-        // `track.words`, to map a context match's span back to the
+        // `track.words`, to map a power-step match's span back to the
         // word(s) that produced it.
         let mut joined = String::new();
         let mut word_spans = Vec::with_capacity(track.words.len());
@@ -1248,53 +1595,85 @@ impl Validator {
             joined.push_str(&word.text);
             word_spans.push((start, joined.len(), word.seq));
         }
-        for (candidate, spot_type, range, exact_range) in context::parse(&joined) {
-            let involved_max_seq = word_spans
-                .iter()
-                .filter(|(start, end, _)| *start < range.end && range.start < *end)
-                .map(|(_, _, seq)| *seq)
-                .max()
-                .unwrap_or(0);
-            match exact_range {
-                // Named-pattern origin: no exact-word binding by design,
-                // resolved by text in evaluate_candidate (see context::
-                // parse's own docs on why -- V29 needs it).
-                None => candidates.push((candidate, spot_type, involved_max_seq, None)),
+        let mut power_step_seqs = Vec::new();
+        if !context::power_step_framing_is_unresolved(&joined) {
+            for (candidate, range, r) in context::power_step_candidates(&joined) {
+                let involved_max_seq = word_spans
+                    .iter()
+                    .filter(|(start, end, _)| *start < range.end && range.start < *end)
+                    .map(|(_, _, seq)| *seq)
+                    .max()
+                    .unwrap_or(0);
                 // Power-step origin MUST bind to the exact word or be
-                // discarded entirely -- falling back to a text search here
-                // is exactly the bug this whole mechanism exists to close.
-                // A capture landing on only PART of a decoded word (e.g.
-                // the regex's `\b` matching mid-word after a punctuation
-                // character glued onto a callsign, "-K5ARH") produces a
-                // range that doesn't equal any word's own span; resolving
-                // it by text could then bind this match to a wholly
-                // unrelated, unsuppressed word that merely happens to
-                // share the callsign's text (Codex review on PR #65,
-                // round 10).
-                Some(r) => {
-                    if let Some(seq) = word_spans
-                        .iter()
-                        .find(|(start, end, _)| *start == r.start && *end == r.end)
-                        .map(|(_, _, seq)| *seq)
-                    {
-                        candidates.push((candidate, spot_type, involved_max_seq, Some(seq)));
-                    }
+                // discarded entirely. A capture landing on only PART of a
+                // decoded word (e.g. the regex's `\b` matching mid-word
+                // after a punctuation character glued onto a callsign,
+                // "-K5ARH") produces a range that doesn't equal any word's
+                // own span; resolving it by text could then bind this
+                // match to a wholly unrelated, unsuppressed word that
+                // merely happens to share the callsign's text (Codex
+                // review on PR #65, round 10).
+                let Some(index) = word_spans
+                    .iter()
+                    .position(|(start, end, _)| *start == r.start && *end == r.end)
+                else {
+                    continue;
+                };
+                // MAN-201 D8: a trailing `T` alone is not beacon evidence;
+                // `record_beacon_no_evidence` explains the unlisted call.
+                if !self.allowlist.contains(&candidate) {
+                    continue;
                 }
+                // MAN-201: a call the exchange shows was only called or
+                // mentioned is never that station's beacon ID.
+                if matches!(
+                    roles[index],
+                    Some((Role::Addressee | Role::RelayedMention, _, _))
+                ) {
+                    continue;
+                }
+                let seq = seqs[index];
+                power_step_seqs.push(seq);
+                candidates.push((
+                    candidate,
+                    SpotType::Beacon,
+                    involved_max_seq,
+                    Some(seq),
+                    track.words[index].end_ts,
+                ));
             }
         }
 
-        // MAN-28 Watch List: an allowlisted word is found independently of
-        // context parsing -- including with no recognized CQ/DE/UP/beacon
-        // pattern at all, the primary real-world case (an NCDXF beacon
-        // transmits its callsign followed by power-step dashes, no
-        // framing words). `SpotType::Unknown` is the context-parse-
-        // documented fallback for exactly this case.
-        for word in &track.words {
-            if self.allowlist.contains(&word.text)
-                && !candidates.iter().any(|(c, _, _, _)| *c == word.text)
-            {
-                candidates.push((word.text.clone(), SpotType::Unknown, word.seq, None));
-            }
+        // MAN-201: a settled `self_id` occurrence with a spot form is a
+        // candidate of that type, bound to its exact word (D6). D7: the
+        // allowlist skips plausibility and repetition, not role -- an
+        // allowlisted `uncertain` occurrence, or a `self_id` with no spot
+        // form (`TU <call>`), is offered as `Unknown` (the MAN-28 Watch
+        // List case: no framing words at all), unless a power-step
+        // candidate already names that word. An `addressee` or
+        // `relayed_mention` occurrence is never a candidate.
+        for (index, entry) in roles.iter().enumerate() {
+            let Some((role, frame, involved)) = *entry else {
+                continue;
+            };
+            let word = &track.words[index];
+            let spot_type = match (role, frame.and_then(Frame::spot_type)) {
+                (Role::SelfId, Some(ty)) => ty,
+                (Role::SelfId | Role::Uncertain, _)
+                    if self.allowlist.contains(&word.text)
+                        && !power_step_seqs.contains(&word.seq) =>
+                {
+                    SpotType::Unknown
+                }
+                _ => continue,
+            };
+            candidates.push((
+                word.text.clone(),
+                spot_type,
+                involved,
+                Some(word.seq),
+                word.end_ts,
+            ));
         }
 
         candidates
@@ -1349,6 +1728,9 @@ impl Validator {
                     .iter()
                     .find(|(start, end, _)| *start == call_range.start && *end == call_range.end)
                     .map(|(_, _, seq)| *seq)?;
+                // MAN-201 D8: only an allowlisted call has a beacon
+                // candidacy for the guard to burn.
+                self.allowlist.contains(&call).then_some(())?;
                 Some((call, involved_max_seq, exact_seq))
             })
             .collect()
@@ -1407,7 +1789,7 @@ impl Validator {
         involved_max_seq: u64,
         sample_ts: u64,
     ) {
-        let (first_suppression, freq_hz) = {
+        let (first_suppression, freq_hz, cause) = {
             let Some(track) = self.tracks.get_mut(&track_id) else {
                 return;
             };
@@ -1420,14 +1802,26 @@ impl Validator {
             // this function's own docs.
             let already_processed = word.last_spot_type == Some(SpotType::Beacon);
             let first_suppression = !word.power_step_suppressed && !already_processed;
+            // MAN-207: a word already decided as another spot type is
+            // reclassified by the burn, not decided for the first time.
+            let cause = if word.attempted {
+                Cause::Reclassified
+            } else {
+                Cause::Decided
+            };
             word.power_step_suppressed = true;
             word.attempted = true;
             word.classified_max_seq = word.classified_max_seq.max(involved_max_seq);
-            (first_suppression, track.freq_hz * self.freq_calibration)
+            (
+                first_suppression,
+                track.freq_hz * self.freq_calibration,
+                cause,
+            )
         };
         if first_suppression {
             self.suppression_counts.power_step_guard += 1;
-            self.decide(|| {
+            let at = At::new(track_id, exact_seq, cause);
+            self.decide(at, Some(Reason::PowerStepGuard), || {
                 Decision::withheld(
                     track_id,
                     sample_ts,
@@ -1440,7 +1834,87 @@ impl Validator {
         }
     }
 
-    fn try_spot(&mut self, track_id: u32, sample_ts: u64) -> Vec<Spot> {
+    /// MAN-201 D8: records one `BeaconNoEvidence` decision per unguarded
+    /// `<call> T` occurrence of a plausible, allocated, unlisted call. A
+    /// call the exchange shows was only called or mentioned has no beacon
+    /// question to explain.
+    fn record_beacon_no_evidence(&mut self, track_id: u32) {
+        let Some(track) = self.tracks.get(&track_id) else {
+            return;
+        };
+        let mut joined = String::new();
+        let mut word_spans = Vec::with_capacity(track.words.len());
+        for word in &track.words {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            let start = joined.len();
+            joined.push_str(&word.text);
+            word_spans.push((start, joined.len()));
+        }
+        let guarded = context::power_step_framing_is_unresolved(&joined);
+        let mut found = Vec::new();
+        for (call, _, r) in context::power_step_candidates(&joined) {
+            let Some(index) = word_spans
+                .iter()
+                .position(|&(start, end)| start == r.start && end == r.end)
+            else {
+                continue;
+            };
+            let word = &track.words[index];
+            if guarded && !self.allowlist.contains(&call) {
+                found.push((call, word.seq, word.end_ts));
+                continue;
+            }
+            if word.beacon_no_evidence_recorded
+                || self.allowlist.contains(&call)
+                || matches!(word.role, Some((Role::Addressee | Role::RelayedMention, _)))
+                || !grammar::is_plausible(&call)
+                || !self.cty.is_allocated(&call)
+            {
+                continue;
+            }
+            found.push((call, word.seq, word.end_ts));
+        }
+        for (call, seq, end_ts) in found {
+            let Some(track) = self.tracks.get_mut(&track_id) else {
+                return;
+            };
+            let freq_hz = track.freq_hz * self.freq_calibration;
+            // MAN-207: a word already decided as another spot type is
+            // reclassified by this decision, not decided for the first time.
+            let mut cause = Cause::Decided;
+            if let Some(word) = track.words.iter_mut().find(|w| w.seq == seq) {
+                word.beacon_no_evidence_recorded = true;
+                if word.attempted {
+                    cause = Cause::Reclassified;
+                }
+            }
+            // A guarded occurrence stays explained by its CQ/DE framing,
+            // also once that framing ages out of the window.
+            if guarded {
+                continue;
+            }
+            self.suppression_counts.beacon_no_evidence += 1;
+            let at = At::new(track_id, seq, cause);
+            self.decide(at, Some(Reason::BeaconNoEvidence), || {
+                Decision::withheld(
+                    track_id,
+                    end_ts,
+                    &call,
+                    freq_hz,
+                    SpotType::Beacon,
+                    Reason::BeaconNoEvidence,
+                )
+            });
+        }
+    }
+
+    /// Decides every settled candidate on `track_id`, each at its own
+    /// word's `end_ts` (MAN-201 D5); `complete` settles the window's last
+    /// call (the track is closing). `sample_ts` is the triggering event's
+    /// time, used only for guard burns.
+    fn try_spot(&mut self, track_id: u32, sample_ts: u64, complete: bool) -> Vec<Spot> {
         // No real TrackMeta yet -- freq_hz/snr_db still hold bogus 0.0
         // defaults. Bail without marking anything attempted, so pending
         // candidates are simply re-evaluated once metadata does arrive.
@@ -1448,7 +1922,7 @@ impl Validator {
         if !self.tracks.get(&track_id).is_some_and(|t| t.has_meta) {
             return Vec::new();
         }
-        let candidates = self.candidates(track_id);
+        let candidates = self.candidates(track_id, complete);
         // Suppressed candidates must be computed before evaluating the
         // accepted list below (which can mutate track.words), but burned
         // only after: evaluate_candidate assigns classified_max_seq
@@ -1459,17 +1933,20 @@ impl Validator {
         let suppressed = self.suppressed_power_step_candidates(track_id);
         let spots = candidates
             .into_iter()
-            .filter_map(|(candidate, spot_type, involved_max_seq, exact_seq)| {
-                self.evaluate_candidate(
-                    track_id,
-                    sample_ts,
-                    candidate,
-                    spot_type,
-                    involved_max_seq,
-                    exact_seq,
-                )
-            })
+            .filter_map(
+                |(candidate, spot_type, involved_max_seq, exact_seq, end_ts)| {
+                    self.evaluate_candidate(
+                        track_id,
+                        end_ts,
+                        candidate,
+                        spot_type,
+                        involved_max_seq,
+                        exact_seq,
+                    )
+                },
+            )
             .collect();
+        self.record_beacon_no_evidence(track_id);
         for (call, involved_max_seq, exact_seq) in suppressed {
             // Identity resolved via exact_seq, not text -- see burn's own docs.
             self.burn_suppressed_power_step_candidate(
@@ -1480,7 +1957,48 @@ impl Validator {
                 sample_ts,
             );
         }
+        self.record_not_candidates(track_id);
         spots
+    }
+
+    /// MAN-207 D10: counts, and at `Detail::Records` and above records,
+    /// each settled call occurrence on `track_id` that its role kept from
+    /// becoming a candidate. Each occurrence once. Only a word with a
+    /// plausible callsign structure counts: the exchange grammar also gives
+    /// roles to ordinary call-shaped words (`TNX`, `NAME`).
+    fn record_not_candidates(&mut self, track_id: u32) {
+        let Some(track) = self.tracks.get_mut(&track_id) else {
+            return;
+        };
+        let freq_hz = track.freq_hz * self.freq_calibration;
+        let mut skipped = Vec::new();
+        for word in track.words.iter_mut() {
+            let Some((role, _)) = word.role else {
+                continue;
+            };
+            if word.attempted
+                || word.power_step_suppressed
+                || word.beacon_no_evidence_recorded
+                || word.not_candidate_recorded
+                || !grammar::is_plausible(&word.text)
+            {
+                continue;
+            }
+            word.not_candidate_recorded = true;
+            skipped.push((role, word.seq, word.text.clone(), word.end_ts));
+        }
+        for (role, seq, call, end_ts) in skipped {
+            self.observations.count_not_candidate(role);
+            if self.observations.keeps_records() {
+                let finding = Finding::NotCandidate {
+                    call,
+                    sample_ts: end_ts,
+                    freq_hz,
+                };
+                let draft = self.observation_draft(At::new(track_id, seq, Cause::Decided), finding);
+                self.observations.append(draft, self.now_ts);
+            }
+        }
     }
 
     fn evaluate_candidate(
@@ -1587,14 +2105,22 @@ impl Validator {
         let withheld = |reason: Reason| {
             Decision::withheld(track_id, sample_ts, &candidate, freq_hz, spot_type, reason)
         };
+        let cause = if reclassifying {
+            Cause::Reclassified
+        } else {
+            Cause::Decided
+        };
+        let mut at = At::new(track_id, resolved_word_seq, cause);
         if self.blocklist.contains(&candidate) {
             self.suppression_counts.blocklist += 1;
-            self.decide(|| withheld(Reason::Blocklist));
+            let reason = Reason::Blocklist;
+            self.decide(at, Some(reason), || withheld(reason));
             return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
-            self.decide(|| withheld(Reason::Notch));
+            let reason = Reason::Notch;
+            self.decide(at, Some(reason), || withheld(reason));
             return None;
         }
 
@@ -1604,11 +2130,13 @@ impl Validator {
 
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
-                self.decide(|| withheld(Reason::Grammar));
+                let reason = Reason::Grammar;
+                self.decide(at, Some(reason), || withheld(reason));
                 return None;
             }
             if !self.cty.is_allocated(&candidate) {
-                self.decide(|| withheld(Reason::Cty));
+                let reason = Reason::Cty;
+                self.decide(at, Some(reason), || withheld(reason));
                 return None;
             }
         }
@@ -1624,8 +2152,7 @@ impl Validator {
             track
                 .words
                 .iter()
-                .rev()
-                .find(|w| w.text == candidate)
+                .find(|w| w.seq == resolved_word_seq)
                 .map(|w| w.last_reps)
                 .unwrap_or(0)
         } else {
@@ -1638,18 +2165,34 @@ impl Validator {
             // identity continues on a survivor, so `self.merged_into`
             // (round 3) still counts it as active. See
             // `gate::message_distinct_indices`'s doc.
-            self.gate.record(
-                track_id,
-                freq_hz,
-                &candidate,
-                sample_ts,
-                resolved_word_seq,
-                |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
-            ) as u32
+            let is_active =
+                |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
+            if self.observations.keeps_records() {
+                // MAN-207: the same record, plus the occurrences it counted.
+                let (reps, counted) = self.gate.record_traced(
+                    track_id,
+                    freq_hz,
+                    &candidate,
+                    sample_ts,
+                    resolved_word_seq,
+                    is_active,
+                );
+                at.evidence = evidence_links(&counted);
+                reps as u32
+            } else {
+                self.gate.record(
+                    track_id,
+                    freq_hz,
+                    &candidate,
+                    sample_ts,
+                    resolved_word_seq,
+                    is_active,
+                ) as u32
+            }
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
-            if let Some(word) = track.words.iter_mut().rev().find(|w| w.text == candidate) {
+            if let Some(word) = track.words.iter_mut().find(|w| w.seq == resolved_word_seq) {
                 word.last_reps = reps;
             }
         }
@@ -1665,7 +2208,8 @@ impl Validator {
         // repetition gate; allowlist, SCP and Beacon exemptions do not
         // bypass it.
         if !confidence::has_acoustic_evidence(&char_confidences) {
-            self.decide(|| withheld(Reason::NoEvidence).with_reps(reps));
+            let reason = Reason::NoEvidence;
+            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
             return None;
         }
         let tier = self.patterns.tier(&candidate);
@@ -1673,6 +2217,7 @@ impl Validator {
         if let Some(scp) = &self.scp {
             confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
         }
+        let at = at.with_call_confidence(confidence);
         let emission_state = if reps >= self.level.required_reps(tier) {
             EmissionState::Confirmed
         } else {
@@ -1686,7 +2231,8 @@ impl Validator {
         // dispatch above).
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
         {
-            self.decide(|| withheld(Reason::Repetition).with_reps(reps));
+            let reason = Reason::Repetition;
+            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
             return None;
         }
 
@@ -1722,7 +2268,7 @@ impl Validator {
         };
         if let Some((rival_call, rival_support)) = rival {
             self.suppression_counts.variant += 1;
-            self.decide(|| {
+            self.decide(at, Some(Reason::Variant), || {
                 let mut d = withheld(Reason::Variant).with_reps(reps);
                 d.rival = Some(Rival {
                     call: rival_call,
@@ -1734,12 +2280,26 @@ impl Validator {
         }
 
         let input = self.input_of(track_id);
+        // MAN-201 D5: a settled occurrence is decided at its own, possibly
+        // older, timestamp. One older than this station's last spot here
+        // must not rewind dedupe's watermark: withhold it, as MAN-174 does
+        // for a deferred beacon.
+        if self
+            .dedupe
+            .last_sample_ts(&candidate, freq_hz, input)
+            .is_some_and(|last| sample_ts < last)
+        {
+            let reason = Reason::Dedupe;
+            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
+            return None;
+        }
         let outcome = self
             .dedupe
             .assess(&candidate, freq_hz, snr_db, spot_type, sample_ts, input);
         if outcome != DedupeOutcome::Emit {
             self.count_cross_input_dedupe(outcome, input);
-            self.decide(|| withheld(Reason::Dedupe).with_reps(reps));
+            let reason = Reason::Dedupe;
+            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
             return None;
         }
 
@@ -1759,7 +2319,7 @@ impl Validator {
             mode: SpotMode::Cw,
             baud: None,
         };
-        self.admit(spot, reps, is_allowlisted)
+        self.admit(spot, reps, is_allowlisted, at)
     }
 
     /// Captures a non-allowlisted Beacon candidate once every permanent,
@@ -1785,7 +2345,7 @@ impl Validator {
         // PR #154, round 3): checking blocklist/notch before this guard
         // would re-count a permanently-suppressed candidate every time an
         // unrelated later word re-triggers a scan that finds it again.
-        let (char_confidences, word_seq) = {
+        let (char_confidences, word_seq, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = if let Some(seq) = exact_seq {
                 track.words.iter_mut().find(|w| w.seq == seq)?
@@ -1803,10 +2363,11 @@ impl Validator {
             {
                 return None;
             }
+            let reclassifying = word.attempted;
             word.attempted = true;
             word.last_spot_type = Some(SpotType::Beacon);
             word.classified_max_seq = involved_max_seq;
-            (word.confidences.clone(), word.seq)
+            (word.confidences.clone(), word.seq, reclassifying)
         };
 
         // Operator suppression overrides (MAN-31), same boundary as the
@@ -1834,11 +2395,18 @@ impl Validator {
         } else {
             None
         };
+        let cause = if reclassifying {
+            Cause::Reclassified
+        } else {
+            Cause::Decided
+        };
+        let at = At::new(track_id, word_seq, cause);
         if let Some(reason) = rejected {
-            self.decide(|| withheld(reason));
+            self.decide(at, Some(reason), || withheld(reason));
             return None;
         }
-        self.decide(|| withheld(Reason::BeaconPending));
+        let reason = Reason::BeaconPending;
+        self.decide(at, Some(reason), || withheld(reason));
 
         let pending = &mut self.tracks.get_mut(&track_id)?.pending_beacons;
         // Past the cap, drop the oldest to bound growth on a track that
@@ -1860,9 +2428,10 @@ impl Validator {
         );
         if let Some(evicted) = evicted {
             self.suppression_counts.pending_beacon_overflow += 1;
-            if let Some(log) = self.decisions.as_mut() {
-                log.push(beacon_decision(track_id, &evicted, Reason::BeaconOverflow));
-            }
+            let reason = Reason::BeaconOverflow;
+            self.decide(settled_at(&evicted), Some(reason), || {
+                beacon_decision(track_id, &evicted, reason)
+            });
         }
         None
     }
@@ -1917,19 +2486,27 @@ impl Validator {
                 // Merged by `sample_ts`, not appended (MAN-174): the cap
                 // must drop the true oldest across both queues, so an old
                 // loser candidate never displaces the survivor's newer ones.
+                let mut overflowed = Vec::new();
                 for pb in pending {
                     if let Some(evicted) = insert_by_age(&mut survivor_track.pending_beacons, pb) {
-                        self.suppression_counts.pending_beacon_overflow += 1;
-                        if let Some(log) = self.decisions.as_mut() {
-                            log.push(beacon_decision(survivor, &evicted, Reason::BeaconOverflow));
-                        }
+                        overflowed.push(evicted);
                     }
+                }
+                for evicted in overflowed {
+                    self.suppression_counts.pending_beacon_overflow += 1;
+                    let reason = Reason::BeaconOverflow;
+                    self.decide(settled_at(&evicted), Some(reason), || {
+                        beacon_decision(survivor, &evicted, reason)
+                    });
                 }
             }
             None => {
                 self.suppression_counts.pending_beacon_lost_to_eviction += pending.len() as u64;
                 for pb in &pending {
-                    self.decide(|| beacon_decision(track_id, pb, Reason::BeaconDiscarded));
+                    let reason = Reason::BeaconDiscarded;
+                    self.decide(settled_at(pb), Some(reason), || {
+                        beacon_decision(track_id, pb, reason)
+                    });
                 }
             }
         }
@@ -1997,7 +2574,9 @@ impl Validator {
                         Reason::BeaconSpeed
                     }
                 };
-                self.decide(|| beacon_decision(track_id, pb, reason));
+                self.decide(settled_at(pb), Some(reason), || {
+                    beacon_decision(track_id, pb, reason)
+                });
             }
             return Vec::new();
         }
@@ -2006,8 +2585,9 @@ impl Validator {
             .filter_map(|pb| {
                 // Before `gate.record`, so a suppressed beacon never feeds
                 // the repetition gate.
+                let mut at = settled_at(&pb);
                 if let Some(reason) = self.operator_suppressed(&pb) {
-                    self.decide(|| beacon_decision(track_id, &pb, reason));
+                    self.decide(at, Some(reason), || beacon_decision(track_id, &pb, reason));
                     return None;
                 }
                 // pb.origin_track_id, not the resolving `track_id`
@@ -2018,20 +2598,37 @@ impl Validator {
                 // rapid-same-track exemption -- letting one real
                 // over-the-air occurrence, captured by two overlapping
                 // duplicate-spawn tracks, reach reps >= 2 on its own.
-                let reps = self.gate.record(
-                    pb.origin_track_id,
-                    pb.freq_hz,
-                    &pb.candidate,
-                    pb.sample_ts,
-                    pb.word_seq,
-                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
-                ) as u32;
+                let is_active =
+                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
+                let reps = if self.observations.keeps_records() {
+                    // MAN-207: the same record, plus the occurrences it counted.
+                    let (reps, counted) = self.gate.record_traced(
+                        pb.origin_track_id,
+                        pb.freq_hz,
+                        &pb.candidate,
+                        pb.sample_ts,
+                        pb.word_seq,
+                        is_active,
+                    );
+                    at.evidence = evidence_links(&counted);
+                    reps as u32
+                } else {
+                    self.gate.record(
+                        pb.origin_track_id,
+                        pb.freq_hz,
+                        &pb.candidate,
+                        pb.sample_ts,
+                        pb.word_seq,
+                        is_active,
+                    ) as u32
+                };
                 // MAN-106: the zero-evidence abstention gate applies to
                 // beacons exactly as to every other candidate -- absent
                 // sound is absent sound (see `try_spot`'s gate).
                 if !confidence::has_acoustic_evidence(&pb.char_confidences) {
-                    self.decide(|| {
-                        beacon_decision(track_id, &pb, Reason::NoEvidence).with_reps(reps)
+                    let reason = Reason::NoEvidence;
+                    self.decide(at, Some(reason), || {
+                        beacon_decision(track_id, &pb, reason).with_reps(reps)
                     });
                     return None;
                 }
@@ -2072,8 +2669,9 @@ impl Validator {
                 {
                     if pb.sample_ts < last_ts {
                         self.suppression_counts.pending_beacon_stale += 1;
-                        self.decide(|| {
-                            beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps)
+                        let reason = Reason::Dedupe;
+                        self.decide(at, Some(reason), || {
+                            beacon_decision(track_id, &pb, reason).with_reps(reps)
                         });
                         return None;
                     }
@@ -2088,7 +2686,10 @@ impl Validator {
                 );
                 if outcome != DedupeOutcome::Emit {
                     self.count_cross_input_dedupe(outcome, input);
-                    self.decide(|| beacon_decision(track_id, &pb, Reason::Dedupe).with_reps(reps));
+                    let reason = Reason::Dedupe;
+                    self.decide(at, Some(reason), || {
+                        beacon_decision(track_id, &pb, reason).with_reps(reps)
+                    });
                     return None;
                 }
                 let spot = Spot {
@@ -2106,10 +2707,16 @@ impl Validator {
                     mode: SpotMode::Cw,
                     baud: None,
                 };
-                self.admit(spot, reps, false)
+                self.admit(spot, reps, false, at)
             })
             .collect()
     }
+}
+
+/// MAN-207: a pending beacon is decided later about the occurrence that
+/// captured it -- its origin track's word, even after a merge migrated it.
+fn settled_at(pb: &PendingBeacon) -> At {
+    At::new(pb.origin_track_id, pb.word_seq, Cause::Settled)
 }
 
 /// Inserts `pb` at its `sample_ts` position (after any equal ones, so
@@ -2250,6 +2857,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_000_000.0,
+            last_char_ts: 0,
         });
     }
 
@@ -2407,7 +3015,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = recording(CTY_FIXTURE);
         v.set_callsign_lookup(lookup.clone());
         v.allowlist("W4KTNL");
-        let spots = run(&transmission_events(1, &["W4KTNL"], 0), &mut v);
+        // MAN-201 (D5): the trailing `K` settles the call's role.
+        let spots = run(&transmission_events(1, &["W4KTNL", "K"], 0), &mut v);
         assert_eq!(spots.len(), 1);
         assert!(lookup.asked().is_empty());
     }
@@ -2439,6 +3048,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_010_000.0,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = Vec::new();
@@ -2568,7 +3178,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(run(&events, &mut v).is_empty());
         let log = v.take_decisions();
         let decisions = decisions_for(&log, "W4KTNL");
-        assert_eq!(decisions.len(), 2, "DE then CQ reclassification: {log:?}");
+        // MAN-201 (D5): the call is decided once, when the trailing `CQ`
+        // settles it -- as `Cq` -- not as `De` first and again as `Cq`.
+        assert_eq!(decisions.len(), 1, "decided once, at settle: {log:?}");
+        assert_eq!(decisions[0].spot_type, SpotType::Cq);
         for d in decisions {
             assert_eq!(d.reason, Some(Reason::Repetition));
             assert_eq!(d.required_reps, 5);
@@ -2582,7 +3195,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = recording(CTY_FIXTURE);
         v.allowlist("W4KTNL");
         assert_eq!(
-            run(&transmission_events(1, &["W4KTNL"], 0), &mut v).len(),
+            run(&transmission_events(1, &["W4KTNL", "K"], 0), &mut v).len(),
             1
         );
         let log = v.take_decisions();
@@ -2600,6 +3213,78 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
         assert_eq!(spots.len(), 1);
         assert!(v.take_decisions().is_empty());
+    }
+
+    fn meta_with_chars(track_id: u32, sample_ts: u64, last_char_ts: u64) -> DecoderEvent {
+        DecoderEvent::TrackMeta {
+            track_id,
+            sample_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_020_000.0,
+            last_char_ts,
+        }
+    }
+
+    /// MAN-201 D3: silence after the tail word ends its turn at a `TrackMeta`,
+    /// which settles the call without waiting for the track to close.
+    #[test]
+    fn a_silent_tail_settles_at_track_meta() {
+        let mut v = Validator::bundled(FS);
+        v.allowlist("K5ARH");
+        seed_meta(&mut v, 1);
+        let events = transmission_events(1, &["DE", "K5ARH"], 1_000);
+        assert!(run(&events, &mut v).is_empty(), "the tail is unsettled");
+        let end = 1_000 + 2_000;
+        let spots = v.ingest(&meta_with_chars(1, end + 480_000, end));
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
+    }
+
+    /// MAN-201 D3: the MAN-317 prior holds a word's characters until it
+    /// ends. A newer character in the decoder's hands is not silence, even
+    /// though nothing newer than the tail has reached the validator.
+    #[test]
+    fn a_word_the_decoder_still_holds_is_not_silence() {
+        let mut v = Validator::bundled(FS);
+        v.allowlist("K5ARH");
+        seed_meta(&mut v, 1);
+        let events = transmission_events(1, &["DE", "K5ARH"], 1_000);
+        assert!(run(&events, &mut v).is_empty());
+        let now = 1_000 + 2_000 + 480_000;
+        let spots = v.ingest(&meta_with_chars(1, now, now - 96_000));
+        assert!(spots.is_empty(), "{spots:?}");
+    }
+
+    /// MAN-201 D6: a candidate is bound to its exact word, not the newest
+    /// word sharing its text.
+    #[test]
+    fn exact_binding_evaluates_the_occurrence_not_the_newest_same_text_word() {
+        let mut v = recording(CTY_FIXTURE);
+        let words = ["DE", "K1ABC", "K", "K1ABC", "DE", "W1AW", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let log = v.take_decisions();
+        let d = decisions_for(&log, "K1ABC");
+        assert_eq!(d.len(), 1, "{log:?}");
+        assert_eq!(d[0].sample_ts, 800, "the first occurrence's boundary");
+    }
+
+    /// MAN-201 D5: the V41 shape. A held occurrence reaches the gate at its
+    /// own time, so two calls 80 s apart still confirm.
+    #[test]
+    fn held_occurrences_are_recorded_in_the_gate_at_their_own_time() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let mut spots = run(&transmission_events(1, &["DE", "K5ARH"], 0), &mut v);
+        spots.extend(run(
+            &transmission_events(1, &["DE", "K5ARH"], (80.0 * FS) as u64),
+            &mut v,
+        ));
+        spots.extend(v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        }));
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARH");
     }
 
     #[test]
@@ -2785,7 +3470,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut ts = 0u64;
         for i in 0..(MAX_PENDING_BEACONS + 1) {
             let call = format!("K5AA{}", (b'A' + i as u8) as char);
-            run(&transmission_events(1, &[call.as_str(), "T"], ts), &mut v);
+            run(
+                &transmission_events(1, &["V", "V", "V", call.as_str(), "K"], ts),
+                &mut v,
+            );
             ts += 1_000_000;
         }
         let log = v.take_decisions();
@@ -2800,6 +3488,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn a_power_step_guard_withhold_is_recorded() {
         let mut v = recording(CTY_FIXTURE);
+        v.allowlist("K5ARH");
         let words = ["CQ", "DX", "FILLER1", "FILLER2", "FILLER3", "K5ARH", "T"];
         run(&transmission_events(1, &words, 0), &mut v);
         assert_eq!(v.suppression_counts().power_step_guard, 1);
@@ -2871,6 +3560,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz,
+            last_char_ts: 0,
         });
     }
 
@@ -3022,7 +3712,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         // "K5ARH T" parses as SpotType::Beacon (context::parse) -- exempt
         // from the repetition gate, so one occurrence would otherwise spot.
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots.is_empty(),
@@ -3058,7 +3748,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 46.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
 
@@ -3145,10 +3835,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
         seed_meta(&mut v, 1);
         seed_meta(&mut v, 2);
-        let spots = run(&transmission_events(1, &["W1AW"], 0), &mut v);
+        // MAN-201 (D5): each trailing `K` settles the call's role.
+        let spots = run(&transmission_events(1, &["W1AW", "K"], 0), &mut v);
         assert_eq!(spots.len(), 1, "got {spots:?}");
         assert_eq!(spots[0].callsign, "W1AW");
-        let spots = run(&transmission_events(2, &["K5ARH"], 0), &mut v);
+        let spots = run(&transmission_events(2, &["K5ARH", "K"], 0), &mut v);
         assert!(
             spots.is_empty(),
             "the old allowlist must be gone, got {spots:?}"
@@ -3166,7 +3857,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
@@ -3188,7 +3882,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(&[], Blocklist::parse("K5ARH\n"), NotchList::default());
         v.ingest(&DecoderEvent::SpeedUpdate {
@@ -3211,7 +3908,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3232,7 +3932,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty(), "should be captured, not yet resolved");
         let spots = run(&transmission_events(1, &["QRL?", "5NN"], 10_000), &mut v);
         assert!(spots.is_empty(), "got {spots:?}");
@@ -3302,7 +4005,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         v.replace_operator_lists(
             &[],
@@ -3364,7 +4070,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "the blocklist must still hold, got {spots:?}"
         );
         assert_eq!(v.suppression_counts().blocklist, before.blocklist + 1);
-        let spots = run(&transmission_events(2, &["W1AW"], 200_000), &mut v);
+        let spots = run(&transmission_events(2, &["W1AW", "K"], 200_000), &mut v);
         assert_eq!(
             spots.len(),
             1,
@@ -3399,7 +4105,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH", "K"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty());
         assert_eq!(v.suppression_counts().blocklist, 1);
@@ -3424,7 +4130,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3440,7 +4149,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     fn a_beacon_rejected_for_unconfirmed_wpm_is_counted() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
@@ -3461,7 +4173,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 2,
             wpm: 22.0,
         });
-        let spots = run(&transmission_events(2, &["K5ARH", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(2, &["V", "V", "V", "K5ARH"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         for (track_id, survivor) in [(1, 3), (2, 1)] {
             let spots = v.ingest(&DecoderEvent::TrackClosed {
@@ -3498,14 +4213,17 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
         seed_meta(&mut v, 2);
-        let spots = run(&transmission_events(1, &["K5AAZ", "T"], 0), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5AAZ", "K"], 0),
+            &mut v,
+        );
         assert!(spots.is_empty());
         let mut expected = Vec::new();
         for i in 0..MAX_PENDING_BEACONS {
             let call = format!("K5AA{}", (b'A' + i as u8) as char);
             let start = 10_000_000 + i as u64 * 1_000_000;
             let spots = run(
-                &transmission_events(2, &[call.as_str(), "T"], start),
+                &transmission_events(2, &["V", "V", "V", call.as_str(), "K"], start),
                 &mut v,
             );
             assert!(spots.is_empty());
@@ -3546,9 +4264,12 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        // The capture is stamped at "T"'s word boundary, 700 samples after
-        // "K5ARH"'s first character.
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], t - 700), &mut v);
+        // MAN-201 (D5): the capture is stamped at "K5ARH"'s own word
+        // boundary, 1 100 samples after the first `V`.
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH", "K"], t - 1_100),
+            &mut v,
+        );
         assert!(spots.is_empty());
         assert_eq!(
             v.tracks[&1]
@@ -3588,7 +4309,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             // 26 distinct, grammar/cty-valid callsigns (K-prefixed, ending
             // in a letter): K5AAA, K5AAB, K5AAC, ...
             let call = format!("K5AA{}", (b'A' + (i % 26) as u8) as char);
-            let words = [call.as_str(), "T"];
+            let words = ["V", "V", "V", call.as_str()];
             let spots = run(&transmission_events(1, &words, ts), &mut v);
             assert!(spots.is_empty(), "must only ever capture, not spot yet");
             ts += 1_000_000;
@@ -3625,7 +4346,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // timestamp, on 14_000_000.0 Hz (seed_meta's fixture value), but
         // does not close yet.
         seed_meta(&mut v, 1);
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 1_000), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -3685,12 +4406,16 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 sample_ts: 0,
                 snr_2500_db: 20.0,
                 freq_hz,
+                last_char_ts: 0,
             });
         };
 
         // bucket(14_012_549) == 46_708, bucket(14_012_551) == 46_709.
         meta(&mut v, 1, 14_012_549.0);
-        let spots = run(&transmission_events(1, &["K5ARH", "T"], 1_000), &mut v);
+        let spots = run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 1_000),
+            &mut v,
+        );
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
         meta(&mut v, 2, 14_012_551.0);
@@ -3739,7 +4464,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -3860,7 +4585,11 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         // scenario, which must still complete the repetition gate.
         seed_meta(&mut v, 3);
         let ten_seconds = (10.0 * FS) as u64;
-        let spots = run(&transmission_events(3, &words, ten_seconds), &mut v);
+        // MAN-201 (D5): the trailing `K` settles the call's role.
+        let spots = run(
+            &transmission_events(3, &["DE", "K5ARH", "K"], ten_seconds),
+            &mut v,
+        );
         assert_eq!(
             spots.len(),
             1,
@@ -3932,7 +4661,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     #[test]
     fn duplicate_tracks_capturing_the_same_beacon_do_not_self_confirm_through_a_shared_survivor() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
 
         seed_meta(&mut v, 1);
         let spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4009,7 +4738,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
@@ -4064,7 +4793,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots.is_empty(),
@@ -4095,7 +4824,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 60.0,
         });
-        let words = ["K5ARH", "T"];
+        let words = ["V", "V", "V", "K5ARH", "K"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(
             spots
@@ -4174,7 +4903,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
-            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket
+            freq_hz: 14_000_030.0, // 30 Hz away -- same signal, same bucket,
+            last_char_ts: 0,
         });
         let spots = run(&transmission_events(2, &words, 100_000), &mut v);
 
@@ -4198,7 +4928,8 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             track_id: 2,
             snr_2500_db: 20.0,
-            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket
+            freq_hz: 14_001_000.0, // 1 kHz away -- a different bucket,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4227,6 +4958,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: RAW_FREQ_HZ,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4249,6 +4981,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             sample_ts: 0,
             snr_2500_db: 20.0,
             freq_hz: 14_027_000.0,
+            last_char_ts: 0,
         });
         let words = ["DE", "K5ARH", "K"];
         let mut spots = run(&transmission_events(1, &words, 0), &mut v);
@@ -4421,6 +5154,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
                 track_id,
                 snr_2500_db: 20.0,
                 freq_hz: 14_000_000.0 + (track_id as f64) * 1000.0,
+                last_char_ts: 0,
             });
             run(&transmission_events(track_id, &words, 0), &mut v);
             v.ingest(&DecoderEvent::TrackClosed {

@@ -584,6 +584,10 @@ fn settle_lookups(
         tap.decisions(validator.take_decisions());
         tap.end_batch(validator);
     }
+    // MAN-207: the settled lookups' decisions, as `emit` stores a batch's.
+    if let Some(q) = ctx.quality {
+        q.store_decisions(&validator.observation_counts());
+    }
 }
 
 fn emit(
@@ -648,6 +652,7 @@ fn emit(
     if let Some(q) = ctx.quality {
         q.add_chars(chars);
         q.store_repetitions(validator.repetition_counts());
+        q.store_decisions(&validator.observation_counts());
     }
 }
 
@@ -836,6 +841,7 @@ pub fn listen_with_observers(
 
     let lifecycle = observers.track_lifecycle.as_deref();
     let mut close_base = CloseCounts::default();
+    let mut spawn_base = 0;
 
     let mut seg = new_segment(
         fs,
@@ -883,6 +889,10 @@ pub fn listen_with_observers(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-201: no track exists yet, so a stall has nothing to settle.
+            if src.take_stalled() {
+                continue;
+            }
             // MAN-252: a live source's wrapper reports a stop request during
             // an outage as EOF; that is the stop, not a source that ended.
             if stop.load(Ordering::Relaxed) {
@@ -955,6 +965,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -981,6 +992,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -990,6 +1002,7 @@ pub fn listen_with_observers(
     }
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
+    let mut stalled = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1010,6 +1023,17 @@ pub fn listen_with_observers(
                 if let Some(obs) = lifecycle {
                     obs.clear_active();
                 }
+                // MAN-201: a call that was held for its role is decided now;
+                // nothing later will settle it. Not evidence the signal
+                // ended, so the outage teardown.
+                let finish_events = seg.tm.finish_for_discontinuity();
+                emit(
+                    finish_events,
+                    &mut validator,
+                    &mut ctx,
+                    &mut on_event,
+                    &mut on_spot,
+                );
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
                 on_tracks(0);
@@ -1017,6 +1041,21 @@ pub fn listen_with_observers(
             }
         };
         if n == 0 {
+            // MAN-201: a stalled stream delivers no hops, so close its
+            // tracks here (the outage teardown) and read on: their last
+            // calls settle now, not when the stream returns.
+            if src.take_stalled() {
+                let finish_events = seg.tm.finish_for_discontinuity();
+                emit(
+                    finish_events,
+                    &mut validator,
+                    &mut ctx,
+                    &mut on_event,
+                    &mut on_spot,
+                );
+                stalled = true;
+                continue;
+            }
             break;
         }
         // MAN-305: a short loss the source spliced over. Advancing
@@ -1027,7 +1066,12 @@ pub fn listen_with_observers(
         // the loss is also held at its boundary (`seg_consumed`), so the
         // hops the channelizer still buffers from before it keep their
         // time.
-        let cont = ReadContinuity::take(&mut *src);
+        let mut cont = ReadContinuity::take(&mut *src);
+        // MAN-201: samples after a stall start a fresh segment, a
+        // zero-length discontinuity, as a replay of its `gap` record does.
+        if std::mem::take(&mut stalled) {
+            cont.discontinuity.get_or_insert(0);
+        }
         if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
@@ -1052,6 +1096,7 @@ pub fn listen_with_observers(
             let next_id = seg.tm.next_track_id();
             if lifecycle.is_some() {
                 close_base = close_base + seg.tm.close_counts();
+                spawn_base += seg.tm.total_spawns();
             }
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
@@ -1129,6 +1174,7 @@ pub fn listen_with_observers(
             obs.publish_counts(
                 close_base + seg.tm.close_counts(),
                 validator.gate_records_total(),
+                spawn_base + seg.tm.total_spawns(),
             );
             obs.publish_chunk(seg.tm.active_track_count());
         }
@@ -1172,6 +1218,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
         obs.clear_active();
     }
@@ -1407,11 +1454,22 @@ fn to_common(
             match &mut ev {
                 DecoderEvent::CharDecoded { sample_ts, .. }
                 | DecoderEvent::WordBoundary { sample_ts, .. }
-                | DecoderEvent::TrackMeta { sample_ts, .. }
                 | DecoderEvent::ReadingsHeld { sample_ts, .. }
                 | DecoderEvent::TimingUpdate { sample_ts, .. }
                 | DecoderEvent::TrackPromoted { sample_ts, .. } => {
                     *sample_ts = clock.to_common(*sample_ts);
+                }
+                // MAN-201: the validator compares these with word times on
+                // the shared clock. `0` means no character yet.
+                DecoderEvent::TrackMeta {
+                    sample_ts,
+                    last_char_ts,
+                    ..
+                } => {
+                    *sample_ts = clock.to_common(*sample_ts);
+                    if *last_char_ts > 0 {
+                        *last_char_ts = clock.to_common(*last_char_ts);
+                    }
                 }
                 DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackClosed { .. } => {}
             }
@@ -1523,6 +1581,10 @@ pub(crate) fn run_input_front(
         }
         let n = src.read(&mut calib[filled..])?;
         if n == 0 {
+            // MAN-201: as `listen_with_observers`.
+            if src.take_stalled() {
+                continue;
+            }
             // MAN-252, as `listen_with_observers`: a live source's wrapper
             // reports a stop request during an outage as EOF; that is the
             // stop, not a source that ended.
@@ -1590,6 +1652,7 @@ pub(crate) fn run_input_front(
 
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     let mut read_error = None;
+    let mut stalled = false;
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1602,12 +1665,26 @@ pub(crate) fn run_input_front(
             }
         };
         if n == 0 {
+            // MAN-201, as `listen_with_observers`.
+            if src.take_stalled() {
+                let finish_events = seg.tm.finish_for_discontinuity();
+                if !send(batch(finish_events, seg_base + seg_consumed, &seg.tm)) {
+                    return Ok(());
+                }
+                stalled = true;
+                continue;
+            }
             break;
         }
         // MAN-305, as `listen_with_observers`: a spliced loss advances
         // this input's clock without closing its tracks, and (MAN-423) is
         // held at its boundary, so hops already buffered keep their time.
-        let cont = ReadContinuity::take(&mut *src);
+        let mut cont = ReadContinuity::take(&mut *src);
+        // MAN-201: samples after a stall start a fresh segment, a
+        // zero-length discontinuity, as a replay of its `gap` record does.
+        if std::mem::take(&mut stalled) {
+            cont.discontinuity.get_or_insert(0);
+        }
         if let Some(k) = cont.missing_samples {
             seg_base += k;
             let filter_len = seg.ch.filter_len() as u64;
@@ -1743,6 +1820,7 @@ mod tests {
             sample_ts: start_ts,
             snr_2500_db: 20.0,
             freq_hz: 14_012_340.0 + f64::from(track_id),
+            last_char_ts: 0,
         }];
         let mut ts = start_ts;
         for word in ["DE", "W1AW", "K"] {
@@ -1847,6 +1925,7 @@ mod tests {
                 sample_ts,
                 snr_2500_db: 20.0,
                 freq_hz: 14_030_000.0,
+                last_char_ts: 0,
             };
             // Live batches arrive in input order, not common-clock order.
             back.ingest(
@@ -4202,10 +4281,19 @@ mod tests {
         truncate: Option<usize>,
         offer_at: Option<u64>,
     ) -> (Vec<(String, u64)>, u64) {
+        fast_text("W1AW W1AW W1AW W1AW W1AW", wpm, truncate, offer_at)
+    }
+
+    fn fast_text(
+        text: &str,
+        wpm: f32,
+        truncate: Option<usize>,
+        offer_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
         let mut spec = manta_testkit::vectors::v1();
         spec.duration_s = 3.0;
         spec.signals[0].wpm = wpm;
-        spec.signals[0].text = "W1AW W1AW W1AW W1AW W1AW".into();
+        spec.signals[0].text = text.into();
         let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
         if let Some(n) = truncate {
             samples.truncate(n);
@@ -4252,11 +4340,169 @@ mod tests {
         (spots, reads.load(Ordering::Relaxed))
     }
 
+    /// MAN-201: a mixed-rate session compares the character clock with word
+    /// times on the shared clock.
+    #[test]
+    fn to_common_converts_the_character_clock_with_the_sample_clock() {
+        let clock = crate::multi::SourceClock {
+            scale: 2,
+            offset: 0,
+        };
+        let event = |sample_ts, last_char_ts| DecoderEvent::TrackMeta {
+            track_id: 1,
+            sample_ts,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0,
+            last_char_ts,
+        };
+        let got = to_common(vec![event(1_000, 900), event(1_000, 0)], clock, 1.0);
+        assert_eq!(got[0], event(2_000, 1_800));
+        assert_eq!(got[1], event(2_000, 0));
+    }
+
+    /// Stops at `at` samples: with `stall`, reporting a stall, otherwise
+    /// resuming behind a zero-length recorded gap.
+    struct PausingSource {
+        inner: FixedFreqSource,
+        at: usize,
+        stall: bool,
+        paused: bool,
+        stalled: bool,
+        gap: Option<u64>,
+    }
+
+    impl IqSource for PausingSource {
+        fn sample_rate(&self) -> f64 {
+            self.inner.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.inner.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if !self.paused && self.inner.cursor == self.at {
+                self.paused = true;
+                if self.stall {
+                    self.stalled = true;
+                    return Ok(0);
+                }
+                self.gap = Some(0);
+            }
+            let n = if self.inner.cursor < self.at {
+                (self.at - self.inner.cursor).min(buf.len())
+            } else {
+                buf.len()
+            };
+            self.inner.read(&mut buf[..n])
+        }
+        fn take_stalled(&mut self) -> bool {
+            std::mem::take(&mut self.stalled)
+        }
+        fn take_discontinuity(&mut self) -> Option<u64> {
+            self.gap.take()
+        }
+    }
+
+    /// MAN-201: a stall resets the pipeline as a replay of its zero-length
+    /// `gap` record does, so both decode the samples after it alike.
+    #[test]
+    fn a_stall_and_its_recorded_gap_produce_the_same_events() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 8.0;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let run = |stall| {
+            let src = PausingSource {
+                inner: FixedFreqSource {
+                    samples: samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                },
+                at: 400_000,
+                stall,
+                paused: false,
+                stalled: false,
+                gap: None,
+            };
+            let mut events = Vec::new();
+            listen_with_observers(
+                Box::new(src),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                ListenObservers::default(),
+                |e| events.push(e.clone()),
+                |_| {},
+                |_| {},
+            )
+            .unwrap();
+            events
+        };
+        let stalled = run(true);
+        assert!(!stalled.is_empty());
+        assert_eq!(stalled, run(false));
+    }
+
+    /// Delivers its samples, then fails: a dead receiver.
+    struct FailingSource(FixedFreqSource);
+
+    impl IqSource for FailingSource {
+        fn sample_rate(&self) -> f64 {
+            self.0.sample_rate()
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.0.center_freq_hz()
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            match self.0.read(buf)? {
+                0 => anyhow::bail!("receiver unplugged"),
+                n => Ok(n),
+            }
+        }
+    }
+
+    /// MAN-201: a read error closes the tracks, so a call held for its role
+    /// is decided rather than lost with the input.
+    #[test]
+    fn a_read_error_settles_the_last_call() {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 4.0;
+        spec.signals[0].wpm = 40.0;
+        spec.signals[0].text = "DE W1AW".into();
+        spec.signals[0].loop_text = false;
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        let src = FailingSource(FixedFreqSource {
+            samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig {
+            allowlist: vec!["W1AW".into()],
+            ..Default::default()
+        };
+        let mut spots = Vec::new();
+        let result = listen_with_observers(
+            Box::new(src),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers::default(),
+            |_| {},
+            |s| spots.push(s.callsign.clone()),
+            |_| {},
+        );
+        assert!(result.is_err());
+        assert!(spots.iter().any(|c| c == "W1AW"), "{spots:?}");
+    }
+
     #[test]
     fn lists_offered_during_calibration_apply_to_the_calibration_buffer() {
-        let (control, _) = fast_w1aw(72.0, None, None);
+        // MAN-201 (D12, a spot emitted at settle): a bare run settles only
+        // when another token follows it, so the turn ends keep W1AW's spot
+        // inside the calibration buffer. The leading `K` takes the first
+        // word's warm-up damage (`W1AW` decodes as `T1AW`).
+        let text = "K W1AW K W1AW K W1AW K W1AW K";
+        let (control, _) = fast_text(text, 72.0, None, None);
         assert_eq!(control, vec![("W1AW".to_string(), 1)]);
-        let (spots, _) = fast_w1aw(72.0, None, Some(1));
+        let (spots, _) = fast_text(text, 72.0, None, Some(1));
         assert!(spots.is_empty(), "got {spots:?}");
     }
 
@@ -5454,11 +5700,71 @@ mod tests {
             "V1's repeated call must reach the repetition gate"
         );
 
+        // MAN-207: emit stores the validator's decision counts; every spot
+        // is one `spotted` decision.
+        let spotted = snap
+            .decisions
+            .iter()
+            .find(|&&(_, reason, _)| reason.is_none())
+            .map(|&(_, _, n)| n);
+        assert_eq!(spotted, Some(spots_observed.len() as u64));
+
         let (_, spots_plain) = run(ListenObservers::default());
         assert!(!spots_plain.is_empty(), "V1 must spot");
         assert_eq!(
             spots_observed, spots_plain,
             "the observer must not change decode output"
+        );
+    }
+
+    /// MAN-207: after a V1 listen run the observer holds every decision
+    /// count a validator replaying the run's events arrives at.
+    #[test]
+    fn emit_stores_the_validators_decision_counts() {
+        use crate::quality::DecodeQualityObserver;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig::default();
+        let obs = Arc::new(DecodeQualityObserver::new());
+        let mut events = Vec::new();
+        listen_with_observers(
+            src,
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_quality: Some(obs.clone()),
+                ..Default::default()
+            },
+            |ev| events.push(ev.clone()),
+            |_spot| {},
+            |_n| {},
+        )
+        .unwrap();
+
+        let mut replay = cfg.validator(spec.fs).unwrap();
+        for ev in &events {
+            replay.ingest(ev);
+        }
+        let expected: Vec<_> = replay.observation_counts().iter().collect();
+        assert_eq!(obs.snapshot().decisions, expected);
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_none() && n > 0),
+            "V1 must spot"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_some() && n > 0),
+            "V1 must withhold something"
         );
     }
 

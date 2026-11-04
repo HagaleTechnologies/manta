@@ -395,6 +395,12 @@ pub struct DecodeQuality {
     pub garbles_total: u64,
     pub rail_ratio: ValueHistogram,
     pub repetitions: ValueHistogram,
+    /// MAN-207: `(decision, reason, count)` for every valid pair, `reason`
+    /// `"none"` on a spot, in a fixed order.
+    pub decisions: Vec<(&'static str, &'static str, u64)>,
+    /// MAN-207: `(role, count)` for every role a role-skipped call
+    /// occurrence can have, in a fixed order.
+    pub not_candidates: Vec<(&'static str, u64)>,
 }
 
 /// Writes `h` as Prometheus histogram samples under `name`: cumulative
@@ -3125,6 +3131,28 @@ impl Metrics {
         if let Some(q) = &quality {
             push_histogram_samples(&mut out, "manta_candidate_repetitions", &q.repetitions);
         }
+        out.push_str(
+            "# HELP manta_candidate_decisions_total Validation decisions about callsign candidates, by decision and reason (docs/LIVE-STATE.md). A candidate withheld for repetition and spotted later counts once in each series.\n",
+        );
+        out.push_str("# TYPE manta_candidate_decisions_total counter\n");
+        if let Some(q) = &quality {
+            for (decision, reason, n) in &q.decisions {
+                out.push_str(&format!(
+                    "manta_candidate_decisions_total{{decision=\"{decision}\",reason=\"{reason}\"}} {n}\n"
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP manta_call_occurrences_not_candidate_total Decoded callsign occurrences that never became a spot candidate because of their role in the exchange.\n",
+        );
+        out.push_str("# TYPE manta_call_occurrences_not_candidate_total counter\n");
+        if let Some(q) = &quality {
+            for (role, n) in &q.not_candidates {
+                out.push_str(&format!(
+                    "manta_call_occurrences_not_candidate_total{{role=\"{role}\"}} {n}\n"
+                ));
+            }
+        }
 
         // MAN-128: health gauges, computed from the SAME `health_at` that
         // backs `/healthz` -- a Prometheus-only operator never sees a
@@ -4346,7 +4374,53 @@ mod tests {
                 bucket_counts: vec![116, 38, 120],
                 sum: 899.0,
             },
+            decisions: vec![
+                ("spotted", "none", 49),
+                ("withheld", "repetition", 211),
+                ("deferred", "lookupPending", 0),
+            ],
+            not_candidates: vec![
+                ("addressee", 12),
+                ("relayed_mention", 0),
+                ("self_id", 3),
+                ("uncertain", 7),
+            ],
         }
+    }
+
+    /// MAN-207: one series per pair, zeros included, in the given order.
+    #[test]
+    fn decision_counts_render_every_valid_series() {
+        let m = Metrics::new();
+        m.set_decode_quality(sample_decode_quality());
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_candidate_decisions_total counter\n"));
+        let series: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_candidate_decisions_total{"))
+            .collect();
+        assert_eq!(
+            series,
+            vec![
+                r#"manta_candidate_decisions_total{decision="spotted",reason="none"} 49"#,
+                r#"manta_candidate_decisions_total{decision="withheld",reason="repetition"} 211"#,
+                r#"manta_candidate_decisions_total{decision="deferred",reason="lookupPending"} 0"#,
+            ]
+        );
+        assert!(text.contains("# TYPE manta_call_occurrences_not_candidate_total counter\n"));
+        let roles: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_call_occurrences_not_candidate_total{"))
+            .collect();
+        assert_eq!(
+            roles,
+            vec![
+                r#"manta_call_occurrences_not_candidate_total{role="addressee"} 12"#,
+                r#"manta_call_occurrences_not_candidate_total{role="relayed_mention"} 0"#,
+                r#"manta_call_occurrences_not_candidate_total{role="self_id"} 3"#,
+                r#"manta_call_occurrences_not_candidate_total{role="uncertain"} 7"#,
+            ]
+        );
     }
 
     #[test]
@@ -4363,6 +4437,8 @@ mod tests {
             ("manta_decode_garbles_total", "counter"),
             ("manta_track_rail_ratio", "histogram"),
             ("manta_candidate_repetitions", "histogram"),
+            ("manta_candidate_decisions_total", "counter"),
+            ("manta_call_occurrences_not_candidate_total", "counter"),
         ] {
             assert!(text.contains(&format!("# HELP {name} ")), "{name} HELP");
             assert!(

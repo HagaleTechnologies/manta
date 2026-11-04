@@ -1,18 +1,15 @@
-//! CQ/DE/beacon context parse. ARCHITECTURE §6.1.
+//! Text-level context parse: a compatibility adapter over `exchange`, plus
+//! the power-step beacon shape and its CQ/DE framing guard.
+//! ARCHITECTURE §6.1.
 //!
-//! Deliberately lightweight: matches the exact pattern families
-//! ARCHITECTURE §6.1 lists (`CQ <call>`, `CQ <contest> <call>`,
-//! `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T`).
-//! Contest framing (MAN-104) is recognized through an enumerated set of
-//! filler words (`CQ_FILLER`) skipped between `CQ`/`TEST` and the call --
-//! `CQ WPX <call>`, `CQ TEST CQ TEST <call>`, a bare `TEST <call>` -- and a
-//! bare `TEST` word suppresses the power-step fallback wherever a bare `CQ`
-//! does, but promotes only the `DE <call>` it directly precedes.
-//! The set is closed on purpose: a word outside it is captured as the
-//! candidate call (and rejected by grammar if it is not one), never
-//! skipped on shape alone.
+//! `exchange::interpret` decides who a callsign occurrence is (MAN-201);
+//! `parse` reports the occurrences it reads as a sending station in a whole
+//! decoded text. `Validator` runs the grammar over its own word window, not
+//! through `parse`, so it can settle and latch each role per word. The
+//! `<call> T` shape stays here: a lone `T` is not a grammar token, and the
+//! guard below decides when the shape counts at all.
 
-use crate::grammar;
+use crate::exchange::{self, ExchangeWord, Role};
 use regex::Regex;
 use std::ops::Range;
 use std::sync::LazyLock;
@@ -42,36 +39,27 @@ impl std::fmt::Display for SpotType {
     }
 }
 
-/// One `parse` match: callsign (uppercased), spot type, the full match's
-/// byte range, and -- for a power-step-origin match only -- the exact
-/// range of the callsign capture itself. See `parse`'s own docs for what
-/// the last field is for and why only the power-step family gets it.
+/// One `parse` match: callsign (uppercased), spot type, the byte range of
+/// every word that decided it, and the exact range of the callsign word.
 pub type ContextMatch = (String, SpotType, Range<usize>, Option<Range<usize>>);
 
 /// Contest filler words skipped between a `CQ`/`TEST` framing token and the
 /// call (MAN-104): "CQ WPX <call>", "CQ TEST CQ TEST <call>", "TEST DX
 /// <call>". An enumerated list rather than "skip any digit-free word": a
 /// generic rule would also skip a callsign garbled into a digit-free word and
-/// capture the NEXT station instead -- the kind of clever generalization
-/// `parse`'s own docs record failing here before. `CQ` is listed so a
-/// repeated "CQ WPX CQ WPX <call>" resolves to the call.
+/// capture the NEXT station instead. `CQ` is listed so a repeated "CQ WPX CQ
+/// WPX <call>" resolves to the call.
 ///
 /// Invariant: no entry contains a digit, so `grammar::is_plausible` rejects
 /// every one (pinned by `no_filler_word_is_a_plausible_callsign`). Adding a
-/// filler can therefore never create a spot by itself, and the transient
-/// "CQ WPX" window -- before the call arrives, where `CQ_CALL_RE` captures
-/// `WPX` -- is rejected downstream, the same as "CQ TEST" always was.
-const CQ_FILLER: &str = "CQ|TEST|CONTEST|WPX|WW|NA|SS|FD|DX";
+/// filler can therefore never create a spot by itself.
+pub(crate) const CQ_FILLER: &str = "CQ|TEST|CONTEST|WPX|WW|NA|SS|FD|DX";
 
 /// Sign-off words that make a following bare `TEST` the run station's
 /// trailing "TU TEST" form, so the call after it is the next caller's, not
-/// the CQer's (MAN-104; see `parse_named_pattern`).
-const TEST_SIGN_OFF: [&str; 3] = ["TU", "TNX", "QSL"];
+/// the CQer's (MAN-104; `exchange`).
+pub(crate) const TEST_SIGN_OFF: [&str; 3] = ["TU", "TNX", "QSL"];
 
-static BEACON_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bV\s+V\s+V\s+([A-Z0-9/]{3,15})\b").unwrap());
-static DE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bDE\s+([A-Z0-9/]{3,15})\b").unwrap());
 /// A bare `CQ`/`DE` framing token. The token must be a COMPLETE decoded word
 /// in the joined window -- start-of-text or whitespace on both sides -- not
 /// merely a `\b` word/non-word transition: `/` and `-` are themselves
@@ -95,42 +83,9 @@ static DE_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:^|\s)DE(?:\s|$)").unwrap());
 /// A bare `TEST` token, under `CQ_TOKEN_RE`'s complete-word rule
 /// (MAN-104). It suppresses the power-step fallback exactly as a bare `CQ`
-/// does, but unlike `CQ` it does not promote a `DE <call>` match from
-/// anywhere in the window: see `TEST_BEFORE_DE_RE`.
+/// does.
 static TEST_TOKEN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)(?:^|\s)TEST(?:\s|$)").unwrap());
-/// A bare `TEST`, then any run of `CQ_FILLER` words, then the end of the
-/// text. Matched against the text BEFORE a `DE <call>` match, it finds the
-/// `TEST` of a contest "TEST DE <call>" CQ, the only `TEST` that promotes
-/// that match to `Cq` (MAN-104). A `TEST` elsewhere in the window is as
-/// likely a run station's "TU TEST" sign-off, or an older "TEST <mycall>"
-/// CQ, ahead of the next caller's "DE <call>"; counting it promoted that
-/// caller (Codex review on PR #239). Same complete-word rule as
-/// `CQ_TOKEN_RE`.
-static TEST_BEFORE_DE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"(?i)(?:^|\s)TEST(?:\s+(?:{CQ_FILLER}))*\s+$")).unwrap());
-/// `CQ`, any run of `CQ_FILLER` words, then the call (MAN-104; subsumes the
-/// old single optional `TEST`).
-static CQ_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"(?i)\bCQ(?:\s+(?:{CQ_FILLER}))*\s+([A-Z0-9/]{{3,15}})\b"
-    ))
-    .unwrap()
-});
-/// A bare `TEST` with no `CQ` -- the contest station's short CQ, "TEST
-/// <call>" -- then any run of `CQ_FILLER` words, then the call (MAN-104).
-/// `TEST` must be a complete decoded word, the same rule and the same
-/// consumed-boundary reasoning as `CQ_TOKEN_RE`: a `\b` anchor also matched
-/// the `TEST` glued inside "K5ARH/TEST". `parse_named_pattern` additionally
-/// skips an occurrence sitting between two different callsigns (see there).
-static TEST_CALL_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"(?i)(?:^|\s)TEST(?:\s+(?:{CQ_FILLER}))*\s+([A-Z0-9/]{{3,15}})\b"
-    ))
-    .unwrap()
-});
-static UP_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+UP\b").unwrap());
 /// NCDXF/IARU-style beacon ID: a callsign followed by four unmodulated
 /// power-step dashes (100W/10W/1W/100mW), no spoken "V V V" preamble
 /// (MAN-37). The decoder's on/off-keying detector can't resolve the
@@ -138,101 +93,15 @@ static UP_RE: LazyLock<Regex> =
 /// there's no inter-element keying gap to split the four dashes on -- so
 /// this decodes as the callsign followed by a single trailing "T" (one
 /// dash), not "TTTT". A lone "T" is also the single most common
-/// garbled/noise decode in CW, so this pattern is a known, accepted
-/// source of false-positive `Beacon` tags (see MAN-37 decision notes) --
-/// bounded blast radius since `Beacon` only lifts the repetition-gate
-/// requirement (ARCHITECTURE §6 step 4), it doesn't bypass grammar/cty.
+/// garbled/noise decode in CW, so the shape alone is not beacon evidence
+/// (MAN-201): only an allowlisted call becomes a `Beacon` candidate from it.
+/// `parse` still reports the shape.
 /// The trailing `T` must be a complete decoded word (end-of-text or
 /// followed by whitespace), not just a word-boundary transition -- a bare
 /// `\b` also matched a portable-designator suffix glued onto the same
 /// word, e.g. "K5ARH T/QRP" (Codex review on PR #65).
 static POWER_STEP_BEACON_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\b([A-Z0-9/]{3,15})\s+T(?:\s|$)").unwrap());
-
-/// The `BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`TEST_CALL_RE`/`UP_RE` family: the
-/// first (in that priority order) named-keyword pattern that matches
-/// anywhere in `text`. Returns the callsign candidate (uppercased), spot
-/// type, and match byte range -- see `parse`'s own docs for what the range
-/// is for.
-///
-/// `TEST_CALL_RE` is the one family that can pass over a match: a bare
-/// `TEST` whose preceding word is a DIFFERENT plausible callsign or a
-/// `TEST_SIGN_OFF` word (`test_is_a_sign_off`) is skipped and the next
-/// occurrence tried. The same guard decides whether the `TEST` of a "TEST
-/// DE <call>" (`TEST_BEFORE_DE_RE`) promotes that match to `Cq`. The
-/// standard run exchange "TU <mycall> TEST <caller> ..." (or the shorter "TU
-/// TEST <caller> ...") puts the next caller's call right after `TEST`, and
-/// taking it spotted the caller as a CQing station (measured end-to-end
-/// through `Validator`, MAN-104). Such an occurrence is ambiguous -- it may
-/// also be a CQer's "<other> TEST <mycall>" -- so it yields nothing: a
-/// missed scan, never a wrong `Cq`. The same call either side ("W5AU TEST
-/// W5AU") or another non-callsign before it ("5NN 04 TEST W5AU") is
-/// unambiguous.
-///
-/// The guard reads only `text`, the rolling window: once the preceding word
-/// ages out, a `TEST` left as the window's first word is accepted. That
-/// gives the caller one evaluation per slide, below the repetition gate on
-/// its own -- measured: a six-QSO run on one track spots only the run
-/// station. Accepted residual, same reasoning as `parse`'s coarse guard.
-fn parse_named_pattern(text: &str) -> Option<(String, SpotType, Range<usize>)> {
-    if let Some(caps) = BEACON_RE.captures(text) {
-        let m = caps.get(0).unwrap();
-        return Some((caps[1].to_uppercase(), SpotType::Beacon, m.range()));
-    }
-    if let Some(caps) = DE_RE.captures(text) {
-        let de_match = caps.get(0).unwrap();
-        let call = caps[1].to_uppercase();
-        // The CQ token's range may include the separator space on either
-        // side (CQ_TOKEN_RE consumes its boundary; see its own docs) -- the
-        // union below is only ever used as a word-overlap range, and a bound
-        // sitting exactly on a neighbouring word's boundary is excluded by
-        // that test's strict comparison, so no extra word is pulled in.
-        let framing = CQ_TOKEN_RE.find(text).or_else(|| {
-            TEST_BEFORE_DE_RE
-                .find(&text[..de_match.start()])
-                .filter(|m| !test_is_a_sign_off(text, m.start(), &call))
-        });
-        if let Some(cq_match) = framing {
-            let start = de_match.start().min(cq_match.start());
-            let end = de_match.end().max(cq_match.end());
-            return Some((call, SpotType::Cq, start..end));
-        }
-        return Some((call, SpotType::De, de_match.range()));
-    }
-    if let Some(caps) = CQ_CALL_RE.captures(text) {
-        let m = caps.get(0).unwrap();
-        return Some((caps[1].to_uppercase(), SpotType::Cq, m.range()));
-    }
-    for caps in TEST_CALL_RE.captures_iter(text) {
-        let m = caps.get(0).unwrap();
-        let call = caps[1].to_uppercase();
-        if test_is_a_sign_off(text, m.start(), &call) {
-            continue; // trailing "<mycall> TEST" / "TU TEST": the call is the next caller's
-        }
-        return Some((call, SpotType::Cq, m.range()));
-    }
-    if let Some(caps) = UP_RE.captures(text) {
-        let m = caps.get(0).unwrap();
-        return Some((caps[1].to_uppercase(), SpotType::De, m.range()));
-    }
-    None
-}
-
-/// Whether the bare `TEST` matched at byte `start` of `text` is a run
-/// station's trailing sign-off rather than a CQ by `call` (uppercased): the
-/// word right before it is a `TEST_SIGN_OFF` word or a plausible callsign
-/// other than `call`. `parse_named_pattern` applies it to both
-/// `TEST_CALL_RE` and `TEST_BEFORE_DE_RE` (MAN-104). Each match starts at
-/// the first `TEST` of a run, so that word is never itself a `TEST`.
-fn test_is_a_sign_off(text: &str, start: usize, call: &str) -> bool {
-    text[..start]
-        .split_whitespace()
-        .next_back()
-        .map(str::to_uppercase)
-        .is_some_and(|w| {
-            (w != call && grammar::is_plausible(&w)) || TEST_SIGN_OFF.contains(&w.as_str())
-        })
-}
 
 /// Every power-step fallback match in `text` (see `POWER_STEP_BEACON_RE`),
 /// each its own independent candidate -- collapsing to a single "best"
@@ -249,8 +118,7 @@ fn test_is_a_sign_off(text: &str, start: usize, call: &str) -> bool {
 /// "involved" for the reclassification-aging guard, same as every other
 /// pattern family), and the CALLSIGN CAPTURE'S OWN range alone. The
 /// latter identifies the exact decoded word the callsign landed on --
-/// `Validator` uses it (unlike named patterns, which resolve by text; see
-/// `parse`'s own docs) to bind a match to that specific word rather than
+/// `Validator` uses it to bind a match to that specific word rather than
 /// searching for the newest word sharing its text, since two textually
 /// identical but semantically unrelated power-step occurrences -- one
 /// stale/suppressed, one a brand-new decode with no trailing "T" at all
@@ -273,80 +141,50 @@ fn parse_power_step_beacons(text: &str) -> Vec<(String, SpotType, Range<usize>, 
         .collect()
 }
 
-/// Scans `text` for every CQ/DE/beacon context match, returning each as
-/// (callsign candidate uppercased, spot type, byte range of every token
-/// that determined that type). The named-keyword family
-/// (`BEACON_RE`/`DE_RE`/`CQ_CALL_RE`/`TEST_CALL_RE`/`UP_RE`) contributes at
-/// most one candidate (first match wins within that family); the power-step
-/// fallback (`POWER_STEP_BEACON_RE`) contributes one PER match it finds
-/// (see `parse_power_step_beacons`) -- but only when NONE of a bare `CQ`,
-/// `TEST` or `DE` token appears anywhere else in `text` at all.
+/// Every context match in `text`, read as a complete exchange: each
+/// occurrence `exchange::interpret` calls `self_id` with a spot type, then
+/// each `<call> T` power-step shape (see `parse_power_step_beacons`) -- but
+/// only when NONE of a bare `CQ`, `TEST` or `DE` token appears anywhere in
+/// `text` at all.
 ///
-/// That last rule is deliberately coarse, not position-scoped: a lone `T`
-/// is also the single most common garbled/noise decode in CW, so without
-/// SOME guard, an ordinary, unrecognized CQ/DE call (one whose own
-/// adjacency-strict pattern merely failed to match, e.g. a garbled word
-/// in `CQ EE <call>`) would get mistagged `Beacon` and wrongly bypass
-/// the repetition gate. Three rounds of review (Codex review on PR #65,
-/// rounds 3-6) tried increasingly precise position/range-based versions of
-/// this guard -- scoped to the fallback's own vicinity, then to whether a
-/// resolved named match's own range covered the nearby token, then to a
-/// wider filler-word bound -- and each one only shifted the false-positive
-/// gap to a new, subtler input shape (a resolved match elsewhere bridging
-/// over genuinely unresolved content, a named match failing to cover a
-/// SECOND resolved fragment, etc.). Given the real cost is asymmetric --
-/// `Beacon` only lifts the repetition-gate requirement, it doesn't bypass
-/// grammar/cty (ARCHITECTURE §6 step 4), and a real NCDXF beacon repeats
-/// every ~10s, so a window suppressed by unrelated nearby CQ/DE chatter is
-/// very likely followed by a clean one shortly after -- the simpler,
-/// coarser rule was chosen deliberately over continuing to chase
-/// text-position edge cases: occasionally missing a real beacon in a busy
-/// window is a far smaller cost than reward-hacking a smarter-looking
-/// heuristic that keeps finding new ways to be wrong.
-///
-/// The range lets a caller distinguish a genuine reclassification (driven
-/// by a newly-arrived word) from a type merely changing because an older
-/// framing word aged out of its own rolling window -- MAN-28 round 12
-/// review: `manta-spot::Validator` maps each candidate's range back to
-/// word identities and only accepts a reclassification when it covers a
-/// word younger than any that produced the previous classification. This
-/// is also what reconciles two candidates naming the SAME callsign (e.g.
-/// "CQ K5ARH K5ARH", if a trailing "T" arrived without any bare CQ/DE
-/// having already ruled the fallback out): both map to the same decoded
-/// `Word`, and that word's own seq-based provenance guard -- not a
-/// text-position heuristic here -- decides whether the second one is a
-/// genuine reclassification. `parse` itself does not try to pick a winner
-/// between candidates beyond the coarse guard above (Codex review on PR
-/// #65, rounds 2-4: every attempt at a finer text-level
-/// recency/same-callsign/"one match per family" heuristic here proved too
-/// coarse in a new way every round); it just reports what it found and
-/// lets the caller's real per-word state decide.
-///
-/// A `DE <call>` match is classified `Cq` (not `De`) when a bare `CQ`
-/// token also appears anywhere in `text`, or when a bare `TEST` directly
-/// precedes that match (`CQ_FILLER` words allowed between) and
-/// `test_is_a_sign_off` does not reject it -- the common `CQ CQ DE <call>`
-/// (or contest `TEST DE <call>`) transmission shape, where the callsign
-/// always follows `DE` but the operator is calling CQ, not answering one.
-///
-/// The 4th element of each returned tuple is `Some(exact call-word range)`
-/// for a power-step-origin candidate, `None` for a named-pattern-origin
-/// one. Named patterns deliberately do NOT get exact-word binding: V29
-/// (MAN-28 round 13) depends on `Validator` resolving a named candidate to
-/// the NEWEST word sharing its text, specifically ignoring which
-/// occurrence the regex itself matched (a repeated "DE K5ARH ... DE
-/// K5ARH" must credit the newest occurrence, not the first one DE_RE's
-/// own match happens to describe). The power-step fallback needs the
-/// opposite: exact binding to the one word the regex actually captured,
-/// not a text search that could land on an unrelated, unsuppressed same-
-/// text word (round 9). Both are real, already-tested requirements that
-/// directly conflict for a single shared resolution strategy, so each
-/// pattern family gets the one it needs.
+/// That guard is deliberately coarse, not position-scoped: a lone `T` is the
+/// single most common garbled decode in CW, so an unrecognized CQ/DE call (a
+/// garbled word in `CQ EE <call>`) would otherwise read as a beacon. Three
+/// review rounds (PR #65, rounds 3-6) tried position- and range-scoped
+/// versions, and each only shifted the false positive to a new input shape.
+/// Missing a beacon in a busy window costs less than that, so the coarser
+/// rule stands (MAN-37).
 pub fn parse(text: &str) -> Vec<ContextMatch> {
-    let mut candidates = Vec::new();
-    if let Some((call, ty, range)) = parse_named_pattern(text) {
-        candidates.push((call, ty, range, None));
+    let mut ranges = Vec::new();
+    let mut end = 0;
+    for word in text.split_whitespace() {
+        let start = end + text[end..].find(word).unwrap_or(0);
+        end = start + word.len();
+        ranges.push(start..end);
     }
+    let words: Vec<ExchangeWord<'_>> = ranges
+        .iter()
+        .map(|r| ExchangeWord {
+            text: &text[r.clone()],
+            ends_turn: false,
+            corrected: false,
+        })
+        .collect();
+    let mut candidates: Vec<ContextMatch> = exchange::interpret(&words, true)
+        .into_iter()
+        .filter(|o| o.role == Role::SelfId)
+        .filter_map(|o| {
+            let spot_type = o.frame.and_then(exchange::Frame::spot_type)?;
+            let first = ranges[o.span.start].start;
+            let last = ranges[o.span.end - 1].end;
+            Some((
+                o.call,
+                spot_type,
+                first..last,
+                Some(ranges[o.index].clone()),
+            ))
+        })
+        .collect();
     if !power_step_framing_is_unresolved(text) {
         for (call, ty, range, call_range) in parse_power_step_beacons(text) {
             candidates.push((call, ty, range, Some(call_range)));
@@ -410,7 +248,10 @@ mod tests {
     fn cq_de_call_call_is_cq_type() {
         assert_eq!(
             parse_types("CQ CQ DE K5ARH K5ARH K"),
-            vec![("K5ARH".to_string(), SpotType::Cq)]
+            vec![
+                ("K5ARH".to_string(), SpotType::Cq),
+                ("K5ARH".to_string(), SpotType::Cq)
+            ]
         );
     }
 
@@ -426,7 +267,10 @@ mod tests {
     fn cq_test_call_is_cq_type() {
         assert_eq!(
             parse_types("CQ TEST K5ARH K5ARH"),
-            vec![("K5ARH".to_string(), SpotType::Cq)]
+            vec![
+                ("K5ARH".to_string(), SpotType::Cq),
+                ("K5ARH".to_string(), SpotType::Cq)
+            ]
         );
     }
 
@@ -442,7 +286,10 @@ mod tests {
     fn v_v_v_call_is_beacon_type() {
         assert_eq!(
             parse_types("V V V K5ARH K5ARH"),
-            vec![("K5ARH".to_string(), SpotType::Beacon)]
+            vec![
+                ("K5ARH".to_string(), SpotType::Beacon),
+                ("K5ARH".to_string(), SpotType::Beacon)
+            ]
         );
     }
 
@@ -452,17 +299,14 @@ mod tests {
     }
 
     #[test]
-    fn de_call_range_covers_only_the_de_match_when_no_cq_present() {
+    fn de_call_range_covers_the_de_and_the_call_when_no_cq_present() {
         let text = "DE K5ARH K";
         let candidates = parse(text);
         assert_eq!(candidates.len(), 1);
         let (_, ty, range, exact) = &candidates[0];
         assert_eq!(*ty, SpotType::De);
         assert_eq!(&text[range.clone()], "DE K5ARH");
-        assert_eq!(
-            *exact, None,
-            "named-pattern candidates get no exact-word range"
-        );
+        assert_eq!(&text[exact.clone().unwrap()], "K5ARH");
     }
 
     #[test]
@@ -643,7 +487,10 @@ mod tests {
         // ...while a genuine bare CQ still reclassifies, as before.
         assert_eq!(
             parse_types("CQ CQ DE K5ARH K5ARH K"),
-            vec![("K5ARH".to_string(), SpotType::Cq)]
+            vec![
+                ("K5ARH".to_string(), SpotType::Cq),
+                ("K5ARH".to_string(), SpotType::Cq)
+            ]
         );
     }
 
@@ -708,7 +555,7 @@ mod tests {
         // grammar accepted could be skipped while being a real call, or spot
         // by itself when captured in a transient "CQ <filler>" window.
         for filler in CQ_FILLER.split('|') {
-            assert!(!grammar::is_plausible(filler), "{filler}");
+            assert!(!crate::grammar::is_plausible(filler), "{filler}");
         }
     }
 
@@ -743,7 +590,10 @@ mod tests {
         // A sign-off before an earlier, leading "TEST <call>" changes nothing.
         assert_eq!(
             parse_types("TEST W5AU W5AU TU TEST K1ABC"),
-            vec![("W5AU".to_string(), SpotType::Cq)]
+            vec![
+                ("W5AU".to_string(), SpotType::Cq),
+                ("W5AU".to_string(), SpotType::Cq)
+            ]
         );
     }
 
@@ -783,8 +633,6 @@ mod tests {
             "TU W5AU TEST DE K1ABC",
             "TU TEST TEST DE K1ABC",
             "TEST TU TEST DE K1ABC",
-            "TEST W5AU W5AU DE K1ABC",
-            "TU TEST DE K1ABC K1ABC TEST DE W5AU",
         ] {
             assert_eq!(
                 parse_types(text),
@@ -792,6 +640,22 @@ mod tests {
                 "{text}"
             );
         }
+        // MAN-201: every sending occurrence is reported, not only the first.
+        assert_eq!(
+            parse_types("TEST W5AU W5AU DE K1ABC"),
+            vec![
+                ("W5AU".to_string(), SpotType::Cq),
+                ("K1ABC".to_string(), SpotType::De)
+            ]
+        );
+        assert_eq!(
+            parse_types("TU TEST DE K1ABC K1ABC TEST DE W5AU"),
+            vec![
+                ("K1ABC".to_string(), SpotType::De),
+                ("K1ABC".to_string(), SpotType::De),
+                ("W5AU".to_string(), SpotType::De)
+            ]
+        );
         // A TEST the guard accepts still promotes, as does a bare CQ after
         // a rejected TEST.
         for text in ["W5AU TEST DE W5AU", "TU TEST CQ DE K1ABC"] {

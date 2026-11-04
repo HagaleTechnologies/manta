@@ -192,7 +192,11 @@ side of it together. A loss the input splices over and counts instead
 (MAN-305: HPSDR protocol 2's lost datagrams, `take_missing_samples`)
 moves the live engine's clock on without closing tracks, but the
 recording does not carry it: a replay runs the spliced samples together,
-so its timestamps after such a loss are early by the lost duration.
+so its timestamps after such a loss are early by the lost duration. A stream
+that stops long enough for the engine to close its tracks and then resumes
+with no reconnect (ka9q after 5 s, MAN-201) leaves a zero-length `gap` record,
+so a replay closes its tracks there too; its timestamps after the pause are
+early by the pause.
 
 `manta decode` handles them the same way: it closes its tracks at each
 gap, as a discontinuity rather than an end of signal, and starts a fresh
@@ -217,6 +221,24 @@ A stop signal ends that wait within about 0.1 s, so a long recorded
 outage does not hold up shutdown.
 `--loop` keeps a gap at the end of the recording and reports it at the
 start of the next pass.
+
+### Finding out why a station was not spotted
+
+Replay the recording with `--observations` to write why each callsign
+candidate was or was not spotted (MAN-207,
+[OBSERVATIONS.md](../OBSERVATIONS.md)):
+
+```sh
+manta decode session.cf32 --observations session.jsonl
+jq -c 'select(.call=="K5ARH")' session.jsonl
+jq -c 'select(.trackId==12)' session.jsonl
+```
+
+Each line names the candidate, its `decision` and `reason` (for example
+`withheld` for `repetition`: only one copy was heard), and the earlier
+copies the repetition gate counted. A call heard only as the station being
+called is a `notCandidate` line with its `role` (`addressee`). Add
+`--observation-text` for the decoded characters.
 
 ## Headerless cf32 and ci16
 

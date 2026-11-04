@@ -108,11 +108,18 @@ Per hop, for a track whose selected channel is `k₀`, two estimators run.
 
 **Ownership centroid** (§2.5) and the drift fitter's input (§2.8):
 
-- Quadratic interpolation on **dB** powers of `(k₀−1, k₀, k₀+1)`:
-  `δ_m = 0.5·(P₋ − P₊) / (P₋ − 2P₀ + P₊)` where `P• = PdB[k₀•, m]`.
-  Clamp `δ_m` to `[−0.5, +0.5]`; if the denominator ≥ 0 (no local max — a
-  peak requires `P₋ − 2P₀ + P₊ < 0`), set `δ_m = 0` and mark the hop unusable.
-- Centroid `C`: an EMA of `k₀ + δ_m` with α = 0.01 over the usable hops.
+- On unsuppressed, non-DORMANT hops at least 6 dB over the channel floor,
+  unwrap the lag-1 phase position (defined below) near `C`. Accept only
+  positions within 0.6 channel of `C`; update `C` with EMA α = 0.01.
+  The same outlier gate guards the spot-frequency phase sum (MAN-112).
+- At CANDIDATE → ACTIVE, a track with no other track's centre within 2.5
+  channels re-seeds `C` to the median of the phase positions it saw as a
+  CANDIDATE (ungated, same 6 dB rule), when there are at least 8 and their
+  interquartile range is at most 0.2 channel. A birth on the carrier's
+  skirt channel, more than 0.6 channel from the carrier, could otherwise
+  never pass the gate, and a split birth then took its carrier (MAN-112).
+- Key-up holds `C`. Power-only synthetic hops without complex observations
+  retain the three-bin dB parabola for detector unit tests only.
 
 **Spot frequency** (MAN-114): a power-weighted lag-1 phase estimator.
 
@@ -387,10 +394,22 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
 - A track tracks a fractional center `c` (the §1.4 running centroid,
-  initialized to its birth channel `k₀`). It **owns** channels
+  initialized from the gated spawn phase position when available, otherwise
+  its birth channel `k₀`). It **owns** channels
   `{round(c) − 1, round(c), round(c) + 1}`.
-- A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
-  with the incumbent.
+- A rising local maximum in an owned channel may spawn a second track
+  when it is at least 0.8 channel from every owning track's centre,
+  each owner has phase-frequency evidence, and no owner is DORMANT.
+  The peak also needs two consecutive observations at least 6 dB over its
+  floor whose lag-1 phase position is at least 100 Hz from each owner.
+  This prevents a loud carrier's skirt from posing as an independent signal.
+  For unowned peaks too, a usable phase position more than 0.6 channel from
+  the peak bin vetoes birth; missing phase observations keep the power-only
+  unowned-peak rule. A birth with no open track's centre within 2.5
+  channels is isolated: it uses the power-only unowned-peak rule and starts
+  at `k₀`, because one rising-edge phase observation can veto or mis-seed
+  it, which shifted single-signal births by a few hops (MAN-112).
+  Closer candidates are absorbed (MAN-112).
 - A DORMANT track (§2.4) keeps its ownership: its channels block spawns,
   and a rise sustained there re-acquires it instead (MAN-108).
 - A rising, unowned channel `k` may start a spawn decision only if its
@@ -434,24 +453,41 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   applies this to `k+1`'s own window. Gating the birth channel alone let a
   neighbour-born candidate absorb the cooling channel via max-power
   selection. (MAN-197, see docs/DECISIONS/2026-10-14-man197-respawn-cooldown-ownership-window.md)
-- Each hop, the track's demod input is taken from the **max-power channel
-  among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
-  owned set follows `round(c)` as the centroid drifts, which is how drifting
-  signals (§7 test 9) are followed without retuning. A live track's
-  selection additionally **skips channels still serving a post-`Silent`
-  respawn cooldown**, falling back to the plain max-power channel only when
-  every owned channel is cooling: a candidate born two bins from a cooling
-  channel passes the spawn gate legitimately, yet a stronger neighbour can
-  drag `round(c)` onto the cooling channel, whose continuous power would
-  otherwise keep the track decoding the silenced birdie for a whole extra
-  GC cycle inside the cooldown window. (MAN-197, see
-  docs/DECISIONS/2026-10-14-man197-live-window-cooldown-enforcement.md)
+- Each hop, tracking selects the max-power owned channel after skipping
+  post-Silent cooldown channels and channels nearer another track's centre.
+  Distances wrap around the FFT; exact ties go to the lower track id.
+  If no exclusive channel remains, use the existing cooldown-aware maximum,
+  falling back to the plain maximum only when all owned channels are cooling
+  (MAN-197). Before the straddle override, if a selected channel is more
+  than 1.0 channel from the centre, two consecutive complex observations
+  at least 6 dB above its floor reject it when its phase position is more
+  than 0.6 channel from the centre. Select the strongest remaining exclusive,
+  non-cooling owned channel passing that phase check; if none remains,
+  retain the previous selection. Missing phase evidence does not reject a
+  channel. The centre snapshot is taken before driving any track.
+- With a neighbor within 2.5 channels, decoder input uses
+  the rounded centre when that channel is exclusive and
+  not cooling; otherwise it uses the selected channel. Tracking retains the
+  exclusive max-power selection (F1, MAN-112). The optional
+  refiner remains on the centroid channel. At a straddle (at least 0.40
+  channel from the nearest integer), the closest neighbor within 2.0 channels
+  selects the straddle channel away from that neighbor, provided it is
+  exclusive and not cooling. This selection ignores instantaneous neighbor strength.
+  A neighbor 2.0 channels or more away leaves the selection alone: the
+  facing channel is outside its main lobe, and reading the away channel
+  biases the centroid toward the straddle (MAN-112). The experimental steered frontend
+  is off by default and is available only through the Rust pipeline config.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
-  neither is owned, a spawn decision at `k` creates one CANDIDATE at the
+  both pass the ownership admission rule, a spawn decision at `k` creates one CANDIDATE at the
   higher instantaneous-power channel. This existing pairing rule can select
   `k+1` even when only `k` is a smoothed-power local maximum.
 - Two tracks whose centers converge within 1.0 channel (interference or
-  drift-collision) are merged: the lower-SNR track is CLOSED with reason
+  drift-collision) merge unconditionally only below 0.5 channel. Between
+  0.5 and 1.0 channel, they merge only when their selected-channel dB
+  envelopes have at least 150 contemporaneous unsuppressed hops and Pearson
+  correlation >= 0.6 over the last at most 750 observations per track.
+  Constant envelopes provide no correlation evidence. Dormancy clears that
+  history. On a merge, the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
   stands). On equal SNR the older track (lower `track_id`) survives.
   (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
@@ -754,6 +790,9 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `SHORT_MARK_DEBOUNCE_HOPS` | 4 | D′: key-down/key-up run debounce for a keyed mark |
 | `SHORT_HYST_FRAC` | 0.15 | D′: keyed-marks hysteresis half-band, fraction of the Q10–Q90 gap |
 | `SHORT_MIN_KEYING_RATIO` | 2.0 | D′: Q90/Q10 ratio the queued input must show at all |
+| `KEYDOWN_DOMINANCE_CH` / `KEYDOWN_DOMINANCE_DB` | 2 / 10.0 | MAN-112: a channel this close and this much louder than `k` makes the hop not key-down |
+| `KEYDOWN_LEVEL_SPAN_DB` | 30.0 | MAN-112: a key-down hop lies within this of the track's strongest key-down SNR |
+| `KEYDOWN_MARK_SWING_DB` | 10.0 | MAN-112, D′: a key-down mark ends this far under its own maximum; the next starts this far over the gap's minimum |
 
 **A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
 hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
@@ -780,7 +819,14 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
   at each evaluation, so D′ can fire only at the first evaluation after a
   drop.
 - A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
-  track's selected channel (§2.5). On it, until the track qualifies:
+  track's selected channel (§2.5), where no channel within
+  `KEYDOWN_DOMINANCE_CH` of `k` is `KEYDOWN_DOMINANCE_DB` or more louder,
+  and whose SNR is no more than `KEYDOWN_LEVEL_SPAN_DB` below the
+  strongest key-down SNR so far (MAN-112). Frequency-anchored association
+  (§2.5) keeps a swept carrier's track in place after the carrier moves
+  on; without these two clauses its edge channel kept reading the
+  departed carrier (its skirt, or the channel filter's ringing) as
+  key-down, which flattened the slope. On it, until the track qualifies:
   - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
     `t = hop − first key-down hop` and `f = wrap(k − k₀) + δ` in
     channels, where `k₀` is the birth channel, `wrap` maps to
@@ -789,6 +835,13 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
     key-down hop's `t`. The slope in Hz/s is the least-squares `df/dt`
     (channels per hop) × channel spacing × hops per second
     (4 × spacing; 375 at 93.75 Hz).
+  - **Key-down marks** (MAN-112, D′): over every hop until the track
+    qualifies, with each non-key-down hop read as −∞ dB, a mark ends after
+    `SHORT_MARK_DEBOUNCE_HOPS` hops at least `KEYDOWN_MARK_SWING_DB` under
+    the mark's maximum SNR, and the next mark starts, and counts, after as
+    many hops that far over the gap's minimum. The thresholds follow the
+    local extremes, so a fast element gap that the channel filter keeps
+    above `on_snr_db` still separates two marks.
   - **Flatness:** let `side = max(PdB[k±2], PdB[k±3])` (indices mod N).
     The hop is **non-flat** when `|PdB[k] − side| ≥ ISO_DB`: a neighbour
     at least 6 dB louder is a different signal, so only a neighbourhood
@@ -920,6 +973,9 @@ track qualifies when all hold:
   The count is computed only at an evaluation where the track is in HANG
   with `dropped_since_eval` set — one quantile selection over the bounded
   queue per drop, nowhere else.
+- **key-down marks ≥ `SHORT_MIN_MARKS`** (MAN-112, B): a carrier swept
+  past a frequency-anchored track is one key-down run, however its queued
+  amplitudes ripple below `on_snr_db` after it has passed.
 
 Qualification through D′ leases the decoder, replays the queue and emits
 the deferred `TrackPromoted` exactly as D does. A track still unqualified
@@ -1494,8 +1550,11 @@ decode (MAN-28). `r` still feeds `c_call` above unchanged, so a spot of
 either kind still carries the `r=1` confidence penalty at the repetition
 count it actually resolved with. An allowlisted callsign also bypasses
 ARCHITECTURE §6 steps 1 (context parse -- tagged `SpotType::Unknown` when no
-CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, and may spot
-the instant its pattern completes, as before.
+CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, but not role:
+a listed call heard only as the station called or mentioned is not spotted.
+Every candidate is decided at settle, once another word follows its run, its
+turn ends or its track ends (MAN-201). A `BEACON` tag needs `V V V` or an
+allowlisted power-step ID.
 
 **Beacon emission timing (amended 2026-09-09, see
 `docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md`):** a
@@ -1833,6 +1892,9 @@ in the fixture manifest. Text payload (unless stated):
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 | V52 | zero-evidence | `CQ DE W1AW W1AW K` event sequences at the validator event contract, every `char_decoded` confidence 0.0 (with and without SCP), plus positive-control and mixed-`?` variants | n/a (event stream, not audio) | no spot from the all-zero streams and a withheld `NoEvidence` decision; positive evidence still spots; a mixed word still spots; a two-rep clean CQ spot is `confirmed`, a single-rep allowlisted spot `tentative`; `emissionState` serializes `confirmed`/`tentative` (MAN-106) |
 
+V7 close-pair variants and the unchanged two-track/CER/frequency gates are in
+`crates/manta-cli/tests/golden_close_pairs.rs` (MAN-112).
+
 V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
 frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz
 control renders of the same scene, which was read as a channel-table-size
@@ -1887,11 +1949,13 @@ are implemented in `crates/manta-spot/tests/golden_v11_v15.rs`; V16-V17
 (operator suppression, MAN-31 -- orthogonal to this pipeline, see
 ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 (non-gating RST/QRL? spot annotations, MAN-272) in
-`crates/manta-spot/tests/golden_v32_v33.rs`.
+`crates/manta-spot/tests/golden_v32_v33.rs`; V53-V57 (exchange roles, MAN-201)
+in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
+`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
-| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family |
+| V11 | context-parse | Each of `CQ <call>`, `CQ TEST <call>`, `CQ <contest> <call>` (e.g. `CQ WPX`; filler set per `manta-spot::context`), `TEST <call>`, `DE <call>`, `<call> UP`, `V V V <call>`, `<call> T` | Correct `SpotType` assigned per pattern family. Amended (MAN-201): the `<call> T` row runs with the call allowlisted |
 | V12 | bogus-prefix | Structurally-valid callsign with a prefix absent from cty.dat | 0 spots, even though grammar passes |
 | V13 | scp-boost | Same callsign/confidences with vs. without SCP membership | `c_call` strictly higher when a member; absence never rejects |
 | V14 | repetition-gate | 1 decode vs. 2 decodes of a common-pattern callsign within 90 s, non-beacon spot type | 1 rep never spots; the tier's requirement (2 for a common pattern) spots |
@@ -1903,20 +1967,20 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 | V20 | allowlist-no-context | An allowlisted callsign decoded with no CQ/DE/UP/beacon framing at all | Spots, tagged `SpotType::Unknown` (MAN-28 Watch List, the primary NCDXF-beacon case) |
 | V21 | allowlist-independent-of-context | A stale, already-attempted context match (e.g. `CQ K5ARH`, decoded once, never spotted) sits in the window when a different, freshly-allowlisted word arrives | The allowlisted word still spots -- context-match and allowlist candidates are evaluated independently, not one-or-the-other by priority (MAN-28 Watch List) |
 | V22 | exempt-spot-waits-for-metadata | An allowlisted callsign decoded before the track's first `TrackMeta` event | No spot until real telemetry arrives; the pending candidate spots once metadata does arrive, on the next word boundary. A non-allowlisted BEACON candidate decoded before `TrackMeta` is captured once metadata arrives and spots only at `TrackClosed` (V18/V30; `power_step_beacon_retains_every_unattempted_occurrence_across_the_metadata_gate`) |
-| V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type |
+| V23 | allowlist-reclassification | An allowlisted call spots immediately with no context (type `Unknown`), then a trailing word completes a real context pattern (e.g. `<call> UP` -> `De`) | A second, corrected spot is emitted with the new type -- an already-attempted word is not permanently locked to its first type. Amended (MAN-201): a call's type is decided once, at settle; the word that settles it can type it, but no later word reclassifies it |
 | V24 | reclassification-reps-reuse | "DE K5ARH" decodes once (reps=1, held back by the repetition gate), then a trailing `CQ` token reclassifies the same word from `De` to `Cq` | Still 0 spots -- the reclassification reuses the word's existing rep count rather than recording a second decode |
 | V25 | metadata-retries-pending-candidate | A `TrackMeta` event arrives for a track with a pending allowlisted candidate (held back by V22) and no further word ever completes | The candidate is retried and spots as part of the `TrackMeta` ingest itself, not left waiting on a `WordBoundary` that may never come. A pending non-allowlisted BEACON candidate is captured at that `TrackMeta`, not spotted; it spots only at `TrackClosed` (V18/V30) |
 | V26 | reclassification-never-downgrades | "DE K5ARH" spots as `De`; 15 more words push "DE" out of the 16-word window while "K5ARH" remains | No spot reverts to `Unknown` -- reclassification only ever promotes a word's type, never downgrades one that already earned a contextual type |
 | V27 | reclassification-never-downgrades-between-types | "CQ DE K5ARH" spots as `Cq`; 15 more words push both "CQ" and "DE" out of the window while "K5ARH" remains | No spot reclassifies to `De` -- the same aging-out bug shape as V26, for a pair of two contextual types instead of type-vs-`Unknown` |
-| V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general |
+| V28 | reclassification-still-accepted | "DE K5ARH" spots as `De`; a `CQ` token then arrives as a genuinely new trailing word (not via aging) | A second spot promotes it to `Cq` -- V26/V27's fix rejects aging-driven changes specifically, not reclassification in general. Amended (MAN-201): a call's type is decided once, at settle; the word that settles it can type it, but no later word reclassifies it |
 | V29 | provenance-bound-to-occurrence | "CQ DE K5ARH K CQ DE K5ARH" repeats DE-K5ARH across two genuinely separate messages (MAN-100 Scenario 2 requires the gap); the newest K5ARH spots as `Cq` after 2 reps, then "CQ" and the first "DE" age out while the second "DE K5ARH" remains | No spot reclassifies to `De` -- provenance is bound to the exact word occurrence `evaluate_candidate` selects, not whichever occurrence the regex matched first |
-| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note |
+| V30 | power-step-beacon-exemption | 1 decode of a `<call> T` power-step beacon pattern (MAN-37), track closed at a plausible speed | `BEACON`-tagged spot emits once the track closes, gate not applied regardless -- same exemption V18 proves for `V V V <call>`, extended to the power-step pattern; emission timing per V18's amendment note. Amended (MAN-201): the exemption needs the call on the allowlist, where it spots on the first decode; an unlisted `<call> T` does not spot (V58) |
 | V32 | rst-on-spot | A track decodes `TU 5NN` before its callsign spots; a later `339` replaces it; a report aged out of the 16-word window is still carried | The spot carries `rst = "599"`, then `"339"`; aged-out still `"599"`; no report → `null` |
 | V33 | qrl-query-flag | A track sends `QRL?` before its callsign spots; bare `QRL`; a merge loser's `QRL?`; a closed track's `QRL?` | `qrl_query` true only in the first case; a merge survivor and a new track carry neither annotation (MAN-272 D5) |
 | V38 | variant-arbitration | A track decodes both a callsign and a confusable, less-supported variant of it (truncation or shared-prefix near-miss) inside one 90 s window -- variants V38b (per-track scoping) and V38c (a well-supported real call is not suppressed by a 1-rep head-merge artifact) | Only the better-supported candidate spots; arbitration is per track, and never fires against a form that could not itself be spotted |
 | V39 | same-message-repetition | One `CQ CQ DE <CALL> <CALL> K` transmission, then a second, genuinely later one | The first message's doubled call alone never satisfies the repetition gate (2 for its common pattern); the second message completes it |
 | V40 | truncation-arrives-first | A strict-prefix truncation clears the repetition gate on a track before the genuine, longer call has any support at all, which then appears | The genuine call still spots once observed -- the prefix-containment asymmetry fires regardless of arrival order (MAN-100 remediation C1) |
-| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2) |
+| V41 | short-id-wide-time-gap | A 2-word ID ("DE `<CALL>`") repeated 80 s apart -- below `MIN_MESSAGE_WORD_GAP` but past `MIN_MESSAGE_TIME_GAP_SECONDS` | Still clears the repetition gate as two distinct messages (MAN-100 remediation C2). Amended (MAN-201): the event sequence closes the track, which settles the last call |
 | V42 | beacon-exempt-from-arbitration | A confusable rival of a `BEACON`-tagged candidate reaches more reps than the genuine, once-per-cycle beacon | The genuine beacon still spots -- `BEACON` candidates are exempt from step 4b arbitration (MAN-100 remediation C3) |
 | V43 | short-id-ordinary-cadence-unspotted | A 2-word ID ("DE `<CALL>`") repeated only twice, 20 s apart -- below both `MIN_MESSAGE_WORD_GAP` and `MIN_MESSAGE_TIME_GAP_SECONDS` | Not spotted -- an accepted, bounded recall cost (MAN-100 remediation C2, quantified), not tightened further |
 | V44 | 1-rep-rival-still-wins-by-shape | The literal, measured V8w track-90 shape: a 3-rep truncation ("W6JQ") vs. its genuine, longer form ("W6JQA") observed only once on the track | The truncation is withheld -- shape decides a prefix-containment pair once the rival has been observed at all, regardless of how few reps it has (MAN-100 remediation round 3; a rival-side rep floor tried in remediation C5 excluded this exact case and was reverted) |
@@ -1927,6 +1991,12 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 | V48 | unlisted-pattern-five-reps | `DE W4KTNL K` with its pattern absent, on the same track | No spot through 4; spots at 5 message-distinct repetitions |
 | V49 | minimal-level-is-flat-two | V48's unlisted pattern at `validation_level = "minimal"` | No spot at 1; spots at 2 |
 | V50 | exemptions-ignore-pattern-tier | An unlisted-pattern allowlisted call, then a `V V V <call>` beacon | Allowlisted call spots at its first decode; beacon spots at track close with confirmed plausible speed |
+| V53 | addressee-never-spotted (MAN-201) | `DE W1AW DE K1ABC K` twice; the same with no turn end, 1 s and 6.25 s apart; `W1AW W1AW DE K1ABC K1ABC K` twice | K1ABC spots `De` at its own word's boundary; W1AW never spots and no decision names it. Unterminated pairs under the 5 s bound spot neither call |
+| V54 | bare-cq-with-filler (MAN-201) | `CQ DX W1AW` once, then twice and closed | No spot, then W1AW `Cq` `confirmed` |
+| V55 | stale-cq (MAN-201) | A `CQ` many words back from a different station, then `DE K1ABC K1ABC K`; `CQ W1AW DE K1ABC` | K1ABC `De`, never `Cq`; in the second, no W1AW |
+| V56 | allowlist-skips-plausibility-not-role (MAN-201) | W1AW listed, `W1AW DE K1ABC K` and `DE K1ABC K1ABC OP W1AW K`; lone `W1AW`; K5ARH listed, `K5ARH T` | No W1AW spot; one `Unknown` at close; one `Beacon` at K5ARH's boundary |
+| V57 | decided-once-settled (MAN-201) | `DE K5ARH`, K5ARH listed, then each of: next word, `K`, `<AR>`, a character or `TrackMeta` 5 s later, `TrackClosed` of either kind | No spot while K5ARH is the newest word; one spot at its own timestamp on each. 4.35 s settles nothing; `<ERR>` retracts a word; an older held occurrence behind a newer spot is withheld `dedupe`; a settled mention stays one after its framing scrolls out |
+| V58 | beacon-evidence (MAN-201) | `K5ARH T` and similar unlisted, listed and guarded; `V V V K5ARH` | Unlisted: no spot, one `BeaconNoEvidence` per occurrence. Listed: one `Beacon`. Guarded: neither. `V V V` keeps V18's deferred path |
 
 ### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
 
@@ -1990,6 +2060,8 @@ as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 | §5 events | `manta-decode::events` |
 | §7 vectors | `manta-testkit::vectors` |
 | §7.2 static-crash vectors | `manta-testkit::crash` |
+| §7 independent generator cross-check | `manta-testkit::baseband`, `::measure`, `::crosscheck` |
+| §7 failure minimizer, synthetic repros | `manta-testkit::scenespec`, `::minimize`, `::repro` |
 
 ## 9. Configuration keys
 
