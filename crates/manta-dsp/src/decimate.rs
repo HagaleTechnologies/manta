@@ -176,13 +176,11 @@ pub fn design_halfband(taps: usize) -> Vec<f32> {
 /// kept (every-other) input instants -- never spends a multiply-
 /// accumulate on a sample that will be dropped.
 ///
-/// NOTE: this already did not skip the ~half of `taps` that used to be
-/// structurally exactly zero (the classic halfband property) -- see
-/// `docs/SPEC-decode-core.md` §1.5 and issue #176 for the unrealized 2x
-/// MAC saving and the still-missing Pi4 CPU-budget bench for this stage.
-/// As of the `CUTOFF_FRACTION` change (see its doc comment), the cutoff no
-/// longer sits at exactly `fs_in/4`, so those taps are no longer exactly
-/// zero either -- issue #176's skip opportunity no longer applies here.
+/// NOTE: the cutoff (`CUTOFF_FRACTION`, see its doc comment) does not sit
+/// at exactly `fs_in/4`, so no tap is structurally zero (the classic
+/// halfband property does not hold) and `process` evaluates all `taps`;
+/// there is no zero-tap saving to take (`docs/SPEC-decode-core.md` §1.5).
+/// `benches/decimate.rs` (MAN-186) measures this stage's cost.
 pub(crate) struct HalfbandStage {
     taps: Vec<f32>,
     hist: std::collections::VecDeque<Complex32>,

@@ -168,16 +168,14 @@ the channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated
 rate must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
 Module: `manta-dsp::decimate`.
 
-A halfband filter has every other tap forced to zero by construction
-(except the center tap), which in principle halves the multiply-accumulate
-cost per output sample. The current implementation does not exploit this:
-`HalfbandStage::process` iterates all taps unconditionally, including the
-structurally-zero ones, so the 2x MAC saving is not yet realized. This is a
-known, deliberate gap for now (tracked in issue #176), not an oversight,
-and there is likewise no criterion bench yet measuring this stage's cost
-against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
-(above) also gives up this exact-zero-tap property, so issue #176's skip
-opportunity no longer applies to this stage regardless.
+The classic halfband property (every tap at a nonzero even offset from
+the center exactly zero, which would halve the multiply-accumulate cost per
+output sample) needs a cutoff at exactly `fs_in/4`. This stage's 0.235
+cutoff gives it up: none of the 62 even-offset taps is zero, so
+`HalfbandStage::process` evaluates all `HALFBAND_TAPS` taps and there is no
+zero-tap saving to take. `crates/manta-dsp/benches/decimate.rs` (MAN-186)
+measures the stage's cost; host numbers, with no Pi4 claim, are in
+[the MAN-186 decision record](DECISIONS/2026-11-03-man186-decimator-cost.md).
 
 **Trusted band** (MAN-196): the `CUTOFF_FRACTION` margin means channels
 near the decimated Nyquist edge see real, non-negligible attenuation
