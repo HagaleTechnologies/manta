@@ -1,9 +1,9 @@
 # MAN-166 decode-core diagnostics (2026-09-09)
 
 Throwaway, clean-room diagnostic scripts behind
-`docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` §1.
+`docs/archive/plans/specs/2026-09-09-decode-core-real-hf-design.md` §1.
 They are kept for reproducibility only; the real harness is Task 6 of
-`docs/superpowers/plans/2026-09-09-decode-core-v2.md`. Python 3 with
+`docs/archive/plans/plans/2026-09-09-decode-core-v2.md`. Python 3 with
 `numpy` + `scipy` (create a venv; nothing here is part of the build).
 
 - `probe2.py <B2.wav> <rbn.csv> <outdir> [max]` — numpy replica of the SPEC

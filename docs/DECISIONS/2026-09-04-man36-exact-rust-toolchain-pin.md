@@ -41,7 +41,7 @@ observed directly rather than hypothesized.
    `dtolnay/rust-toolchain@master` to accept an explicit `toolchain:` input
    ("the default is to match the @rev"), which would weaken this repo's
    SHA-pinning convention for third-party Actions
-   (`docs/superpowers/plans/2026-07-25-m2-soapysdr-input.md:19`). It would
+   (`docs/archive/plans/plans/2026-07-25-m2-soapysdr-input.md:19`). It would
    also duplicate the version string across five workflow steps — recreating
    the exact drift surface this ticket removes, just moved from "no pin" to
    "five pins that can independently go stale."

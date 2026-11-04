@@ -13,7 +13,7 @@ the original pins.
 | Fragment removed from ROADMAP.md | Record |
 |---|---|
 | Mac CPU measurements, the warmup correction, and the Pi4 estimate | [MAN-18 CPU-budget status](2026-09-02-man18-pi4-cpu-budget-gate.md) |
-| VR1–VR8 origin: the B2/K5TR keying-threshold defect V1–V10 missed, and their promotion to standing M2 gates (MAN-166) | [Decode-core real-HF design](../superpowers/specs/2026-09-09-decode-core-real-hf-design.md) §1 and §8 |
+| VR1–VR8 origin: the B2/K5TR keying-threshold defect V1–V10 missed, and their promotion to standing M2 gates (MAN-166) | [Decode-core real-HF design](../archive/plans/specs/2026-09-09-decode-core-real-hf-design.md) §1 and §8 |
 | The 2026-09-09 hsmm VR result, 3/9 passing | [Decode-core-v2 stage-2 gate](2026-09-09-decode-core-v2-stage2-gate.md) |
 | V8w spot recall restored to 28/50, with 0 bogus calls | [MAN-213 fading fixes](2026-10-05-man213-fade-tracking-keying-rails.md) |
 | PFB channelizer completion | [PFB pins](2026-07-18-m2-pfb-channelizer-pins.md) |

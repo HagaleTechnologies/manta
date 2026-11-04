@@ -1,8 +1,8 @@
 # M2 sub-project 2 (detector, track manager, decoder pool) implementation pins
 
 This is the M2 sub-project 2
-(`docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md`, design:
-`docs/superpowers/specs/2026-07-19-m2-detector-track-pool-design.md`)
+(`docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md`, design:
+`docs/archive/plans/specs/2026-07-19-m2-detector-track-pool-design.md`)
 implementation's pinned-decision record. Treat every numbered item below as
 decided; SPEC and docs/ still win on anything not listed here.
 
@@ -213,8 +213,8 @@ decided; SPEC and docs/ still win on anything not listed here.
     `render_scene` if a future vector needs finer drift-rate resolution.
 
 12. **V8/V8w pileup-scene validation and the CPU-budget criterion bench
-    are confirmed deferred**, restating the design doc's (`docs/
-    superpowers/specs/2026-07-19-m2-detector-track-pool-design.md` §1)
+    are confirmed deferred**, restating the design doc's
+    (`docs/archive/plans/specs/2026-07-19-m2-detector-track-pool-design.md` §1)
     explicit out-of-scope boundary as this sub-project's actual executed
     scope: the 50-signal pileup vectors (V8 AWGN, V8w Watterson) and the
     300-active-track CPU-budget bench are real scene/fixture-authoring and

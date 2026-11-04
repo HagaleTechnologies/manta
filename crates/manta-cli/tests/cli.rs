@@ -211,7 +211,7 @@ fn assert_exit_1_without_panic(out: &Output) {
 /// larger fraction than V1's full 120 s gate. Measured empirically (Task 11
 /// Step 0): CER = 0.1304, deterministic (V1's fixed `noise_seed`). 0.17
 /// gives headroom above that floor. See
-/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
+/// docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md.
 #[test]
 fn gen_then_decode_prints_text() {
     let dir = tempfile::tempdir().unwrap();
