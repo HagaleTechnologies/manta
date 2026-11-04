@@ -680,7 +680,7 @@ impl RepetitionGate {
         is_track_active: impl Fn(u32) -> bool,
     ) -> usize {
         let span = (span.0.min(span.1), span.1);
-        let reps = self.record_inner(
+        let (reps, _) = self.record_inner(
             track_id,
             freq_hz,
             callsign,
@@ -705,11 +705,59 @@ impl RepetitionGate {
         word_seq: u64,
         is_track_active: impl Fn(u32) -> bool,
     ) -> (usize, Vec<GateOccurrence>) {
+        self.record_traced_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            sample_ts,
+            None,
+            word_seq,
+            is_track_active,
+        )
+    }
+
+    /// `record_span`, plus the occurrences the entry holds after it, as
+    /// `record_traced` reads them (MAN-200 with MAN-207). Same effects as
+    /// `record_span`.
+    pub fn record_span_traced(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        span: (u64, u64),
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Vec<GateOccurrence>) {
+        let span = (span.0.min(span.1), span.1);
+        self.record_traced_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            span.1,
+            Some(span.0),
+            word_seq,
+            is_track_active,
+        )
+    }
+
+    /// `record_traced` and `record_span_traced`'s shared body.
+    #[allow(clippy::too_many_arguments)]
+    fn record_traced_inner(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        span_start: Option<u64>,
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Vec<GateOccurrence>) {
         let (reps, key) = self.record_inner(
             track_id,
             freq_hz,
             callsign,
             sample_ts,
+            span_start,
             word_seq,
             is_track_active,
         );
@@ -851,11 +899,12 @@ impl RepetitionGate {
                     .retain(|_, &mut (ts, _, _)| ts >= cutoff);
                 entry.spans.retain(|&(_, e, _)| e >= cutoff);
                 promote_orphaned_leader(&mut entry.accepted);
-                return entry
+                let reps = entry
                     .accepted
                     .iter()
                     .filter(|&&(_, _, _, counted, _)| counted)
                     .count();
+                return (reps, Some(entry_key));
             }
         }
         // Codex review, PR #152, round 8: a track's own previous touch
@@ -1074,6 +1123,34 @@ mod tests {
             assert_eq!(a, b);
             assert_eq!(counted.iter().filter(|o| o.message_distinct).count(), b);
         }
+        assert_eq!(plain.records_total(), traced.records_total());
+        assert_eq!(plain.repetition_counts(), traced.repetition_counts());
+        assert_eq!(plain.len(), traced.len());
+    }
+
+    /// MAN-200 with MAN-207: tracing a span-aware record changes nothing it
+    /// decides, including an overlapping replay counted once.
+    #[test]
+    fn record_span_traced_has_the_same_effects_as_record_span() {
+        let calls = [
+            (1, 7_080_000.0, "W1AW", (100, 400), 0),
+            (1, 7_080_000.0, "W1AW", (150, 420), 9),
+            (2, 7_080_010.0, "W1AW", (300_000, 300_400), 0),
+            (3, 14_020_000.0, "K5ARH", (0, 50), 0),
+            (4, f64::NAN, "N0CALL", (0, 50), 0),
+        ];
+        let mut plain = RepetitionGate::new(FS);
+        let mut traced = RepetitionGate::new(FS);
+        let mut reps = Vec::new();
+        for (t, f, c, span, seq) in calls {
+            let a = plain.record_span(t, f, c, span, seq, always_active);
+            let (b, counted) = traced.record_span_traced(t, f, c, span, seq, always_active);
+            assert_eq!(a, b);
+            assert_eq!(counted.iter().filter(|o| o.message_distinct).count(), b);
+            reps.push(b);
+        }
+        // [150, 420] overlaps [100, 400]: the same samples, still one.
+        assert_eq!(reps[..2], [1, 1]);
         assert_eq!(plain.records_total(), traced.records_total());
         assert_eq!(plain.repetition_counts(), traced.repetition_counts());
         assert_eq!(plain.len(), traced.len());

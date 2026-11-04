@@ -1,11 +1,6 @@
 {
-<<<<<<< HEAD
   "generated_at": "2026-11-03T06:45:00Z",
   "head_commit": "212fa51",
-=======
-  "generated_at": "2026-10-30T15:36:30Z",
-  "head_commit": "efa79c4",
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",

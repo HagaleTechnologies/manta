@@ -197,10 +197,8 @@ struct Word {
     text: String,
     confidences: Vec<f32>,
     /// MAN-200: each character's alternatives, parallel to `confidences`.
-    alternatives: Vec<Vec<(char, f32)>>,
-    /// MAN-200 D2: the first character's `sample_ts`; with `end_ts`, the
-    /// word's sample span.
-    start_ts: u64,
+    /// Kept at every observation detail level, unlike `alternatives`.
+    char_alternatives: Vec<Vec<(char, f32)>>,
     /// Assigned from `TrackState::next_word_seq` when this word is pushed
     /// to `TrackState::words` -- a per-track, strictly-increasing "age"
     /// used to tell a genuinely new supporting word apart from an older
@@ -251,7 +249,8 @@ struct Word {
     /// MAN-201: this word's `<call> T` occurrence has recorded its
     /// `BeaconNoEvidence` decision; each occurrence counts once.
     beacon_no_evidence_recorded: bool,
-    /// MAN-207: the first character's `sample_ts`.
+    /// MAN-207: the first character's `sample_ts`; with `end_ts`, the
+    /// word's sample span (MAN-200 D2).
     start_ts: u64,
     /// MAN-201: the `WordBoundary` `sample_ts` this word completed at. A
     /// settled occurrence is evaluated -- repetition gate, dedupe, decision
@@ -623,17 +622,14 @@ pub struct Validator {
     /// MAN-318: spots held until their base call's lookup settles, keyed by
     /// that base call, in hold order.
     held: BTreeMap<String, Vec<HeldSpot>>,
-<<<<<<< HEAD
     /// MAN-200: the opt-in evidence lattice (`with_repetition_fusion`).
     /// `None`, the default, allocates nothing.
     lattice: Option<EvidenceLattice>,
-=======
     /// MAN-207: the bounded observation record. Counts every decision at
     /// every detail level; keeps records only when `with_observations`
     /// asks for them.
     observations: ObservationLog,
     /// The sample rate, for `with_observations`.
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
     fs: f64,
 }
 
@@ -641,18 +637,16 @@ pub struct Validator {
 struct HeldSpot {
     spot: Spot,
     reps: u32,
-<<<<<<< HEAD
     /// MAN-200 D12: how the spot met its repetition requirement.
     confirmation: Confirmation,
+    /// MAN-207: the occurrence the held spot was decoded from.
+    id: ObservationId,
 }
 
 /// MAN-200 D12: the marker a spotted decision carries -- only a confirmed
 /// spot met its repetition requirement.
 fn confirmation_of(spot: &Spot, how: Confirmation) -> Option<Confirmation> {
     (spot.emission_state == EmissionState::Confirmed).then_some(how)
-=======
-    /// MAN-207: the occurrence the held spot was decoded from.
-    id: ObservationId,
 }
 
 /// MAN-207: which occurrence a decision is about, why it is recorded, and
@@ -693,7 +687,6 @@ fn evidence_links(counted: &[GateOccurrence]) -> Vec<EvidenceLink> {
             message_distinct: o.message_distinct,
         })
         .collect()
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
 }
 
 /// How often (in seconds of `sample_ts`) the repetition gate is swept
@@ -743,11 +736,8 @@ impl Validator {
             input_count: 1,
             lookup: None,
             held: BTreeMap::new(),
-<<<<<<< HEAD
             lattice: None,
-=======
             observations: ObservationLog::new(fs, ObservationPolicy::summary()),
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
             fs,
         }
     }
@@ -778,28 +768,21 @@ impl Validator {
     /// allowlisted, a call the lookup does not list is withheld, and one it
     /// has not answered yet is held until `poll_lookups`/`finish_lookups`.
     /// Dedupe has already stored the spot either way.
-<<<<<<< HEAD
     fn admit(
         &mut self,
         spot: Spot,
         reps: u32,
         allowlisted: bool,
         confirmation: Confirmation,
+        at: At,
     ) -> Option<Spot> {
-        let lookup = match &self.lookup {
-            Some(l) if !allowlisted => l.clone(),
-            _ => {
-                self.decide(|| {
-                    Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
-                });
-=======
-    fn admit(&mut self, spot: Spot, reps: u32, allowlisted: bool, at: At) -> Option<Spot> {
         let at = at.with_call_confidence(spot.confidence);
         let lookup = match &self.lookup {
             Some(l) if !allowlisted => l.clone(),
             _ => {
-                self.decide(at, None, || Decision::spotted(&spot, reps));
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+                self.decide(at, None, || {
+                    Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
+                });
                 return Some(spot);
             }
         };
@@ -811,32 +794,21 @@ impl Validator {
                 None
             }
             LookupStatus::Known(Existence::Exists | Existence::Unknown) => {
-<<<<<<< HEAD
-                self.decide(|| {
+                self.decide(at, None, || {
                     Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
                 });
-                Some(spot)
-            }
-            LookupStatus::Pending => {
-                self.decide(|| lookup_decision(&spot, Reason::LookupPending, reps));
-                self.held.entry(key).or_default().push(HeldSpot {
-                    spot,
-                    reps,
-                    confirmation,
-                });
-=======
-                self.decide(at, None, || Decision::spotted(&spot, reps));
                 Some(spot)
             }
             LookupStatus::Pending => {
                 let id = at.id;
                 let reason = Reason::LookupPending;
                 self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
-                self.held
-                    .entry(key)
-                    .or_default()
-                    .push(HeldSpot { spot, reps, id });
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+                self.held.entry(key).or_default().push(HeldSpot {
+                    spot,
+                    reps,
+                    confirmation,
+                    id,
+                });
                 None
             }
         }
@@ -881,18 +853,15 @@ impl Validator {
             let Some(held) = self.held.remove(&key) else {
                 continue;
             };
-<<<<<<< HEAD
             for HeldSpot {
                 spot,
                 reps,
                 confirmation,
+                id,
             } in held
             {
-=======
-            for HeldSpot { spot, reps, id } in held {
                 let at = At::new(id.track_id, id.word_seq, Cause::Settled)
                     .with_call_confidence(spot.confidence);
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
                 if let Some(reason) = self.held_operator_suppressed(&spot) {
                     self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 } else if existence == Existence::NotFound
@@ -901,13 +870,9 @@ impl Validator {
                     let reason = Reason::LookupNotFound;
                     self.decide(at, Some(reason), || lookup_decision(&spot, reason, reps));
                 } else {
-<<<<<<< HEAD
-                    self.decide(|| {
+                    self.decide(at, None, || {
                         Decision::spotted(&spot, reps, confirmation_of(&spot, confirmation))
                     });
-=======
-                    self.decide(at, None, || Decision::spotted(&spot, reps));
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
                     spots.push(spot);
                 }
             }
@@ -1144,13 +1109,10 @@ impl Validator {
     fn maybe_sweep(&mut self) {
         if self.now_ts.saturating_sub(self.last_swept_ts) >= self.sweep_interval_samples {
             self.gate.sweep(self.now_ts);
-<<<<<<< HEAD
             if let Some(lattice) = self.lattice.as_mut() {
                 lattice.sweep(self.now_ts);
             }
-=======
             self.observations.sweep(self.now_ts);
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
             // `merged_into` bounded the same way, on the same cadence, as
             // a memory-bound backstop for a root that lives past this
             // window without ever closing (its own `SignalEnded` retires
@@ -1295,13 +1257,9 @@ impl Validator {
                                 }
                             }
                         }
-                        if buffer_empty {
-                            track.current.start_ts = *sample_ts;
-                        }
                         track.current.text.push(c.to_ascii_uppercase());
                         track.current.confidences.push(*confidence);
-<<<<<<< HEAD
-                        track.current.alternatives.push(
+                        track.current.char_alternatives.push(
                             alternatives
                                 .iter()
                                 .filter_map(|(g, a)| match g {
@@ -1310,11 +1268,9 @@ impl Validator {
                                 })
                                 .collect(),
                         );
-=======
                         if keep_text {
                             track.current.alternatives.push(alternatives.clone());
                         }
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
                     }
                     Glyph::Prosign(Prosign::Err) => {
                         // SPEC §4.4: operator-error prosign discards the
@@ -2218,7 +2174,7 @@ impl Validator {
                     .chars()
                     .zip(&word.confidences)
                     .zip(
-                        word.alternatives
+                        word.char_alternatives
                             .iter()
                             .chain(std::iter::repeat(&Vec::new())),
                     )
@@ -2270,6 +2226,7 @@ impl Validator {
         };
         let fused_site = FusedSite {
             track_id,
+            word_seq: resolved_word_seq,
             sample_ts,
             spot_type,
             freq_hz,
@@ -2313,23 +2270,14 @@ impl Validator {
 
         if !is_allowlisted {
             if !grammar::is_plausible(&candidate) {
-<<<<<<< HEAD
-                self.decide(|| withheld(Reason::Grammar));
-                return self.try_fused_other(&fused_site, &candidate);
-            }
-            if !self.cty.is_allocated(&candidate) {
-                self.decide(|| withheld(Reason::Cty));
-                return self.try_fused_other(&fused_site, &candidate);
-=======
                 let reason = Reason::Grammar;
                 self.decide(at, Some(reason), || withheld(reason));
-                return None;
+                return self.try_fused_other(&fused_site, &candidate);
             }
             if !self.cty.is_allocated(&candidate) {
                 let reason = Reason::Cty;
                 self.decide(at, Some(reason), || withheld(reason));
-                return None;
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+                return self.try_fused_other(&fused_site, &candidate);
             }
         }
 
@@ -2357,41 +2305,30 @@ impl Validator {
             // identity continues on a survivor, so `self.merged_into`
             // (round 3) still counts it as active. See
             // `gate::message_distinct_indices`'s doc.
-<<<<<<< HEAD
-            self.gate.record_span(
-                track_id,
-                freq_hz,
-                &candidate,
-                (start_ts, sample_ts),
-                resolved_word_seq,
-                |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
-            ) as u32
-=======
             let is_active =
                 |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
             if self.observations.keeps_records() {
                 // MAN-207: the same record, plus the occurrences it counted.
-                let (reps, counted) = self.gate.record_traced(
+                let (reps, counted) = self.gate.record_span_traced(
                     track_id,
                     freq_hz,
                     &candidate,
-                    sample_ts,
+                    (start_ts, sample_ts),
                     resolved_word_seq,
                     is_active,
                 );
                 at.evidence = evidence_links(&counted);
                 reps as u32
             } else {
-                self.gate.record(
+                self.gate.record_span(
                     track_id,
                     freq_hz,
                     &candidate,
-                    sample_ts,
+                    (start_ts, sample_ts),
                     resolved_word_seq,
                     is_active,
                 ) as u32
             }
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
         };
         {
             let track = self.tracks.get_mut(&track_id)?;
@@ -2434,20 +2371,15 @@ impl Validator {
         // dispatch above).
         if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
         {
-<<<<<<< HEAD
             // MAN-200 D10: a fused winner that is this candidate's own text
             // replaces its `Repetition` decision; any other winner is
             // decided after it.
             let fused = self.fused_winner(&fused_site);
             if fused.as_ref().is_none_or(|f| f.call != candidate) {
-                self.decide(|| withheld(Reason::Repetition).with_reps(reps));
+                let reason = Reason::Repetition;
+                self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
             }
             return self.try_fused(&fused_site, fused);
-=======
-            let reason = Reason::Repetition;
-            self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
-            return None;
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
         }
 
         // MAN-100 step 4b: cross-candidate arbitration. Allowlisted calls
@@ -2533,8 +2465,7 @@ impl Validator {
             mode: SpotMode::Cw,
             baud: None,
         };
-<<<<<<< HEAD
-        self.admit(spot, reps, is_allowlisted, Confirmation::ExactRepeat)
+        self.admit(spot, reps, is_allowlisted, Confirmation::ExactRepeat, at)
     }
 
     /// MAN-200 D8/D9: the episode's confirmed winner, if every position is
@@ -2587,29 +2518,35 @@ impl Validator {
             Decision::withheld(track_id, sample_ts, &call, freq_hz, spot_type, reason)
                 .with_reps(reps)
         };
+        // MAN-207: a fused decision is recorded about the copy that
+        // triggered it, with no gate evidence links: the exact gate never
+        // counted the fused call.
+        let at = At::new(track_id, site.word_seq, Cause::Decided);
         if self.blocklist.contains(&call) {
             self.suppression_counts.blocklist += 1;
-            self.decide(|| withheld(Reason::Blocklist));
+            self.decide(at, Some(Reason::Blocklist), || withheld(Reason::Blocklist));
             return None;
         }
         if self.notch.contains(freq_hz) {
             self.suppression_counts.notch += 1;
-            self.decide(|| withheld(Reason::Notch));
+            self.decide(at, Some(Reason::Notch), || withheld(Reason::Notch));
             return None;
         }
         let is_allowlisted = self.allowlist.contains(&call);
         if !is_allowlisted {
             if !grammar::is_plausible(&call) {
-                self.decide(|| withheld(Reason::Grammar));
+                self.decide(at, Some(Reason::Grammar), || withheld(Reason::Grammar));
                 return None;
             }
             if !self.cty.is_allocated(&call) {
-                self.decide(|| withheld(Reason::Cty));
+                self.decide(at, Some(Reason::Cty), || withheld(Reason::Cty));
                 return None;
             }
         }
         if !confidence::has_acoustic_evidence(&fused.char_confidences) {
-            self.decide(|| withheld(Reason::NoEvidence));
+            self.decide(at, Some(Reason::NoEvidence), || {
+                withheld(Reason::NoEvidence)
+            });
             return None;
         }
         let mut confidence = confidence::c_call(&fused.char_confidences, reps);
@@ -2631,7 +2568,7 @@ impl Validator {
         };
         if let Some((rival_call, rival_support)) = rival {
             self.suppression_counts.variant += 1;
-            self.decide(|| {
+            self.decide(at, Some(Reason::Variant), || {
                 let mut d = withheld(Reason::Variant);
                 d.rival = Some(Rival {
                     call: rival_call,
@@ -2647,7 +2584,7 @@ impl Validator {
             .last_sample_ts(&call, freq_hz, input)
             .is_some_and(|last| sample_ts < last)
         {
-            self.decide(|| withheld(Reason::Dedupe));
+            self.decide(at, Some(Reason::Dedupe), || withheld(Reason::Dedupe));
             return None;
         }
         let outcome = self
@@ -2655,7 +2592,7 @@ impl Validator {
             .assess(&call, freq_hz, site.snr_db, spot_type, sample_ts, input);
         if outcome != DedupeOutcome::Emit {
             self.count_cross_input_dedupe(outcome, input);
-            self.decide(|| withheld(Reason::Dedupe));
+            self.decide(at, Some(Reason::Dedupe), || withheld(Reason::Dedupe));
             return None;
         }
         let (rst, qrl_query) = self.track_annotations(track_id);
@@ -2674,10 +2611,7 @@ impl Validator {
             mode: SpotMode::Cw,
             baud: None,
         };
-        self.admit(spot, reps, is_allowlisted, Confirmation::Fused)
-=======
-        self.admit(spot, reps, is_allowlisted, at)
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+        self.admit(spot, reps, is_allowlisted, Confirmation::Fused, at)
     }
 
     /// Captures a non-allowlisted Beacon candidate once every permanent,
@@ -2703,11 +2637,7 @@ impl Validator {
         // PR #154, round 3): checking blocklist/notch before this guard
         // would re-count a permanently-suppressed candidate every time an
         // unrelated later word re-triggers a scan that finds it again.
-<<<<<<< HEAD
-        let (char_confidences, word_seq, start_ts) = {
-=======
-        let (char_confidences, word_seq, reclassifying) = {
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+        let (char_confidences, word_seq, start_ts, reclassifying) = {
             let track = self.tracks.get_mut(&track_id)?;
             let word = if let Some(seq) = exact_seq {
                 track.words.iter_mut().find(|w| w.seq == seq)?
@@ -2729,15 +2659,12 @@ impl Validator {
             word.attempted = true;
             word.last_spot_type = Some(SpotType::Beacon);
             word.classified_max_seq = involved_max_seq;
-<<<<<<< HEAD
             (
                 word.confidences.clone(),
                 word.seq,
                 word.start_ts.min(sample_ts),
+                reclassifying,
             )
-=======
-            (word.confidences.clone(), word.seq, reclassifying)
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
         };
 
         // Operator suppression overrides (MAN-31), same boundary as the
@@ -2969,41 +2896,30 @@ impl Validator {
                 // rapid-same-track exemption -- letting one real
                 // over-the-air occurrence, captured by two overlapping
                 // duplicate-spawn tracks, reach reps >= 2 on its own.
-<<<<<<< HEAD
-                let reps = self.gate.record_span(
-                    pb.origin_track_id,
-                    pb.freq_hz,
-                    &pb.candidate,
-                    (pb.start_ts, pb.sample_ts),
-                    pb.word_seq,
-                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid),
-                ) as u32;
-=======
                 let is_active =
                     |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
                 let reps = if self.observations.keeps_records() {
                     // MAN-207: the same record, plus the occurrences it counted.
-                    let (reps, counted) = self.gate.record_traced(
+                    let (reps, counted) = self.gate.record_span_traced(
                         pb.origin_track_id,
                         pb.freq_hz,
                         &pb.candidate,
-                        pb.sample_ts,
+                        (pb.start_ts, pb.sample_ts),
                         pb.word_seq,
                         is_active,
                     );
                     at.evidence = evidence_links(&counted);
                     reps as u32
                 } else {
-                    self.gate.record(
+                    self.gate.record_span(
                         pb.origin_track_id,
                         pb.freq_hz,
                         &pb.candidate,
-                        pb.sample_ts,
+                        (pb.start_ts, pb.sample_ts),
                         pb.word_seq,
                         is_active,
                     ) as u32
                 };
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
                 // MAN-106: the zero-evidence abstention gate applies to
                 // beacons exactly as to every other candidate -- absent
                 // sound is absent sound (see `try_spot`'s gate).
@@ -3089,33 +3005,31 @@ impl Validator {
                     mode: SpotMode::Cw,
                     baud: None,
                 };
-<<<<<<< HEAD
-                self.admit(spot, reps, false, Confirmation::ExactRepeat)
-=======
-                self.admit(spot, reps, false, at)
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+                self.admit(spot, reps, false, Confirmation::ExactRepeat, at)
             })
             .collect()
     }
 }
 
-<<<<<<< HEAD
 /// MAN-200: where a fused spot would be emitted -- the triggering copy's
 /// track, time, frequency, SNR, speed and spot type (D11) -- and its episode.
 struct FusedSite {
     track_id: u32,
+    /// MAN-207: the triggering copy's word, which a fused decision is
+    /// recorded about.
+    word_seq: u64,
     sample_ts: u64,
     spot_type: SpotType,
     freq_hz: f64,
     snr_db: f32,
     wpm: f32,
     episode: Option<lattice::EpisodeKey>,
-=======
+}
+
 /// MAN-207: a pending beacon is decided later about the occurrence that
 /// captured it -- its origin track's word, even after a merge migrated it.
 fn settled_at(pb: &PendingBeacon) -> At {
     At::new(pb.origin_track_id, pb.word_seq, Cause::Settled)
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
 }
 
 /// Inserts `pb` at its `sample_ts` position (after any equal ones, so
@@ -3525,14 +3439,14 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             1.0,
         ));
         let current = &v.tracks[&1].current;
-        assert!(current.text.is_empty() && current.alternatives.is_empty());
+        assert!(current.text.is_empty() && current.char_alternatives.is_empty());
         v.ingest(&ch(
             40,
             'w',
             vec![(Glyph::Char('v'), 0.3), (Glyph::Prosign(Prosign::Ar), 0.2)],
         ));
         let current = &v.tracks[&1].current;
-        assert_eq!(current.alternatives, vec![vec![('V', 0.3)]]);
+        assert_eq!(current.char_alternatives, vec![vec![('V', 0.3)]]);
         assert_eq!(current.start_ts, 40);
     }
 

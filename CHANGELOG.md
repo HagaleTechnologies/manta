@@ -144,13 +144,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
   copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
   `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
   records gain `confirmation` (`exactRepeat`, `fused` or `null`). With the
   key off, decoder output is unchanged.
-=======
 - MAN-207: each validator keeps a bounded, local observation record of why
   each callsign candidate was or was not spotted (`manta_spot::observation`):
   counters by default, opt-in records with evidence links and append-only
@@ -163,7 +161,6 @@ the git history and `docs/DECISIONS/`.
   `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
   stdout and every wire format are unchanged. See
   [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times

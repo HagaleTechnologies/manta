@@ -65,25 +65,6 @@ pub enum Reason {
     LookupNotFound,
 }
 
-<<<<<<< HEAD
-/// How a spotted call met its repetition requirement (MAN-200 D12). Set on
-/// `Spotted` decisions whose spot is `EmissionState::Confirmed` only.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confirmation {
-    /// Enough separate decodes read the call exactly.
-    ExactRepeat,
-    /// `[spot] repetition_fusion` combined damaged copies of one station's
-    /// self-ID into the call (`lattice::EvidenceLattice`).
-    Fused,
-}
-
-impl Confirmation {
-    /// The live-state spelling: `"exactRepeat"` or `"fused"`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::ExactRepeat => "exactRepeat",
-            Self::Fused => "fused",
-=======
 impl Reason {
     /// Every reason, in declaration order (MAN-207's counters index by it).
     pub const ALL: [Reason; 16] = [
@@ -136,13 +117,10 @@ impl Reason {
             Reason::NoEvidence => 13,
             Reason::LookupPending => 14,
             Reason::LookupNotFound => 15,
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
         }
     }
 }
 
-<<<<<<< HEAD
-=======
 // `ALL[i].index() == i` for every slot, so `ALL` and `index` agree.
 const _: () = {
     let mut i = 0;
@@ -152,7 +130,27 @@ const _: () = {
     }
 };
 
->>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
+/// How a spotted call met its repetition requirement (MAN-200 D12). Set on
+/// `Spotted` decisions whose spot is `EmissionState::Confirmed` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Enough separate decodes read the call exactly.
+    ExactRepeat,
+    /// `[spot] repetition_fusion` combined damaged copies of one station's
+    /// self-ID into the call (`lattice::EvidenceLattice`).
+    Fused,
+}
+
+impl Confirmation {
+    /// The live-state spelling: `"exactRepeat"` or `"fused"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRepeat => "exactRepeat",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rival {
