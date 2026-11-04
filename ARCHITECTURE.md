@@ -344,6 +344,14 @@ tracks on its tones close. The marked set is reported in `decode --json`,
 the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
 §2.6 is normative.
 
+**Guarded cancellation (MAN-204, offline experiment).** `manta-dsp::cancel`
+estimates a strong keyed station's received waveform from raw IQ and checks
+whether subtracting it would uncover a neighbour; `manta-engine::cancel`
+runs it around an unchanged `decode_samples` and decodes the residual with a
+separate validator. It sits outside the data flow above: nothing in `decode`,
+`run` or `listen` calls it, and no recovered identity reaches any output. See
+[the decision record](docs/DECISIONS/2026-11-03-man204-guarded-two-stage-cancellation.md).
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
@@ -1126,6 +1134,21 @@ truth with realistic HF impairment already exists.**
   recording, AWGN or Watterson good/poor) and reports recall/CER vs SNR in
   500 Hz; same build and flags, same bytes
   (`docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md`).
+- Independent generator gate (MAN-206): `manta_testkit::baseband` renders
+  keyed CW straight to complex baseband with its own Morse table, timeline,
+  carrier, fader and noise (no code shared with `keyer`/`scene`/`noise`,
+  `manta-decode` or `manta-dsp`), and `crosscheck` compares it with the
+  production routes through the independent `measure` estimators on envelope
+  durations, spectra, total power, 2500 Hz SNR, noise whiteness and fading
+  autocorrelation. Only `crosscheck::verified()` hands out the `Verified`
+  token that `independent_scene` requires, so no decoded-text comparison
+  can run on an unchecked generator
+  (`docs/DECISIONS/2026-11-03-man206-independent-generator-and-scene-minimizer.md`).
+- Failure minimizer (MAN-206): `manta_testkit::minimize` shrinks a failing
+  `scenespec::SceneSpec` (synthetic only, exact-float JSON) by duration,
+  signals, text and impairments while the probe's failure signature holds;
+  `repro` stores the result. `crates/manta-engine/tests/repros/` holds the
+  committed repros, replayed and linted by `synthetic_repros.rs`.
 
 ## 10. Concurrency model
 
