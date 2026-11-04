@@ -3491,21 +3491,22 @@ impl TrackManager {
         // MAN-273: likewise the analytic front end's DC/Nyquist guard.
         // MAN-198: a new condition here also belongs in
         // `trace_spawn_vetoes`, or the funnel reports its refusals as noRise.
-        let owners_before = self.funnel.as_ref().map(|_| self.owner_of.clone());
-        // MAN-198/MAN-112: the scan's admission verdict per rising channel,
-        // taken before this hop's spawns move ownership. Only with a trace.
-        let admission_before: Option<Vec<Option<crate::funnel::SpawnVeto>>> =
+        // Each channel's owner and, MAN-112, the scan's admission verdict
+        // for a rising one, taken before this hop's spawns move ownership.
+        // Only with a trace.
+        let before: Option<Vec<(Option<u32>, Option<crate::funnel::SpawnVeto>)>> =
             self.funnel.as_ref().map(|_| {
                 (0..self.n_channels())
                     .map(|k| {
-                        if rise[k] {
+                        let veto = if rise[k] {
                             self.admission_veto(
                                 k,
                                 self.spawn_phase_position(k, hop, prev_hop.as_ref()),
                             )
                         } else {
                             None
-                        }
+                        };
+                        (self.owner_of[k], veto)
                     })
                     .collect()
             });
@@ -3555,16 +3556,8 @@ impl TrackManager {
                 k += 1;
             }
         }
-        if let (Some(before), Some(admission)) = (owners_before, admission_before) {
-            self.trace_spawn_vetoes(
-                &rise,
-                &before,
-                &admission,
-                past_warmup,
-                suppress,
-                &hop.power,
-                sample_ts,
-            );
+        if let Some(before) = before {
+            self.trace_spawn_vetoes(&rise, &before, past_warmup, suppress, &hop.power, sample_ts);
         }
         self.recompute_ownership();
         // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
@@ -3788,14 +3781,14 @@ impl TrackManager {
 
     /// MAN-198: the trace's spawn-veto census, run after the spawn scan.
     /// A rising channel a track born this hop claimed (its owner differs
-    /// from `owners_before`) was the scan's to spawn, not a refusal. Every
+    /// from the owner in `before`) was the scan's to spawn, not a refusal.
+    /// `before` also carries the scan's admission verdict. Every
     /// other rising channel failed a scan condition; this names one, source
     /// masks first, then the scan's own order. Reads state only.
     fn trace_spawn_vetoes(
         &self,
         rise: &[bool],
-        owners_before: &[Option<u32>],
-        admission: &[Option<crate::funnel::SpawnVeto>],
+        before: &[(Option<u32>, Option<crate::funnel::SpawnVeto>)],
         past_warmup: bool,
         suppress: bool,
         power: &[f32],
@@ -3809,7 +3802,7 @@ impl TrackManager {
         let fs = self.channel_spacing_hz * n as f64;
         let second = (sample_ts as f64 / fs) as u64;
         let refused = (0..n)
-            .filter(|&k| rise[k] && self.owner_of[k] == owners_before[k])
+            .filter(|&k| rise[k] && self.owner_of[k] == before[k].0)
             .filter_map(|k| {
                 let veto = if self.trusted_vetoes_spawn(k) {
                     V::TrustedBand
@@ -3823,7 +3816,7 @@ impl TrackManager {
                     V::Warmup
                 } else if suppress {
                     V::StaticCrash
-                } else if let Some(v) = admission[k] {
+                } else if let Some(v) = before[k].1 {
                     v
                 } else if self.spawn_window_cooling_down(k) {
                     V::CoolingDown
