@@ -3,6 +3,8 @@
 //! candidate callsign, with its reason. Opt-in through
 //! `Validator::record_decisions`; off, the validator allocates nothing for
 //! it. See docs/DECISIONS/2026-10-12-man324-live-state-stream.md D4.
+//! MAN-207 keeps these decisions, with their evidence, in the bounded
+//! observation record (`crate::observation`).
 
 use crate::context::SpotType;
 use crate::support::Support;
@@ -63,6 +65,92 @@ pub enum Reason {
     LookupNotFound,
 }
 
+impl Reason {
+    /// Every reason, in declaration order (MAN-207's counters index by it).
+    pub const ALL: [Reason; 16] = [
+        Reason::Blocklist,
+        Reason::Notch,
+        Reason::Grammar,
+        Reason::Cty,
+        Reason::Repetition,
+        Reason::Variant,
+        Reason::Dedupe,
+        Reason::PowerStepGuard,
+        Reason::BeaconNoEvidence,
+        Reason::BeaconPending,
+        Reason::BeaconSpeed,
+        Reason::BeaconOverflow,
+        Reason::BeaconDiscarded,
+        Reason::NoEvidence,
+        Reason::LookupPending,
+        Reason::LookupNotFound,
+    ];
+
+    /// The verdict a decision with this reason carries: `Deferred` while a
+    /// beacon or lookup is pending, else `Withheld`.
+    pub fn verdict(self) -> Verdict {
+        match self {
+            Reason::BeaconPending | Reason::LookupPending => Verdict::Deferred,
+            _ => Verdict::Withheld,
+        }
+    }
+
+    /// This reason's position in `ALL`. Exhaustive on purpose: a new
+    /// variant fails to compile here until it has a slot, and it must take
+    /// the same position in `ALL` (checked at compile time below), or the
+    /// MAN-207 counters would index past their arrays.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Reason::Blocklist => 0,
+            Reason::Notch => 1,
+            Reason::Grammar => 2,
+            Reason::Cty => 3,
+            Reason::Repetition => 4,
+            Reason::Variant => 5,
+            Reason::Dedupe => 6,
+            Reason::PowerStepGuard => 7,
+            Reason::BeaconNoEvidence => 8,
+            Reason::BeaconPending => 9,
+            Reason::BeaconSpeed => 10,
+            Reason::BeaconOverflow => 11,
+            Reason::BeaconDiscarded => 12,
+            Reason::NoEvidence => 13,
+            Reason::LookupPending => 14,
+            Reason::LookupNotFound => 15,
+        }
+    }
+}
+
+// `ALL[i].index() == i` for every slot, so `ALL` and `index` agree.
+const _: () = {
+    let mut i = 0;
+    while i < Reason::ALL.len() {
+        assert!(Reason::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
+/// How a spotted call met its repetition requirement (MAN-200 D12). Set on
+/// `Spotted` decisions whose spot is `EmissionState::Confirmed` only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Confirmation {
+    /// Enough separate decodes read the call exactly.
+    ExactRepeat,
+    /// `[spot] repetition_fusion` combined damaged copies of one station's
+    /// self-ID into the call (`lattice::EvidenceLattice`).
+    Fused,
+}
+
+impl Confirmation {
+    /// The live-state spelling: `"exactRepeat"` or `"fused"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRepeat => "exactRepeat",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rival {
@@ -92,6 +180,9 @@ pub struct Decision {
     pub rival: Option<Rival>,
     /// The emitted spot, `Verdict::Spotted` only.
     pub spot: Option<Spot>,
+    /// MAN-200: how a `Spotted`, confirmed call met its repetition
+    /// requirement. `None` for any other decision and for a tentative spot.
+    pub confirmation: Option<Confirmation>,
 }
 
 impl Decision {
@@ -105,11 +196,7 @@ impl Decision {
         spot_type: SpotType,
         reason: Reason,
     ) -> Self {
-        let verdict = if matches!(reason, Reason::BeaconPending | Reason::LookupPending) {
-            Verdict::Deferred
-        } else {
-            Verdict::Withheld
-        };
+        let verdict = reason.verdict();
         Self {
             track_id,
             sample_ts,
@@ -124,11 +211,12 @@ impl Decision {
             pattern_tier: None,
             rival: None,
             spot: None,
+            confirmation: None,
         }
     }
 
     /// The `Spotted` decision for `spot`.
-    pub(crate) fn spotted(spot: &Spot, reps: u32) -> Self {
+    pub(crate) fn spotted(spot: &Spot, reps: u32, confirmation: Option<Confirmation>) -> Self {
         Self {
             track_id: spot.track_id,
             sample_ts: spot.sample_ts,
@@ -143,6 +231,7 @@ impl Decision {
             pattern_tier: None,
             rival: None,
             spot: Some(spot.clone()),
+            confirmation,
         }
     }
 

@@ -275,12 +275,13 @@ mod tests {
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: None,
+            confirmation: None,
         });
         assert_eq!(
             render(&withheld, "W1AW", &bus),
             (
                 "candidateDecision",
-                r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null}"#.to_string()
+                r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null,"confirmation":null}"#.to_string()
             )
         );
         let closed = LiveRecord::TrackClosed {
@@ -316,6 +317,7 @@ mod tests {
             pattern_tier: Some(manta_spot::PatternTier::Common),
             rival: None,
             spot: Some(s.clone()),
+            confirmation: None,
         });
         let (_, line) = render(&spotted, "W1AW", &bus);
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();

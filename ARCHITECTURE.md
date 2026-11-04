@@ -355,6 +355,14 @@ tracks on its tones close. The marked set is reported in `decode --json`,
 the `run` log and the `manta_rtty_signals{band}` gauge. SPEC-decode-core.md
 §2.6 is normative.
 
+**Guarded cancellation (MAN-204, offline experiment).** `manta-dsp::cancel`
+estimates a strong keyed station's received waveform from raw IQ and checks
+whether subtracting it would uncover a neighbour; `manta-engine::cancel`
+runs it around an unchanged `decode_samples` and decodes the residual with a
+separate validator. It sits outside the data flow above: nothing in `decode`,
+`run` or `listen` calls it, and no recovered identity reaches any output. See
+[the decision record](docs/DECISIONS/2026-11-03-man204-guarded-two-stage-cancellation.md).
+
 **CPU budget** (the reason this whole design is viable):
 
 | Stage | Cost at 192 kS/s | Notes |
@@ -513,7 +521,14 @@ transmission may never produce again).
    satisfy the gate; without the time-gap half, a short ID (e.g.
    "DE `<CALL>`") puts even two genuinely separate transmissions only 2
    words apart, which a word-gap-only rule cannot tell apart from one
-   message's double utterance.
+   message's double utterance. A decode whose sample span overlaps one the gate already
+   counted for that call (a replay, a second track on one signal) adds no
+   repetition (MAN-200). With `[spot] repetition_fusion` on (default off),
+   damaged copies of one station's CQ/DE/UP self-ID are aligned character
+   by character and can together confirm the call a clear per-position
+   majority reads, from as many separate messages as its tier needs
+   (`crates/manta-spot/src/lattice.rs`,
+   `docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md`).
 4b. **Cross-candidate variant arbitration** (MAN-100): before a candidate
    spots, it's checked against every other decoded, spottable-shaped word
    (one that itself passes steps 1's grammar/cty check) observed on the same
@@ -588,6 +603,20 @@ never introduces a *newer* word, only removes an old one. Legacy
 precedent: CW Skimmer's Watch List (Aggregator manual Appendix A2), which
 exists specifically for calls that wouldn't otherwise pass automatic
 validation (MAN-28). Dedupe (step 5) still applies.
+
+**Observation record (MAN-207).** Every decision passes one boundary,
+`Validator::decide`, which counts it by reason in the validator's
+`ObservationLog` (`manta_spot::observation`); a settled call occurrence its
+MAN-201 role kept from ever becoming a candidate (an addressee, say) is
+counted by role. By default the log keeps those counters only;
+`Validator::with_observations` can make it keep records (call, reason,
+role, turn, scores, sample and frequency spans, and links to the
+occurrences the repetition gate counted, plus a `notCandidate` record per
+role-skipped occurrence) or records plus each word's text trace. A later decision about the same occurrence (reclassification, a
+settled beacon or lookup, a refinement) appends a record that supersedes
+the earlier one and never rewrites it. Records are capped and expire by
+sample time. See
+[MAN-207](docs/DECISIONS/2026-11-03-man207-observation-record.md).
 
 ## 7. Output layer (`manta-server`)
 
@@ -954,6 +983,9 @@ validation (MAN-28). Dedupe (step 5) still applies.
   per second) and `manta_candidate_repetitions` (the repetition gate's
   count per candidate), fed by `manta_engine::DecodeQualityObserver` — see
   [MAN-118](docs/DECISIONS/2026-10-12-man118-decode-quality-metrics.md).
+  **MAN-207** adds `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`, the validator's
+  decision and role-skip counts, on the same path.
   **MAN-13** (several `[[input]]` entries) adds no family: the `{source}`
   label of `manta_source_health` and the other per-source families is each
   input's `name`; `manta_active_tracks` and `manta_static_crashes_total`
@@ -1130,6 +1162,21 @@ truth with realistic HF impairment already exists.**
   recording, AWGN or Watterson good/poor) and reports recall/CER vs SNR in
   500 Hz; same build and flags, same bytes
   (`docs/DECISIONS/2026-10-10-man116-sensitivity-benchmark.md`).
+- Independent generator gate (MAN-206): `manta_testkit::baseband` renders
+  keyed CW straight to complex baseband with its own Morse table, timeline,
+  carrier, fader and noise (no code shared with `keyer`/`scene`/`noise`,
+  `manta-decode` or `manta-dsp`), and `crosscheck` compares it with the
+  production routes through the independent `measure` estimators on envelope
+  durations, spectra, total power, 2500 Hz SNR, noise whiteness and fading
+  autocorrelation. Only `crosscheck::verified()` hands out the `Verified`
+  token that `independent_scene` requires, so no decoded-text comparison
+  can run on an unchecked generator
+  (`docs/DECISIONS/2026-11-03-man206-independent-generator-and-scene-minimizer.md`).
+- Failure minimizer (MAN-206): `manta_testkit::minimize` shrinks a failing
+  `scenespec::SceneSpec` (synthetic only, exact-float JSON) by duration,
+  signals, text and impairments while the probe's failure signature holds;
+  `repro` stores the result. `crates/manta-engine/tests/repros/` holds the
+  committed repros, replayed and linted by `synthetic_repros.rs`.
 
 ## 10. Concurrency model
 

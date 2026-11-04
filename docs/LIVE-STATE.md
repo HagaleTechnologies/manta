@@ -200,7 +200,7 @@ the same batch's `trackState` records, so the state naming its candidate
 always arrives first.
 
 ```json
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"repetition","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":null}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"repetition","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":null,"confirmation":null}
 ```
 
 | Field | JSON type | Null? | Meaning |
@@ -220,6 +220,7 @@ always arrives first.
 | `patternTier` | string or null | for an allowlisted call or beacon | `"common"`, `"listed"` or `"unlisted"`: the candidate's callsign-pattern tier. |
 | `rival` | object or null | unless variant | When `reason` is `variant`, the better-supported variant that wins on this track, as `{"call", "reps", "confSum"}`: its callsign, its message-distinct repetitions on this track within the last 90 s, and its `confSum`. `null` for every other reason. |
 | `spotId` | string or null | unless spotted | When `decision` is `spotted`, the `id` of the spot published on the `:7301` stream, so a dashboard can join the two streams. `null` otherwise. |
+| `confirmation` | string or null | unless spotted and confirmed | How a spotted call met its repetition requirement: `"exactRepeat"` when enough separate decodes read the call exactly, `"fused"` when `[spot] repetition_fusion` combined damaged copies into it. `null` for a decision that is not `spotted` and for a tentative spot. |
 | `confSum` | number | never | Only inside `rival`: the rival's sum of per-repetition mean character confidence, as a `trackState` candidate's `confSum`. Variant arbitration compares `reps` first and `confSum` on a tie. |
 
 Each decoded word is decided once. It is decided again only when a newer
@@ -303,9 +304,9 @@ timestamps, `occupancy` and `confSum` are illustrative.
 $ nc 127.0.0.1 7303
 {"kind":"bandState","deCall":"W1AW","timestamp":1700000005,"bands":[{"band":"20m","loHz":14000000,"hiHz":14047906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0059,"activeTracks":1},{"band":"unknown","loHz":13952000,"hiHz":13999906,"channels":512,"noiseFloorDb":-62.2,"occupancy":0.0,"activeTracks":0}]}
 {"kind":"trackState","deCall":"W1AW","timestamp":1700000013,"trackId":1,"frequency":14012362,"band":"20m","wpm":20,"snr":21,"snrRefHz":2500,"text":"CQ CQ DE W1AW","candidates":[{"call":"W1AW","reps":1,"confSum":0.55}]}
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000013,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"withheld","reason":"repetition","reps":1,"requiredReps":2,"patternTier":"common","rival":null,"spotId":null,"confirmation":null}
 {"kind":"trackState","deCall":"W1AW","timestamp":1700000020,"trackId":1,"frequency":14012362,"band":"20m","wpm":20,"snr":21,"snrRefHz":2500,"text":"CQ CQ DE W1AW W1AW","candidates":[{"call":"W1AW","reps":2,"confSum":1.1}]}
-{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000020,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"patternTier":"common","rival":null,"spotId":"W1AW:12534119743695398054:1:2006272:W1AW"}
+{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000020,"trackId":1,"call":"W1AW","frequency":14012362,"band":"20m","spotType":"cq","decision":"spotted","reason":null,"reps":2,"requiredReps":2,"patternTier":"common","rival":null,"spotId":"W1AW:12534119743695398054:1:2006272:W1AW","confirmation":"exactRepeat"}
 {"kind":"trackClosed","deCall":"W1AW","timestamp":1700000120,"trackId":1,"closure":"signalEnded","survivorTrackId":null}
 ```
 

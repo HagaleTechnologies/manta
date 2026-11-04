@@ -101,6 +101,8 @@ generation settings and exact coppa revision. The current dependency pin
 is in [Cargo.toml](Cargo.toml); the
 [golden-vector freeze note](wiki/pages/golden-vector-freeze.md) explains why
 fading fixtures need that provenance.
+To shrink a failing synthetic scene to a small committed repro, follow
+[the repros README](crates/manta-engine/tests/repros/README.md).
 
 Some acceptance gates remain open and some tests are explicitly ignored.
 A passing default test run does not mean every milestone has passed.
