@@ -76,7 +76,7 @@ proptest! {
     // `decode_samples` returned Err ("no signal found"), panicking the
     // `.unwrap()` below. **This specific duration/warmup-floor mechanism is
     // fixed** (Task 11 Step 0,
-    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md): loop the
+    // docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md): loop the
     // generated text (`loop_text: true`) across a 12 s floor, same fix and
     // reasoning as `regression_char_gap_high_wpm.rs` (see that file's doc
     // comment for why a silent lead-in was tried and rejected first).

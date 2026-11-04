@@ -19,6 +19,10 @@ pub enum SpawnVeto {
     Warmup,
     StaticCrash,
     OwnedByTrack,
+    /// MAN-112: the rise's two-hop phase position sat more than
+    /// `CENTROID_OUTLIER_CH` from the channel next to a live track: a
+    /// carrier's skirt, not a second carrier.
+    SidelobePosition,
     CoolingDown,
     NotLocalPeak,
     Rtty,
@@ -36,6 +40,7 @@ impl SpawnVeto {
             SpawnVeto::Warmup => "warmup",
             SpawnVeto::StaticCrash => "staticCrash",
             SpawnVeto::OwnedByTrack => "ownedByTrack",
+            SpawnVeto::SidelobePosition => "sidelobePosition",
             SpawnVeto::CoolingDown => "coolingDown",
             SpawnVeto::NotLocalPeak => "notLocalPeak",
             SpawnVeto::Rtty => "rtty",

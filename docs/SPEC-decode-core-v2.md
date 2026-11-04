@@ -11,7 +11,7 @@ stage-2 gate (§8.4) was measured before either was wired. That gate
 **failed** —
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` has the full
 result; `decode.engine` stays default `legacy`. Companion to
-`docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` (the
+`docs/archive/plans/specs/2026-09-09-decode-core-real-hf-design.md` (the
 rationale and evidence) and `docs/SPEC-decode-core.md` (v1).
 
 Relationship to v1: §1 (channelizer), §2.1–§2.5 (detection floor, gate,

@@ -525,6 +525,7 @@ use manta_dsp::channelizer::{
 use manta_dsp::comod::CoModDetector;
 use manta_dsp::crash::{CrashDetector, CRASH_MIN_HOPS};
 use manta_dsp::floor::{FloorBank, Gate};
+use manta_dsp::frontend::SteeredFrontend;
 use manta_dsp::fsk::{FskDetector, BLOCK_HOPS as FSK_BLOCK_HOPS};
 use manta_dsp::refine::{Refiner, GROUP_DELAY_HOPS};
 use num_complex::Complex64;
@@ -639,6 +640,7 @@ pub(crate) struct Track {
     /// `refine_bw_hz > 0.0`. `None` when refinement is disabled (the
     /// default) or not yet constructed.
     refiner: Option<Refiner>,
+    steered: Option<SteeredFrontend>,
     /// The integer owned channel `refiner` was last fed from. A change
     /// here -- NOT a fractional `center` EMA nudge -- is what resets the
     /// refiner's FIR history/phase accumulator (SPEC v2 §3: "a change of
@@ -695,9 +697,14 @@ pub(crate) struct Track {
     /// MAN-114 (SPEC §1.4): power-weighted EMA (`CENTER_EMA_ALPHA`) of
     /// absolute-frame lag-1 phase products (`phase_lag_product`) of the
     /// selected channel, fed by key-down hops at or above
-    /// `FINE_FREQ_MIN_SNR_DB`; feeds `freq_hz` only. Zero until the first
+    /// `FINE_FREQ_MIN_SNR_DB`; supplies frequency evidence for reporting and
+    /// split admission. Individual gated products also steer the centroid. Zero until the first
     /// such hop. A merge survivor keeps its own (D5).
     phase_z: Complex64,
+    /// MAN-112: ungated phase positions seen while CANDIDATE, for the
+    /// isolated-promotion re-seed. Cleared at promotion.
+    confirm_positions: Vec<f64>,
+    envelope: VecDeque<(u64, f32)>,
     /// MAN-114 (Codex review, PR #346): `phase_z` before each of the last
     /// `CRASH_MIN_HOPS - 1` unsuppressed hops, oldest first. A crash is
     /// only declared on its `CRASH_MIN_HOPS`-th lifted hop, so on that hop
@@ -854,6 +861,50 @@ fn keyed_marks(amps: &[f32]) -> u64 {
     marks
 }
 
+/// MAN-112: a channel within this many channels of the selected one that
+/// is louder by at least `KEYDOWN_DOMINANCE_DB` means the selected channel
+/// is reading another carrier's skirt or a swept carrier's filter ringing,
+/// not this track's own key-down.
+const KEYDOWN_DOMINANCE_CH: usize = 2;
+/// MAN-112: see `KEYDOWN_DOMINANCE_CH`.
+const KEYDOWN_DOMINANCE_DB: f64 = 10.0;
+/// MAN-112: key-down evidence lies within this many dB of the track's
+/// strongest key-down hop so far.
+const KEYDOWN_LEVEL_SPAN_DB: f64 = 30.0;
+/// MAN-112 (SPEC §2.8 D′): a key-down mark ends when the SNR stays this
+/// many dB under the mark's own maximum, and the next starts when it stays
+/// this many dB over the gap's minimum. Relative to the local extremes, so
+/// a fast element gap that the channel filter keeps above `on_snr_db`
+/// still separates two marks, and one loud onset sets no level for later
+/// marks.
+const KEYDOWN_MARK_SWING_DB: f64 = 10.0;
+
+/// MAN-112 (SPEC §2.8): is `k` dominated by a nearby louder channel? Such a
+/// hop is not keying evidence for the track on `k`: frequency-anchored
+/// association keeps a swept carrier's track in place after the carrier
+/// has moved on, and its edge channel keeps reading the departed carrier.
+fn neighbor_dominates(power_db: &[f64], k: usize) -> bool {
+    let n = power_db.len();
+    (1..=KEYDOWN_DOMINANCE_CH).any(|d| {
+        [power_db[(k + d) % n], power_db[(k + n - d) % n]]
+            .into_iter()
+            .any(|p| p - power_db[k] >= KEYDOWN_DOMINANCE_DB)
+    })
+}
+
+/// MAN-112: the median of `positions` when there are at least
+/// `RESEED_MIN_OBS` and their interquartile range is at most
+/// `RESEED_MAX_IQR_CH`; `None` otherwise.
+fn agreeing_median(mut positions: Vec<f64>) -> Option<f64> {
+    let n = positions.len();
+    if n < RESEED_MIN_OBS {
+        return None;
+    }
+    positions.sort_by(f64::total_cmp);
+    let (q1, q3) = (positions[n / 4], positions[(3 * n) / 4]);
+    (q3 - q1 <= RESEED_MAX_IQR_CH).then_some(positions[n / 2])
+}
+
 /// MAN-313 (SPEC §2.8): one promoted track's evidence that it is keyed CW,
 /// plus the state its unkeyed close reads. Every field is integer-hop
 /// driven and summed in a fixed order, so the decision is deterministic.
@@ -893,6 +944,16 @@ struct KeyingEvidence {
     t_last: u64,
     /// Key-down hops whose neighbourhood was not flat (Discovery 7).
     non_flat: u64,
+    /// MAN-112 (SPEC §2.8 D′): debounced key-down marks in the evidence
+    /// hops themselves (`note_keydown`): the count, whether a mark is in
+    /// progress, the current mark's maximum or gap's minimum SNR, and how
+    /// many consecutive hops have met the opposite transition.
+    keydown_marks: u64,
+    keydown_now: bool,
+    keydown_extreme_db: f64,
+    keydown_switch_hops: u32,
+    /// MAN-112: the strongest key-down SNR so far, in dB.
+    peak_keydown_snr_db: f64,
     /// Hop of the promotion or the latest HANG -> ACTIVE re-rise.
     last_rise_hop: u64,
     /// `hop_counter` at the end of the latest batch that decoded a
@@ -922,6 +983,11 @@ impl KeyingEvidence {
             sum_tf: 0.0,
             t_last: 0,
             non_flat: 0,
+            keydown_marks: 0,
+            keydown_now: false,
+            keydown_extreme_db: f64::NEG_INFINITY,
+            keydown_switch_hops: 0,
+            peak_keydown_snr_db: f64::NEG_INFINITY,
             last_rise_hop: promo_hop,
             last_char_hop: 0,
             word: String::new(),
@@ -944,6 +1010,7 @@ impl KeyingEvidence {
         k: usize,
         birth_channel: usize,
         keydown: bool,
+        snr_db: f64,
         power: &[f32],
         power_db: &[f64],
     ) {
@@ -967,7 +1034,11 @@ impl KeyingEvidence {
             self.active_run += 1;
             self.active_hops_since_eval += 1;
         }
-        if qualified || !keydown {
+        if qualified {
+            return;
+        }
+        self.note_keydown(if keydown { snr_db } else { f64::NEG_INFINITY });
+        if !keydown {
             return;
         }
         let n_ch = power.len();
@@ -993,6 +1064,50 @@ impl KeyingEvidence {
             .fold(f64::NEG_INFINITY, f64::max);
         if (power_db[k] - side).abs() >= ISO_DB {
             self.non_flat += 1;
+        }
+    }
+
+    /// MAN-112: a hop far below this track's strongest key-down is the
+    /// far skirt of a carrier that has left, not this track's key-down.
+    /// Raises the running peak for every admitted hop.
+    fn admits_keydown_level(&mut self, snr_db: f64) -> bool {
+        if snr_db < self.peak_keydown_snr_db - KEYDOWN_LEVEL_SPAN_DB {
+            return false;
+        }
+        self.peak_keydown_snr_db = self.peak_keydown_snr_db.max(snr_db);
+        true
+    }
+
+    /// MAN-112 (SPEC §2.8 D′): count marks in this track's own key-down
+    /// evidence. `snr_db` is the hop's SNR when it is a key-down hop and
+    /// `NEG_INFINITY` otherwise. A mark ends after
+    /// `SHORT_MARK_DEBOUNCE_HOPS` hops at least `KEYDOWN_MARK_SWING_DB`
+    /// under its maximum; the next begins, and counts, after as many hops
+    /// that far over the gap's minimum. A swept carrier crossing the channel
+    /// is one mark however its decoder-input amplitude ripples.
+    fn note_keydown(&mut self, snr_db: f64) {
+        let switching = if self.keydown_now {
+            snr_db <= self.keydown_extreme_db - KEYDOWN_MARK_SWING_DB
+        } else {
+            snr_db.is_finite() && snr_db >= self.keydown_extreme_db + KEYDOWN_MARK_SWING_DB
+        };
+        if !switching {
+            self.keydown_switch_hops = 0;
+            self.keydown_extreme_db = if self.keydown_now {
+                self.keydown_extreme_db.max(snr_db)
+            } else {
+                self.keydown_extreme_db.min(snr_db)
+            };
+            return;
+        }
+        self.keydown_switch_hops += 1;
+        if self.keydown_switch_hops >= SHORT_MARK_DEBOUNCE_HOPS {
+            self.keydown_now = !self.keydown_now;
+            self.keydown_switch_hops = 0;
+            self.keydown_extreme_db = snr_db;
+            if self.keydown_now {
+                self.keydown_marks += 1;
+            }
         }
     }
 
@@ -1092,6 +1207,7 @@ impl KeyingEvidence {
             && self.slope_hz_s(spacing_hz).abs() <= self.short_slope_tolerance()
             && self.non_flat_fraction() >= ISO_MIN_FRACTION
             && keyed_marks >= SHORT_MIN_MARKS
+            && self.keydown_marks >= SHORT_MIN_MARKS
     }
 
     /// A decoded character (`None` for a prosign) at batch-end hop `hop`.
@@ -1128,6 +1244,67 @@ const CENTER_EMA_ALPHA: f64 = 0.01;
 /// SPEC §1.4: only key-down hops at or above this SNR feed the spot-frequency estimator.
 const FINE_FREQ_MIN_SNR_DB: f64 = 6.0;
 
+/// MAN-112: reject phase observations pulled toward a neighboring carrier.
+const CENTROID_OUTLIER_CH: f64 = 0.6;
+/// MAN-112: with no other track's centre this close (the F1 neighbor
+/// distance), a birth or a promotion is isolated.
+const ISOLATION_CH: f64 = 2.5;
+/// MAN-112: confirm-window phase positions an isolated promotion needs to
+/// re-seed its centre, and the largest interquartile spread they may show.
+const RESEED_MIN_OBS: usize = 8;
+const RESEED_MAX_IQR_CH: f64 = 0.2;
+const SPLIT_MIN_CH: f64 = 0.8;
+/// MAN-112: the straddle override applies only to a neighbor closer than
+/// this. Farther away, the channel facing it sits outside the neighbor's
+/// main lobe, and the away channel's off-carrier phase reading biases the
+/// centroid toward the straddle that selected it.
+const STRADDLE_NEIGHBOR_CH: f64 = 2.0;
+/// The supported close-pair region starts at 100 Hz. An owned peak at
+/// one channel spacing can be a keyed carrier's sidelobe (MAN-112).
+const SPLIT_MIN_FREQ_CH: f64 = 100.0 / manta_dsp::channelizer::CHANNEL_SPACING_HZ;
+const ENVELOPE_HOPS: usize = 750;
+const MERGE_ALWAYS_CH: f64 = 0.5;
+const MERGE_MIN_ENVELOPE_CORR: f64 = 0.6;
+
+fn channel_distance(a: f64, b: f64, n: usize) -> f64 {
+    let span = n as f64;
+    let d = (a - b).abs();
+    // Most pairs are inside one FFT span. Avoid a floating-point remainder
+    // in the O(tracks²) association loop except at an unwrapped boundary.
+    let d = if d > span { d.rem_euclid(span) } else { d };
+    d.min(span - d)
+}
+
+/// Compare only contemporaneous unsuppressed observations, including tracks
+/// born at different times. Constant envelopes provide no merge evidence.
+fn envelope_correlation(a: &VecDeque<(u64, f32)>, b: &VecDeque<(u64, f32)>) -> Option<f64> {
+    let (mut i, mut j) = (0, 0);
+    let (mut count, mut sx, mut sy, mut sxx, mut syy, mut sxy) = (0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let (x, y) = (a[i].1 as f64, b[j].1 as f64);
+                count += 1;
+                sx += x;
+                sy += y;
+                sxx += x * x;
+                syy += y * y;
+                sxy += x * y;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    if count < 150 {
+        return None;
+    }
+    let n = count as f64;
+    let variance = ((n * sxx - sx * sx) * (n * syy - sy * sy)).sqrt();
+    (variance > 0.0).then(|| (n * sxy - sx * sy) / variance)
+}
+
 /// MAN-324: one channel's state for the live-state stream's band rollup,
 /// read by `TrackManager::take_channel_levels`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1163,6 +1340,7 @@ impl Track {
             input_gaps: VecDeque::new(),
             has_emitted: false,
             refiner: None,
+            steered: None,
             refiner_channel: None,
             refiner_hops_since_reset: 0,
             refiner_backlog: VecDeque::new(),
@@ -1171,6 +1349,8 @@ impl Track {
             keying: None,
             qualified: false,
             phase_z: Complex64::new(0.0, 0.0),
+            confirm_positions: Vec::new(),
+            envelope: VecDeque::new(),
             phase_hist: VecDeque::new(),
         }
     }
@@ -1270,8 +1450,9 @@ impl Track {
         freq_hz: f64,
         crash: bool,
     ) -> SmallVec<[DecoderInputEntry; 1]> {
-        let raw_power = hop.power[k];
-        if refine_bw_hz <= 0.0 {
+        let home = (self.center.round() as i64).rem_euclid(hop.power.len() as i64) as usize;
+        let raw_power = hop.power[if self.steered.is_some() { home } else { k }];
+        if refine_bw_hz <= 0.0 && self.steered.is_none() {
             return smallvec![(
                 raw_power.sqrt(),
                 raw_power,
@@ -1287,30 +1468,36 @@ impl Track {
         // detector ownership/gating elsewhere) -- see the original MAN-168
         // wiring comment (Codex review, PR #161) for why `k` can flicker
         // independently of the true centroid.
-        let c = self.center.round() as usize;
-        let delta = (self.center - c as f64) as f32;
+        let c = (self.center.round() as i64).rem_euclid(hop.power.len() as i64) as usize;
+        let delta = (self.center - self.center.round()) as f32;
 
         let mut out: SmallVec<[DecoderInputEntry; 1]> = SmallVec::new();
-        if self.refiner_channel != Some(c) {
+        if self.steered.is_none() && self.refiner_channel != Some(c) {
             out.extend(self.refiner_backlog.drain(..));
         }
 
-        let refiner = self
-            .refiner
-            .get_or_insert_with(|| Refiner::new(refine_bw_hz, delta));
-        if self.refiner_channel != Some(c) {
-            refiner.reset();
-            self.refiner_channel = Some(c);
-            self.refiner_hops_since_reset = 0;
-        }
-        refiner.set_delta(delta);
-        // The channelizer's rotation step leaves a checkerboard sign
-        // artifact on odd channels at odd hops; a phase-sensitive consumer
-        // like this derotating/filtering refiner must correct it before the
-        // sample reaches `Refiner::push` (measured ~39 dB of spurious
-        // attenuation before this correction was applied here).
-        let corrected = hop.x[c] * odd_channel_sign_correction(hop.m, c);
-        let refined_amp = refiner.push(corrected);
+        let refined_amp = if let Some(frontend) = &mut self.steered {
+            let n = hop.power.len();
+            let partner = if self.center >= self.center.round() {
+                (c + 1) % n
+            } else {
+                (c + n - 1) % n
+            };
+            // Absolute-frame reconstruction retains history on a home change.
+            // No backlog drain/reset is needed in this path.
+            frontend.push(hop.x[c], hop.x[partner], c, partner, self.center, hop.m)
+        } else {
+            let refiner = self
+                .refiner
+                .get_or_insert_with(|| Refiner::new(refine_bw_hz, delta));
+            if self.refiner_channel != Some(c) {
+                refiner.reset();
+                self.refiner_hops_since_reset = 0;
+            }
+            refiner.set_delta(delta);
+            refiner.push(hop.x[c] * odd_channel_sign_correction(hop.m, c))
+        };
+        self.refiner_channel = Some(c);
         self.refiner_hops_since_reset += 1;
         let n = self.refiner_hops_since_reset;
 
@@ -1323,13 +1510,18 @@ impl Track {
             freq_hz,
             crash,
         ));
+        let delay = if self.steered.is_some() {
+            manta_dsp::frontend::GROUP_DELAY_HOPS
+        } else {
+            GROUP_DELAY_HOPS
+        };
         debug_assert!(
-            self.refiner_backlog.len() <= GROUP_DELAY_HOPS + 1,
+            self.refiner_backlog.len() <= delay + 1,
             "refiner_backlog must never hold more than GROUP_DELAY_HOPS + 1 entries \
              (one push then one pop per call once steady state is reached)"
         );
 
-        let d = GROUP_DELAY_HOPS as u64;
+        let d = delay as u64;
         if n > d {
             let (
                 due_raw_amp,
@@ -1539,6 +1731,10 @@ impl Track {
         self.pending.clear();
         self.input_gaps.clear();
         self.refiner = None;
+        if self.steered.is_some() {
+            self.steered = Some(SteeredFrontend::default());
+        }
+        self.envelope.clear();
         self.refiner_channel = None;
         self.refiner_hops_since_reset = 0;
         self.clean_hist.clear();
@@ -1620,8 +1816,109 @@ impl Track {
             .unwrap_or(plain)
     }
 
-    /// Update `center` (live EMA), from this hop's selected channel's
-    /// fine-frequency interpolation. SPEC §1.4/§2.5.
+    /// MAN-112: cooldown first, then nearest-centre association, with ids
+    /// breaking exact ties. O(tracks) for each of the three candidates.
+    fn channel_exclusive(&self, k: usize, centers: &[(u32, f64)], n: usize) -> bool {
+        let own = channel_distance(k as f64, self.center, n);
+        centers.iter().all(|&(id, center)| {
+            id == self.id || {
+                let other = channel_distance(k as f64, center, n);
+                own < other || (own == other && self.id < id)
+            }
+        })
+    }
+
+    fn select_exclusive(
+        &self,
+        centers: &[(u32, f64)],
+        power: &[f32],
+        cooldown: &[u64],
+        now: u64,
+        n: usize,
+    ) -> usize {
+        self.owned(n)
+            .into_iter()
+            .filter(|&k| cooldown[k] <= now && self.channel_exclusive(k, centers, n))
+            .max_by(|&a, &b| power[a].total_cmp(&power[b]))
+            .unwrap_or_else(|| self.select_live_channel(power, n, cooldown, now))
+    }
+
+    /// F1: isolated tracks retain the drift/fading-tolerant selected input.
+    /// Use the home channel only when a neighboring track can contaminate it.
+    fn decoder_channel(
+        &self,
+        selected: usize,
+        centers: &[(u32, f64)],
+        cooldown: &[u64],
+        now: u64,
+        n: usize,
+    ) -> usize {
+        let home = (self.center.round() as i64).rem_euclid(n as i64) as usize;
+        let neighbor = centers
+            .iter()
+            .any(|&(id, c)| id != self.id && channel_distance(c, self.center, n) < 2.5);
+        if neighbor && cooldown[home] <= now && self.channel_exclusive(home, centers, n) {
+            home
+        } else {
+            selected
+        }
+    }
+
+    /// A straddle channel facing a close neighbor carries its keying
+    /// sidebands. Select the opposite straddle channel consistently across
+    /// key-up and key-down, retaining exclusivity and cooldown checks.
+    fn select_straddle_channel(
+        &self,
+        selected: usize,
+        centers: &[(u32, f64)],
+        cooldown: &[u64],
+        now: u64,
+        n: usize,
+    ) -> usize {
+        if (self.center - self.center.round()).abs() < 0.40 {
+            return selected;
+        }
+        let mut nearest = STRADDLE_NEIGHBOR_CH;
+        let mut candidate = selected;
+        for &(id, center) in centers {
+            let distance = channel_distance(center, self.center, n);
+            if id == self.id || distance >= nearest {
+                continue;
+            }
+            nearest = distance;
+            let direction =
+                (center - self.center + n as f64 / 2.0).rem_euclid(n as f64) - n as f64 / 2.0;
+            let away = if direction > 0.0 {
+                self.center.floor()
+            } else {
+                self.center.ceil()
+            };
+            candidate = (away as i64).rem_euclid(n as i64) as usize;
+        }
+        if cooldown[candidate] <= now && self.channel_exclusive(candidate, centers, n) {
+            candidate
+        } else {
+            selected
+        }
+    }
+
+    fn observe_phase(&mut self, z: Complex64, snr_db: f64) {
+        if snr_db >= FINE_FREQ_MIN_SNR_DB {
+            self.update_centroid_phase(z);
+        }
+    }
+
+    fn update_centroid_phase(&mut self, z: Complex64) {
+        if let Some(raw) = phase_position(z, self.center) {
+            if (raw - self.center).abs() <= CENTROID_OUTLIER_CH {
+                self.center += CENTER_EMA_ALPHA * (raw - self.center);
+                self.update_phase(z);
+            }
+        }
+    }
+
+    /// Power-only synthetic-hop fallback for the centroid. Live complex
+    /// observations use the gated phase position instead (MAN-112).
     fn update_centroid(&mut self, k: usize, power: &[f32], n_channels: usize) {
         let k_minus = (k + n_channels - 1) % n_channels;
         let k_plus = (k + 1) % n_channels;
@@ -1811,7 +2108,6 @@ pub struct TrackManager {
     /// metric).
     #[cfg(test)]
     spawns_by_channel: Vec<u64>,
-    #[cfg(test)]
     total_spawns: u64,
     /// MAN-312 (SPEC §2.7): the band-wide static-crash detector. Every
     /// channel is live until `set_rf_passband_hz` narrows it to the
@@ -1984,7 +2280,6 @@ impl TrackManager {
             mirror_image_guard: false,
             #[cfg(test)]
             spawns_by_channel: vec![0; n_channels],
-            #[cfg(test)]
             total_spawns: 0,
             crash: CrashDetector::new(n_channels),
             dormant_flush: Vec::new(),
@@ -2187,7 +2482,6 @@ impl TrackManager {
     }
 
     /// MAN-273: every spawn since construction, the census's sum.
-    #[cfg(test)]
     pub(crate) fn total_spawns(&self) -> u64 {
         self.total_spawns
     }
@@ -2602,17 +2896,78 @@ impl TrackManager {
         // MAN-108: for the DORMANT-entry flush inside the loop.
         let dormant_quality = self.quality.clone();
         let ids: Vec<u32> = self.tracks.keys().copied().collect();
+        let centers: Vec<_> = self.tracks.iter().map(|(&id, t)| (id, t.center)).collect();
         for id in ids {
             let n = self.n_channels();
             let track = self.tracks.get_mut(&id).unwrap();
             // MAN-197: selection skips channels still serving a post-Silent
             // cooldown, so a track whose window drifted onto a silenced
             // birdie cannot keep decoding it inside the cooldown window.
-            let k = track.select_live_channel(
+            let k = track.select_exclusive(
+                &centers,
                 &hop.power,
-                n,
                 &self.channel_cooldown_until,
                 self.hop_counter,
+                n,
+            );
+            // Before the neighbor has its own track, its stronger channel
+            // must not train this track: `k` feeds tracking (envelope, rise,
+            // SNR, phase) as well as decoder input. Reject measured carriers
+            // outside this identity's centroid gate, just as centroid
+            // updates do.
+            let phase_matches = |ch: usize| {
+                if channel_distance(ch as f64, track.center, n) <= 1.0 {
+                    return true;
+                }
+                let floor = self.floor.effective_floor_db(ch);
+                if power_db_vals[ch] - floor < FINE_FREQ_MIN_SNR_DB
+                    || prev_hop
+                        .as_ref()
+                        .is_none_or(|prev| power_db(prev.power[ch]) - floor < FINE_FREQ_MIN_SNR_DB)
+                {
+                    return true;
+                }
+                prev_hop
+                    .as_ref()
+                    .and_then(|prev| phase_lag_product(prev, hop, ch))
+                    .and_then(|z| phase_position(z, track.center))
+                    .is_none_or(|pos| (pos - track.center).abs() <= CENTROID_OUTLIER_CH)
+            };
+            let k = if phase_matches(k) {
+                k
+            } else {
+                track
+                    .owned(n)
+                    .into_iter()
+                    .filter(|&ch| {
+                        self.channel_cooldown_until[ch] <= self.hop_counter
+                            && track.channel_exclusive(ch, &centers, n)
+                            && phase_matches(ch)
+                    })
+                    .max_by(|&a, &b| hop.power[a].total_cmp(&hop.power[b]))
+                    .unwrap_or(k)
+            };
+            // A stronger neighbor can contaminate one side of a straddle.
+            let k = track.select_straddle_channel(
+                k,
+                &centers,
+                &self.channel_cooldown_until,
+                self.hop_counter,
+                n,
+            );
+            let k_dec = track.decoder_channel(
+                k,
+                &centers,
+                &self.channel_cooldown_until,
+                self.hop_counter,
+                n,
+            );
+            let k_dec = track.select_straddle_channel(
+                k_dec,
+                &centers,
+                &self.channel_cooldown_until,
+                self.hop_counter,
+                n,
             );
             let prev_state = track.lifecycle.state();
             // MAN-312: a crash's energy would drag the centroid toward
@@ -2624,13 +2979,27 @@ impl TrackManager {
             if crash_onset {
                 track.rollback_phase();
             } else if !suppress && prev_state != LifecycleState::Dormant {
-                track.update_centroid(k, &hop.power, n);
+                // Power-only synthetic hops have no phase observation.
+                if hop.x.is_empty() {
+                    track.update_centroid(k, &hop.power, n);
+                }
+                track
+                    .envelope
+                    .push_back((self.hop_counter, power_db_vals[k] as f32));
+                if track.envelope.len() > ENVELOPE_HOPS {
+                    track.envelope.pop_front();
+                }
                 track.note_phase();
                 // MAN-114 (SPEC §1.4): key-down hops at >= 6 dB feed the
                 // spot-frequency estimator.
                 if power_db_vals[k] - self.floor.effective_floor_db(k) >= FINE_FREQ_MIN_SNR_DB {
                     if let Some(z) = prev_hop.as_ref().and_then(|p| phase_lag_product(p, hop, k)) {
-                        track.update_phase(z);
+                        if prev_state == LifecycleState::Candidate {
+                            if let Some(pos) = phase_position(z, track.center) {
+                                track.confirm_positions.push(pos);
+                            }
+                        }
+                        track.observe_phase(z, power_db_vals[k] - self.floor.effective_floor_db(k));
                     }
                 }
             }
@@ -2696,8 +3065,10 @@ impl TrackManager {
             let hop_now = self.hop_counter;
             let qualified = track.qualified;
             if let Some(ev) = track.keying.as_mut() {
-                let keydown = power_db_vals[k] - self.floor.effective_floor_db(k)
-                    >= f64::from(self.cfg.on_snr_db);
+                let snr_db = power_db_vals[k] - self.floor.effective_floor_db(k);
+                let keydown = snr_db >= f64::from(self.cfg.on_snr_db)
+                    && !neighbor_dominates(&power_db_vals, k)
+                    && ev.admits_keydown_level(snr_db);
                 ev.on_hop(
                     hop_now,
                     prev_state,
@@ -2706,6 +3077,7 @@ impl TrackManager {
                     k,
                     track.birth_channel,
                     keydown,
+                    snr_db,
                     &hop.power,
                     &power_db_vals,
                 );
@@ -2742,6 +3114,19 @@ impl TrackManager {
                             sample_ts,
                         });
                     }
+                    // MAN-112: an isolated promotion re-seeds its centre from
+                    // the confirm window's agreeing phase positions. A birth
+                    // on the carrier's skirt channel more than 0.6 channel
+                    // away could otherwise never pass the centroid gate.
+                    let isolated = centers.iter().all(|&(other, center)| {
+                        other == id || channel_distance(center, track.center, n) >= ISOLATION_CH
+                    });
+                    let positions = std::mem::take(&mut track.confirm_positions);
+                    if isolated {
+                        if let Some(c) = agreeing_median(positions) {
+                            track.center = c;
+                        }
+                    }
                     // SPEC §1.1/§5 (freq_hz's doc comment covers the §1.4
                     // deviation): seed TrackMeta.freq_hz from this track's
                     // own centroid EMA (already warm from its
@@ -2774,7 +3159,7 @@ impl TrackManager {
                     // re-applied uniformly here after the fact. MAN-211:
                     // `freq_hz` likewise.
                     let burst = track.decoder_input(
-                        k,
+                        k_dec,
                         hop,
                         sample_ts,
                         refine_bw_hz,
@@ -2838,7 +3223,7 @@ impl TrackManager {
                         // rationale): current_snr_db and (MAN-211) freq_hz
                         // passed INTO decoder_input, captured per-entry.
                         let burst = track.decoder_input(
-                            k,
+                            k_dec,
                             hop,
                             sample_ts,
                             refine_bw_hz,
@@ -2979,13 +3364,14 @@ impl TrackManager {
                             LifecycleState::Dormant => "D",
                         };
                         eprintln!(
-                            "[man372]   id={id} k={k} state={state_tag} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} qual={qualifies} || {}",
+                            "[man372]   id={id} k={k} state={state_tag} D={} Dp={} | slope={:.1} n={} t_last={} mean={mean:.1} peak={peak:.1} count={count} rho={:.2} marks={marks} kd_marks={} qual={qualifies} || {}",
                             ev.qualifies(comod, k, spacing),
                             ev.qualifies_short(comod, k, spacing, state, marks),
                             ev.slope_hz_s(spacing),
                             ev.n,
                             ev.t_last,
                             comod.diag_best_rho(k),
+                            ev.keydown_marks,
                             ev.diag_gates(comod, k, spacing),
                         );
                     }
@@ -3106,12 +3492,29 @@ impl TrackManager {
         // MAN-198: a new condition here also belongs in
         // `trace_spawn_vetoes`, or the funnel reports its refusals as noRise.
         let owners_before = self.funnel.as_ref().map(|_| self.owner_of.clone());
+        // MAN-198/MAN-112: the scan's admission verdict per rising channel,
+        // taken before this hop's spawns move ownership. Only with a trace.
+        let admission_before: Option<Vec<Option<crate::funnel::SpawnVeto>>> =
+            self.funnel.as_ref().map(|_| {
+                (0..self.n_channels())
+                    .map(|k| {
+                        if rise[k] {
+                            self.admission_veto(
+                                k,
+                                self.spawn_phase_position(k, hop, prev_hop.as_ref()),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            });
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
             while k < n {
                 if rise[k]
-                    && self.owner_of[k].is_none()
+                    && self.spawn_admits(k, self.spawn_phase_position(k, hop, prev_hop.as_ref()))
                     && !self.spawn_window_cooling_down(k)
                     && self.is_local_peak(k)
                     && !self.rtty_vetoes_spawn(k)
@@ -3124,7 +3527,10 @@ impl TrackManager {
                     let mut winner = k;
                     if k + 1 < n
                         && rise[k + 1]
-                        && self.owner_of[k + 1].is_none()
+                        && self.spawn_admits(
+                            k + 1,
+                            self.spawn_phase_position(k + 1, hop, prev_hop.as_ref()),
+                        )
                         && !self.spawn_window_cooling_down(k + 1)
                         && !self.rtty_vetoes_spawn(k + 1)
                         && !self.comod_vetoes_spawn(k + 1)
@@ -3138,19 +3544,27 @@ impl TrackManager {
                         }
                         // both channels claimed by this decision; skip past k+1
                         // next iteration so we don't re-evaluate it as its own birth.
-                        let id = self.spawn(winner);
+                        let id = self.spawn_positioned(winner, hop, prev_hop.as_ref());
                         self.trace_spawn(id, winner, sample_ts);
                         k += 2;
                         continue;
                     }
-                    let id = self.spawn(winner);
+                    let id = self.spawn_positioned(winner, hop, prev_hop.as_ref());
                     self.trace_spawn(id, winner, sample_ts);
                 }
                 k += 1;
             }
         }
-        if let Some(before) = owners_before {
-            self.trace_spawn_vetoes(&rise, &before, past_warmup, suppress, &hop.power, sample_ts);
+        if let (Some(before), Some(admission)) = (owners_before, admission_before) {
+            self.trace_spawn_vetoes(
+                &rise,
+                &before,
+                &admission,
+                past_warmup,
+                suppress,
+                &hop.power,
+                sample_ts,
+            );
         }
         self.recompute_ownership();
         // Round 10 (PR #154, Codex): only HangExpired is a genuine observed
@@ -3212,6 +3626,79 @@ impl TrackManager {
         s >= self.gate.smoothed_db((k + n - 1) % n) && s >= self.gate.smoothed_db((k + 1) % n)
     }
 
+    /// A split needs two key-down complex observations. A local maximum
+    /// on a loud carrier's skirt is not evidence of an independent carrier.
+    fn spawn_phase_position(
+        &self,
+        k: usize,
+        hop: &HopOutput,
+        prev: Option<&HopOutput>,
+    ) -> Option<f64> {
+        let prev = prev?;
+        let floor = self.floor.effective_floor_db(k);
+        if power_db(*prev.power.get(k)?) - floor < FINE_FREQ_MIN_SNR_DB
+            || power_db(hop.power[k]) - floor < FINE_FREQ_MIN_SNR_DB
+        {
+            return None;
+        }
+        phase_position(phase_lag_product(prev, hop, k)?, k as f64)
+    }
+
+    /// MAN-112: both the peak channel and its measured carrier must be
+    /// separate from the owner. Dormant identities retain their window.
+    fn spawn_admits(&self, k: usize, position: Option<f64>) -> bool {
+        if self.birth_isolated(k) {
+            return self.owner_of[k].is_none();
+        }
+        // A distant carrier's sidelobe cannot claim this bin's identity.
+        // Empty complex observations retain power-only detector test semantics.
+        if position.is_some_and(|pos| {
+            channel_distance(pos, k as f64, self.n_channels()) > CENTROID_OUTLIER_CH
+        }) {
+            return false;
+        }
+        self.owner_of[k].is_none()
+            || (self.is_local_peak(k)
+                && position.is_some_and(|pos| {
+                    self.tracks.values().all(|t| {
+                        !t.owned(self.n_channels()).contains(&k)
+                            || (t.lifecycle.state() != LifecycleState::Dormant
+                                && t.phase_z.norm_sqr() > 0.0
+                                && channel_distance(k as f64, t.center, self.n_channels())
+                                    >= SPLIT_MIN_CH
+                                && channel_distance(pos, t.center, self.n_channels())
+                                    >= SPLIT_MIN_FREQ_CH)
+                    })
+                }))
+    }
+
+    /// MAN-198: why `spawn_admits` refuses `k`, or `None` when it admits:
+    /// a non-isolated rise whose phase position is a far sidelobe, else a
+    /// channel a track owns without a split. Same conditions, same order.
+    fn admission_veto(&self, k: usize, position: Option<f64>) -> Option<crate::funnel::SpawnVeto> {
+        use crate::funnel::SpawnVeto as V;
+        if self.spawn_admits(k, position) {
+            return None;
+        }
+        let sidelobe = !self.birth_isolated(k)
+            && position.is_some_and(|pos| {
+                channel_distance(pos, k as f64, self.n_channels()) > CENTROID_OUTLIER_CH
+            });
+        Some(if sidelobe {
+            V::SidelobePosition
+        } else {
+            V::OwnedByTrack
+        })
+    }
+
+    /// MAN-112: no open track's centre is within `ISOLATION_CH` of `k`.
+    fn birth_isolated(&self, k: usize) -> bool {
+        let n = self.n_channels();
+        self.tracks
+            .values()
+            .all(|t| channel_distance(t.center, k as f64, n) >= ISOLATION_CH)
+    }
+
     /// MAN-171: is `k` still serving out a post-`Silent`-closure spawn
     /// cooldown (`DetectorConfig::silent_respawn_cooldown_hops`)?
     fn channel_cooling_down(&self, k: usize) -> bool {
@@ -3231,6 +3718,23 @@ impl TrackManager {
             .any(|ch| self.channel_cooling_down(ch))
     }
 
+    /// Bootstrap identity from the same two gated complex observations used
+    /// for spawn admission. An integer-bin seed can lock a straddling birth
+    /// onto a neighbor's skirt before the slow centroid EMA settles.
+    fn spawn_positioned(&mut self, k: usize, hop: &HopOutput, prev: Option<&HopOutput>) -> u32 {
+        let position = if self.birth_isolated(k) {
+            None
+        } else {
+            self.spawn_phase_position(k, hop, prev)
+        };
+        let id = self.spawn(k);
+        if let Some(position) = position {
+            self.tracks.get_mut(&id).unwrap().center = position;
+            self.recompute_ownership();
+        }
+        id
+    }
+
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
     /// is seeded from this hop's live gate/floor state (not left at
     /// `Track::new`'s placeholder `0.0`) so a track born this same hop is
@@ -3248,11 +3752,14 @@ impl TrackManager {
             .checked_add(self.id_stride)
             .unwrap_or(self.id_first);
         let mut track = Track::new(id, birth_channel, &self.cfg);
+        if self.decode_cfg.steered_frontend {
+            track.steered = Some(SteeredFrontend::default());
+        }
         #[cfg(test)]
         {
             self.spawns_by_channel[birth_channel] += 1;
-            self.total_spawns += 1;
         }
+        self.total_spawns += 1;
         let f = self.floor.effective_floor_db(birth_channel);
         track.current_snr_db = (self.gate.smoothed_db(birth_channel) - f) as f32;
         // `snr_peak_db` is left at `Track::new`'s `NEG_INFINITY`: it is only
@@ -3288,6 +3795,7 @@ impl TrackManager {
         &self,
         rise: &[bool],
         owners_before: &[Option<u32>],
+        admission: &[Option<crate::funnel::SpawnVeto>],
         past_warmup: bool,
         suppress: bool,
         power: &[f32],
@@ -3315,8 +3823,8 @@ impl TrackManager {
                     V::Warmup
                 } else if suppress {
                     V::StaticCrash
-                } else if self.owner_of[k].is_some() {
-                    V::OwnedByTrack
+                } else if let Some(v) = admission[k] {
+                    v
                 } else if self.spawn_window_cooling_down(k) {
                     V::CoolingDown
                 } else if !self.is_local_peak(k) {
@@ -3353,8 +3861,9 @@ impl TrackManager {
         self.funnel = trace;
     }
 
-    /// SPEC §2.5: tracks whose centers converge within 1.0 channel merge;
-    /// the lower-current-SNR one is closed. Returns the closed ids (with
+    /// SPEC §2.5: merge below 0.5 channel unconditionally, or below 1.0
+    /// with correlated keying envelopes (MAN-112). The lower-current-SNR
+    /// one is closed. Returns the closed ids (with
     /// `ClosureKind::Bookkeeping` naming the surviving track -- round 9,
     /// PR #154: the loser's identity may continue there, so a consumer
     /// holding deferred per-identity evidence must migrate it rather than
@@ -3370,7 +3879,16 @@ impl TrackManager {
                     continue;
                 }
                 let (ca, cb) = (self.tracks[&a].center, self.tracks[&b].center);
-                if (ca - cb).abs() < 1.0 {
+                // Correlation is O(750), only for pairs closer than one channel.
+                let distance = channel_distance(ca, cb, self.n_channels());
+                if distance < MERGE_ALWAYS_CH
+                    || (distance < 1.0
+                        && envelope_correlation(
+                            &self.tracks[&a].envelope,
+                            &self.tracks[&b].envelope,
+                        )
+                        .is_some_and(|r| r >= MERGE_MIN_ENVELOPE_CORR))
+                {
                     // MAN-172: ids are ascending, so `a` is the incumbent.
                     // Converged tracks often select the same channel and tie
                     // exactly. Keep its established decoder on that tie.
@@ -5055,6 +5573,359 @@ mod tests {
     fn hop_with_x(m: u64, x: Vec<num_complex::Complex32>) -> HopOutput {
         let power = x.iter().map(|c| c.norm_sqr()).collect();
         HopOutput { m, x, power }
+    }
+
+    #[test]
+    fn circular_distance_wraps_phase_centres_at_the_fft_boundary() {
+        for (a, b) in [(0.1, 63.9), (-0.1, 64.1), (128.1, -0.1)] {
+            assert!((channel_distance(a, b, 64) - 0.2).abs() < 1e-10);
+        }
+    }
+    #[test]
+    fn exclusive_selection_never_reads_a_channel_nearer_another_track() {
+        let mut a = Track::new(1, 107, &DetectorConfig::default());
+        let mut b = Track::new(2, 109, &DetectorConfig::default());
+        b.center = 108.6;
+        a.center = 107.0;
+        let centers = [(1, 107.0), (2, 108.6)];
+        let mut power = vec![0.0; 1024];
+        power[107] = 1.0;
+        power[108] = 10.0;
+        assert_eq!(
+            a.select_exclusive(&centers, &power, &vec![0; 1024], 0, 1024),
+            107
+        );
+        assert_eq!(
+            b.select_exclusive(&centers, &power, &vec![0; 1024], 0, 1024),
+            108
+        );
+    }
+
+    #[test]
+    fn untracked_neighbor_cannot_train_a_straddling_tracks_decoder() {
+        let mut tm = TrackManager::new(
+            1024,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(108);
+        tm.tracks.get_mut(&1).unwrap().center = 107.52;
+        let spectrum = |m| {
+            let mut x = vec![num_complex::Complex32::new(0.0, 0.0); 1024];
+            for (k, pos, amp) in [(107, 107.5, 1.0), (108, 107.5, 0.9), (109, 108.833, 3.0)] {
+                x[k] = num_complex::Complex32::from_polar(
+                    amp,
+                    (std::f64::consts::FRAC_PI_2 * (pos - k as f64) * m as f64) as f32,
+                ) * odd_channel_sign_correction(m, k);
+            }
+            hop_with_x(m, x)
+        };
+        tm.prev_hop = Some(spectrum(0));
+        tm.step_hop(&spectrum(1), 1);
+        let observed_db = tm.tracks[&1].envelope.back().unwrap().1;
+        assert!(
+            observed_db.abs() < 1e-4,
+            "must read the 0 dB own carrier, not the stronger untracked neighbor: {observed_db}"
+        );
+    }
+
+    #[test]
+    fn phase_centroid_rejects_an_outlier_more_than_0_6_channel_away() {
+        let mut t = Track::new(1, 107, &DetectorConfig::default());
+        t.update_centroid_phase(Complex64::from_polar(
+            1.0,
+            std::f64::consts::FRAC_PI_2 * 108.6,
+        ));
+        assert_eq!(t.center, 107.0);
+        assert_eq!(t.phase_z, Complex64::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn phase_centroid_ignores_a_neighbour_one_channel_away() {
+        let mut t = Track::new(1, 107, &DetectorConfig::default());
+        let centers = [(1, 107.0), (2, 108.07)];
+        let spectrum = |m| {
+            let mut x = vec![num_complex::Complex32::new(0.0, 0.0); 1024];
+            for (k, pos, amp) in [(107, 107.0, 1.0), (108, 108.07, 3.0)] {
+                x[k] = num_complex::Complex32::from_polar(
+                    amp,
+                    (std::f64::consts::FRAC_PI_2 * (pos - k as f64) * m as f64) as f32,
+                ) * odd_channel_sign_correction(m, k);
+            }
+            hop_with_x(m, x)
+        };
+        let mut prev = spectrum(0);
+        for m in 1..2001 {
+            let h = spectrum(m);
+            let k = t.select_exclusive(&centers, &h.power, &[0; 1024], m, 1024);
+            assert_eq!(k, 107, "the stronger neighbor must not be selected");
+            t.observe_phase(phase_lag_product(&prev, &h, k).unwrap(), 20.0);
+            prev = h;
+        }
+        assert!((t.center - 107.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn envelope_correlation_needs_shared_variable_history() {
+        let a: VecDeque<_> = (0..750).map(|i| (i, (i % 7) as f32)).collect();
+        let b: VecDeque<_> = (0..750).map(|i| (i, (i % 11) as f32)).collect();
+        assert!((envelope_correlation(&a, &a).unwrap() - 1.0).abs() < 1e-6);
+        assert!(envelope_correlation(&a, &b).unwrap().abs() < 0.05);
+        assert!(envelope_correlation(&a, &a.iter().take(149).copied().collect()).is_none());
+        let shifted = a.iter().map(|&(i, x)| (i + 1000, x)).collect();
+        assert!(envelope_correlation(&a, &shifted).is_none());
+    }
+
+    fn close_merge_tracks() -> TrackManager {
+        let mut tm = TrackManager::new(
+            64,
+            96000.0,
+            14000000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        tm.spawn(10);
+        tm.spawn(20);
+        tm.tracks.get_mut(&1).unwrap().center = 10.0;
+        tm.tracks.get_mut(&2).unwrap().center = 10.7;
+        tm
+    }
+    #[test]
+    fn uncorrelated_tracks_0_7_channel_apart_do_not_merge() {
+        let mut tm = close_merge_tracks();
+        for id in [1, 2] {
+            tm.tracks.get_mut(&id).unwrap().envelope = (0..750)
+                .map(|i| (i, (i % if id == 1 { 7 } else { 11 }) as f32))
+                .collect();
+        }
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 2);
+    }
+    #[test]
+    fn correlated_tracks_0_7_channel_apart_merge() {
+        let mut tm = close_merge_tracks();
+        for t in tm.tracks.values_mut() {
+            t.envelope = (0..750).map(|i| (i, (i % 7) as f32)).collect();
+        }
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 1);
+        assert!(tm.tracks.contains_key(&1));
+    }
+    #[test]
+    fn merge_waits_for_150_hops_of_shared_history() {
+        let mut tm = close_merge_tracks();
+        for t in tm.tracks.values_mut() {
+            t.envelope = (0..10).map(|i| (i, (i % 7) as f32)).collect();
+        }
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 2);
+    }
+    #[test]
+    fn tracks_under_half_a_channel_apart_merge_unconditionally() {
+        let mut tm = close_merge_tracks();
+        tm.tracks.get_mut(&2).unwrap().center = 10.4;
+        tm.merge_converged();
+        assert_eq!(tm.tracks.len(), 1);
+    }
+
+    #[test]
+    fn owned_channel_far_from_the_owner_centre_may_spawn() {
+        let mut tm = close_merge_tracks();
+        tm.tracks.remove(&2);
+        assert!(
+            !tm.spawn_admits(12, Some(10.0)),
+            "a remote sidelobe has the carrier's phase, not the peak bin's"
+        );
+        assert!(
+            !tm.spawn_admits(11, Some(11.07)),
+            "no frequency evidence for a split yet"
+        );
+        tm.tracks.get_mut(&1).unwrap().phase_z = Complex64::new(1.0, 0.0);
+        assert!(tm.spawn_admits(11, Some(11.07)));
+        assert!(
+            !tm.spawn_admits(11, Some(10.0)),
+            "a skirt has the owner's phase position"
+        );
+        assert!(!tm.spawn_admits(11, None));
+        tm.tracks.get_mut(&1).unwrap().center = 10.5;
+        assert!(!tm.spawn_admits(11, Some(11.07)));
+    }
+    /// MAN-198 after MAN-112: the funnel's spawn-veto census names what
+    /// `spawn_admits` refused, not bare ownership. A split-admitted owned
+    /// channel is no refusal, and a skirt rise is `sidelobePosition`.
+    #[test]
+    fn funnel_census_mirrors_spawn_admission() {
+        use crate::funnel::SpawnVeto as V;
+        let mut tm = close_merge_tracks();
+        tm.tracks.remove(&2);
+        assert_eq!(tm.admission_veto(12, Some(10.0)), Some(V::SidelobePosition));
+        assert_eq!(tm.admission_veto(11, Some(11.07)), Some(V::OwnedByTrack));
+        tm.tracks.get_mut(&1).unwrap().phase_z = Complex64::new(1.0, 0.0);
+        assert!(tm.owner_of[11].is_some());
+        assert_eq!(tm.admission_veto(11, Some(11.07)), None);
+        assert_eq!(tm.admission_veto(11, Some(10.0)), Some(V::SidelobePosition));
+        // Isolated and unowned: admitted whatever the position says.
+        assert_eq!(tm.admission_veto(40, Some(30.0)), None);
+    }
+    #[test]
+    fn off_midpoint_neighbor_does_not_force_the_outer_straddle_channel() {
+        let mut t = Track::new(1, 107, &DetectorConfig::default());
+        // Restored V7 is at 106.667. Small centroid noise must not switch
+        // its decoder to 106, where transition sidelobes bias phase tracking.
+        t.center = 106.64;
+        let centers = [(1, t.center), (2, 108.27)];
+        assert_eq!(
+            t.select_straddle_channel(107, &centers, &[0; 1024], 0, 1024),
+            107
+        );
+    }
+
+    /// MAN-112: the isolated-promotion re-seed needs enough agreeing
+    /// confirm-window positions; a scattered or short set keeps the centre.
+    #[test]
+    fn agreeing_median_needs_enough_tight_positions() {
+        let tight = vec![
+            1013.1, 1013.15, 1013.12, 1013.08, 1013.2, 1013.11, 1013.13, 1013.1,
+        ];
+        assert_eq!(agreeing_median(tight.clone()), Some(1013.12));
+        assert_eq!(agreeing_median(tight[..7].to_vec()), None);
+        let scattered = vec![
+            1012.5, 1013.8, 1013.1, 1012.9, 1013.6, 1012.7, 1013.4, 1013.0,
+        ];
+        assert_eq!(agreeing_median(scattered), None);
+    }
+
+    /// MAN-112: a birth with no track within 2.5 channels keeps the
+    /// pre-MAN-112 unowned-peak rule, so one rising-edge phase position can
+    /// neither veto it nor seed it; near a track the phase veto stays.
+    #[test]
+    fn isolated_birth_ignores_its_phase_position() {
+        let mut tm = TrackManager::new(
+            1024,
+            96_000.0,
+            14_000_000.0,
+            DetectorConfig::default(),
+            DecodeConfig::default(),
+        );
+        assert!(tm.spawn_admits(25, Some(23.96)));
+        tm.spawn(27);
+        tm.recompute_ownership();
+        assert!(!tm.spawn_admits(25, Some(23.96)));
+    }
+
+    /// MAN-112: a neighbor two or more channels away does not move a
+    /// straddling track off its selected channel. In the quarter-bin 200 Hz
+    /// pair the override read the upper track from its away channel, whose
+    /// biased phase pulled the centre up to 109.5 and the spot 18 Hz high.
+    #[test]
+    fn straddle_override_ignores_a_neighbor_two_channels_away() {
+        let mut t = Track::new(2, 109, &DetectorConfig::default());
+        t.center = 109.42;
+        let far = [(1, 107.25), (2, t.center)];
+        assert_eq!(
+            t.select_straddle_channel(109, &far, &[0; 1024], 0, 1024),
+            109
+        );
+        let near = [(1, 107.6), (2, t.center)];
+        assert_eq!(
+            t.select_straddle_channel(109, &near, &[0; 1024], 0, 1024),
+            110
+        );
+    }
+
+    #[test]
+    fn stronger_neighbor_does_not_choose_the_contaminated_straddle_channel() {
+        let mut t = Track::new(1, 11, &DetectorConfig::default());
+        t.center = 10.55;
+        let centers = [(1, 10.55), (2, 12.15)];
+        assert_eq!(t.select_straddle_channel(11, &centers, &[0; 64], 0, 64), 10);
+        let mut cooldown = [0; 64];
+        cooldown[10] = 100;
+        assert_eq!(
+            t.select_straddle_channel(11, &centers, &cooldown, 0, 64),
+            11
+        );
+    }
+
+    #[test]
+    fn phase_centroid_holds_through_key_up() {
+        let mut t = Track::new(1, 10, &DetectorConfig::default());
+        let z = Complex64::from_polar(1.0, std::f64::consts::FRAC_PI_2 * 10.5);
+        t.observe_phase(z, 5.9);
+        assert_eq!(t.center, 10.0);
+        assert_eq!(t.phase_z, Complex64::new(0.0, 0.0));
+        t.observe_phase(z, 6.0);
+        assert!(t.center > 10.0);
+    }
+    #[test]
+    fn decoder_reads_the_home_channel_not_the_neighbours_sidebands() {
+        let mut t = Track::new(1, 10, &DetectorConfig::default());
+        let mut power = vec![1.0; 64];
+        power[11] = 100.0;
+        let h = hop(0, power);
+        let k = t.decoder_channel(11, &[(1, 10.0), (2, 12.0)], &[0; 64], 0, 64);
+        assert_eq!(k, 10);
+        assert_eq!(t.decoder_channel(11, &[(1, 10.0)], &[0; 64], 0, 64), 11);
+        let own = t.decoder_input(k, &h, 0, 0.0, None, 0.0, 0.0, false);
+        assert_eq!(own[0].0, 1.0);
+    }
+    #[test]
+    fn decoder_input_steered_delays_reported_sample_ts_by_group_delay() {
+        let mut t = Track::new(1, 10, &DetectorConfig::default());
+        t.steered = Some(SteeredFrontend::default());
+        let d = manta_dsp::frontend::GROUP_DELAY_HOPS as u64;
+        for m in 0..40 {
+            let h = hop_with_x(m, vec![num_complex::Complex32::new(1.0, 0.0); 64]);
+            let out = t.decoder_input(10, &h, m * 128, 0.0, None, m as f32, 0.0, false);
+            if m < d {
+                assert!(out.is_empty());
+            } else {
+                assert_eq!(out.len(), 1);
+                assert_eq!(out[0].3, (m - d) * 128);
+                assert_eq!(out[0].4, (m - d) as f32);
+            }
+        }
+    }
+    #[test]
+    fn steered_partner_wraps_with_an_unwrapped_centroid() {
+        let mut t = Track::new(1, 63, &DetectorConfig::default());
+        t.center = 63.9;
+        t.steered = Some(SteeredFrontend::default());
+        for m in 0..60 {
+            let mut x = vec![num_complex::Complex32::new(0.0, 0.0); 64];
+            for k in [0, 63] {
+                x[k] = num_complex::Complex32::from_polar(
+                    0.5,
+                    (std::f64::consts::FRAC_PI_2 * (63.9 - k as f64) * m as f64) as f32,
+                ) * odd_channel_sign_correction(m, k);
+            }
+            let h = hop_with_x(m, x);
+            let out = t.decoder_input(0, &h, m * 128, 0.0, None, 0.0, 0.0, false);
+            if m > 40 {
+                assert!((out[0].0 - 1.0).abs() < 0.001, "hop {m}: {}", out[0].0);
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_input_steered_drains_its_backlog_on_close() {
+        let mut t = Track::new(1, 10, &DetectorConfig::default());
+        t.steered = Some(SteeredFrontend::default());
+        for m in 0..10 {
+            let h = hop_with_x(m, vec![num_complex::Complex32::new(1.0, 0.0); 64]);
+            assert!(t
+                .decoder_input(10, &h, m * 128, 0.0, None, 0.0, 0.0, false)
+                .is_empty());
+        }
+        let drained = t.drain_refiner_backlog();
+        assert_eq!(drained.len(), 10);
+        assert_eq!(
+            drained.iter().map(|e| e.3).collect::<Vec<_>>(),
+            (0..10).map(|m| m * 128).collect::<Vec<_>>()
+        );
+        assert!(t.drain_refiner_backlog().is_empty());
     }
 
     fn quiet_power(n: usize) -> Vec<f32> {
@@ -7368,7 +8239,7 @@ mod tests {
         );
         tm.spawn(10);
         tm.spawn(40);
-        for (id, center) in [(1, 20.4), (2, 21.1)] {
+        for (id, center) in [(1, 20.4), (2, 20.8)] {
             let track = tm.tracks.get_mut(&id).unwrap();
             track.center = center;
             track.current_snr_db = 18.0;
@@ -7407,6 +8278,8 @@ mod tests {
             track.center = center;
             track.current_snr_db = snr;
             track.has_emitted = emitted;
+            // MAN-112: these closure-order fixtures represent one correlated signal.
+            track.envelope = (0..150).map(|i| (i, (i % 7) as f32)).collect();
         }
         tm
     }
@@ -7628,7 +8501,7 @@ mod tests {
         }
         {
             let strong = tm.tracks.get_mut(&strong_id).unwrap();
-            strong.center = 21.1; // within 1.0 channel of weak's center (SPEC §2.5)
+            strong.center = 20.8; // MAN-112: inside unconditional 0.5-channel merge radius.
             strong.current_snr_db = 18.0;
         }
 
@@ -7644,7 +8517,7 @@ mod tests {
             survivor.current_snr_db, 18.0,
             "the higher-SNR track must survive; the lower-SNR one must be closed"
         );
-        assert_eq!(survivor.center, 21.1);
+        assert_eq!(survivor.center, 20.8);
         assert_eq!(
             tm.close_counts().merged,
             1,
@@ -7800,7 +8673,7 @@ mod tests {
         }
         {
             let strong = tm.tracks.get_mut(&strong_id).unwrap();
-            strong.center = 21.1;
+            strong.center = 20.8; // MAN-112: inside unconditional 0.5-channel merge radius.
             strong.current_snr_db = 18.0;
         }
 
@@ -7871,7 +8744,7 @@ mod tests {
         }
         {
             let strong = tm.tracks.get_mut(&strong_id).unwrap();
-            strong.center = 21.1;
+            strong.center = 20.8; // MAN-112: inside unconditional 0.5-channel merge radius.
             strong.current_snr_db = 18.0;
         }
 
@@ -7946,7 +8819,7 @@ mod tests {
         }
         {
             let strong = tm.tracks.get_mut(&strong_id).unwrap();
-            strong.center = 21.1;
+            strong.center = 20.8; // MAN-112: inside unconditional 0.5-channel merge radius.
             strong.current_snr_db = 18.0;
         }
 
@@ -8774,7 +9647,74 @@ mod tests {
             ev.sum_tf += tt * f;
             ev.non_flat += 1;
         }
+        ev.keydown_marks = SHORT_MIN_MARKS;
         ev
+    }
+
+    /// MAN-112: D′ also needs `SHORT_MIN_MARKS` debounced key-down runs in
+    /// the evidence hops. A swept carrier's decoder input can ripple into
+    /// several `keyed_marks` while its key-down evidence is one run.
+    #[test]
+    fn short_rule_needs_marks_in_the_keydown_evidence() {
+        let comod = CoModDetector::new(NC_N);
+        let mut ev = short_evidence(120, 0.0);
+        ev.keydown_marks = SHORT_MIN_MARKS - 1;
+        assert!(!ev.qualifies_short(&comod, 10, 1500.0, LifecycleState::Hang, 6));
+    }
+
+    /// MAN-112: marks debounce like `keyed_marks`, count once however long
+    /// they last, and follow the local level: a loud onset sets no
+    /// threshold for later, quieter marks, and a 6 dB ripple is no gap.
+    #[test]
+    fn keydown_marks_debounce_and_follow_the_local_level() {
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        let feed = |db: f64, hops: usize, ev: &mut KeyingEvidence| {
+            for _ in 0..hops {
+                ev.note_keydown(db);
+            }
+        };
+        feed(124.0, 20, &mut ev);
+        assert_eq!(ev.keydown_marks, 1);
+        feed(f64::NEG_INFINITY, 2, &mut ev); // shorter than the debounce
+        feed(108.0, 10, &mut ev);
+        assert_eq!(ev.keydown_marks, 1);
+        feed(60.0, 8, &mut ev); // a gap the filter keeps above on_snr_db
+        feed(108.0, 3, &mut ev); // too short to count yet
+        assert_eq!(ev.keydown_marks, 1);
+        feed(108.0, 1, &mut ev);
+        assert_eq!(ev.keydown_marks, 2);
+        for i in 0..40 {
+            feed(if i % 8 < 4 { 13.0 } else { 19.0 }, 1, &mut ev);
+        }
+        assert_eq!(ev.keydown_marks, 2, "a 6 dB ripple is one mark");
+    }
+
+    /// MAN-112: a hop 30 dB under the strongest key-down so far is not
+    /// key-down evidence, and it does not lower the running peak.
+    #[test]
+    fn keydown_level_rejects_a_departed_carriers_far_skirt() {
+        let mut ev = KeyingEvidence::new(0, 0.0, 0);
+        assert!(ev.admits_keydown_level(56.0));
+        assert!(!ev.admits_keydown_level(12.0));
+        assert!(ev.admits_keydown_level(27.0));
+        assert_eq!(ev.peak_keydown_snr_db, 56.0);
+    }
+
+    /// MAN-112: a channel within two channels and 10 dB louder dominates
+    /// the selected one; three channels away, or 9 dB louder, does not.
+    #[test]
+    fn neighbor_dominance_window_and_margin() {
+        let mut p = vec![0.0_f64; 16];
+        p[8] = 20.0;
+        p[10] = 30.0;
+        assert!(neighbor_dominates(&p, 8));
+        p[10] = 29.0;
+        assert!(!neighbor_dominates(&p, 8));
+        p[10] = 0.0;
+        p[5] = 60.0;
+        assert!(!neighbor_dominates(&p, 8));
+        p[15] = 40.0; // wraps: channel 15 is one below channel 0
+        assert!(neighbor_dominates(&p, 0));
     }
 
     /// D′ fires only at the first evaluation after an ACTIVE → HANG drop,

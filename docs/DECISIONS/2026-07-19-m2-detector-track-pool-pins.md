@@ -1,8 +1,8 @@
 # M2 sub-project 2 (detector, track manager, decoder pool) implementation pins
 
 This is the M2 sub-project 2
-(`docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md`, design:
-`docs/superpowers/specs/2026-07-19-m2-detector-track-pool-design.md`)
+(`docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md`, design:
+`docs/archive/plans/specs/2026-07-19-m2-detector-track-pool-design.md`)
 implementation's pinned-decision record. Treat every numbered item below as
 decided; SPEC and docs/ still win on anything not listed here.
 
@@ -70,7 +70,8 @@ decided; SPEC and docs/ still win on anything not listed here.
    `owned()`/`select_channel()` and the alpha constant itself are
    byte-for-byte unchanged, confirmed by the Task 9 review.
 
-4. **V7 golden vector: SPEC §7's literal 150 Hz separation (10,000/10,150
+4. Superseded by [MAN-112](2026-11-01-man112-close-pair-resolution.md).
+   **Historical V7 golden vector: SPEC §7's literal 150 Hz separation (10,000/10,150
    Hz) deviated to a grid-aligned, 4-channel pair.** `crates/manta-testkit/
    src/vectors.rs` places V7's two signals at channel 107 (10,031.25 Hz)
    and channel 111 (10,406.25 Hz), both bin-centered (zero fractional
@@ -213,8 +214,8 @@ decided; SPEC and docs/ still win on anything not listed here.
     `render_scene` if a future vector needs finer drift-rate resolution.
 
 12. **V8/V8w pileup-scene validation and the CPU-budget criterion bench
-    are confirmed deferred**, restating the design doc's (`docs/
-    superpowers/specs/2026-07-19-m2-detector-track-pool-design.md` §1)
+    are confirmed deferred**, restating the design doc's
+    (`docs/archive/plans/specs/2026-07-19-m2-detector-track-pool-design.md` §1)
     explicit out-of-scope boundary as this sub-project's actual executed
     scope: the 50-signal pileup vectors (V8 AWGN, V8w Watterson) and the
     300-active-track CPU-budget bench are real scene/fixture-authoring and

@@ -1,7 +1,7 @@
 # M2 KiwiSDR input implementation pins
 
-This is the M2 KiwiSDR-input sub-project's (`docs/superpowers/plans/2026-07-25-m2-kiwisdr-input.md`,
-design: `docs/superpowers/specs/2026-07-25-m2-kiwisdr-input-design.md`)
+This is the M2 KiwiSDR-input sub-project's (`docs/archive/plans/plans/2026-07-25-m2-kiwisdr-input.md`,
+design: `docs/archive/plans/specs/2026-07-25-m2-kiwisdr-input-design.md`)
 implementation's pinned-decision record. Treat every numbered item below as
 decided; SPEC and docs/ still win on anything not listed here.
 

@@ -567,6 +567,31 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             r.listen, r.callsign, r.enabled
         ));
     }
+    // MAN-142: the two spot outputs, file-only and restart-only.
+    lines.push(match &loaded.pskreporter {
+        None => "pskreporter: none".to_string(),
+        Some(p) => format!(
+            "pskreporter: enabled={} host={} port={} spot_types={} antenna={}",
+            p.enabled,
+            p.host,
+            p.port,
+            p.spot_types.as_str(),
+            if p.antenna.is_empty() {
+                "none".to_string()
+            } else {
+                manta_server::human::quoted(&p.antenna)
+            }
+        ),
+    });
+    if loaded.wsjtx_output.is_empty() {
+        lines.push("wsjtx_output: none".to_string());
+    }
+    for w in &loaded.wsjtx_output {
+        lines.push(format!(
+            "wsjtx_output: destination={} enabled={}",
+            w.destination, w.enabled
+        ));
+    }
 
     lines.push(match &loaded.callsign_lookup {
         None => "callsign_lookup: none".to_string(),
@@ -596,7 +621,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     lines.push(format!(
         "spot: allowlist={} blocklist_path={} notch_path={} cty_path={} scp_path={} \
          cty_sha256={} scp_sha256={} refresh_lists={} list_cache_dir={} cty_url={} scp_url={} \
-         validation_level={} pattern_path={}",
+         validation_level={} pattern_path={} repetition_fusion={}",
         if spot.allowlist.is_empty() {
             "none".to_string()
         } else {
@@ -620,6 +645,7 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
         spot.pattern_path
             .as_ref()
             .map_or("bundled".to_string(), |p| p.display().to_string()),
+        if spot.repetition_fusion { "on" } else { "off" },
     ));
 
     if let Some(path) = &spot.calls_heard_path {
@@ -1233,6 +1259,42 @@ mod tests {
     }
 
     #[test]
+    fn summary_lists_pskreporter_and_wsjtx_output() {
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W5AU\"\noperator_grid = \"EM10dh\"\n\
+             [pskreporter]\nenabled = true\nantenna = \"Inverted V at 12 m\"\n\
+             [[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n",
+        );
+        assert_eq!(
+            line(&lines, "pskreporter:"),
+            "pskreporter: enabled=true host=report.pskreporter.info port=4739 \
+             spot_types=cq_beacon antenna=\"Inverted V at 12 m\""
+        );
+        assert_eq!(
+            line(&lines, "wsjtx_output:"),
+            "wsjtx_output: destination=192.168.1.255:2237 enabled=true"
+        );
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+        assert_eq!(at("pskreporter:"), at("wsjtx_relay:") + 1, "{lines:#?}");
+        assert_eq!(at("wsjtx_output:"), at("pskreporter:") + 1, "{lines:#?}");
+        assert_eq!(
+            at("callsign_lookup:"),
+            at("wsjtx_output:") + 1,
+            "{lines:#?}"
+        );
+
+        let lines = lines_of("[server]\nstation_callsign = \"W5AU\"\n[pskreporter]\n");
+        assert_eq!(
+            line(&lines, "pskreporter:"),
+            "pskreporter: enabled=false host=report.pskreporter.info port=4739 \
+             spot_types=cq_beacon antenna=none"
+        );
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "pskreporter:"), "pskreporter: none");
+        assert_eq!(line(&lines, "wsjtx_output:"), "wsjtx_output: none");
+    }
+
+    #[test]
     fn config_check_prints_hpsdr_protocol() {
         let body = "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nport = 1024\n\
                     freq_hz = 7030000.0\nrate_hz = 192000.0\n";
@@ -1464,7 +1526,7 @@ mod tests {
              scp_path=bundled cty_sha256=none scp_sha256=none refresh_lists=off \
              list_cache_dir=none cty_url=http://www.country-files.com/cty/cty.dat \
              scp_url=http://www.supercheckpartial.com/MASTER.SCP \
-             validation_level=normal pattern_path=bundled"
+             validation_level=normal pattern_path=bundled repetition_fusion=off"
         );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("manta.toml");
@@ -1477,7 +1539,8 @@ mod tests {
                 "[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\nblocklist_path = \"bad.txt\"\n\
                  notch_path = '{}'\ncty_path = 'cty.dat'\nscp_path = 'MASTER.SCP'\n\
                  cty_sha256 = '{}'\nrefresh_lists = true\nlist_cache_dir = 'cache'\n\
-                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n",
+                 scp_url = 'http://mirror.lan/MASTER.SCP'\npattern_path = 'patterns.lst'\n\
+                 repetition_fusion = true\n",
                 notch.display(),
                 PIN.to_ascii_uppercase()
             ),
@@ -1491,7 +1554,7 @@ mod tests {
                  scp_path={} cty_sha256={PIN} scp_sha256=none refresh_lists=on \
                  list_cache_dir={} cty_url=http://www.country-files.com/cty/cty.dat \
                  scp_url=http://mirror.lan/MASTER.SCP \
-                 validation_level={} pattern_path={}",
+                 validation_level={} pattern_path={} repetition_fusion=on",
                 dir.path().join("bad.txt").display(),
                 notch.display(),
                 dir.path().join("cty.dat").display(),
@@ -2025,6 +2088,7 @@ mod tests {
         ("skimmer_relay", "port"),
         ("skimmer_relay", "callsign"),
         ("wsjtx_relay", "callsign"),
+        ("wsjtx_output", "destination"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -2093,7 +2157,10 @@ mod tests {
     /// The loader's own key list for `table`: serde's `expected one of ...`
     /// for an unknown key (every table is `deny_unknown_fields`).
     fn loader_keys(table: &str) -> BTreeSet<String> {
-        let header = if matches!(table, "rbn_uplink" | "skimmer_relay" | "wsjtx_relay") {
+        let header = if matches!(
+            table,
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output"
+        ) {
             format!("[[{table}]]")
         } else {
             format!("[{table}]")
@@ -2104,8 +2171,11 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("[{table}] accepted an unknown key"))
         );
+        // serde words a two-key table "expected `a` or `b`" (MAN-142's
+        // `[[wsjtx_output]]`), and a longer one "expected one of ...".
         let list = err
             .split_once("expected one of")
+            .or_else(|| err.split_once("expected "))
             .unwrap_or_else(|| panic!("[{table}]: no key list in {err:?}"))
             .1;
         let keys: BTreeSet<String> = regex::Regex::new(r"`([a-z][a-z0-9_]*)`")
@@ -2113,7 +2183,7 @@ mod tests {
             .captures_iter(list)
             .map(|c| c[1].to_string())
             .collect();
-        assert!(keys.len() >= 3, "[{table}]: {err}");
+        assert!(keys.len() >= 2, "[{table}]: {err}");
         keys
     }
 
@@ -2158,6 +2228,12 @@ mod tests {
                 "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"h\"\ntarget_port = 1\n\
                  [[wsjtx_relay]]\ncallsign = \"W1AW\"\n"
             ),
+            // MAN-142: an enabled `[pskreporter]` needs `[server]` and a
+            // grid; the scaffold's `enabled = false` loads alone.
+            ("pskreporter", _) => "[pskreporter]\n".to_string(),
+            ("wsjtx_output", _) => {
+                format!("{SERVER}[[wsjtx_output]]\ndestination = \"127.0.0.1:2237\"\n")
+            }
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
@@ -2187,6 +2263,8 @@ mod tests {
             "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "skimmer_relay" => a.skimmer_relay == b.skimmer_relay,
             "wsjtx_relay" => a.wsjtx_relay == b.wsjtx_relay,
+            "pskreporter" => a.pskreporter == b.pskreporter,
+            "wsjtx_output" => a.wsjtx_output == b.wsjtx_output,
             "callsign_lookup" => a.callsign_lookup == b.callsign_lookup,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,

@@ -211,7 +211,7 @@ fn assert_exit_1_without_panic(out: &Output) {
 /// larger fraction than V1's full 120 s gate. Measured empirically (Task 11
 /// Step 0): CER = 0.1304, deterministic (V1's fixed `noise_seed`). 0.17
 /// gives headroom above that floor. See
-/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md.
+/// docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md.
 #[test]
 fn gen_then_decode_prints_text() {
     let dir = tempfile::tempdir().unwrap();
@@ -2051,6 +2051,31 @@ fn legacy_soapy_freq_and_rate_spellings_still_parse() {
             !stderr.contains("unexpected argument"),
             "{spelling} should still be accepted, got: {stderr}"
         );
+    }
+}
+
+#[test]
+#[cfg(feature = "soapy")]
+fn soapy_gain_help_warns_that_sdrplay_reads_it_as_attenuation() {
+    // `-h` shows only a doc comment's first paragraph, so the warning must sit there.
+    let warning = "On an SDRplay a higher value means more attenuation, not more gain";
+    for cmd in ["run", "listen", "soak", "doctor", "calibrate", "check"] {
+        for flag in ["-h", "--help"] {
+            let out = manta().args([cmd, flag]).output().unwrap();
+            assert!(out.status.success(), "manta {cmd} {flag} failed");
+            let text = String::from_utf8_lossy(&out.stdout);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                text.contains(warning),
+                "manta {cmd} {flag} must warn that --soapy-gain is attenuation on an SDRplay: {text}"
+            );
+            if flag == "--help" {
+                assert!(
+                    text.contains("0 is the most sensitive setting and 48 the least"),
+                    "manta {cmd} --help must give the measured RSP1B range: {text}"
+                );
+            }
+        }
     }
 }
 

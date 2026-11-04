@@ -1,5 +1,5 @@
 //! ROADMAP.md M2 CPU-budget accept criterion (see
-//! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md and
+//! docs/archive/plans/specs/2026-07-24-m2-pileup-cpu-budget-design.md and
 //! benches/cpu_budget.rs's module doc). This test's own `assert!`s check
 //! the Mac budget (< 0.5x of one core) against both wall-clock and
 //! (user+sys) CPU-time ratios -- see 2026-09-02 pins for why both, not

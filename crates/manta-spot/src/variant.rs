@@ -53,7 +53,7 @@ pub enum Relation {
 const MIN_SHARED_PREFIX: usize = 3;
 /// Widest edit distance still consistent with one fading-corrupted decode
 /// of the same underlying transmission.
-const MAX_EDIT_DISTANCE: usize = 2;
+pub(crate) const MAX_EDIT_DISTANCE: usize = 2;
 
 /// Whether `a` and `b` are plausibly two corrupted decodes of the same
 /// underlying callsign. Symmetric, and `None` for a call compared with

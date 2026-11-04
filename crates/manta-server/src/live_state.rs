@@ -6,7 +6,7 @@
 //! two in step.
 
 use crate::band::{allocations, band_for_freq_hz};
-use manta_spot::{Decision, Reason, Support, Verdict};
+use manta_spot::{Confirmation, Decision, Reason, Support, Verdict};
 use serde::Serialize;
 
 /// Every `kind` the live stream carries, in `/metrics` label order.
@@ -236,6 +236,9 @@ pub struct CandidateDecisionRecord {
     pub pattern_tier: Option<&'static str>,
     pub rival: Option<CandidateRow>,
     pub spot_id: Option<String>,
+    /// MAN-200: how a spotted, confirmed call met its repetition
+    /// requirement: `"exactRepeat"` or `"fused"`. `null` otherwise.
+    pub confirmation: Option<&'static str>,
 }
 
 impl CandidateDecisionRecord {
@@ -261,6 +264,7 @@ impl CandidateDecisionRecord {
                 .as_ref()
                 .map(|r| CandidateRow::new(&r.call, &r.support)),
             spot_id,
+            confirmation: d.confirmation.map(Confirmation::as_str),
         }
     }
 }
@@ -454,6 +458,7 @@ mod tests {
             pattern_tier: Some(PatternTier::Unlisted),
             rival: None,
             spot: None,
+            confirmation: None,
         }
     }
 
@@ -534,7 +539,7 @@ mod tests {
                 None
             ))
             .unwrap(),
-            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null}"#
+            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1700000044,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"withheld","reason":"variant","reps":2,"requiredReps":5,"patternTier":"unlisted","rival":{"call":"W4KCL","reps":2,"confSum":1.016},"spotId":null,"confirmation":null}"#
         );
         let spot = Spot {
             callsign: "W4KTNL".into(),
@@ -554,6 +559,7 @@ mod tests {
         let mut spotted = decision(Verdict::Spotted, None);
         spotted.spot = Some(spot);
         spotted.reps = Some(5);
+        spotted.confirmation = Some(Confirmation::ExactRepeat);
         assert_eq!(
             serde_json::to_string(&CandidateDecisionRecord::new(
                 "W1AW",
@@ -562,7 +568,20 @@ mod tests {
                 Some("W1AW:1:9:0:W4KTNL".into())
             ))
             .unwrap(),
-            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"spotted","reason":null,"reps":5,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":"W1AW:1:9:0:W4KTNL"}"#
+            r#"{"kind":"candidateDecision","deCall":"W1AW","timestamp":1,"trackId":9,"call":"W4KTNL","frequency":14031200,"band":"20m","spotType":"de","decision":"spotted","reason":null,"reps":5,"requiredReps":5,"patternTier":"unlisted","rival":null,"spotId":"W1AW:1:9:0:W4KTNL","confirmation":"exactRepeat"}"#
+        );
+        // MAN-200: a call confirmed from damaged copies.
+        spotted.confirmation = Some(Confirmation::Fused);
+        let line = serde_json::to_string(&CandidateDecisionRecord::new(
+            "W1AW",
+            1,
+            &spotted,
+            Some("W1AW:1:9:0:W4KTNL".into()),
+        ))
+        .unwrap();
+        assert!(
+            line.ends_with(r#""spotId":"W1AW:1:9:0:W4KTNL","confirmation":"fused"}"#),
+            "{line}"
         );
         let cases = [
             (
