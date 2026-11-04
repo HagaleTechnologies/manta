@@ -36,6 +36,7 @@
 //!   unless flags bit `0x80` is set (little-endian). Real captures were a
 //!   constant 2068 bytes (20-byte header + 512 complex pairs) every frame.
 
+use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{anyhow, bail, Context, Result};
 use num_complex::Complex32;
@@ -275,6 +276,13 @@ const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// dead connection surfaces an error instead of hanging the caller forever.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 
+/// MAN-489: the hard bound the soft stall report must precede -- the same
+/// 40 x 250 ms of *no messages at all* `MAX_CONSECUTIVE_TIMEOUTS` bounds,
+/// as elapsed time. Kept as a duration so the soft report's guard can
+/// compare against it.
+const HARD_STALL_AFTER: Duration =
+    Duration::from_millis(READ_TIMEOUT.as_millis() as u64 * MAX_CONSECUTIVE_TIMEOUTS as u64);
+
 /// How often `SET keepalive` must be resent or the server stops streaming
 /// `SND` frames (confirmed live: an initial send is not enough).
 const KEEPALIVE_INTERVAL: Duration = Duration::from_millis(1000);
@@ -307,6 +315,14 @@ pub struct KiwiIqSource {
     /// MAN-259: `connect`'s runtime up to the post-handshake `SET` loop
     /// that turns streaming on; surfaced by `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
+    /// MAN-489: time of the last *usable SND sample payload* -- a wall
+    /// clock ping/MSG/unknown frames cannot move, unlike the consecutive
+    /// timeout counter above, which any WebSocket frame resets. A peer
+    /// that keeps the transport alive while sending no IQ must still
+    /// report its stopped stream inside the 5 s bound.
+    last_usable_iq: Instant,
+    /// MAN-489: the one-shot soft-stall episode behind `take_stalled`.
+    stall: StallEpisode,
 }
 
 impl KiwiIqSource {
@@ -467,6 +483,8 @@ impl KiwiIqSource {
             health: Arc::new(InputHealthCounters::new()),
             seq: SndSeqTracker::default(),
             acquisition_start_offset,
+            last_usable_iq: Instant::now(),
+            stall: StallEpisode::new(SOFT_STALL_AFTER),
         })
     }
 
@@ -703,6 +721,9 @@ impl IqSource for KiwiIqSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         let mut consecutive_timeouts = 0u32;
         loop {
             let n = self.pending.len().min(buf.len());
@@ -715,6 +736,19 @@ impl IqSource for KiwiIqSource {
                     }
                 }
                 return Ok(n);
+            }
+
+            // MAN-489: a delivering stream whose usable IQ stopped reports
+            // the stop once, inside the 5 s bound, while the connection
+            // stays open. Checked at the top of every receive iteration,
+            // so ping/MSG/unknown traffic cannot hide the outage; the
+            // engine settles each track's last call and reads again.
+            if self
+                .stall
+                .due(self.last_usable_iq, Instant::now(), HARD_STALL_AFTER)
+            {
+                self.stall.report();
+                return Ok(0);
             }
 
             self.send_keepalive_if_due()?;
@@ -743,6 +777,13 @@ impl IqSource for KiwiIqSource {
             match msg {
                 Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"SND" => {
                     if let Some(samples) = account_snd_frame(&self.health, &mut self.seq, &b[3..]) {
+                        // MAN-489: only a usable sample payload is source
+                        // progress. A malformed frame counted above is not;
+                        // neither is an empty one.
+                        if !samples.is_empty() {
+                            self.last_usable_iq = Instant::now();
+                            self.stall.note_delivery();
+                        }
                         for s in samples {
                             self.raw.push(s.re);
                             self.raw.push(s.im);
@@ -769,6 +810,11 @@ impl IqSource for KiwiIqSource {
                 Message::Frame(_) => {}
             }
         }
+    }
+
+    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    fn take_stalled(&mut self) -> bool {
+        self.stall.take()
     }
 }
 
@@ -1034,6 +1080,115 @@ mod tests {
     #[test]
     fn frame_shorter_than_header_is_malformed() {
         assert!(parse_snd_frame(&[0u8; 10]).is_none());
+    }
+
+    /// One usable SND frame: `"SND"` + flags + 4-byte LE seq + 2-byte BE
+    /// S-meter + 10-byte GPS + `n` interleaved BE I/Q pairs (the layout
+    /// `parses_snd_frame_be_and_le` pins).
+    fn snd_frame(seq: u32, n: u16) -> Message {
+        let mut body = vec![0u8; 17];
+        body[0] = 0x08; // stereo, big-endian
+        body[1..5].copy_from_slice(&seq.to_le_bytes());
+        for _ in 0..n {
+            body.extend_from_slice(&1000i16.to_be_bytes());
+            body.extend_from_slice(&(-1000i16).to_be_bytes());
+        }
+        let mut frame = b"SND".to_vec();
+        frame.extend_from_slice(&body);
+        Message::binary(frame)
+    }
+
+    /// What the fake receiver should put on the wire next.
+    enum FakeOp {
+        Samples(u32),
+        Ping,
+    }
+
+    /// MAN-489: a delivering Kiwi stream that stops sending IQ while the
+    /// WebSocket stays alive (pings keep arriving) reports the stop once
+    /// inside the 5 s bound, resumes on the same socket, and reports a
+    /// second stop the same way. Before this ticket, ping/MSG traffic
+    /// reset the consecutive-timeout counter forever, so the stop never
+    /// surfaced at any latency.
+    #[test]
+    fn a_ping_fed_iq_outage_reports_a_stall_once_and_resumes() {
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<FakeOp>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read(); // SET auth
+            let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
+            // Serve the script; a closed channel ends the session.
+            for op in rx {
+                let frame = match op {
+                    FakeOp::Samples(seq) => snd_frame(seq, 512),
+                    FakeOp::Ping => Message::Ping(Vec::new().into()),
+                };
+                if ws.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+        // Shorten only the soft deadline (the production hard bound stays
+        // at ~10 s of no frames at all, which the pings outrun).
+        src.stall = StallEpisode::new(Duration::from_millis(250));
+        let pinger = tx.clone();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished = Arc::clone(&done);
+        let pings = std::thread::spawn(move || {
+            while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = pinger.send(FakeOp::Ping);
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        let mut buf = vec![Complex32::default(); 1024];
+        // Enough frames to fill one resampler chunk and deliver, then
+        // drain every pending sample until the outage surfaces: the last
+        // read blocks on pings only and returns the report.
+        fn drain_until_report(src: &mut KiwiIqSource, buf: &mut [Complex32]) -> usize {
+            let mut total = 0usize;
+            loop {
+                let n = src.read(buf).unwrap();
+                if n == 0 {
+                    return total;
+                }
+                total += n;
+            }
+        }
+        for seq in 0..40 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        let started = Instant::now();
+        let delivered = drain_until_report(&mut src, &mut buf);
+        assert!(delivered > 0, "the frames must deliver samples");
+        let reported = started.elapsed();
+        assert!(
+            reported >= Duration::from_millis(250) && reported < Duration::from_secs(5),
+            "report due at the soft deadline, got {reported:?}"
+        );
+        assert!(src.take_stalled());
+        assert!(!src.take_stalled());
+        // Resume on the same socket: a fresh delivery outruns the pings.
+        for seq in 40..80 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        assert!(src.read(&mut buf).unwrap() > 0);
+        assert!(!src.take_stalled());
+        // A second outage reports again (the resume burst leaves samples
+        // queued; draining them ends in the second report).
+        assert!(drain_until_report(&mut src, &mut buf) > 0);
+        assert!(src.take_stalled());
+        done.store(true, std::sync::atomic::Ordering::Relaxed);
+        pings.join().unwrap();
+        drop(tx);
+        server.join().unwrap();
     }
 
     #[test]

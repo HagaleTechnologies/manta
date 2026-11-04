@@ -1280,6 +1280,82 @@ mod tests {
         assert_eq!(src.read(&mut b).unwrap(), 8);
     }
 
+    /// A source that delivers, reports one soft stall of its own
+    /// (MAN-489's source-level report), then keeps waiting on the same
+    /// stream: the wrapper forwards the flagged zero without opening a
+    /// replacement or waiting out any backoff, and the same inner source
+    /// delivers the resume.
+    struct StallingSource {
+        phase: u32,
+        stalled: bool,
+    }
+
+    impl IqSource for StallingSource {
+        fn sample_rate(&self) -> f64 {
+            FS
+        }
+        fn center_freq_hz(&self) -> f64 {
+            CENTER
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+            self.phase += 1;
+            match self.phase {
+                1 => {
+                    buf[..8].fill(Complex32::new(0.25, 0.0));
+                    Ok(8)
+                }
+                2 => {
+                    self.stalled = true;
+                    Ok(0)
+                }
+                3 => {
+                    buf[..4].fill(Complex32::new(0.5, 0.0));
+                    Ok(4)
+                }
+                _ => Ok(0),
+            }
+        }
+        fn take_stalled(&mut self) -> bool {
+            std::mem::take(&mut self.stalled)
+        }
+    }
+
+    #[test]
+    fn a_source_soft_stall_is_forwarded_without_opening_a_replacement() {
+        let first = StallingSource {
+            phase: 0,
+            stalled: false,
+        };
+        // No replacements scripted: the opener panics if the wrapper
+        // tries to reconnect on a soft stall (opener_from's contract).
+        let (opener, calls) = opener_from(VecDeque::new());
+        let (health, _log) = health_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "test",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        );
+        src.report_stalls = true;
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert!(!src.take_stalled());
+        // The inner soft stall rides the inner `Ok(0)` out unchanged: one
+        // report, no reopen, no sleep.
+        assert_eq!(src.read(&mut b).unwrap(), 0);
+        assert!(src.take_stalled());
+        assert!(!src.take_stalled());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        // The same stream resumes.
+        assert_eq!(src.read(&mut b).unwrap(), 4);
+        assert_eq!(b[0].re, 0.5);
+        assert!(!src.take_stalled());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn health_reports_false_on_loss_and_true_on_first_samples_only_on_change() {
         let first = scripted(

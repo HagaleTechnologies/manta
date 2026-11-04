@@ -17,6 +17,7 @@ use super::{
     GapStats, HpsdrConfig, INITIAL_BURST_REPEATS, MAX_CONSECUTIVE_MALFORMED,
     MAX_CONSECUTIVE_TIMEOUTS, READ_TIMEOUT, RECV_BUF_LEN,
 };
+use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -241,6 +242,11 @@ pub struct Protocol2IqSource {
     health_counters: Arc<InputHealthCounters>,
     /// Elapsed time with no valid IQ datagram before `read()` errors (D13).
     pub(crate) stall_after: Duration,
+    /// MAN-489: the one-shot soft-stall episode behind `take_stalled`:
+    /// a delivering radio whose IQ stopped reports the stop once, inside
+    /// the 5 s bound, before this hard failure and without losing the
+    /// session. `stall_after` stays the hard bound.
+    pub(crate) stall: StallEpisode,
     /// Consecutive malformed datagrams before `read()` errors (D13).
     pub(crate) max_consecutive_malformed: u32,
     /// MAN-308: `Some` with `input.auto_attenuation`.
@@ -310,6 +316,7 @@ impl Protocol2IqSource {
             confirmed_live: Arc::new(AtomicBool::new(false)),
             health_counters: Arc::new(InputHealthCounters::new()),
             stall_after: STALL_AFTER,
+            stall: StallEpisode::new(SOFT_STALL_AFTER),
             max_consecutive_malformed: MAX_CONSECUTIVE_MALFORMED,
             // Engaged before the bring-up sends, so a reopen's restored
             // level goes out with run = 1 (MAN-308 D6).
@@ -645,13 +652,30 @@ impl Protocol2IqSource {
     }
 
     /// Receive datagrams until the queue holds DDC0 samples (D5 demux).
-    fn fill_queue(&mut self) -> Result<()> {
+    /// Returns `false` instead when a soft stall was reported (MAN-489):
+    /// the queue is still empty and `read()` must return `Ok(0)` with its
+    /// `take_stalled` flag pending.
+    fn fill_queue(&mut self) -> Result<bool> {
         // D13's stall clock runs only while a read waits: time the caller
         // spent not reading (a multi-input run parks sources until every
         // opener finishes) is not the radio's silence, and the IQ it sent
         // meanwhile is still queued on the socket (MAN-305 review).
         let entered = Instant::now();
         while self.queue_pos >= self.queue.len() {
+            // MAN-489: a delivering radio whose IQ datagrams stopped --
+            // status traffic keeps flowing -- reports the stop once inside
+            // the 5 s bound, on the same protected clock the hard bound
+            // uses, so a parked consumer's pause still cannot look like a
+            // stall. The soft return does not move `last_valid_iq`, so the
+            // hard budget below runs on unchanged across it.
+            if self.stall.due(
+                self.last_valid_iq.max(entered),
+                Instant::now(),
+                self.stall_after,
+            ) {
+                self.stall.report();
+                return Ok(false);
+            }
             if self.last_valid_iq.max(entered).elapsed() >= self.stall_after {
                 bail!(
                     "HPSDR protocol 2 radio {host} stalled: no IQ datagram for {secs} s -- if the \
@@ -697,7 +721,7 @@ impl Protocol2IqSource {
                 self.malformed()?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -745,13 +769,23 @@ impl IqSource for Protocol2IqSource {
                 }
             }
         }
-        self.fill_queue()?;
+        // MAN-489: `false` means a soft stall was reported; the flag rides
+        // the `Ok(0)` below and the radio stays connected.
+        if !self.fill_queue()? {
+            return Ok(0);
+        }
         let avail = &self.queue[self.queue_pos..];
         let n = buf.len().min(avail.len());
         buf[..n].copy_from_slice(&avail[..n]);
         self.queue_pos += n;
         self.read_returned = Instant::now();
+        self.stall.note_delivery();
         Ok(n)
+    }
+
+    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    fn take_stalled(&mut self) -> bool {
+        self.stall.take()
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
@@ -1433,6 +1467,40 @@ mod tests {
         let err = src.read(&mut buf).unwrap_err().to_string();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.contains("stalled: no IQ datagram"), "{err}");
+    }
+
+    /// MAN-489: a delivering radio whose IQ datagrams stop -- while status
+    /// keeps flowing -- reports `Ok(0)` with `take_stalled` pending once,
+    /// before the hard failure, on the same session; delivery re-arms, so
+    /// a second outage reports again; a permanent outage still fails at
+    /// the original hard bound.
+    #[test]
+    fn a_stopped_radio_reports_a_soft_stall_once_re_arms_and_still_fails_hard() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        src.stall = StallEpisode::new(Duration::from_millis(250));
+        src.stall_after = Duration::from_secs(1);
+        let _status = fake.stream_status(Duration::from_millis(20));
+        fake.send_iq(0);
+        assert_eq!(read_one(&mut src), (0, 238));
+        // IQ stops; status traffic keeps arriving and must not hide it.
+        let started = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(1), "{reported:?}");
+        assert!(src.take_stalled());
+        assert!(!src.take_stalled());
+        // The same session resumes without a reconnect.
+        fake.send_iq(1);
+        assert_eq!(read_one(&mut src), (1, 238));
+        assert!(!src.take_stalled());
+        // A second outage reports again, and a permanent one still errors
+        // at the hard bound (the soft return did not reset it).
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert!(src.take_stalled());
+        let err = src.read(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("stalled: no IQ datagram for 1 s"), "{err}");
     }
 
     /// MAN-308: a handle whose notice records every change.

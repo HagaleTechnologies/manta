@@ -22,6 +22,7 @@
 //! of file.
 
 use crate::devices::quoted_name;
+use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
 use crate::IqSource;
 use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
@@ -149,6 +150,15 @@ struct LiveDevice {
     silence_notice: Option<SilenceNotice>,
     /// Exact-zero samples read since open, while the notice is armed.
     zero_samples: u64,
+    /// MAN-489: the one-shot soft-stall episode behind `take_stalled`.
+    /// `stall_timeout` stays the hard device-loss bound.
+    stall: StallEpisode,
+    /// MAN-489: when the current empty-ring wait began, carried across a
+    /// soft report's return so the hard bound cannot restart mid-outage.
+    /// Cleared by delivery.
+    waiting_since: Option<Instant>,
+    /// MAN-489: time of the last delivered samples (the soft clock).
+    last_delivery: Instant,
 }
 
 impl LiveDevice {
@@ -222,6 +232,9 @@ impl AudioIqSource {
             stall_timeout,
             silence_notice: None,
             zero_samples: 0,
+            stall: StallEpisode::new(SOFT_STALL_AFTER),
+            waiting_since: None,
+            last_delivery: Instant::now(),
         });
         Ok(source)
     }
@@ -356,27 +369,49 @@ impl IqSource for AudioIqSource {
         buf[..got].copy_from_slice(&analytic);
         Ok(got)
     }
+
+    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    /// Only the live path reports: a file's `Ok(0)` stays ordinary EOF.
+    fn take_stalled(&mut self) -> bool {
+        self.live.as_mut().is_some_and(|live| live.stall.take())
+    }
 }
 
 impl AudioIqSource {
     /// Real samples from the underlying source. A file returns 0 at end of
     /// file; a live device polls its ring until at least one sample
-    /// arrives, or fails after its stall timeout. An empty request never
-    /// waits.
+    /// arrives, reports a resumable soft stall once the ring has been
+    /// empty past the soft deadline after delivery (MAN-489), and fails
+    /// after its stall timeout. An empty request never waits.
     fn read_real(&mut self, real: &mut [f32]) -> Result<usize> {
-        let Some(live) = &self.live else {
+        let Some(live) = &mut self.live else {
             return self.src.read(real);
         };
         if real.is_empty() {
             return Ok(0);
         }
-        let started = Instant::now();
         loop {
             let got = self.src.read(real)?;
             if got > 0 {
+                // Delivery -- zero-valued samples included -- re-arms the
+                // episode and ends any wait episode, so the hard bound
+                // measures only genuine silence.
+                live.waiting_since = None;
+                live.last_delivery = Instant::now();
+                live.stall.note_delivery();
                 return Ok(got);
             }
-            if started.elapsed() >= live.stall_timeout {
+            // The wait episode survives a soft report's return, so the
+            // hard device-loss bound below cannot restart mid-outage.
+            let since = *live.waiting_since.get_or_insert_with(Instant::now);
+            if live
+                .stall
+                .due(live.last_delivery, Instant::now(), live.stall_timeout)
+            {
+                live.stall.report();
+                return Ok(0);
+            }
+            if since.elapsed() >= live.stall_timeout {
                 return Err(no_samples(&live.label, live.stall_timeout));
             }
             std::thread::sleep(DEVICE_POLL_INTERVAL);
@@ -395,13 +430,24 @@ mod tests {
     /// read pops the next `(count, value)` (count 0 = empty ring) and fills
     /// that many samples of `value`; an exhausted script reads as an empty
     /// ring forever, like a callback that never fires.
+    /// The handle a test resumes a scripted ring through.
+    type ScriptFeeder = Arc<Mutex<VecDeque<(usize, f32)>>>;
+
     struct ScriptedRing {
         script: VecDeque<(usize, f32)>,
+        /// MAN-489: externally controlled resume -- entries pushed here
+        /// after the script runs out, like a capture callback that starts
+        /// firing again.
+        more: ScriptFeeder,
     }
 
     impl AudioSource for ScriptedRing {
         fn read(&mut self, buf: &mut [f32]) -> Result<usize> {
-            let (count, value) = self.script.pop_front().unwrap_or((0, 0.0));
+            let (count, value) = self
+                .script
+                .pop_front()
+                .or_else(|| self.more.lock().unwrap().pop_front())
+                .unwrap_or((0, 0.0));
             let n = count.min(buf.len());
             buf[..n].fill(value);
             Ok(n)
@@ -418,16 +464,29 @@ mod tests {
     }
 
     fn scripted(script: &[(usize, f32)], stall: Duration) -> AudioIqSource {
+        let (aiq, _feeder) = scripted_ring(script, stall);
+        aiq
+    }
+
+    /// MAN-489: the source plus the handle its ring can be resumed
+    /// through -- an externally controlled pause/resume, not a fixed
+    /// count of empty polls.
+    fn scripted_ring(script: &[(usize, f32)], stall: Duration) -> (AudioIqSource, ScriptFeeder) {
         let ring = ScriptedRing {
             script: script.iter().copied().collect(),
+            more: Arc::new(Mutex::new(VecDeque::new())),
         };
-        AudioIqSource::live(
-            Box::new(ring),
-            "\"Test Mic\"".to_string(),
-            stall,
-            Duration::ZERO,
+        let feeder = Arc::clone(&ring.more);
+        (
+            AudioIqSource::live(
+                Box::new(ring),
+                "\"Test Mic\"".to_string(),
+                stall,
+                Duration::ZERO,
+            )
+            .unwrap(),
+            feeder,
         )
-        .unwrap()
     }
 
     /// A notice that records each name it is called with.
@@ -448,6 +507,54 @@ mod tests {
         );
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         assert_eq!(aiq.read(&mut buf).unwrap(), 480);
+    }
+
+    /// MAN-489: a delivering device whose ring goes empty reports a
+    /// resumable soft stall (`Ok(0)` + `take_stalled` once) before its
+    /// hard device-loss error, resumes on the same ring, and reports a
+    /// second outage the same way. Zero-valued samples count as delivery.
+    #[test]
+    fn a_delivering_device_reports_stalls_and_resumes_on_the_same_ring() {
+        const HARD: Duration = Duration::from_secs(5);
+        let (mut aiq, feeder) = scripted_ring(&[(256, 0.25)], HARD);
+        // Shorten only the soft deadline; the hard bound stays, so the
+        // guard (`hard > soft`) keeps the report ahead of the error.
+        aiq.live.as_mut().unwrap().stall =
+            crate::stall::StallEpisode::new(Duration::from_millis(80));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
+        assert_eq!(aiq.read(&mut buf).unwrap(), 256);
+        // The ring goes empty; no device reopen, no error -- one report.
+        let started = Instant::now();
+        assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+        assert!(
+            started.elapsed() < HARD,
+            "report must precede the hard error"
+        );
+        assert!(aiq.take_stalled());
+        assert!(!aiq.take_stalled());
+        // Same ring resumes (all-zero samples are delivery too).
+        feeder.lock().unwrap().push_back((128, 0.0));
+        assert_eq!(aiq.read(&mut buf).unwrap(), 128);
+        assert!(!aiq.take_stalled());
+        // A second outage reports again.
+        assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+        assert!(aiq.take_stalled());
+    }
+
+    /// MAN-489: the hard device-loss bound survives the soft report -- a
+    /// stream that never resumes still errors within its stall timeout,
+    /// measured from the wait episode the report did not reset.
+    #[test]
+    fn after_a_soft_stall_the_hard_device_loss_bound_still_fires() {
+        let (mut aiq, _feeder) = scripted_ring(&[(256, 0.25)], Duration::from_millis(300));
+        aiq.live.as_mut().unwrap().stall =
+            crate::stall::StallEpisode::new(Duration::from_millis(60));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
+        assert_eq!(aiq.read(&mut buf).unwrap(), 256);
+        assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+        assert!(aiq.take_stalled());
+        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("delivered no samples in 0.3 s"), "{err}");
     }
 
     #[test]

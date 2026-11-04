@@ -67,6 +67,7 @@
 
 pub mod discovery;
 
+use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -118,6 +119,18 @@ pub(crate) const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
 /// unbounded, unlike a timeout's fixed cadence -- a count bound is what
 /// actually caps worst-case work here.
 pub(crate) const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
+
+/// MAN-489: the hard stall bound the new soft report must precede -- the
+/// same 40 x 250 ms budget `MAX_CONSECUTIVE_TIMEOUTS` bounds, measured as
+/// elapsed time since the last valid Metis packet (protocol 2's D13 made
+/// the same move). Also the soft report's guard: when a test shortens this
+/// below the soft deadline, the hard failure owns the outage.
+pub(crate) const HARD_STALL_AFTER: Duration =
+    Duration::from_millis(READ_TIMEOUT.as_millis() as u64 * MAX_CONSECUTIVE_TIMEOUTS as u64);
+
+/// MAN-489: how long a member that already reported its outage parks
+/// between silent pump windows, leaving the shared socket to siblings.
+const PUMP_HANDOFF: Duration = Duration::from_millis(5);
 
 /// Socket receive buffer size (PR #75 review, round 1): deliberately larger
 /// than [`METIS_PACKET_LEN`], not equal to it. A buffer sized exactly to
@@ -769,6 +782,21 @@ struct Inner {
     /// Outbound C&C packet sequence number (MAN-55) -- incremented on
     /// every C&C send, mirroring piHPSDR's own per-frame sequence counter.
     cc_seq: u32,
+    /// MAN-489: time of the last valid Metis packet (or of the open). The
+    /// shared outage evidence every DDC's soft report and the hard stall
+    /// failure both measure from; one member taking its one-shot report
+    /// never clears it, so siblings measure the same outage.
+    last_valid_packet: Instant,
+    /// MAN-489: consecutive malformed datagrams with no valid packet
+    /// between, kept on `Inner` (not per pump call) so bounded receive
+    /// windows cannot reset the bound `MAX_CONSECUTIVE_MALFORMED` pins.
+    consecutive_malformed: u32,
+    /// MAN-489: hard stall bound (test knob; `HARD_STALL_AFTER` in
+    /// production) since `last_valid_packet`.
+    hard_stall_after: Duration,
+    /// The socket read timeout currently installed, so clamping a receive
+    /// window only touches the socket when the value actually changes.
+    read_timeout: Duration,
 }
 
 impl Inner {
@@ -792,22 +820,25 @@ impl Inner {
         }
     }
 
-    /// Receive and demux Metis packets until one yields real IQ samples,
-    /// filling every DDC's queue and updating the gap detector. All
+    /// Receive and demux Metis packets, filling every DDC's queue and
+    /// updating the gap detector, for at most `wait` of wall clock. All
     /// consumer threads share this single socket, so whichever
     /// `HpsdrIqSource::read` finds its own queue empty drives the pump.
+    /// Returns `true` once a valid packet was demuxed and enqueued, or
+    /// `false` when `wait` elapsed with no valid packet -- the caller then
+    /// re-checks its own deadlines (MAN-489) and pumps again, so the pump
+    /// never blocks past a soft report or hard stall deadline.
     ///
     /// MAN-22: a malformed, truncated, or adversarially-crafted UDP
     /// datagram must not take the input pipeline down. Before this fix, a
     /// length-correct-but-bad-sync-bytes datagram propagated a `bail!` out
     /// of `demux_metis_packet` through this function's `?`, which unwound
-    /// all the way out of `manta-engine::listen`'s read loop and killed the
-    /// whole process — a single crafted 1032-byte packet was a full DoS.
+    /// all the way out of `manta-engine::listen`'s read loop and killed
+    /// the whole process — a single crafted 1032-byte packet was a full DoS.
     /// Both malformed-length and malformed-content packets are now counted
     /// and discarded, and the pump keeps going.
-    fn pump_one_packet(&mut self) -> Result<()> {
-        let mut consecutive_timeouts = 0u32;
-        let mut consecutive_malformed = 0u32;
+    fn pump_for(&mut self, wait: Duration) -> Result<bool> {
+        let deadline = Instant::now() + wait;
         loop {
             // Re-checked every iteration (not just once at function entry)
             // so a sustained run of timeouts or malformed packets doesn't
@@ -818,6 +849,34 @@ impl Inner {
                 bail!("HPSDR session retired");
             }
             self.send_keepalive_if_due()?;
+            // Hard stall bound (MAN-489: was 40 consecutive read timeouts
+            // inside one unbounded pump call; the same budget as elapsed
+            // time since the last valid packet, which a bounded pump call
+            // can no longer accumulate). A stream that never delivered
+            // measures from the open.
+            if self.last_valid_packet.elapsed() >= self.hard_stall_after {
+                bail!(
+                    "HPSDR device stalled: no data for {} s",
+                    self.hard_stall_after.as_secs_f64()
+                );
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(false);
+            };
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            // Clamp the receive to the wait window (and the usual 250 ms
+            // poll), so this call returns to its caller instead of
+            // blocking past its deadlines; only touch the socket when the
+            // value changes.
+            let want = remaining.min(READ_TIMEOUT);
+            if want != self.read_timeout {
+                self.socket
+                    .set_read_timeout(Some(want))
+                    .context("set HPSDR UDP read timeout")?;
+                self.read_timeout = want;
+            }
 
             match self.socket.recv(&mut self.recv_buf) {
                 Ok(n) if n == METIS_PACKET_LEN => {
@@ -856,7 +915,12 @@ impl Inner {
                             for (index, samples) in demuxed.into_iter().enumerate() {
                                 self.enqueue(index, samples);
                             }
-                            return Ok(());
+                            // MAN-489: shared outage evidence for every
+                            // member's soft report, and the anchor the
+                            // malformed bound resets on.
+                            self.last_valid_packet = Instant::now();
+                            self.consecutive_malformed = 0;
+                            return Ok(true);
                         }
                         Err(_) => {
                             // Right length, but failed sync/framing
@@ -865,7 +929,7 @@ impl Inner {
                             // than propagating a fatal error for one bad
                             // packet.
                             self.gap.record_malformed();
-                            consecutive_malformed += 1;
+                            self.consecutive_malformed += 1;
                         }
                     }
                 }
@@ -874,25 +938,18 @@ impl Inner {
                     // reported as a length mismatch rather than truncated
                     // or WSAEMSGSIZE'd, per RECV_BUF_LEN's doc comment).
                     self.gap.record_malformed();
-                    consecutive_malformed += 1;
+                    self.consecutive_malformed += 1;
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    consecutive_timeouts += 1;
-                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
-                        bail!(
-                            "HPSDR device stalled: no data for {} consecutive read timeouts",
-                            MAX_CONSECUTIVE_TIMEOUTS
-                        );
-                    }
                     continue;
                 }
                 Err(e) => return Err(e).context("HPSDR UDP read"),
             }
 
-            if consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED {
+            if self.consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED {
                 bail!(
                     "HPSDR device stalled: {} consecutive malformed datagrams with no valid \
                      Metis packet -- corrupt hardware or a spoofed/non-Metis stream",
@@ -1008,6 +1065,10 @@ impl HpsdrDevice {
             cc_frames,
             cc_cursor: 0,
             cc_seq: 0,
+            last_valid_packet: Instant::now(),
+            consecutive_malformed: 0,
+            hard_stall_after: HARD_STALL_AFTER,
+            read_timeout: READ_TIMEOUT,
         }));
 
         // PR #79 review, round 2 P1 + round 3 P1 + round 4 P2: send every
@@ -1075,6 +1136,7 @@ impl HpsdrDevice {
                 },
                 acquisition_start_offset,
                 retire_on_drop: false,
+                stall: StallEpisode::new(SOFT_STALL_AFTER),
             })
             .collect())
     }
@@ -1228,6 +1290,11 @@ pub struct HpsdrIqSource {
     /// owns its session. A grouped receiver's session is retired by its
     /// group (MAN-307), never by one member's drop.
     retire_on_drop: bool,
+    /// MAN-489: this DDC's one-shot soft-stall episode. The outage clock
+    /// itself (`Inner::last_valid_packet`) is shared with every sibling on
+    /// the same socket; the latch is per-member, so each reports the same
+    /// outage exactly once.
+    stall: StallEpisode,
 }
 
 impl HpsdrIqSource {
@@ -1262,23 +1329,64 @@ impl IqSource for HpsdrIqSource {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut inner = self.inner.lock().unwrap();
-        if inner.retired.load(Ordering::SeqCst) {
-            bail!("HPSDR session retired");
+        loop {
+            let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
+            if inner.retired.load(Ordering::SeqCst) {
+                bail!("HPSDR session retired");
+            }
+            if !inner.queues[self.ddc_index].is_empty() {
+                let missed = std::mem::take(&mut inner.queue_gaps[self.ddc_index]);
+                if missed > 0 {
+                    self.discontinuity = Some(self.discontinuity.unwrap_or(0) + missed);
+                }
+                let queue = &mut inner.queues[self.ddc_index];
+                let n = buf.len().min(queue.len());
+                for slot in buf.iter_mut().take(n) {
+                    *slot = queue.pop_front().expect("checked len above");
+                }
+                self.stall.note_delivery();
+                return Ok(n);
+            }
+            // MAN-489: a delivering stream whose shared IQ flow stopped
+            // reports the stop once, inside the 5 s bound, without losing
+            // the session. `last_valid_packet` is the shared outage
+            // evidence -- one member's report never clears it -- and the
+            // latch is this member's own, so every DDC reports the same
+            // outage independently.
+            if self.stall.due(
+                inner.last_valid_packet,
+                Instant::now(),
+                inner.hard_stall_after,
+            ) {
+                self.stall.report();
+                return Ok(0);
+            }
+            // One bounded receive window at a time, then the mutex is
+            // released and re-acquired: a sibling DDC whose queue is also
+            // empty gets to observe its own deadlines between this
+            // member's attempts, instead of one reader monopolizing the
+            // pump through the whole hard stall period after its report.
+            let got = inner.pump_for(READ_TIMEOUT)?;
+            drop(inner);
+            if !got {
+                // A silent window: park briefly so a sibling reader on
+                // this socket takes the pump before the next attempt.
+                // Mutex acquisition is not fair, so an immediate re-lock
+                // would let one member (armed for its own report or
+                // already reporting) monopolize the socket until the hard
+                // stall failure while a sibling waits to deliver queued
+                // samples or observe its own soft deadline. A few
+                // milliseconds per 250 ms window keeps every member's
+                // deadline checks well inside the report margin.
+                std::thread::sleep(PUMP_HANDOFF);
+                continue;
+            }
         }
-        while inner.queues[self.ddc_index].is_empty() {
-            inner.pump_one_packet()?;
-        }
-        let missed = std::mem::take(&mut inner.queue_gaps[self.ddc_index]);
-        if missed > 0 {
-            self.discontinuity = Some(self.discontinuity.unwrap_or(0) + missed);
-        }
-        let queue = &mut inner.queues[self.ddc_index];
-        let n = buf.len().min(queue.len());
-        for slot in buf.iter_mut().take(n) {
-            *slot = queue.pop_front().expect("checked len above");
-        }
-        Ok(n)
+    }
+
+    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    fn take_stalled(&mut self) -> bool {
+        self.stall.take()
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
@@ -1814,12 +1922,132 @@ mod tests {
         let cfg = HpsdrConfig {
             host: "127.0.0.1".into(),
             port: CONTROL_PORT,
-            ddc_count: 9,
-            sample_rate_hz: 48_000.0,
-            center_freq_hz: vec![14_025_000.0; 9],
+            ddc_count: 1,
+            sample_rate_hz: 44_100.0,
+            center_freq_hz: vec![14_025_000.0],
             auto_attenuation: None,
         };
         assert!(cfg.validate().is_err());
+    }
+
+    /// MAN-489: two DDCs reading one shared Metis stream must EACH get the
+    /// stopped stream's soft report once, promptly (not one at the soft
+    /// deadline and its sibling only at the hard failure), resume on the
+    /// same session, report a second outage, and still hit the original
+    /// hard failure when the outage is permanent.
+    #[test]
+    fn concurrent_ddcs_each_report_a_stalled_shared_stream_and_re_arm() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        assert_eq!(sources.len(), 2);
+        let client_addr = drain_initial_open_packets(&device_socket, 2);
+
+        // Shorten both knobs through the same private fields production
+        // fills: the soft episode per member, the hard bound on the
+        // shared `Inner`.
+        let soft = Duration::from_millis(300);
+        let hard = Duration::from_secs(2);
+        for src in &mut sources {
+            src.stall = StallEpisode::new(soft);
+        }
+        sources[0].inner.lock().unwrap().hard_stall_after = hard;
+
+        #[derive(Debug)]
+        enum Step {
+            Delivered,
+            Reported(Duration),
+            Resumed,
+            Failed(String, Duration),
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Step>();
+        let readers: Vec<_> = sources
+            .into_iter()
+            .map(|mut src| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+                    // A: both DDCs deliver from the shared packet.
+                    assert!(src.read(&mut buf).unwrap() > 0);
+                    tx.send(Step::Delivered).unwrap();
+                    // B: the stream stops; each member reports once,
+                    // promptly, without losing the session.
+                    let started = Instant::now();
+                    assert_eq!(src.read(&mut buf).unwrap(), 0);
+                    let reported = started.elapsed();
+                    assert!(src.take_stalled());
+                    assert!(!src.take_stalled());
+                    tx.send(Step::Reported(reported)).unwrap();
+                    // C: the same session resumes.
+                    assert!(src.read(&mut buf).unwrap() > 0);
+                    assert!(!src.take_stalled());
+                    tx.send(Step::Resumed).unwrap();
+                    // D: a permanent outage reports once more, then the
+                    // original hard failure still occurs.
+                    let started = Instant::now();
+                    assert_eq!(src.read(&mut buf).unwrap(), 0);
+                    assert!(src.take_stalled());
+                    let err = src.read(&mut buf).unwrap_err().to_string();
+                    tx.send(Step::Failed(err, started.elapsed())).unwrap();
+                })
+            })
+            .collect();
+        drop(tx);
+
+        let pkt = synth_metis_packet(2, |rx| Complex32::new(0.1 * (rx as f32 + 1.0), 0.0));
+        let next = |what: &str| rx.recv_timeout(Duration::from_secs(10)).expect(what);
+        // A: one packet delivers to both queues.
+        device_socket.send_to(&pkt, client_addr).unwrap();
+        for _ in 0..2 {
+            match next("delivery") {
+                Step::Delivered => {}
+                other => panic!("expected delivery, got {other:?}"),
+            }
+        }
+        // B: the outage reports to both members inside the bound.
+        for _ in 0..2 {
+            match next("report") {
+                Step::Reported(elapsed) => {
+                    assert!(
+                        elapsed >= soft.saturating_sub(Duration::from_millis(150))
+                            && elapsed < Duration::from_secs(5),
+                        "report due near the soft deadline, got {elapsed:?}"
+                    );
+                }
+                other => panic!("expected a report, got {other:?}"),
+            }
+        }
+        // C: one more packet resumes both.
+        std::thread::sleep(Duration::from_millis(100));
+        device_socket.send_to(&pkt, client_addr).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(next("resume"), Step::Resumed));
+        }
+        // D: permanent outage: report, then the hard failure.
+        for _ in 0..2 {
+            match next("failure") {
+                Step::Failed(err, elapsed) => {
+                    assert!(err.contains("no data for"), "{err}");
+                    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+                }
+                other => panic!("expected the hard failure, got {other:?}"),
+            }
+        }
+        for reader in readers {
+            reader.join().expect("reader thread must not panic");
+        }
     }
 
     #[test]

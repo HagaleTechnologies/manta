@@ -374,6 +374,18 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
+  audio, SoapySDR; ka9q already did) now reports a stopped stream through
+  `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),
+  before its own loss/reconnect bound, so a held call's spot is emitted
+  without waiting out the stall bound or a reconnect and the same stream
+  keeps reading and spots again after it resumes. A Kiwi peer that keeps
+  pinging while sending no IQ can no longer hide the outage forever, two
+  DDCs on one HPSDR radio each get the report, a grouped member's soft
+  stall no longer retires its whole radio generation, and audio resumes
+  on the same device instead of reopening. Hard failure bounds and
+  reconnect policy are unchanged. See
+  docs/DECISIONS/2026-11-04-man489-live-source-stall-settlement.md.
 - MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
   longer stamped late when the reopen thread stalls before it drains the
   data socket. The startup stash now stamps each packet with the last
