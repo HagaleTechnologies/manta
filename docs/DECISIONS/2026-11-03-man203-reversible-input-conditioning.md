@@ -149,8 +149,13 @@ output changes, and no operator surface changes in this slice.
 | +60 and +150 Hz, DC 0.01 | **0 of 8** | **8 of 8** |
 | +60 and +150 Hz, no DC (control) | 8 of 8 | 8 of 8, same calls |
 | +900 Hz, DC 0.01 | (not run) | 4 of 4 |
-| +150 Hz, DC 0.005: false tracks within 100 Hz of the centre | **5** | **0** |
+| +150 Hz, DC 0.003: false tracks within 100 Hz of the centre | **4** | **0** |
 | ten 12 dB stations plus one 1e8 impulse at 5 s | 0 of 10 | 0 of 10 |
+
+The false-track row first used DC 0.005 (bypass 5, apply 0). After main
+gained MAN-112's close-pair association, DC 0.005 grows no false track in
+bypass, so the row moved to DC 0.003, where bypass still grows one in all
+four trials.
 
 The last row is the impulse stage's baseline: DC removal alone neither
 helps nor hurts there (its update clamp keeps the impulse from moving the

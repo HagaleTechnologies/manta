@@ -22,6 +22,10 @@ const TRIALS: std::ops::RangeInclusive<u32> = 1..=4;
 const NEAR_SNR_DB: f64 = 6.0;
 /// The DC offset `(DC, 0.7 DC)` that hides a near-centre station.
 const DC: f32 = 0.01;
+/// The smaller DC offset that grows a false DC track beside a +150 Hz
+/// station. MAN-112's close-pair association moved this window: 0.005 no
+/// longer grows one in bypass, 0.003 grows one in all four trials.
+const FALSE_TRACK_DC: f32 = 0.003;
 
 fn bypass() -> PipelineConfig {
     PipelineConfig::default()
@@ -84,10 +88,10 @@ fn bypass_loses_a_station_near_a_dc_offset() {
 fn bypass_grows_a_false_dc_track_at_a_small_offset() {
     let mut tracks = 0;
     for trial in TRIALS {
-        let scene = near_centre_scene(150.0, NEAR_SNR_DB, 0.005, trial);
+        let scene = near_centre_scene(150.0, NEAR_SNR_DB, FALSE_TRACK_DC, trial);
         tracks += false_dc_tracks(&scene, &decode(&scene.samples, &bypass()));
     }
-    eprintln!("bypass, DC 0.005 at +150 Hz: {tracks} false DC tracks");
+    eprintln!("bypass, DC {FALSE_TRACK_DC} at +150 Hz: {tracks} false DC tracks");
     assert!(tracks >= 3, "bypass grew only {tracks} false DC tracks");
 }
 
@@ -149,11 +153,13 @@ fn dc_removal_does_not_regress_the_clean_control() {
 fn dc_removal_removes_the_false_dc_track() {
     let (mut bypass_tracks, mut applied_tracks) = (0, 0);
     for trial in TRIALS {
-        let scene = near_centre_scene(150.0, NEAR_SNR_DB, 0.005, trial);
+        let scene = near_centre_scene(150.0, NEAR_SNR_DB, FALSE_TRACK_DC, trial);
         bypass_tracks += false_dc_tracks(&scene, &decode(&scene.samples, &bypass()));
         applied_tracks += false_dc_tracks(&scene, &decode(&scene.samples, &dc_apply()));
     }
-    eprintln!("DC 0.005: false DC tracks bypass {bypass_tracks}, dc_block apply {applied_tracks}");
+    eprintln!(
+        "DC {FALSE_TRACK_DC}: false DC tracks bypass {bypass_tracks}, dc_block apply {applied_tracks}"
+    );
     assert!(
         bypass_tracks >= 3,
         "the fixture lost its false DC track ({bypass_tracks})"

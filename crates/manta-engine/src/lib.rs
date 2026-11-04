@@ -173,19 +173,16 @@ pub struct PipelineConfig {
     pub patterns: Option<Arc<manta_spot::pattern::Table>>,
     /// Repetition thresholds by callsign-pattern rarity.
     pub validation_level: manta_spot::ValidationLevel,
-<<<<<<< HEAD
     /// MAN-203: the optional input-conditioning chain every decode
     /// channelizer runs after the sample guard (SPEC §1.3 step 0a). The
     /// default turns every stage off, which is bit-identical to no chain.
     /// `check` does not use it: it reports the raw receiver.
     pub conditioning: ConditioningConfig,
-=======
     /// MAN-200: let damaged copies of one station's self-ID count toward
     /// its repetition requirement (`[spot] repetition_fusion`, default
     /// off). See `manta_spot::lattice` and
     /// docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md.
     pub repetition_fusion: bool,
->>>>>>> 9ddb49ccd904307399d19ea181f7d70033ab3a42
 }
 
 impl PipelineConfig {
@@ -240,11 +237,8 @@ impl Default for PipelineConfig {
             scp: None,
             patterns: None,
             validation_level: manta_spot::ValidationLevel::default(),
-<<<<<<< HEAD
             conditioning: ConditioningConfig::default(),
-=======
             repetition_fusion: false,
->>>>>>> 9ddb49ccd904307399d19ea181f7d70033ab3a42
         }
     }
 }
