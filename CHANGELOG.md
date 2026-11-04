@@ -140,6 +140,18 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-207: each validator keeps a bounded, local observation record of why
+  each callsign candidate was or was not spotted (`manta_spot::observation`):
+  counters by default, opt-in records with evidence links and append-only
+  revisions. `manta decode FILE --observations PATH` writes it as JSON Lines
+  (`manta-observations.v1`, docs/OBSERVATIONS.md), and `--observation-text`
+  adds each word's characters. Each record carries the call's MAN-201 role
+  and turn, and a call heard only as the station being called is recorded
+  as `notCandidate`. `/metrics` gains
+  `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
+  stdout and every wire format are unchanged. See
+  [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times

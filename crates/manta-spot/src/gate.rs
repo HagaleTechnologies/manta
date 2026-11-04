@@ -468,6 +468,17 @@ impl GateEntry {
     }
 }
 
+/// One occurrence the gate holds for a call within its window
+/// (`RepetitionGate::record_traced`, MAN-207). Only the `message_distinct`
+/// ones count toward the call's repetitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateOccurrence {
+    pub track_id: u32,
+    pub word_seq: u64,
+    pub sample_ts: u64,
+    pub message_distinct: bool,
+}
+
 pub struct RepetitionGate {
     window_samples: u64,
     min_occurrence_gap_samples: u64,
@@ -623,7 +634,7 @@ impl RepetitionGate {
         word_seq: u64,
         is_track_active: impl Fn(u32) -> bool,
     ) -> usize {
-        let reps = self.record_inner(
+        let (reps, _) = self.record_inner(
             track_id,
             freq_hz,
             callsign,
@@ -633,6 +644,47 @@ impl RepetitionGate {
         );
         self.repetitions.observe(reps);
         reps
+    }
+
+    /// `record`, plus the occurrences the entry holds after it, counted or
+    /// not (MAN-207's evidence links). Same effects as `record`; the
+    /// occurrences are read after the update.
+    pub fn record_traced(
+        &mut self,
+        track_id: u32,
+        freq_hz: f64,
+        callsign: &str,
+        sample_ts: u64,
+        word_seq: u64,
+        is_track_active: impl Fn(u32) -> bool,
+    ) -> (usize, Vec<GateOccurrence>) {
+        let (reps, key) = self.record_inner(
+            track_id,
+            freq_hz,
+            callsign,
+            sample_ts,
+            word_seq,
+            is_track_active,
+        );
+        self.repetitions.observe(reps);
+        let counted = key
+            .and_then(|key| self.seen.get(&key))
+            .map(|entry| {
+                entry
+                    .accepted
+                    .iter()
+                    .map(
+                        |&(sample_ts, word_seq, track_id, message_distinct, _)| GateOccurrence {
+                            track_id,
+                            word_seq,
+                            sample_ts,
+                            message_distinct,
+                        },
+                    )
+                    .collect()
+            })
+            .unwrap_or_default();
+        (reps, counted)
     }
 
     /// `record`'s body; split out so its several early returns all pass
@@ -645,10 +697,10 @@ impl RepetitionGate {
         sample_ts: u64,
         word_seq: u64,
         is_track_active: impl Fn(u32) -> bool,
-    ) -> usize {
+    ) -> (usize, Option<(i64, String)>) {
         self.records_total += 1;
         if !freq_hz.is_finite() {
-            return 0;
+            return (0, None);
         }
         let b = bucket(freq_hz);
         let home_key = (b, callsign.to_string());
@@ -716,7 +768,7 @@ impl RepetitionGate {
         }
         let entry = self
             .seen
-            .entry(entry_key)
+            .entry(entry_key.clone())
             .or_insert_with(|| GateEntry::new(freq_hz));
         // MAN-175: the anchor follows this call only when it is the
         // entry's latest touch (Codex review, PR #255) -- see
@@ -815,11 +867,13 @@ impl RepetitionGate {
         promote_orphaned_leader(&mut entry.accepted);
         // Tally the frozen per-occurrence verdicts still inside the
         // window -- never re-derive them (see `accepted`'s own doc).
-        entry
+        let reps = entry
             .accepted
             .iter()
             .filter(|&&(_, _, _, counted, _)| counted)
-            .count()
+            .count();
+        // MAN-207: the entry key, for `record_traced` to read it back.
+        (reps, Some(entry_key))
     }
 
     /// See `records_total`'s doc.
@@ -885,6 +939,58 @@ mod tests {
     /// e.g. the near-duplicate-time rejection) passes this.
     fn always_active(_: u32) -> bool {
         true
+    }
+
+    /// MAN-207: the traced record names the occurrences it holds.
+    #[test]
+    fn record_traced_returns_the_counted_occurrences() {
+        let mut gate = RepetitionGate::new(FS);
+        let (first, _) = gate.record_traced(1, 7_080_000.0, "K5ARH", 0, 2, always_active);
+        assert_eq!(first, 1);
+        let (reps, counted) =
+            gate.record_traced(1, 7_080_000.0, "K5ARH", 300_000, 9, always_active);
+        assert_eq!(reps, 2);
+        assert_eq!(
+            counted,
+            vec![
+                GateOccurrence {
+                    track_id: 1,
+                    word_seq: 2,
+                    sample_ts: 0,
+                    message_distinct: true,
+                },
+                GateOccurrence {
+                    track_id: 1,
+                    word_seq: 9,
+                    sample_ts: 300_000,
+                    message_distinct: true,
+                },
+            ]
+        );
+    }
+
+    /// MAN-207: tracing changes nothing the gate decides or counts.
+    #[test]
+    fn record_traced_has_the_same_effects_as_record() {
+        let calls: [(u32, f64, &str, u64, u64); 6] = [
+            (1, 7_080_000.0, "K5ARH", 0, 0),
+            (1, 7_080_000.0, "K5ARH", 1_000, 1),
+            (2, 7_080_010.0, "K5ARH", 300_000, 0),
+            (1, 7_080_000.0, "K5ARH", 600_000, 4),
+            (3, 14_020_000.0, "W1AW", 0, 0),
+            (4, f64::NAN, "N0CALL", 0, 0),
+        ];
+        let mut plain = RepetitionGate::new(FS);
+        let mut traced = RepetitionGate::new(FS);
+        for (t, f, c, ts, seq) in calls {
+            let a = plain.record(t, f, c, ts, seq, always_active);
+            let (b, counted) = traced.record_traced(t, f, c, ts, seq, always_active);
+            assert_eq!(a, b);
+            assert_eq!(counted.iter().filter(|o| o.message_distinct).count(), b);
+        }
+        assert_eq!(plain.records_total(), traced.records_total());
+        assert_eq!(plain.repetition_counts(), traced.repetition_counts());
+        assert_eq!(plain.len(), traced.len());
     }
 
     #[test]

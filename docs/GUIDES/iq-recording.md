@@ -222,6 +222,24 @@ outage does not hold up shutdown.
 `--loop` keeps a gap at the end of the recording and reports it at the
 start of the next pass.
 
+### Finding out why a station was not spotted
+
+Replay the recording with `--observations` to write why each callsign
+candidate was or was not spotted (MAN-207,
+[OBSERVATIONS.md](../OBSERVATIONS.md)):
+
+```sh
+manta decode session.cf32 --observations session.jsonl
+jq -c 'select(.call=="K5ARH")' session.jsonl
+jq -c 'select(.trackId==12)' session.jsonl
+```
+
+Each line names the candidate, its `decision` and `reason` (for example
+`withheld` for `repetition`: only one copy was heard), and the earlier
+copies the repetition gate counted. A call heard only as the station being
+called is a `notCandidate` line with its `role` (`addressee`). Add
+`--observation-text` for the decoded characters.
+
 ## Headerless cf32 and ci16
 
 ```sh
