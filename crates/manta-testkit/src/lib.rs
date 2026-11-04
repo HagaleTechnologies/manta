@@ -4,16 +4,22 @@
 //! via `next_u64()` with hand-rolled conversions (pinned decision 2), so
 //! fixtures are bit-stable across dependency upgrades and platforms.
 
+pub mod baseband;
 mod callsigns;
 pub mod cer;
 pub mod crash;
+pub mod crosscheck;
 pub mod fsk;
 pub mod ftx;
 pub mod keyer;
+pub mod measure;
+pub mod minimize;
 pub mod noise;
 pub mod noncw;
 pub mod oracle;
+pub mod repro;
 pub mod scene;
+pub mod scenespec;
 pub mod sensitivity;
 pub mod vectors;
 pub mod wav;

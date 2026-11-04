@@ -77,7 +77,8 @@ backoff (96 000 samples).
    `RCVBUF_BYTES` (4 MiB), so on a channel fast enough to overflow it
    during the wait the replay starts at the first packet of the chosen
    channel the stash still holds, and the offset reports that packet's
-   arrival (each stashed packet keeps its receive `Instant`); with nothing
+   arrival (each stashed packet keeps a lower bound on its arrival,
+   MAN-407); with nothing
    of the channel retained, the join remains the anchor. The first
    implementation anchored at the join on the false belief that the stash
    replays everything queued from it: an evicted opening never reaches
@@ -125,6 +126,11 @@ pass (~1 ms) after its true arrival. Neither approaches one second on a
 single-channel group; a shared group whose foreign traffic dominates the
 stash can stretch the first, and is a decision for the field-node ticket
 if it ever shows up.
+
+**Corrected by MAN-407 (annotated 2026-11-03):** that bound held only
+while the opener never stalled; a stall before the drain added its whole
+length. The stash now stamps a lower bound on arrival; see
+[the MAN-407 record](2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md).
 
 The opener's own runtime is still unbounded for SoapySDR (MAN-73's
 documented gap); this record only re-anchors the outage around it.

@@ -589,6 +589,10 @@ fn settle_lookups(
         tap.decisions(validator.take_decisions());
         tap.end_batch(validator);
     }
+    // MAN-207: the settled lookups' decisions, as `emit` stores a batch's.
+    if let Some(q) = ctx.quality {
+        q.store_decisions(&validator.observation_counts());
+    }
 }
 
 fn emit(
@@ -653,6 +657,7 @@ fn emit(
     if let Some(q) = ctx.quality {
         q.add_chars(chars);
         q.store_repetitions(validator.repetition_counts());
+        q.store_decisions(&validator.observation_counts());
     }
 }
 
@@ -841,6 +846,7 @@ pub fn listen_with_observers(
 
     let lifecycle = observers.track_lifecycle.as_deref();
     let mut close_base = CloseCounts::default();
+    let mut spawn_base = 0;
 
     let mut seg = new_segment(
         fs,
@@ -964,6 +970,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -990,6 +997,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
     }
     on_tracks(n_tracks);
@@ -1093,6 +1101,7 @@ pub fn listen_with_observers(
             let next_id = seg.tm.next_track_id();
             if lifecycle.is_some() {
                 close_base = close_base + seg.tm.close_counts();
+                spawn_base += seg.tm.total_spawns();
             }
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
@@ -1170,6 +1179,7 @@ pub fn listen_with_observers(
             obs.publish_counts(
                 close_base + seg.tm.close_counts(),
                 validator.gate_records_total(),
+                spawn_base + seg.tm.total_spawns(),
             );
             obs.publish_chunk(seg.tm.active_track_count());
         }
@@ -1213,6 +1223,7 @@ pub fn listen_with_observers(
         obs.publish_counts(
             close_base + seg.tm.close_counts(),
             validator.gate_records_total(),
+            spawn_base + seg.tm.total_spawns(),
         );
         obs.clear_active();
     }
@@ -5694,11 +5705,71 @@ mod tests {
             "V1's repeated call must reach the repetition gate"
         );
 
+        // MAN-207: emit stores the validator's decision counts; every spot
+        // is one `spotted` decision.
+        let spotted = snap
+            .decisions
+            .iter()
+            .find(|&&(_, reason, _)| reason.is_none())
+            .map(|&(_, _, n)| n);
+        assert_eq!(spotted, Some(spots_observed.len() as u64));
+
         let (_, spots_plain) = run(ListenObservers::default());
         assert!(!spots_plain.is_empty(), "V1 must spot");
         assert_eq!(
             spots_observed, spots_plain,
             "the observer must not change decode output"
+        );
+    }
+
+    /// MAN-207: after a V1 listen run the observer holds every decision
+    /// count a validator replaying the run's events arrives at.
+    #[test]
+    fn emit_stores_the_validators_decision_counts() {
+        use crate::quality::DecodeQualityObserver;
+
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FixedFreqSource {
+            samples: rendered.samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let cfg = PipelineConfig::default();
+        let obs = Arc::new(DecodeQualityObserver::new());
+        let mut events = Vec::new();
+        listen_with_observers(
+            src,
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_quality: Some(obs.clone()),
+                ..Default::default()
+            },
+            |ev| events.push(ev.clone()),
+            |_spot| {},
+            |_n| {},
+        )
+        .unwrap();
+
+        let mut replay = cfg.validator(spec.fs).unwrap();
+        for ev in &events {
+            replay.ingest(ev);
+        }
+        let expected: Vec<_> = replay.observation_counts().iter().collect();
+        assert_eq!(obs.snapshot().decisions, expected);
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_none() && n > 0),
+            "V1 must spot"
+        );
+        assert!(
+            expected
+                .iter()
+                .any(|&(_, reason, n)| reason.is_some() && n > 0),
+            "V1 must withhold something"
         );
     }
 

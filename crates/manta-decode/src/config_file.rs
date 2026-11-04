@@ -329,6 +329,7 @@ impl DecodeConfigToml {
                 ..HsmmConfig::default()
             },
             refine_bw_hz: self.refine_bw_hz,
+            steered_frontend: false,
         }
     }
 }

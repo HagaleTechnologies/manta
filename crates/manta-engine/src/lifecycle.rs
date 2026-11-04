@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct TrackLifecycleSnapshot {
     /// Steady-state input chunks processed after the startup calibration fill.
     pub chunks: u64,
+    /// Every candidate birth, including tracks that never promoted.
+    pub spawns: u64,
     /// Every open track after the latest steady-state chunk; zero at EOF
     /// or a source read error. Includes unconfirmed candidates.
     pub active_tracks: u64,
@@ -30,6 +32,7 @@ pub struct TrackLifecycleSnapshot {
 #[derive(Debug, Default)]
 pub struct TrackLifecycleObserver {
     chunks: AtomicU64,
+    spawns: AtomicU64,
     active_tracks: AtomicU64,
     peak_active_tracks: AtomicU64,
     unconfirmed: AtomicU64,
@@ -49,6 +52,7 @@ impl TrackLifecycleObserver {
     pub fn snapshot(&self) -> TrackLifecycleSnapshot {
         TrackLifecycleSnapshot {
             chunks: self.chunks.load(Ordering::Relaxed),
+            spawns: self.spawns.load(Ordering::Relaxed),
             active_tracks: self.active_tracks.load(Ordering::Relaxed),
             peak_active_tracks: self.peak_active_tracks.load(Ordering::Relaxed),
             close_counts: CloseCounts {
@@ -66,7 +70,8 @@ impl TrackLifecycleObserver {
         }
     }
 
-    pub(crate) fn publish_counts(&self, closes: CloseCounts, gate_records_total: u64) {
+    pub(crate) fn publish_counts(&self, closes: CloseCounts, gate_records_total: u64, spawns: u64) {
+        self.spawns.store(spawns, Ordering::Relaxed);
         self.unconfirmed
             .store(closes.unconfirmed, Ordering::Relaxed);
         self.hang_expired
@@ -120,7 +125,7 @@ mod tests {
             unkeyed: 8,
             false_lease_hops: 750,
         };
-        obs.publish_counts(closes, 19);
+        obs.publish_counts(closes, 19, 27);
         assert_eq!(
             obs.snapshot().close_counts.false_lease_hops as f64 / 375.0,
             2.0
@@ -134,6 +139,7 @@ mod tests {
             obs.snapshot(),
             TrackLifecycleSnapshot {
                 chunks: 2,
+                spawns: 27,
                 active_tracks: 2,
                 peak_active_tracks: 5,
                 close_counts: closes,
@@ -145,6 +151,7 @@ mod tests {
             obs.snapshot(),
             TrackLifecycleSnapshot {
                 chunks: 2,
+                spawns: 27,
                 active_tracks: 0,
                 peak_active_tracks: 5,
                 close_counts: closes,

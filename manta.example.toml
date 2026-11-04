@@ -251,6 +251,7 @@ station_callsign = "N0CALL"
 # type = "soapy", a SoapySDR device (needs a manta built with soapy support):
 #driver = "driver=rtlsdr"            # required: SoapySDR device arguments
 #gain_db = 30.0                      # no default: the device's automatic gain
+# On an SDRplay, gain_db is an attenuation scale: a higher value is less sensitive; 0 is the most sensitive.
 
 # Shared by kiwi, soapy and hpsdr:
 #freq_hz = 7030000.0                 # required unless bands is set: the receiver's centre frequency, Hz
@@ -382,6 +383,15 @@ station_callsign = "N0CALL"
 # 2 for every call (manta before 0.2). Allowlisted calls and beacons are
 # exempt either way. Changes need a restart.
 #validation_level = "normal"
+
+# Let damaged copies of one station's CQ, DE or UP self-ID count toward its
+# repetition requirement. The copies are lined up character by character;
+# a call is confirmed when every character has a clear majority of copies
+# from enough separate messages (2, 3 or 5 by pattern, as validation_level
+# sets). Copies of the same samples count once, and no character is used
+# that no copy read. Off by default until recorded and live RBN regression
+# gates pass. Changes need a restart.
+#repetition_fusion = false
 
 # Callsign-pattern list used in place of the copy built into manta (derived
 # from MASTER.SCP). One pattern per line, a leading + marks a common one, `#`

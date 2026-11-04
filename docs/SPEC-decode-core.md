@@ -140,11 +140,18 @@ Per hop, for a track whose selected channel is `k₀`, two estimators run.
 
 **Ownership centroid** (§2.5) and the drift fitter's input (§2.8):
 
-- Quadratic interpolation on **dB** powers of `(k₀−1, k₀, k₀+1)`:
-  `δ_m = 0.5·(P₋ − P₊) / (P₋ − 2P₀ + P₊)` where `P• = PdB[k₀•, m]`.
-  Clamp `δ_m` to `[−0.5, +0.5]`; if the denominator ≥ 0 (no local max — a
-  peak requires `P₋ − 2P₀ + P₊ < 0`), set `δ_m = 0` and mark the hop unusable.
-- Centroid `C`: an EMA of `k₀ + δ_m` with α = 0.01 over the usable hops.
+- On unsuppressed, non-DORMANT hops at least 6 dB over the channel floor,
+  unwrap the lag-1 phase position (defined below) near `C`. Accept only
+  positions within 0.6 channel of `C`; update `C` with EMA α = 0.01.
+  The same outlier gate guards the spot-frequency phase sum (MAN-112).
+- At CANDIDATE → ACTIVE, a track with no other track's centre within 2.5
+  channels re-seeds `C` to the median of the phase positions it saw as a
+  CANDIDATE (ungated, same 6 dB rule), when there are at least 8 and their
+  interquartile range is at most 0.2 channel. A birth on the carrier's
+  skirt channel, more than 0.6 channel from the carrier, could otherwise
+  never pass the gate, and a split birth then took its carrier (MAN-112).
+- Key-up holds `C`. Power-only synthetic hops without complex observations
+  retain the three-bin dB parabola for detector unit tests only.
 
 **Spot frequency** (MAN-114): a power-weighted lag-1 phase estimator.
 
@@ -193,16 +200,14 @@ the channelizer prototype (§1.2's `KAISER_BETA`, 80 dB). The decimated
 rate must itself satisfy §1.1's `fs/93.75` power-of-two table constraint.
 Module: `manta-dsp::decimate`.
 
-A halfband filter has every other tap forced to zero by construction
-(except the center tap), which in principle halves the multiply-accumulate
-cost per output sample. The current implementation does not exploit this:
-`HalfbandStage::process` iterates all taps unconditionally, including the
-structurally-zero ones, so the 2x MAC saving is not yet realized. This is a
-known, deliberate gap for now (tracked in issue #176), not an oversight,
-and there is likewise no criterion bench yet measuring this stage's cost
-against the repo's Pi4 CPU budget. Moving the cutoff off exactly `fs_in/4`
-(above) also gives up this exact-zero-tap property, so issue #176's skip
-opportunity no longer applies to this stage regardless.
+The classic halfband property (every tap at a nonzero even offset from
+the center exactly zero, which would halve the multiply-accumulate cost per
+output sample) needs a cutoff at exactly `fs_in/4`. This stage's 0.235
+cutoff gives it up: none of the 62 even-offset taps is zero, so
+`HalfbandStage::process` evaluates all `HALFBAND_TAPS` taps and there is no
+zero-tap saving to take. `crates/manta-dsp/benches/decimate.rs` (MAN-186)
+measures the stage's cost; host numbers, with no Pi4 claim, are in
+[the MAN-186 decision record](DECISIONS/2026-11-03-man186-decimator-cost.md).
 
 **Trusted band** (MAN-196): the `CUTOFF_FRACTION` margin means channels
 near the decimated Nyquist edge see real, non-negligible attenuation
@@ -419,10 +424,22 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
 ### 2.5 Adjacent-channel ownership (one signal ⇒ one track)
 
 - A track tracks a fractional center `c` (the §1.4 running centroid,
-  initialized to its birth channel `k₀`). It **owns** channels
+  initialized from the gated spawn phase position when available, otherwise
+  its birth channel `k₀`). It **owns** channels
   `{round(c) − 1, round(c), round(c) + 1}`.
-- A CANDIDATE in an owned channel is absorbed: no new track; ownership stays
-  with the incumbent.
+- A rising local maximum in an owned channel may spawn a second track
+  when it is at least 0.8 channel from every owning track's centre,
+  each owner has phase-frequency evidence, and no owner is DORMANT.
+  The peak also needs two consecutive observations at least 6 dB over its
+  floor whose lag-1 phase position is at least 100 Hz from each owner.
+  This prevents a loud carrier's skirt from posing as an independent signal.
+  For unowned peaks too, a usable phase position more than 0.6 channel from
+  the peak bin vetoes birth; missing phase observations keep the power-only
+  unowned-peak rule. A birth with no open track's centre within 2.5
+  channels is isolated: it uses the power-only unowned-peak rule and starts
+  at `k₀`, because one rising-edge phase observation can veto or mis-seed
+  it, which shifted single-signal births by a few hops (MAN-112).
+  Closer candidates are absorbed (MAN-112).
 - A DORMANT track (§2.4) keeps its ownership: its channels block spawns,
   and a rise sustained there re-acquires it instead (MAN-108).
 - A rising, unowned channel `k` may start a spawn decision only if its
@@ -466,24 +483,41 @@ DORMANT track's wake, or turn a HANG track back to ACTIVE.
   applies this to `k+1`'s own window. Gating the birth channel alone let a
   neighbour-born candidate absorb the cooling channel via max-power
   selection. (MAN-197, see docs/DECISIONS/2026-10-14-man197-respawn-cooldown-ownership-window.md)
-- Each hop, the track's demod input is taken from the **max-power channel
-  among its owned set** (per ARCHITECTURE §4 "max-power selection"); the
-  owned set follows `round(c)` as the centroid drifts, which is how drifting
-  signals (§7 test 9) are followed without retuning. A live track's
-  selection additionally **skips channels still serving a post-`Silent`
-  respawn cooldown**, falling back to the plain max-power channel only when
-  every owned channel is cooling: a candidate born two bins from a cooling
-  channel passes the spawn gate legitimately, yet a stronger neighbour can
-  drag `round(c)` onto the cooling channel, whose continuous power would
-  otherwise keep the track decoding the silenced birdie for a whole extra
-  GC cycle inside the cooldown window. (MAN-197, see
-  docs/DECISIONS/2026-10-14-man197-live-window-cooldown-enforcement.md)
+- Each hop, tracking selects the max-power owned channel after skipping
+  post-Silent cooldown channels and channels nearer another track's centre.
+  Distances wrap around the FFT; exact ties go to the lower track id.
+  If no exclusive channel remains, use the existing cooldown-aware maximum,
+  falling back to the plain maximum only when all owned channels are cooling
+  (MAN-197). Before the straddle override, if a selected channel is more
+  than 1.0 channel from the centre, two consecutive complex observations
+  at least 6 dB above its floor reject it when its phase position is more
+  than 0.6 channel from the centre. Select the strongest remaining exclusive,
+  non-cooling owned channel passing that phase check; if none remains,
+  retain the previous selection. Missing phase evidence does not reject a
+  channel. The centre snapshot is taken before driving any track.
+- With a neighbor within 2.5 channels, decoder input uses
+  the rounded centre when that channel is exclusive and
+  not cooling; otherwise it uses the selected channel. Tracking retains the
+  exclusive max-power selection (F1, MAN-112). The optional
+  refiner remains on the centroid channel. At a straddle (at least 0.40
+  channel from the nearest integer), the closest neighbor within 2.0 channels
+  selects the straddle channel away from that neighbor, provided it is
+  exclusive and not cooling. This selection ignores instantaneous neighbor strength.
+  A neighbor 2.0 channels or more away leaves the selection alone: the
+  facing channel is outside its main lobe, and reading the away channel
+  biases the centroid toward the straddle (MAN-112). The experimental steered frontend
+  is off by default and is available only through the Rust pipeline config.
 - If two channels `k` and `k+1` meet the rise condition on the *same hop* and
-  neither is owned, a spawn decision at `k` creates one CANDIDATE at the
+  both pass the ownership admission rule, a spawn decision at `k` creates one CANDIDATE at the
   higher instantaneous-power channel. This existing pairing rule can select
   `k+1` even when only `k` is a smoothed-power local maximum.
 - Two tracks whose centers converge within 1.0 channel (interference or
-  drift-collision) are merged: the lower-SNR track is CLOSED with reason
+  drift-collision) merge unconditionally only below 0.5 channel. Between
+  0.5 and 1.0 channel, they merge only when their selected-channel dB
+  envelopes have at least 150 contemporaneous unsuppressed hops and Pearson
+  correlation >= 0.6 over the last at most 750 observations per track.
+  Constant envelopes provide no correlation evidence. Dormancy clears that
+  history. On a merge, the lower-SNR track is CLOSED with reason
   `merged` (counted); its decoder state is discarded (text already emitted
   stands). On equal SNR the older track (lower `track_id`) survives.
   (MAN-172, see docs/DECISIONS/2026-10-11-man172-high-snr-track-churn.md)
@@ -786,6 +820,9 @@ Constants (compile-time; `COMOD_*` in `manta-dsp::comod`, the rest in
 | `SHORT_MARK_DEBOUNCE_HOPS` | 4 | D′: key-down/key-up run debounce for a keyed mark |
 | `SHORT_HYST_FRAC` | 0.15 | D′: keyed-marks hysteresis half-band, fraction of the Q10–Q90 gap |
 | `SHORT_MIN_KEYING_RATIO` | 2.0 | D′: Q90/Q10 ratio the queued input must show at all |
+| `KEYDOWN_DOMINANCE_CH` / `KEYDOWN_DOMINANCE_DB` | 2 / 10.0 | MAN-112: a channel this close and this much louder than `k` makes the hop not key-down |
+| `KEYDOWN_LEVEL_SPAN_DB` | 30.0 | MAN-112: a key-down hop lies within this of the track's strongest key-down SNR |
+| `KEYDOWN_MARK_SWING_DB` | 10.0 | MAN-112, D′: a key-down mark ends this far under its own maximum; the next starts this far over the gap's minimum |
 
 **A. Lazy lease.** At CANDIDATE → ACTIVE the track records its promotion
 hop, `sample_ts` and `freq_hz`, queues the promotion burst, and from then
@@ -812,7 +849,14 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
   at each evaluation, so D′ can fire only at the first evaluation after a
   drop.
 - A **key-down hop** is one with `PdB[k] − F_eff[k] ≥ on_snr_db`, `k` the
-  track's selected channel (§2.5). On it, until the track qualifies:
+  track's selected channel (§2.5), where no channel within
+  `KEYDOWN_DOMINANCE_CH` of `k` is `KEYDOWN_DOMINANCE_DB` or more louder,
+  and whose SNR is no more than `KEYDOWN_LEVEL_SPAN_DB` below the
+  strongest key-down SNR so far (MAN-112). Frequency-anchored association
+  (§2.5) keeps a swept carrier's track in place after the carrier moves
+  on; without these two clauses its edge channel kept reading the
+  departed carrier (its skirt, or the channel filter's ringing) as
+  key-down, which flattened the slope. On it, until the track qualifies:
   - **Slope:** accumulate `n, Σt, Σf, Σt², Σtf` in `f64`, with
     `t = hop − first key-down hop` and `f = wrap(k − k₀) + δ` in
     channels, where `k₀` is the birth channel, `wrap` maps to
@@ -821,6 +865,13 @@ cannot decode a character; `NotCw` (D) bounds its life instead.
     key-down hop's `t`. The slope in Hz/s is the least-squares `df/dt`
     (channels per hop) × channel spacing × hops per second
     (4 × spacing; 375 at 93.75 Hz).
+  - **Key-down marks** (MAN-112, D′): over every hop until the track
+    qualifies, with each non-key-down hop read as −∞ dB, a mark ends after
+    `SHORT_MARK_DEBOUNCE_HOPS` hops at least `KEYDOWN_MARK_SWING_DB` under
+    the mark's maximum SNR, and the next mark starts, and counts, after as
+    many hops that far over the gap's minimum. The thresholds follow the
+    local extremes, so a fast element gap that the channel filter keeps
+    above `on_snr_db` still separates two marks.
   - **Flatness:** let `side = max(PdB[k±2], PdB[k±3])` (indices mod N).
     The hop is **non-flat** when `|PdB[k] − side| ≥ ISO_DB`: a neighbour
     at least 6 dB louder is a different signal, so only a neighbourhood
@@ -952,6 +1003,9 @@ track qualifies when all hold:
   The count is computed only at an evaluation where the track is in HANG
   with `dropped_since_eval` set — one quantile selection over the bounded
   queue per drop, nowhere else.
+- **key-down marks ≥ `SHORT_MIN_MARKS`** (MAN-112, B): a carrier swept
+  past a frequency-anchored track is one key-down run, however its queued
+  amplitudes ripple below `on_snr_db` after it has passed.
 
 Qualification through D′ leases the decoder, replays the queue and emits
 the deferred `TrackPromoted` exactly as D does. A track still unqualified
@@ -1574,6 +1628,43 @@ not tightened further: any time-gap threshold low enough to rescue it would
 also treat a single corrupted message's own doubled utterance as two
 distinct messages, reopening the hole this rule exists to close.
 
+**The same samples count once (MAN-200).** Every candidate word carries a
+sample span: its first character's `sample_ts` to its `WordBoundary`
+`sample_ts`, closed at both ends. A decode whose span overlaps one the
+repetition gate (or the variant ledger, for its own `(track, text)` entry)
+already holds for the same call on the same channel is the same samples
+decoded again — a replay, a second track on one signal — and adds no
+repetition, whatever its word number or track. Two separate utterances
+never overlap: a word's boundary is its last character's time and the next
+word's first character comes strictly later. Overlap is checked only
+within one call's entry, never across different calls: two stations keying
+at once on one channel overlap and are both real (V59).
+
+**Fused confirmation (MAN-200, opt-in: `[spot] repetition_fusion`).** With
+the key on, CQ/DE/UP self-ID copies from one input, within one channel
+(`SAME_SIGNAL_MAX_HZ`) and the 90 s window, each at most 2 edits from every
+other copy in its episode, are aligned character by character (insertions
+and deletions allowed) and vote per position. Votes count copies, not
+confidence: each copy votes 1 for its top glyph, 1 for "nothing here" where
+the alignment gives it a gap, and 1 for unknown where its character is the
+`?` placeholder; an alternative `(g, a)` adds `min(a / top_confidence, 1)`
+for `g`. A position is decided when one candidate has the unique highest
+vote, more than half the copies, and a lead of at least 0.5 over every
+other candidate, unknown included; "nothing here" winning drops the
+position. Any undecided position makes the explicit unknown hypothesis win
+and nothing is confirmed, so no character is ever used that no copy read or
+listed. The winner must be at least 3 characters and supported by at least
+as many message-distinct copies within 2 edits of it as its pattern tier
+requires; copies of overlapping samples are one observation. The fused call
+then passes the same blocklist, notch, grammar, cty, zero-evidence, variant
+(this episode's own copy texts aside), dedupe and lookup checks as any
+candidate. A fusion is refused outright when any copy that disagrees with
+the winner has itself already spotted on this channel: a copy that spotted
+is a station, not damage. Fusion only ever adds a spot the exact path did
+not confirm (after a grammar, cty or repetition withhold); it never
+withholds one. Addressee and mention copies (MAN-201) never feed it. V60
+to V65.
+
 **Cross-candidate variant arbitration (MAN-100), ARCHITECTURE §6 step 4b.**
 Before a candidate spots, it is checked against every other decoded,
 spottable-shaped word observed on the same track within the same 90 s
@@ -1869,6 +1960,9 @@ in the fixture manifest. Text payload (unless stated):
 | V51 | drift-refine | Same scene as V9 (18 WPM, +12 dB, drift +50 Hz/min, EA8AAA), decoded with `decode.refine_bw_hz = 30` (the narrowband refiner, MAN-168/MAN-194) via a `--config` TOML | AWGN only, no jitter (as V9) | 1 track (no split); char ≥ 90 %; final freq within 15 Hz; the refine-on report differs from the refine-off control (the config reaches the pipeline) |
 | V52 | zero-evidence | `CQ DE W1AW W1AW K` event sequences at the validator event contract, every `char_decoded` confidence 0.0 (with and without SCP), plus positive-control and mixed-`?` variants | n/a (event stream, not audio) | no spot from the all-zero streams and a withheld `NoEvidence` decision; positive evidence still spots; a mixed word still spots; a two-rep clean CQ spot is `confirmed`, a single-rep allowlisted spot `tentative`; `emissionState` serializes `confirmed`/`tentative` (MAN-106) |
 
+V7 close-pair variants and the unchanged two-track/CER/frequency gates are in
+`crates/manta-cli/tests/golden_close_pairs.rs` (MAN-112).
+
 V31's freq-error bound was 25 Hz until MAN-114. The dB-parabola spot
 frequency measured ~17.4 Hz here, and ~15-17 Hz on native 48 kHz and 192 kHz
 control renders of the same scene, which was read as a channel-table-size
@@ -1925,7 +2019,11 @@ ARCHITECTURE §6) in `crates/manta-spot/tests/golden_v16_v17.rs`; V32-V33
 (non-gating RST/QRL? spot annotations, MAN-272) in
 `crates/manta-spot/tests/golden_v32_v33.rs`; V53-V57 (exchange roles, MAN-201)
 in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
-`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`.
+`crates/manta-spot/tests/golden_v58_beacon_evidence.rs`; V59-V65
+(repetition evidence, MAN-200) in
+`crates/manta-spot/tests/golden_v59_v65_repetition_evidence.rs`. V60-V65
+run with `repetition_fusion` on and repeat with it off, where the off run
+gives today's spots.
 
 | # | Name | Scenario | Pass criteria |
 |---|---|---|---|
@@ -1971,6 +2069,13 @@ in `crates/manta-spot/tests/golden_v53_v57_roles.rs`; V58 in
 | V56 | allowlist-skips-plausibility-not-role (MAN-201) | W1AW listed, `W1AW DE K1ABC K` and `DE K1ABC K1ABC OP W1AW K`; lone `W1AW`; K5ARH listed, `K5ARH T` | No W1AW spot; one `Unknown` at close; one `Beacon` at K5ARH's boundary |
 | V57 | decided-once-settled (MAN-201) | `DE K5ARH`, K5ARH listed, then each of: next word, `K`, `<AR>`, a character or `TrackMeta` 5 s later, `TrackClosed` of either kind | No spot while K5ARH is the newest word; one spot at its own timestamp on each. 4.35 s settles nothing; `<ERR>` retracts a word; an older held occurrence behind a newer spot is withheld `dedupe`; a settled mention stays one after its framing scrolls out |
 | V58 | beacon-evidence (MAN-201) | `K5ARH T` and similar unlisted, listed and guarded; `V V V K5ARH` | Unlisted: no spot, one `BeaconNoEvidence` per occurrence. Listed: one `Beacon`. Guarded: neither. `V V V` keeps V18's deferred path |
+| V59 | same-samples-count-once (MAN-200) | `CQ W1AW K` with W1AW at 100/200/300/350, boundary 400; then a replay `CQ W1AW K` on the same track with W1AW at 150/250/350/400, boundary 420, then close; control: the same second message 100 000 samples later | No spot; both W1AW decisions are `Repetition` with reps 1. Control: W1AW `Cq` `confirmed` with reps 2 |
+| V60 | complementary-copies-fuse (MAN-200) | `CQ W1AV K`, then `CQ W1AQ K` 100 000 samples later on one track; the 4th character is V or Q at 0.45 with alternative W at 0.40, every other character 0.95; no decode of W1AW | On: one spot, W1AW `Cq` `confirmed` at the W1AQ word's boundary; decisions W1AV withheld `Repetition` reps 1, W1AQ withheld `Repetition` reps 1, W1AW spotted reps 2 `confirmation: Fused`. Off: no spot |
+| V61 | top1-majority-and-indels (MAN-200) | `CQ W1AV K`, `CQ W1EW K`, `CQ M1AW K` (top-1 only); `CQ W1A K`, `CQ W1AWE K`, `CQ W1AW K` | No spot after two; W1AW `Cq` `Fused` after the third (M1AW's own decision is withheld `Cty` and it still feeds the lattice). Indels: W1AW spotted `Fused` at the third, with no `Repetition` decision for that word |
+| V62 | fusion-abstains (MAN-200) | W1AV + W1AQ with no alternatives; `CQ W1A? K` + `CQ W1AV K`; `CQ W1AV K` twice | No spot and no decision names W1AW; no spot; W1AV spots exactly as with fusion off, `confirmation: ExactRepeat` |
+| V63 | only-self-ids-fuse (MAN-200) | `W1AV DE K1ABC K`, `W1AQ DE K1ABC K` with V60's alternatives; `DE K1ABC OP W1AV K` then `CQ W1AQ K` | K1ABC spots `De` (exact); no decision names W1AW in either |
+| V64 | same-samples-one-observation (MAN-200) | Tracks 1 and 2 decode one transmission as `CQ W1AV K` and `CQ W1AQ K` with overlapping spans (V60 alternatives), at the same frequency and 60 Hz apart; a third track 300 Hz away with its own W1AQ; a same-track overlapping replay | No W1AW in any case |
+| V65 | tier-bar-and-spotted-copy (MAN-200) | Unlisted AB2KLK: 3 exact + AB2KLX, then 4 exact + AB2KLX; K1AV twice 70 s apart spots, then `CQ W1AW K` at 140 s and `CQ W1AV K` at 141 s | No spot at 3 + 1; AB2KLK spotted `Fused` reps 5 at AB2KLX's boundary at 4 + 1. The majority reads W1AV but K1AV, a disagreeing copy, already spotted on this channel: no W1AV and no W1AW spot |
 
 ### 7.2 Static-crash vectors (VC1–VC3, MAN-312)
 
@@ -2034,6 +2139,8 @@ as SPEC v2 §8.2 defines (`docs/SPEC-decode-core-v2.md`).
 | §5 events | `manta-decode::events` |
 | §7 vectors | `manta-testkit::vectors` |
 | §7.2 static-crash vectors | `manta-testkit::crash` |
+| §7 independent generator cross-check | `manta-testkit::baseband`, `::measure`, `::crosscheck` |
+| §7 failure minimizer, synthetic repros | `manta-testkit::scenespec`, `::minimize`, `::repro` |
 
 ## 9. Configuration keys
 
@@ -2225,6 +2332,8 @@ allowlist = []
 # Pattern tier counts: normal = common 2 / listed 3 / unlisted 5; minimal = 2 for all.
 # Allowlisted calls and beacons stay exempt.
 validation_level = "normal"
+# MAN-200: damaged self-ID copies may jointly confirm a call (opt-in).
+repetition_fusion = false
 # Independent list derived from MASTER.SCP. One [+]PATTERN per line, e.g. +K5@@@.
 # Leading # comments; @ for later letters, # for later digits. Same path rule.
 # Unset: bundled. --patterns overrides it.
