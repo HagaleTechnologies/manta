@@ -274,8 +274,8 @@ station_callsign = "N0CALL"
 # An empty list pauses CW decoding. Daily entries and dated overrides replace
 # the base ranges. See docs/CONFIG.md for the complete scheduling example.
 #cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
-#cw_schedule = []
-#cw_overrides = []
+#cw_schedule = []                     # daily at_utc swaps of the ranges
+#cw_overrides = []                    # dated start/end replacements of them
 
 
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
