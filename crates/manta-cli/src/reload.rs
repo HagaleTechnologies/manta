@@ -952,6 +952,17 @@ blocklist_path = \"bl.txt\"
         );
     }
 
+    /// MAN-200: the lattice is built with the validator at startup.
+    #[test]
+    fn repetition_fusion_needs_a_restart() {
+        let old = table("[spot]\nvalidation_level = 'normal'\n");
+        let new = table("[spot]\nvalidation_level = 'normal'\nrepetition_fusion = true\n");
+        assert_eq!(
+            restart_only_changes(&old, &new),
+            vec!["spot.repetition_fusion"]
+        );
+    }
+
     #[test]
     fn restart_only_changes_reports_cty_and_scp_paths() {
         let old = table("[spot]\ncty_path = \"/a/cty.dat\"\nblocklist_path = \"bl.txt\"\n");

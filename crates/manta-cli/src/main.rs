@@ -3158,6 +3158,7 @@ fn build_pipeline_config(
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
         validation_level: spot.validation_level,
+        repetition_fusion: spot.repetition_fusion,
         detector,
         ..Default::default()
     };
@@ -5531,6 +5532,9 @@ struct SpotResolved {
     cty_url: String,
     scp_url: String,
     patterns: Option<PathBuf>,
+    /// MAN-200: `[spot] repetition_fusion`; no flag, so straight from the
+    /// file/env layer.
+    repetition_fusion: bool,
 }
 
 /// MAN-316: `--cty-sha256`/`--scp-sha256`, the only list flags beyond
@@ -5597,6 +5601,7 @@ fn resolve_spot_pinned(
         scp_url: spot.scp_url().to_string(),
         patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
         validation_level: spot.validation_level,
+        repetition_fusion: spot.repetition_fusion,
     }
 }
 
@@ -9290,6 +9295,20 @@ mod tests {
     }
 
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
+
+    #[test]
+    fn repetition_fusion_reaches_the_pipeline_config() {
+        for on in [false, true] {
+            let spot = config::SpotFile {
+                repetition_fusion: on,
+                ..Default::default()
+            };
+            let r = resolve_spot(vec![], None, None, None, None, None, &spot);
+            let (cfg, _) =
+                build_pipeline_config(0.0, &r, Default::default(), Engine::Legacy).unwrap();
+            assert_eq!(cfg.repetition_fusion, on);
+        }
+    }
 
     #[test]
     fn cli_patterns_override_file_and_preserve_validation_level() {

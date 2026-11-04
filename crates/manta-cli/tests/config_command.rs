@@ -987,10 +987,37 @@ fn check_summary_reports_pattern_level_and_resolved_path() {
     let out = succeeds(&check_file(&cfg));
     assert!(
         out.lines().any(|line| line.ends_with(&format!(
-            "validation_level=normal pattern_path={}",
+            "validation_level=normal pattern_path={} repetition_fusion=off",
             patterns.display()
         ))),
         "{out}"
+    );
+}
+
+/// MAN-200: `[spot] repetition_fusion` loads and ends the `spot:` line.
+#[test]
+fn check_summary_reports_repetition_fusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[spot]\nvalidation_level = \"normal\"\nrepetition_fusion = true\n",
+    );
+    let out = succeeds(&check_file(&cfg));
+    assert!(
+        out.lines()
+            .any(|line| line.starts_with("spot:") && line.ends_with(" repetition_fusion=on")),
+        "{out}"
+    );
+    let cfg = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[spot]\nrepetition_fusion = \"on\"\n",
+    );
+    let err = fails(&check_file(&cfg));
+    assert!(
+        err.contains("repetition_fusion") || err.contains("bool"),
+        "{err}"
     );
 }
 

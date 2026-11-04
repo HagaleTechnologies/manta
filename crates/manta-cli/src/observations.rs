@@ -192,6 +192,9 @@ fn decided(finding: &Finding) -> Decided {
             pattern_tier,
             rival,
             spot: _,
+            // MAN-200's confirmation marker is not part of
+            // `manta-observations.v1`; live-state carries it.
+            confirmation: _,
         }) => Decided {
             sample_ts: *sample_ts,
             call: call.clone(),
@@ -432,6 +435,7 @@ mod tests {
                 },
             }),
             spot: None,
+            confirmation: None,
         };
         let mut draft = Draft::new(id, Cause::Decided, Source::default(), decision);
         draft.span = Some(SampleSpan {

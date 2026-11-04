@@ -327,6 +327,9 @@ pub(crate) struct SpotFile {
     pub scp_sha256: Option<String>,
     pub pattern_path: Option<PathBuf>,
     pub validation_level: manta_spot::ValidationLevel,
+    /// MAN-200: let damaged copies of one station's self-ID count toward
+    /// its repetition requirement. Restart-only, default off.
+    pub repetition_fusion: bool,
 }
 
 impl SpotFile {
@@ -359,6 +362,7 @@ struct SpotToml {
     pattern_path: Option<PathBuf>,
     #[serde(default, deserialize_with = "deserialize_validation_level")]
     validation_level: manta_spot::ValidationLevel,
+    repetition_fusion: Option<bool>,
 }
 
 fn deserialize_validation_level<'de, D: serde::Deserializer<'de>>(
@@ -887,6 +891,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             .pattern_path
             .map(|p| resolve_path("spot", "pattern_path", p)),
         validation_level: spot_toml.validation_level,
+        repetition_fusion: spot_toml.repetition_fusion.unwrap_or(false),
     };
     let inputs = match doc.get("input") {
         Some(toml::Value::Array(entries)) if !entries.is_empty() => take_input_array(
@@ -2201,6 +2206,45 @@ mod tests {
         );
         let err = err_of("[spot]\nvalidation_level = 'strict'\n");
         assert!(err.contains("minimal") && err.contains("normal"), "{err}");
+    }
+
+    #[test]
+    fn repetition_fusion_defaults_off_and_reads_true() {
+        assert!(!load_file("[spot]\n").unwrap().spot.repetition_fusion);
+        assert!(
+            load_file("[spot]\nrepetition_fusion = true\n")
+                .unwrap()
+                .spot
+                .repetition_fusion
+        );
+        assert!(
+            !load_file("[spot]\nrepetition_fusion = false\n")
+                .unwrap()
+                .spot
+                .repetition_fusion
+        );
+    }
+
+    #[test]
+    fn repetition_fusion_rejects_a_non_boolean() {
+        let err = err_of("[spot]\nrepetition_fusion = \"on\"\n");
+        assert!(err.contains("[spot]") && err.contains("bool"), "{err}");
+    }
+
+    #[test]
+    fn env_repetition_fusion_overrides_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(&path, "[spot]\nrepetition_fusion = false\n").unwrap();
+        let v = vars(&[("MANTA_SPOT_REPETITION_FUSION", "true")]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert!(loaded.spot.repetition_fusion, "TOML-probed to a bool");
+        assert!(
+            !load(Some(&path), Env::Ignore)
+                .unwrap()
+                .spot
+                .repetition_fusion
+        );
     }
 
     #[test]
