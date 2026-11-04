@@ -16,6 +16,7 @@ pub mod lattice;
 pub mod lookup;
 pub mod message;
 pub mod notch;
+pub mod observation;
 pub mod pattern;
 pub mod prior;
 pub mod reference;
@@ -30,6 +31,7 @@ pub use decision::{CandidateSupport, Confirmation, Decision, Reason, Rival, Verd
 pub use gate::{RepetitionCounts, REPETITION_BUCKETS};
 pub use lookup::{CallsignLookup, Existence, LookupStatus};
 pub use notch::{FreqRange, NotchList};
+pub use observation::{Detail, Observation, ObservationId, ObservationLog, ObservationPolicy};
 pub use pattern::{PatternTier, ValidationLevel};
 pub use support::Support;
 pub use validator::{

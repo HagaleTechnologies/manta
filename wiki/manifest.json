@@ -1,6 +1,11 @@
 {
+<<<<<<< HEAD
   "generated_at": "2026-11-03T06:45:00Z",
   "head_commit": "212fa51",
+=======
+  "generated_at": "2026-10-30T15:36:30Z",
+  "head_commit": "efa79c4",
+>>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
   "pages": [
     {
       "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
@@ -267,7 +272,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2f70653964690d4021916b031dbe1f44ab8791ce21270eaced01bef17b7a85ca",
+      "hash": "sha256:dc3a854d09bdb2746d51c39aa97997bad16975bc92f426fb4d3b885cac79a53c",
       "id": "source-reconnect",
       "kind": "gotcha",
       "links": [
@@ -279,6 +284,7 @@
       "sources": [
         "docs/DECISIONS/2026-10-05-man73-source-reconnect.md",
         "docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md",
+        "docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md",
         "crates/manta-cli/src/reconnect.rs",
         "crates/manta-cli/src/reconnect.rs (InputHealthTotals)",
         "crates/manta-input/src/lib.rs (IqSource::take_discontinuity)",
@@ -292,8 +298,8 @@
       ],
       "status": "current",
       "title": "What's the gotcha with a live source disconnecting?",
-      "verified_commit": "d144e36",
-      "verified_date": "2026-11-01",
+      "verified_commit": "efa79c4",
+      "verified_date": "2026-11-03",
       "visibility": "public"
     },
     {

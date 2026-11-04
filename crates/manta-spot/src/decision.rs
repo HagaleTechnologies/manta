@@ -3,6 +3,8 @@
 //! candidate callsign, with its reason. Opt-in through
 //! `Validator::record_decisions`; off, the validator allocates nothing for
 //! it. See docs/DECISIONS/2026-10-12-man324-live-state-stream.md D4.
+//! MAN-207 keeps these decisions, with their evidence, in the bounded
+//! observation record (`crate::observation`).
 
 use crate::context::SpotType;
 use crate::support::Support;
@@ -63,6 +65,7 @@ pub enum Reason {
     LookupNotFound,
 }
 
+<<<<<<< HEAD
 /// How a spotted call met its repetition requirement (MAN-200 D12). Set on
 /// `Spotted` decisions whose spot is `EmissionState::Confirmed` only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,10 +83,76 @@ impl Confirmation {
         match self {
             Self::ExactRepeat => "exactRepeat",
             Self::Fused => "fused",
+=======
+impl Reason {
+    /// Every reason, in declaration order (MAN-207's counters index by it).
+    pub const ALL: [Reason; 16] = [
+        Reason::Blocklist,
+        Reason::Notch,
+        Reason::Grammar,
+        Reason::Cty,
+        Reason::Repetition,
+        Reason::Variant,
+        Reason::Dedupe,
+        Reason::PowerStepGuard,
+        Reason::BeaconNoEvidence,
+        Reason::BeaconPending,
+        Reason::BeaconSpeed,
+        Reason::BeaconOverflow,
+        Reason::BeaconDiscarded,
+        Reason::NoEvidence,
+        Reason::LookupPending,
+        Reason::LookupNotFound,
+    ];
+
+    /// The verdict a decision with this reason carries: `Deferred` while a
+    /// beacon or lookup is pending, else `Withheld`.
+    pub fn verdict(self) -> Verdict {
+        match self {
+            Reason::BeaconPending | Reason::LookupPending => Verdict::Deferred,
+            _ => Verdict::Withheld,
+        }
+    }
+
+    /// This reason's position in `ALL`. Exhaustive on purpose: a new
+    /// variant fails to compile here until it has a slot, and it must take
+    /// the same position in `ALL` (checked at compile time below), or the
+    /// MAN-207 counters would index past their arrays.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Reason::Blocklist => 0,
+            Reason::Notch => 1,
+            Reason::Grammar => 2,
+            Reason::Cty => 3,
+            Reason::Repetition => 4,
+            Reason::Variant => 5,
+            Reason::Dedupe => 6,
+            Reason::PowerStepGuard => 7,
+            Reason::BeaconNoEvidence => 8,
+            Reason::BeaconPending => 9,
+            Reason::BeaconSpeed => 10,
+            Reason::BeaconOverflow => 11,
+            Reason::BeaconDiscarded => 12,
+            Reason::NoEvidence => 13,
+            Reason::LookupPending => 14,
+            Reason::LookupNotFound => 15,
+>>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
         }
     }
 }
 
+<<<<<<< HEAD
+=======
+// `ALL[i].index() == i` for every slot, so `ALL` and `index` agree.
+const _: () = {
+    let mut i = 0;
+    while i < Reason::ALL.len() {
+        assert!(Reason::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
+>>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
 /// The variant that beat a candidate withheld for `Reason::Variant`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rival {
@@ -129,11 +198,7 @@ impl Decision {
         spot_type: SpotType,
         reason: Reason,
     ) -> Self {
-        let verdict = if matches!(reason, Reason::BeaconPending | Reason::LookupPending) {
-            Verdict::Deferred
-        } else {
-            Verdict::Withheld
-        };
+        let verdict = reason.verdict();
         Self {
             track_id,
             sample_ts,

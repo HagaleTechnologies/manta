@@ -144,11 +144,26 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
   copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
   `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
   records gain `confirmation` (`exactRepeat`, `fused` or `null`). With the
   key off, decoder output is unchanged.
+=======
+- MAN-207: each validator keeps a bounded, local observation record of why
+  each callsign candidate was or was not spotted (`manta_spot::observation`):
+  counters by default, opt-in records with evidence links and append-only
+  revisions. `manta decode FILE --observations PATH` writes it as JSON Lines
+  (`manta-observations.v1`, docs/OBSERVATIONS.md), and `--observation-text`
+  adds each word's characters. Each record carries the call's MAN-201 role
+  and turn, and a call heard only as the station being called is recorded
+  as `notCandidate`. `/metrics` gains
+  `manta_candidate_decisions_total{decision,reason}` and
+  `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
+  stdout and every wire format are unchanged. See
+  [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
+>>>>>>> 2c288cf2beee25a45386f2585ce35aba37e9694a
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -358,6 +373,15 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
+  longer stamped late when the reopen thread stalls before it drains the
+  data socket. The startup stash now stamps each packet with the last
+  instant it saw the socket empty, not the instant it read the packet, so
+  the outage ends no later than the first replayed packet's arrival. A
+  400 ms stall had moved every later spot about 400 ms late. The stamp can
+  now read early instead: by up to the stall when the stream starts inside
+  it or the stash evicts its backlog. See
+  docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md.
 - MAN-202: with a SoapySDR input, a driver overflow no longer decodes the
   dropped span as Morse timing. A wrong character (for example `K` read as
   `T`) becomes a dropped character, and the word the overflow cut ends

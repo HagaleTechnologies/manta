@@ -7,6 +7,7 @@ maintainer: agent
 sources:
   - docs/DECISIONS/2026-10-05-man73-source-reconnect.md
   - docs/DECISIONS/2026-10-16-man259-acquisition-anchored-outage.md
+  - docs/DECISIONS/2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md
   - crates/manta-cli/src/reconnect.rs
   - crates/manta-cli/src/reconnect.rs (InputHealthTotals)
   - crates/manta-input/src/lib.rs (IqSource::take_discontinuity)
@@ -18,8 +19,8 @@ sources:
   - docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md
   - crates/manta-cli/src/hpsdr_group.rs
 verified:
-  commit: d144e36
-  date: 2026-11-01
+  commit: efa79c4
+  date: 2026-11-03
 links:
   - determinism
 ---
@@ -45,6 +46,9 @@ Every driver starts acquiring inside its open call and returns what it buffered 
 reports `IqSource::acquisition_start_offset()` and every wrapper between it and
 `ReconnectingSource` (`DecimatingSource`, `FixedCenterFreqSource`) must forward it; anchoring at
 the opener's return counts those samples twice and stamps every later spot late.
+Gotcha (MAN-407): ka9q's startup stash stamps each packet with the last instant its socket was seen
+empty, never `Instant::now()` after `recv`; a dequeue stamp counts an opener stall both as outage
+and as data.
 Gotcha (MAN-202): there are three gap reports, not two. An outage of known length is
 `take_discontinuity()` (close tracks, rebuild the segment, advance the clock); a known-length loss
 the source spliced over is `take_missing_samples()` (advance the clock only); a loss of unknown

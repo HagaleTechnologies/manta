@@ -15,7 +15,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use manta_decode::decoder::Engine;
-use manta_engine::{decode_wav, PipelineConfig};
+use manta_engine::PipelineConfig;
 use manta_input::IqSource;
 use std::path::{Path, PathBuf};
 
@@ -43,6 +43,7 @@ mod list_refresh;
 mod live_state;
 mod logging;
 mod multi_run;
+mod observations;
 mod qrz;
 mod reconnect;
 mod relay_socket;
@@ -134,6 +135,17 @@ enum Command {
         /// (in dits) on stderr. `--json` always includes them.
         #[arg(long, help_heading = "Output")]
         timing: bool,
+        /// Write why each callsign candidate was or was not spotted to PATH as
+        /// JSON Lines (schema manta-observations.v1, see docs/OBSERVATIONS.md).
+        ///
+        /// PATH must not exist. Holds callsigns, reasons and scores, not the
+        /// decoded text; add --observation-text for that.
+        #[arg(long, value_name = "PATH", help_heading = "Output")]
+        observations: Option<PathBuf>,
+        /// Also write each candidate's characters, confidences, erasures and
+        /// decoder alternatives. Requires --observations.
+        #[arg(long, requires = "observations", help_heading = "Output")]
+        observation_text: bool,
         /// TOML config file; the whole file is validated.
         ///
         /// Its `[decode]` values are the baseline; an explicit --engine
@@ -4254,6 +4266,76 @@ fn latency_histogram_of(
     }
 }
 
+/// `manta decode`'s decode: a manta IQ recording or headerless IQ through
+/// `decode_source_observed` (MAN-309), a WAV otherwise. MAN-131: says so
+/// before decoding when the reported frequencies will be baseband offsets,
+/// only for an existing file, so a missing WAV still fails with just its
+/// `open WAV` error.
+fn decode_for_cli(
+    path: &Path,
+    mut center_freq_hz: Option<f64>,
+    iq_format: Option<manta_input::RawIqFormat>,
+    sample_rate_hz: Option<f64>,
+    cfg: &PipelineConfig,
+    policy: manta_engine::ObservationPolicy,
+) -> Result<(manta_engine::DecodeReport, manta_engine::ObservedRun)> {
+    let native = manta_input::is_native_recording(path);
+    if native || iq_format.is_some() {
+        if !native && (sample_rate_hz.is_none() || center_freq_hz.is_none()) {
+            bail!("headerless IQ requires --sample-rate-hz and --center-freq-hz");
+        }
+        let mut src = manta_input::open_iq_file(
+            path,
+            manta_input::IqFileOptions {
+                raw_format: iq_format,
+                sample_rate_hz,
+                center_freq_hz,
+            },
+        )?;
+        if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
+            errln!(
+                "warning: IQ recording {} has no RF centre frequency in its \
+                 metadata -- reported frequencies are baseband offsets from the \
+                 recording's centre, not absolute RF frequencies. Pass the centre \
+                 frequency, e.g. --center-freq-hz 14000000.",
+                path.display()
+            );
+        }
+        // `decode_source` segments the decode at each recorded gap.
+        manta_engine::decode_source_observed(src.as_mut(), cfg, policy)
+    } else {
+        if center_freq_hz.is_none() && path.is_file() {
+            let sidecar = manta_input::read_sidecar(path)?;
+            if let Some(warning) =
+                recording_center_warning(path, sidecar.map(|sc| sc.center_freq_hz))
+            {
+                errln!("{warning}");
+                // Keep the warning true: a negative sidecar centre
+                // decodes at 0.0, not shifted by itself.
+                center_freq_hz = Some(0.0);
+            }
+        }
+        manta_engine::decode_wav_observed(path, center_freq_hz, cfg, policy)
+    }
+}
+
+/// MAN-207: creates `--observations PATH`, refusing an existing path so a
+/// typo can never truncate the recording itself.
+fn create_observation_file(path: &Path) -> Result<std::fs::File> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "--observations {} already exists; remove it or choose another path",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("create --observations {}", path.display())),
+    }
+}
+
 /// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
 /// bounds and the repetition gate's bucket bounds to their snapshots.
 fn decode_quality_of(
@@ -4275,6 +4357,24 @@ fn decode_quality_of(
             bucket_counts: s.repetition_bucket_counts.clone(),
             sum: s.repetition_sum as f64,
         },
+        // MAN-207: the live-state stream's labels, `none` for a spot.
+        decisions: s
+            .decisions
+            .iter()
+            .map(|&(verdict, reason, n)| {
+                (
+                    manta_server::live_state::decision_label(verdict),
+                    reason.map_or("none", manta_server::live_state::reason_label),
+                    n,
+                )
+            })
+            .collect(),
+        // MAN-207: the MAN-201 role labels.
+        not_candidates: s
+            .not_candidates
+            .iter()
+            .map(|&(role, n)| (role.as_str(), n))
+            .collect(),
     }
 }
 
@@ -6764,6 +6864,8 @@ fn run_command() -> Result<std::process::ExitCode> {
             sample_rate_hz,
             json,
             timing,
+            observations,
+            observation_text,
             filters,
             config,
             engine,
@@ -6854,49 +6956,53 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&spot, &lists_in_use);
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
-            // MAN-131: say so before decoding when the reported frequencies
-            // will be baseband offsets. Only for an existing file, so a
-            // missing WAV still fails with just its `open WAV` error.
-            let mut center_freq_hz = center_freq_hz;
-            // MAN-309: a manta IQ recording or headerless IQ; a WAV
-            // otherwise, exactly as before.
-            let native = manta_input::is_native_recording(&path);
-            let report = if native || iq_format.is_some() {
-                if !native && (sample_rate_hz.is_none() || center_freq_hz.is_none()) {
-                    bail!("headerless IQ requires --sample-rate-hz and --center-freq-hz");
+            // MAN-207: the observation file is created before decoding, so an
+            // existing path fails fast and is never truncated.
+            let policy = match (&observations, observation_text) {
+                (None, _) => manta_engine::ObservationPolicy::summary(),
+                (Some(_), false) => manta_engine::ObservationPolicy::records(),
+                (Some(_), true) => manta_engine::ObservationPolicy::text(),
+            };
+            let observation_file = match &observations {
+                Some(obs_path) => Some(create_observation_file(obs_path)?),
+                None => None,
+            };
+            let decoded = decode_for_cli(
+                &path,
+                center_freq_hz,
+                iq_format,
+                sample_rate_hz,
+                &cfg,
+                policy,
+            );
+            let (report, observed) = match decoded {
+                Ok(decoded) => decoded,
+                Err(e) => {
+                    if let Some(obs_path) = &observations {
+                        // Best effort: the empty file must not look like a record.
+                        let _ = std::fs::remove_file(obs_path);
+                    }
+                    return Err(e);
                 }
-                let mut src = manta_input::open_iq_file(
-                    &path,
-                    manta_input::IqFileOptions {
-                        raw_format: iq_format,
-                        sample_rate_hz,
-                        center_freq_hz,
-                    },
-                )?;
-                if native && center_freq_hz.is_none() && src.center_freq_hz() <= 0.0 {
-                    errln!(
-                        "warning: IQ recording {} has no RF centre frequency in its \
-                         metadata -- reported frequencies are baseband offsets from the \
-                         recording's centre, not absolute RF frequencies. Pass the centre \
-                         frequency, e.g. --center-freq-hz 14000000.",
-                        path.display()
-                    );
-                }
-                // `decode_source` segments the decode at each recorded gap.
-                manta_engine::decode_source(src.as_mut(), &cfg)?
-            } else {
-                if center_freq_hz.is_none() && path.is_file() {
-                    let sidecar = manta_input::read_sidecar(&path)?;
-                    if let Some(warning) =
-                        recording_center_warning(&path, sidecar.map(|sc| sc.center_freq_hz))
+            };
+            // Written before any output, so a failed stdout write cannot
+            // leave the file empty.
+            let written = match (&observations, observation_file) {
+                (Some(obs_path), Some(file)) => {
+                    match observations::write(file, policy.detail, report.sample_rate_hz, &observed)
                     {
-                        errln!("{warning}");
-                        // Keep the warning true: a negative sidecar centre
-                        // decodes at 0.0, not shifted by itself.
-                        center_freq_hz = Some(0.0);
+                        Ok(n) => Some((obs_path, n)),
+                        Err(e) => {
+                            // Best effort: a file cut short has no summary
+                            // trailer and must not look like a record.
+                            let _ = std::fs::remove_file(obs_path);
+                            return Err(e).with_context(|| {
+                                format!("write --observations {}", obs_path.display())
+                            });
+                        }
                     }
                 }
-                decode_wav(&path, center_freq_hz, &cfg)?
+                _ => None,
             };
             if json {
                 outln!("{}", serde_json::to_string(&report)?)?;
@@ -6929,6 +7035,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                     &path.display().to_string(),
                     report.bad_samples,
                 ));
+            }
+            if let Some((obs_path, n)) = written {
+                errln!(
+                    "observations: {n} record{} written to {}",
+                    if n == 1 { "" } else { "s" },
+                    obs_path.display()
+                );
             }
         }
         Command::Oracle {
@@ -12455,6 +12568,34 @@ mod tests {
         );
     }
 
+    /// MAN-207: every valid decision/reason pair, labelled as LIVE-STATE.md.
+    #[test]
+    fn decode_quality_of_carries_the_decision_counts() {
+        let obs = manta_engine::DecodeQualityObserver::new();
+        let q = decode_quality_of(&obs.snapshot());
+        assert_eq!(q.decisions.len(), 1 + manta_spot::Reason::ALL.len());
+        assert_eq!(q.decisions[0], ("spotted", "none", 0));
+        assert!(q.decisions.contains(&("withheld", "repetition", 0)));
+        assert!(q.decisions.contains(&("deferred", "beaconPending", 0)));
+        assert!(q.decisions.contains(&("deferred", "lookupPending", 0)));
+        assert_eq!(
+            q.decisions
+                .iter()
+                .filter(|&&(d, _, _)| d == "spotted")
+                .count(),
+            1
+        );
+        assert_eq!(
+            q.not_candidates,
+            vec![
+                ("addressee", 0),
+                ("relayed_mention", 0),
+                ("self_id", 0),
+                ("uncertain", 0),
+            ]
+        );
+    }
+
     #[test]
     fn a_source_without_counters_publishes_no_input_health_series() {
         struct StubSourceNoCounters;
@@ -13769,6 +13910,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         "center_freq_hz",
         // `decode --timing` (MAN-315): an output choice, like `json`.
         "timing",
+        // `decode --observations`/`--observation-text` (MAN-207): an output
+        // choice, like `json`.
+        "observations",
+        "observation_text",
         "help",
         "version",
         "reference_hz",

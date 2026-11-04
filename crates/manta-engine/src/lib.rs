@@ -34,8 +34,9 @@ pub use calibrate::{calibrate, CalibrateOptions, CalibrationReport};
 pub mod doctor;
 pub use doctor::{doctor, DoctorReport, Verdict, MAX_DURATION, MIN_DURATION};
 pub mod soak;
+pub use manta_spot::observation::{LossCounts, ObservationCounts};
 pub use manta_spot::reference::ReferenceLists;
-pub use manta_spot::{Blocklist, NotchList, Spot, SpotType};
+pub use manta_spot::{Blocklist, NotchList, ObservationPolicy, Spot, SpotType};
 pub use soak::{soak, soak_passed, SoakReport};
 pub mod soak_metrics;
 pub use soak_metrics::{
@@ -529,6 +530,26 @@ fn append_rtty(
 /// synthesized; the validator spans every segment. A gap-free source
 /// decodes exactly as before.
 pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<DecodeReport> {
+    decode_source_observed(src, cfg, ObservationPolicy::summary()).map(|(report, _)| report)
+}
+
+/// MAN-207: what an offline decode's observation record kept.
+#[derive(Debug, Clone, Default)]
+pub struct ObservedRun {
+    /// Every record appended during the decode, in `seq` order.
+    pub records: Vec<manta_spot::Observation>,
+    pub counts: ObservationCounts,
+    pub losses: LossCounts,
+}
+
+/// MAN-207: `decode_source`, with the validator keeping observation
+/// records at `policy`. The report is identical to `decode_source`'s.
+/// Each MAN-309 segment after the first starts a new observation epoch.
+pub fn decode_source_observed(
+    src: &mut dyn IqSource,
+    cfg: &PipelineConfig,
+    policy: ObservationPolicy,
+) -> Result<(DecodeReport, ObservedRun)> {
     // Validated up front so a bad config value (NaN, infinite, or ppm so
     // negative it flips the factor negative/zero) fails fast rather than
     // after the channelizer/decoder work below (MAN-29).
@@ -539,6 +560,8 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     let fs = bands.fs;
     let center_freq_hz = bands.center_freq_hz;
     let mut seg = bands.segment(cfg, 0, 1)?;
+    // MAN-207: the event index each later segment's events start at.
+    let mut segment_starts: Vec<usize> = Vec::new();
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&whole_input)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
@@ -647,6 +670,7 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             .checked_add(missing)
             .context("input discontinuity overflows the sample clock")?;
         seg = bands.segment(cfg, base, seg.tm.next_track_id())?;
+        segment_starts.push(events.len());
         pad_left = seg.pad_samples;
         consumed = 0;
     }
@@ -714,11 +738,24 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
     });
     let text = events_to_text(&this_track);
     let timing = last_timing(&this_track);
-    let mut validator = cfg.validator(fs)?;
+    let mut validator = cfg.validator(fs)?.with_observations(policy);
     let mut spots = Vec::new();
-    for ev in &events {
+    let mut records = Vec::new();
+    let mut starts = segment_starts.iter().peekable();
+    for (i, ev) in events.iter().enumerate() {
+        while starts.next_if(|&&start| start == i).is_some() {
+            validator.observations_mut().note_discontinuity();
+        }
         spots.extend(validator.ingest(ev));
+        if validator.observations().keeps_records() {
+            records.extend(validator.observations_mut().take_appended());
+        }
     }
+    let observed = ObservedRun {
+        records,
+        counts: validator.observation_counts(),
+        losses: validator.observations().losses(),
+    };
     // Mutated in place, after the validator above has already ingested the
     // raw values (validator.ingest() applied its own correction to its
     // internal spot output, so this must not run before that loop) --
@@ -735,7 +772,7 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
             _ => {}
         }
     }
-    Ok(DecodeReport {
+    let report = DecodeReport {
         freq_hz,
         wpm,
         text,
@@ -745,7 +782,8 @@ pub fn decode_source(src: &mut dyn IqSource, cfg: &PipelineConfig) -> Result<Dec
         rtty,
         bad_samples,
         sample_rate_hz: fs,
-    })
+    };
+    Ok((report, observed))
 }
 
 /// decode_samples, sourced from a WAV file via manta-input. ARCHITECTURE
@@ -757,11 +795,23 @@ pub fn decode_wav(
     center_freq_hz: Option<f64>,
     cfg: &PipelineConfig,
 ) -> Result<DecodeReport> {
+    decode_wav_observed(path, center_freq_hz, cfg, ObservationPolicy::summary())
+        .map(|(report, _)| report)
+}
+
+/// MAN-207: `decode_wav`, with observation records at `policy` (see
+/// `decode_source_observed`).
+pub fn decode_wav_observed(
+    path: &Path,
+    center_freq_hz: Option<f64>,
+    cfg: &PipelineConfig,
+    policy: ObservationPolicy,
+) -> Result<(DecodeReport, ObservedRun)> {
     let mut src = match center_freq_hz {
         Some(hz) => WavIqSource::open_with_center_freq_hz(path, hz)?,
         None => WavIqSource::open(path)?,
     };
-    decode_source(&mut src, cfg)
+    decode_source_observed(&mut src, cfg, policy)
 }
 
 /// A JSON object's top-level keys in document order (the workspace's
