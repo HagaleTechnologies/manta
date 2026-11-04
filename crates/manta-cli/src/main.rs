@@ -2792,6 +2792,31 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
     Ok(mtime)
 }
 
+/// A scheduled replay must use a recorded or explicit epoch, never file mtime.
+fn cw_replay_epoch(
+    path: &Path,
+    explicit: Option<i64>,
+    scheduled: bool,
+    input_name: &str,
+) -> Result<(i64, u32)> {
+    if let Some(epoch) = explicit {
+        return Ok((epoch, 0));
+    }
+    if !scheduled {
+        return Ok((0, 0));
+    }
+    if !manta_input::is_native_recording(path) {
+        bail!(
+            "input {}: scheduled file input requires replay_epoch or a native recording epoch",
+            fmt::quoted(input_name)
+        );
+    }
+    let epoch = epoch_for_replay_path(path)?.duration_since(std::time::UNIX_EPOCH)?;
+    check_replay_epoch("recording epoch", i64::try_from(epoch.as_secs())?)
+        .map(|secs| (secs, epoch.subsec_nanos()))
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// Resolves the wall-clock epoch fed to `SpotBus`: an explicit
 /// `--replay-epoch` wins when given AND this is a replay session (the
 /// escape hatch for a copy/download that didn't preserve the file's
@@ -5531,6 +5556,7 @@ impl ReplayMode {
 
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
+    cw_policy: manta_engine::cw_segments::Policy,
     spec: LiveSourceSpec,
     replay: ReplayMode,
     freq_correction_ppm: f64,
@@ -5560,6 +5586,7 @@ struct Resolved {
 /// correction, dial and capture rate.
 #[derive(Clone)]
 struct ResolvedInput {
+    cw_policy: manta_engine::cw_segments::Policy,
     name: String,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
@@ -5719,6 +5746,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
             let spec = cli.into_spec();
             let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
             return Ok(Resolved {
+                cw_policy: Default::default(),
                 spec,
                 replay,
                 freq_correction_ppm: freq_correction_ppm.unwrap_or(0.0),
@@ -5761,6 +5789,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     bail!("[[input]] {} has no type", fmt::quoted(&n.name));
                 };
                 Ok(ResolvedInput {
+                    cw_policy: n.input.shared.cw_policy.clone(),
                     name: n.name.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
@@ -5800,6 +5829,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     };
     let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
+        cw_policy: shared.cw_policy.clone(),
         spec,
         replay,
         freq_correction_ppm: freq_correction_ppm
@@ -6226,6 +6256,33 @@ fn prepare_config_for(
         loaded.detector,
         decode.engine,
     )?;
+    pipeline.cw_policy = resolved.cw_policy.clone();
+    pipeline.cw_clock = if resolved.spec.is_reconnectable()
+        || !matches!(resolved.spec, LiveSourceSpec::File { .. })
+    {
+        manta_engine::cw_segments::Clock::Live
+    } else {
+        manta_engine::cw_segments::Clock::Samples
+    };
+    if let LiveSourceSpec::File { ref path, .. } = resolved.spec {
+        (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = cw_replay_epoch(
+            path,
+            resolved.replay_epoch,
+            pipeline.cw_policy.scheduled()
+                || resolved.inputs.iter().any(|i| i.cw_policy.scheduled()),
+            loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+        )?;
+    }
+    for input in &resolved.inputs {
+        if let LiveSourceSpec::File { ref path, .. } = input.spec {
+            cw_replay_epoch(
+                path,
+                resolved.replay_epoch,
+                input.cw_policy.scheduled(),
+                &input.name,
+            )?;
+        }
+    }
     pipeline.decode = decode;
     attach_language_prior(&mut pipeline, &resolved.spot, None)?;
     Ok(Prepared {
@@ -6933,11 +6990,23 @@ fn run_command() -> Result<std::process::ExitCode> {
                     path.display()
                 );
             }
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| n.input.shared.cw_policy != loaded.inputs[0].input.shared.cw_policy)
+            {
+                bail!("manta decode cannot choose between inputs with different CW coverage in {}: use a config containing only the recording's input",loaded.origin);
+            }
             let shared = &loaded.input.shared;
             if several {
                 errln!(
-                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
-                     in {}",
+                    "note: decode applies {} from the {} [[input]] entries in {}",
+                    if shared.cw_policy == Default::default() {
+                        "only freq_correction_ppm"
+                    } else {
+                        "common freq_correction_ppm and CW coverage"
+                    },
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -6947,7 +7016,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.replay_epoch.is_some()
             {
                 errln!(
-                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    "note: decode applies {} from [input] in {}",
+                    if shared.cw_policy == Default::default() {
+                        "only input.freq_correction_ppm"
+                    } else {
+                        "input.freq_correction_ppm and CW coverage"
+                    },
                     loaded.origin
                 );
             }
@@ -6978,6 +7052,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 decode_cfg.engine,
             )?;
             note_pinned_lists(&spot, &lists_in_use);
+            cfg.cw_policy = loaded.input.shared.cw_policy.clone();
+            (cfg.cw_epoch, cfg.cw_epoch_nanoseconds) = cw_replay_epoch(
+                &path,
+                loaded.input.shared.replay_epoch,
+                cfg.cw_policy.scheduled(),
+                loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+            )?;
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an

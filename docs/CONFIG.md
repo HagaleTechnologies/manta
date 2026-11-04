@@ -755,3 +755,70 @@ The loader also rejects `[detector] guard_hz`, which SPEC §9 does not list:
 it is the internal DC/Nyquist spawn guard, set from the input source
 (600 Hz for live audio, 0 otherwise; see
 [MAN-273](DECISIONS/2026-10-16-man273-hilbert-image-guard.md)).
+
+### CW sub-segments and UTC schedules
+
+Each `[input]` or `[[input]]` can restrict CW decoder coverage. These fields
+never retune a receiver. They reduce per-track work, not the full-passband FFT
+cost. Capture and tuning coverage do not promise active CW coverage.
+
+```toml
+[[input]]
+name = "20m"
+type = "kiwi"
+host = "kiwi.example.org"
+port = 8073
+freq_hz = 14050000
+cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "06:00"
+segments_hz = [[14000000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "18:00"
+segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_overrides]]
+start_utc = 2026-11-28T00:00:00Z
+end_utc = 2026-11-30T00:00:00Z
+segments_hz = [[14000000, 14060000]]
+```
+
+`cw_segments_hz` lists inclusive absolute RF ranges in Hz. Omit it for current
+coverage; an empty list disables CW decoding for this input. Every range needs
+two finite, positive endpoints with lower < upper. Overlapping or touching
+ranges are combined. Ranges outside the captured passband contribute no coverage;
+a band-plan entry can span several streams.
+
+`cw_schedule` selects the most recent daily `at_utc`, including yesterday's last
+entry before today's first switch. Use exactly `HH:MM`, `00:00` through `23:59`,
+without duplicate times. UTC has no daylight-saving adjustment. Each entry
+replaces the base ranges rather than adding to them.
+
+`cw_overrides` replaces daily or base coverage during an absolute interval,
+including its start and excluding its end. Use UTC TOML datetimes with `Z`, whole
+seconds, from 1970 through 2100-01-01. Intervals must not overlap; adjacent
+intervals are valid. At an interval's end, the current daily or base coverage
+resumes. Empty `segments_hz` pauses CW decoding.
+
+Membership uses the calibrated RF estimate, with the estimator's existing
+boundary uncertainty. Trusted-band, analytic-image and digital-window vetoes
+still apply. Decoding inside a default digital exclusion also needs the existing
+`digital_window_filter` setting to permit it. Newly admitted signals acquire
+normally. Excluded tracks release their decoders without flushing a final word.
+Retained tracks keep their state. Acquisition, spectrum and other modes continue.
+
+Live inputs switch before the first processing batch after the UTC boundary.
+A blocked read postpones processing; resumed processing selects current coverage.
+File inputs use replay epoch plus sample time, even with realtime playback.
+Scheduled legacy files require `replay_epoch`; native recordings can use their
+recorded epoch. Looped files use the advancing session sample clock. Replay
+boundaries split decoder batches so excluded input never reaches a decoder.
+
+Policy edits require restart. Loaded schedules switch automatically without
+signals on all supported operating systems. SIGHUP reports edits as restart-only.
+Use `manta config check --config <file>` to validate. No new RBN registration
+exchange is provided. Local timezones, recurring weekday rules and sunrise/sunset
+scheduling are deferred. Removing the keys and restarting restores old coverage;
+remove them before downgrading to a version that does not recognize them.

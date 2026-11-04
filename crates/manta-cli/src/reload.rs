@@ -222,6 +222,12 @@ fn diff_values(
     if is_reloadable(&path) {
         return;
     }
+    // MAN-30: absent coverage is unrestricted, whereas [] pauses CW.
+    // The generic array comparison treats absent and empty as equivalent.
+    if path.ends_with(".cw_segments_hz") && old.is_none() != new.is_none() {
+        out.insert(path);
+        return;
+    }
     let empty_table = toml::Table::new();
     let empty_array: Vec<Value> = Vec::new();
     match (old, new) {
@@ -850,6 +856,28 @@ blocklist_path = \"bl.txt\"
             vec![("127.0.0.1:7000".to_string(), false)]
         );
         assert_eq!(report.restart_needed, vec!["skimmer_relay[0].callsign"]);
+    }
+
+    #[test]
+    fn cw_segments_schedule_edits_are_restart_only_and_invalid_reload_keeps_state() {
+        assert_eq!(
+            restart_only_changes(&table(""), &table("[input]\ncw_segments_hz = []\n")),
+            vec!["input.cw_segments_hz"]
+        );
+
+        let original=format!("{BASE}\n[input]\ncw_segments_hz = [[14000000,14030000]]\n[[input.cw_schedule]]\nat_utc = '06:00'\nsegments_hz = []\n");
+        let f = start(&original, CliOverrides::none());
+        let changed = original.replace("06:00", "18:00");
+        write(&f.path("manta.toml"), &changed);
+        let report = applied(&f.ctx);
+        assert!(report
+            .restart_needed
+            .iter()
+            .any(|k| k.contains("cw_schedule")));
+        assert_eq!(f.ctx.startup_raw, table(&original));
+        write(&f.path("manta.toml"), &original.replace("06:00", "25:00"));
+        assert!(reload_once(&f.ctx).is_err());
+        assert_eq!(f.ctx.startup_raw, table(&original));
     }
 
     /// MAN-310: a band plan decides which streams are open, so it is

@@ -244,6 +244,7 @@ pub(crate) enum LifecycleState {
 /// SPEC §2.4/§2.5: reason for track closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloseReason {
+    Restricted,
     /// Rise never confirmed within `confirm_hops` (SPEC §2.4: CANDIDATE -> IDLE).
     Unconfirmed,
     /// Hang timer expired (SPEC §2.4: HANG -> CLOSED), or, MAN-108, the
@@ -277,6 +278,7 @@ pub(crate) enum CloseReason {
 /// text endpoint itself is explicit M3 scope (ROADMAP.md).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CloseCounts {
+    pub restricted: u64,
     pub unconfirmed: u64,
     pub hang_expired: u64,
     pub silent: u64,
@@ -297,6 +299,7 @@ impl std::ops::Add for CloseCounts {
 
     fn add(self, rhs: Self) -> Self {
         Self {
+            restricted: self.restricted + rhs.restricted,
             unconfirmed: self.unconfirmed + rhs.unconfirmed,
             hang_expired: self.hang_expired + rhs.hang_expired,
             silent: self.silent + rhs.silent,
@@ -313,6 +316,7 @@ impl std::ops::Add for CloseCounts {
 impl CloseCounts {
     fn record(&mut self, reason: CloseReason) {
         match reason {
+            CloseReason::Restricted => self.restricted += 1,
             CloseReason::Unconfirmed => self.unconfirmed += 1,
             CloseReason::HangExpired => self.hang_expired += 1,
             CloseReason::Silent => self.silent += 1,
@@ -2025,6 +2029,13 @@ pub struct TrackManager {
     cfg: DetectorConfig,
     decode_cfg: DecodeConfig,
     hop_counter: u64,
+    cw_policy: crate::cw_segments::Policy,
+    cw_clock: crate::cw_segments::Clock,
+    cw_epoch: i64,
+    cw_epoch_nanoseconds: u32,
+    cw_ranges: Option<std::sync::Arc<crate::cw_segments::Ranges>>,
+    cw_factor: f64,
+    cw_fs: f64,
     center_freq_hz: f64,
     /// Hz per channel (`fs / n_channels`), the unit `Track::freq_hz` (SPEC
     /// §1.1/§1.4) converts its channel-index centroid into absolute Hz.
@@ -2243,6 +2254,13 @@ impl TrackManager {
             hop_counter: 0,
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
+            cw_policy: Default::default(),
+            cw_clock: Default::default(),
+            cw_epoch: 0,
+            cw_epoch_nanoseconds: 0,
+            cw_ranges: None,
+            cw_factor: 1.0,
+            cw_fs: fs,
             close_counts: CloseCounts::default(),
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
@@ -2992,6 +3010,16 @@ impl TrackManager {
                     }
                 }
             }
+            if self.cw_ranges.as_ref().is_some_and(|r| {
+                !r.contains(
+                    track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n) * self.cw_factor,
+                )
+            }) {
+                self.close_counts.record(CloseReason::Restricted);
+                close_reasons.insert(id, CloseReason::Restricted);
+                closed.push(id);
+                continue;
+            }
             let f = self.floor.effective_floor_db(k);
             track.current_snr_db = (self.gate.smoothed_db(k) - f) as f32;
             // MAN-313 (SPEC §2.8 A): a track awaiting qualification has no
@@ -3122,6 +3150,16 @@ impl TrackManager {
                     // this entry's own `push_hop`, so a `TrackMeta` pairs it
                     // with this hop's `sample_ts`.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
+                    if self
+                        .cw_ranges
+                        .as_ref()
+                        .is_some_and(|r| !r.contains(freq_hz * self.cw_factor))
+                    {
+                        self.close_counts.record(CloseReason::Restricted);
+                        close_reasons.insert(id, CloseReason::Restricted);
+                        closed.push(id);
+                        continue;
+                    }
                     // MAN-313 (SPEC §2.8): with the filter on, the decoder is
                     // leased (and `TrackPromoted` emitted) only once the track
                     // qualifies as keyed CW; until then its input queues in
@@ -3431,6 +3469,9 @@ impl TrackManager {
             if !track.has_emitted {
                 return false;
             }
+            if close_reasons.get(id) == Some(&CloseReason::Restricted) {
+                return true; // Drop decoder/refiner queues without manufacturing a final word.
+            }
             // MAN-194: this closure is the LAST point this track's refiner
             // will ever be fed -- drain its backlog into pending BEFORE
             // finish_decoder*/finish_decoder_speed_only* below (which then
@@ -3470,6 +3511,7 @@ impl TrackManager {
             let mut k = 0;
             while k < n {
                 if rise[k]
+                    && self.cw_spawn_admits(k, self.spawn_phase_position(k, hop, prev_hop.as_ref()))
                     && self.spawn_admits(k, self.spawn_phase_position(k, hop, prev_hop.as_ref()))
                     && !self.spawn_window_cooling_down(k)
                     && self.is_local_peak(k)
@@ -3483,6 +3525,10 @@ impl TrackManager {
                     let mut winner = k;
                     if k + 1 < n
                         && rise[k + 1]
+                        && self.cw_spawn_admits(
+                            k + 1,
+                            self.spawn_phase_position(k + 1, hop, prev_hop.as_ref()),
+                        )
                         && self.spawn_admits(
                             k + 1,
                             self.spawn_phase_position(k + 1, hop, prev_hop.as_ref()),
@@ -3834,7 +3880,81 @@ impl TrackManager {
     /// `hop_to_sample_ts` mirrors the existing `decode_samples`/`listen`
     /// convention of converting a channelizer hop index to a raw-sample
     /// timestamp.
+    /// Install immutable source coverage and its clock for every segment.
+    pub(crate) fn set_cw_policy(&mut self, cfg: &crate::PipelineConfig) {
+        self.cw_policy = cfg.cw_policy.clone();
+        self.cw_clock = cfg.cw_clock;
+        self.cw_epoch = cfg.cw_epoch;
+        self.cw_epoch_nanoseconds = cfg.cw_epoch_nanoseconds;
+        self.cw_factor = 1.0 + cfg.freq_correction_ppm * 1e-6;
+        self.cw_ranges = self.cw_policy.active_at(cfg.cw_epoch);
+    }
+
+    fn cw_spawn_admits(&self, k: usize, position: Option<f64>) -> bool {
+        let n = self.n_channels() as f64;
+        let p = position.unwrap_or(k as f64);
+        let offset = (p + n / 2.0).rem_euclid(n) - n / 2.0;
+        let hz = (self.center_freq_hz + offset * self.channel_spacing_hz) * self.cw_factor;
+        self.cw_ranges.as_ref().is_none_or(|r| r.contains(hz))
+    }
+
     pub fn process_hops(
+        &mut self,
+        hops: &[HopOutput],
+        hop_to_sample_ts: impl Fn(u64) -> u64,
+    ) -> Vec<DecoderEvent> {
+        if !self.cw_policy.scheduled() {
+            return self.process_hops_inner(hops, hop_to_sample_ts);
+        }
+        let live = if self.cw_clock == crate::cw_segments::Clock::Live {
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+                    .min(i64::MAX as u64) as i64,
+            )
+        } else {
+            None
+        };
+        self.process_hops_at(hops, hop_to_sample_ts, live)
+    }
+
+    // Injectable UTC batch time keeps live transitions testable without sleeping.
+    fn process_hops_at(
+        &mut self,
+        hops: &[HopOutput],
+        hop_to_sample_ts: impl Fn(u64) -> u64,
+        live: Option<i64>,
+    ) -> Vec<DecoderEvent> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < hops.len() {
+            let at = |h: &HopOutput| {
+                live.unwrap_or_else(|| {
+                    self.cw_epoch.saturating_add(
+                        (hop_to_sample_ts(h.m) as f64 / self.cw_fs
+                            + f64::from(self.cw_epoch_nanoseconds) * 1e-9)
+                            .floor()
+                            .min(i64::MAX as f64) as i64,
+                    )
+                })
+            };
+            let utc = at(&hops[start]);
+            let selected = self.cw_policy.active_at(utc);
+            let next = self.cw_policy.next_transition_after(utc);
+            let mut end = start + 1;
+            while end < hops.len() && at(&hops[end]) < next {
+                end += 1;
+            }
+            self.cw_ranges = selected;
+            out.extend(self.process_hops_inner(&hops[start..end], &hop_to_sample_ts));
+            start = end;
+        }
+        out
+    }
+
+    fn process_hops_inner(
         &mut self,
         hops: &[HopOutput],
         hop_to_sample_ts: impl Fn(u64) -> u64,
@@ -4528,6 +4648,7 @@ mod tests {
     #[test]
     fn close_counts_adds_every_reason() {
         let a = CloseCounts {
+            restricted: 0,
             unconfirmed: 1,
             hang_expired: 2,
             silent: 3,
@@ -4539,6 +4660,7 @@ mod tests {
             false_lease_hops: 9,
         };
         let b = CloseCounts {
+            restricted: 0,
             unconfirmed: 10,
             hang_expired: 20,
             silent: 30,
@@ -4552,6 +4674,7 @@ mod tests {
         assert_eq!(
             a + b,
             CloseCounts {
+                restricted: 0,
                 unconfirmed: 11,
                 hang_expired: 22,
                 silent: 33,
@@ -5922,6 +6045,269 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    fn cw_test_config(ranges: Vec<(f64, f64)>) -> crate::PipelineConfig {
+        crate::PipelineConfig {
+            cw_policy: crate::cw_segments::Policy::new(
+                Some(crate::cw_segments::Ranges::new(ranges).unwrap()),
+                vec![],
+                vec![],
+            )
+            .unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cw_segments_switch_inside_batch_preserves_survivor_and_drops_old_work() {
+        use crate::cw_segments::{Policy, Ranges};
+        let r = |v| Ranges::new(v).unwrap();
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        tm.spawn(10);
+        tm.spawn(30);
+        let old = *tm
+            .tracks
+            .iter()
+            .find(|(_, t)| t.birth_channel == 10)
+            .unwrap()
+            .0;
+        let kept = *tm
+            .tracks
+            .iter()
+            .find(|(_, t)| t.birth_channel == 30)
+            .unwrap()
+            .0;
+        for (&id, t) in &mut tm.tracks {
+            t.lifecycle.state = LifecycleState::Active;
+            t.has_emitted = true;
+            t.decoder = Some(TrackDecoder::new(id, DecodeConfig::default()));
+        }
+        let cfg = crate::PipelineConfig {
+            cw_epoch: 59,
+            cw_policy: Policy::new(
+                None,
+                vec![
+                    (0, r(vec![(14_000_900., 14_002_900.)])),
+                    (1, r(vec![(14_002_700., 14_002_900.)])),
+                ],
+                vec![],
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        tm.set_cw_policy(&cfg);
+        let hops: Vec<_> = (4000..4020)
+            .map(|m| hop(m, strong_on_all(512, &[(10, 30.), (30, 30.)])))
+            .collect();
+        let events = tm.process_hops(&hops, |m| (m - 4000) * 4800);
+        assert!(!tm.tracks.contains_key(&old));
+        assert!(tm.tracks.contains_key(&kept));
+        assert_eq!(tm.close_counts.restricted, 1);
+        assert!(events.iter().any(|e|matches!(e,DecoderEvent::TrackClosed{track_id,closure:ClosureKind::Bookkeeping{survivor_track_id:None}} if *track_id==old)));
+        // No pending sample at or beyond the switch survives revocation.
+        assert_eq!(tm.decoding_track_count(), 1);
+    }
+
+    #[test]
+    fn cw_segments_static_union_reduces_candidate_and_decoder_work() {
+        let run = |restricted: bool| {
+            let mut tm = trusted_band_manager(512);
+            feed_warmup(&mut tm, 512);
+            if restricted {
+                tm.set_cw_policy(&cw_test_config(vec![
+                    (14_000_900., 14_001_000.),
+                    (14_002_700., 14_002_900.),
+                ]));
+            }
+            let mut work = 0;
+            for m in 3750..3900 {
+                tm.step_hop(
+                    &hop(m, strong_on_all(512, &[(10, 30.), (20, 30.), (30, 30.)])),
+                    m,
+                );
+                work += tm.tracks.values().map(|t| t.pending.len()).sum::<usize>();
+                if restricted {
+                    assert!(tm.tracks.values().all(|t| t.birth_channel != 20));
+                }
+            }
+            (tm.total_spawns(), tm.decoding_track_count(), work)
+        };
+        let full = run(false);
+        let restricted = run(true);
+        assert!(
+            restricted.0 < full.0 && restricted.1 < full.1 && restricted.2 < full.2,
+            "{restricted:?} vs {full:?}"
+        );
+    }
+
+    #[test]
+    fn cw_segments_injected_live_clock_handles_jumps_and_resume_after_stall() {
+        use crate::cw_segments::{Policy, Ranges};
+        let r = |v| Ranges::new(v).unwrap();
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        let cfg = crate::PipelineConfig {
+            cw_policy: Policy::new(
+                None,
+                vec![
+                    (0, r(vec![(14_000_900., 14_001_000.)])),
+                    (1, Ranges::default()),
+                ],
+                vec![],
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        tm.set_cw_policy(&cfg);
+        // No sleeps: injected UTC is sampled at batch entry, including a resumed read.
+        tm.process_hops_at(&[hop(4000, quiet_power(512))], |m| m, Some(30));
+        assert!(tm.cw_spawn_admits(10, None));
+        tm.process_hops_at(&[hop(4001, quiet_power(512))], |m| m, Some(60));
+        assert!(!tm.cw_spawn_admits(10, None));
+        tm.process_hops_at(&[hop(4002, quiet_power(512))], |m| m, Some(20));
+        assert!(tm.cw_spawn_admits(10, None));
+        tm.process_hops_at(&[hop(4003, quiet_power(512))], |m| m, Some(86460));
+        assert!(!tm.cw_spawn_admits(10, None));
+    }
+
+    #[test]
+    fn cw_segments_both_arbitration_slots_and_drift_reentry() {
+        for k in [10, 500] {
+            let hz = 14_000_000. + wrapped_channel_offset(k, 512) * 93.75;
+            let births = births_after(
+                |tm| tm.set_cw_policy(&cw_test_config(vec![(hz - 1., hz + 1.)])),
+                strong_on_all(512, &[(k, 22.), (k + 1, 30.)]),
+            );
+            assert!(births.iter().all(|&ch| ch == k), "{births:?}");
+            let mut tm = trusted_band_manager(512);
+            feed_warmup(&mut tm, 512);
+            tm.set_cw_policy(&cw_test_config(vec![(hz - 1., hz + 1.)]));
+            tm.spawn(k);
+            let id = tm.next_id - 1;
+            tm.tracks.get_mut(&id).unwrap().center = (k + 1) as f64;
+            tm.step_hop(&hop(4000, strong_on(512, k + 1)), 4000);
+            assert!(!tm.tracks.contains_key(&id));
+            assert_eq!(tm.close_counts.restricted, 1);
+            assert!(!tm.spawn_window_cooling_down(k));
+            // Returning RF is allowed to create a fresh identity.
+            tm.spawn(k);
+            assert!(tm.tracks.keys().all(|&new| new != id));
+        }
+    }
+
+    #[test]
+    fn cw_segments_native_fractional_epoch_crosses_at_the_first_corrected_hop() {
+        use crate::cw_segments::{Policy, Ranges};
+        let mut tm = trusted_band_manager(512);
+        let cfg = crate::PipelineConfig {
+            cw_epoch: 59,
+            cw_epoch_nanoseconds: 900_000_000,
+            cw_policy: Policy::new(
+                None,
+                vec![
+                    (0, Ranges::new(vec![(14_000_900., 14_001_000.)]).unwrap()),
+                    (1, Ranges::default()),
+                ],
+                vec![],
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        tm.set_cw_policy(&cfg);
+        tm.process_hops_at(&[hop(0, quiet_power(512))], |m| m * 4800, None);
+        assert!(tm.cw_spawn_admits(10, None));
+        tm.process_hops_at(&[hop(1, quiet_power(512))], |m| m * 4800, None);
+        assert!(!tm.cw_spawn_admits(10, None));
+    }
+
+    #[test]
+    fn cw_segments_absent_policy_preserves_control_events_byte_for_byte() {
+        let run = |install: bool| {
+            let mut tm = trusted_band_manager(512);
+            feed_warmup(&mut tm, 512);
+            if install {
+                tm.set_cw_policy(&crate::PipelineConfig::default());
+            }
+            let hops: Vec<_> = (3750..3900).map(|m| hop(m, strong_on(512, 10))).collect();
+            format!("{:?}", tm.process_hops(&hops, |m| m * 256))
+        };
+        assert_eq!(run(false).as_bytes(), run(true).as_bytes());
+    }
+
+    #[test]
+    fn cw_segments_wrapped_fractional_endpoints_and_calibration() {
+        let mut tm = trusted_band_manager(512);
+        let hz = 14_000_000.0 + 10.25 * 93.75;
+        tm.set_cw_policy(&cw_test_config(vec![(hz, hz + 10.)]));
+        assert!(tm.cw_spawn_admits(10, Some(10.25)));
+        assert!(!tm.cw_spawn_admits(10, None));
+        assert!(!tm.cw_spawn_admits(11, None));
+        let hz = 14_000_000.0 - 10.5 * 93.75;
+        tm.set_cw_policy(&cw_test_config(vec![(hz - 10., hz)]));
+        assert!(tm.cw_spawn_admits(502, Some(501.5)));
+        assert!(!tm.cw_spawn_admits(502, None));
+        let mut cfg = cw_test_config(vec![(hz * 1.00001 - 0.1, hz * 1.00001 + 0.1)]);
+        cfg.freq_correction_ppm = 10.;
+        tm.set_cw_policy(&cfg);
+        assert!(tm.cw_spawn_admits(502, Some(501.5)));
+    }
+
+    #[test]
+    fn cw_segments_revoke_all_states_without_flush_or_cooldown() {
+        for state in [
+            LifecycleState::Candidate,
+            LifecycleState::Active,
+            LifecycleState::Hang,
+            LifecycleState::Dormant,
+        ] {
+            let mut tm = trusted_band_manager(512);
+            feed_warmup(&mut tm, 512);
+            tm.spawn(10);
+            tm.spawn(30);
+            let ids: Vec<_> = tm.tracks.keys().copied().collect();
+            let excluded = *ids
+                .iter()
+                .find(|id| tm.tracks[id].birth_channel == 10)
+                .unwrap();
+            let kept = *ids
+                .iter()
+                .find(|id| tm.tracks[id].birth_channel == 30)
+                .unwrap();
+            tm.tracks.get_mut(&kept).unwrap().lifecycle.state = LifecycleState::Active;
+            let t = tm.tracks.get_mut(&excluded).unwrap();
+            t.lifecycle.state = state;
+            t.has_emitted = true;
+            t.decoder = Some(TrackDecoder::new(excluded, DecodeConfig::default()));
+            t.pending.push((0., 0., None, 0, 0., 14_000_937.5));
+            tm.set_cw_policy(&cw_test_config(vec![(14_002_000., 14_004_000.)]));
+            let (closed, _, flush) = tm.step_hop(&hop(4000, strong_on(512, 30)), 4000);
+            assert!(!tm.tracks.contains_key(&excluded));
+            assert!(tm.tracks.contains_key(&kept));
+            assert!(flush.is_empty());
+            assert!(closed.contains(&(
+                excluded,
+                ClosureKind::Bookkeeping {
+                    survivor_track_id: None
+                }
+            )));
+            assert_eq!(tm.close_counts.restricted, 1);
+            assert!(tm.channel_cooldown_until.iter().all(|&v| v == 0));
+        }
+    }
+
+    #[test]
+    fn cw_segments_empty_policy_prevents_candidates_and_releases_tracks() {
+        let births = births_after(
+            |tm| tm.set_cw_policy(&cw_test_config(vec![])),
+            strong_on_all(512, &[(10, 30.), (30, 30.)]),
+        );
+        assert!(births.is_empty());
+        assert_eq!(
+            births_after(|_| {}, strong_on_all(512, &[(10, 30.), (30, 30.)])).len(),
+            2
+        );
     }
 
     // ---- MAN-196: trusted-band spawn veto ----

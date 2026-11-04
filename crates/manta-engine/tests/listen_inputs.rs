@@ -190,6 +190,7 @@ fn spec(name: &str, scene: &Scene, ppm: f64, fail_at: usize, fault: Fault) -> In
     let samples = scene.samples.clone();
     let (fs, center) = (scene.fs, scene.center_freq_hz);
     InputSpec {
+        cw_policy: Default::default(),
         name: name.into(),
         open: Box::new(move || {
             Ok(Box::new(SceneSource {
@@ -457,6 +458,7 @@ fn live_merge_does_not_wait_for_a_stalled_input() {
     let specs = vec![
         plain("a", short_scene()),
         InputSpec {
+            cw_policy: Default::default(),
             name: "b".into(),
             open: Box::new(move || {
                 Ok(Box::new(StalledSource { stop: stalled_stop })
@@ -506,6 +508,7 @@ fn open_inputs_fails_fast_naming_the_input() {
     let specs = vec![
         plain("a", short_scene()),
         InputSpec {
+            cw_policy: Default::default(),
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
@@ -530,6 +533,7 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let specs = vec![
         InputSpec {
+            cw_policy: Default::default(),
             name: "a".into(),
             open: Box::new(move || {
                 // Stands in for an opener blocked in a connect: it returns
@@ -542,6 +546,7 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
             spawn_band_hz: None,
         },
         InputSpec {
+            cw_policy: Default::default(),
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
@@ -589,6 +594,7 @@ fn open_inputs_fails_when_a_source_panics_reading_its_metadata() {
     let specs = vec![
         plain("a", short_scene()),
         InputSpec {
+            cw_policy: Default::default(),
             name: "b".into(),
             open: Box::new(|| {
                 Ok(Box::new(PanickingMetadataSource) as Box<dyn manta_input::IqSource>)
@@ -885,6 +891,7 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
     let mk = |name: &str, samples: Arc<Vec<Complex32>>, counter: Arc<AtomicU64>| {
         let (fs, center) = (scene.fs, scene.center_freq_hz);
         InputSpec {
+            cw_policy: Default::default(),
             name: name.into(),
             open: Box::new(move || {
                 Ok(Box::new(SceneSource {

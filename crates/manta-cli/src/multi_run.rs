@@ -524,6 +524,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let input_counters = input_counters.clone();
             let bad = bad[index].clone();
             InputSpec {
+                cw_policy: input.cw_policy.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
                 spawn_band_hz: input.spawn_band_hz,
@@ -1290,6 +1291,7 @@ mod tests {
     #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
+            cw_policy: Default::default(),
             name: "b".into(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,

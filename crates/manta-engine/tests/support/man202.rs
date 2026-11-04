@@ -190,6 +190,7 @@ pub fn listen_inputs_events(src: Chunked) -> Vec<DecoderEvent> {
     let stop = Arc::new(AtomicBool::new(false));
     let slot = std::sync::Mutex::new(Some(src));
     let spec = InputSpec {
+        cw_policy: Default::default(),
         name: "a".into(),
         open: Box::new(move || {
             Ok(Box::new(slot.lock().unwrap().take().expect("opened once")) as Box<dyn IqSource>)
