@@ -51,6 +51,7 @@ mod reload;
 mod silent;
 mod source_check;
 mod spectrum_feed;
+mod spot_outputs;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -4713,6 +4714,7 @@ fn start_spot_server(
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
     pipeline: &PipelineConfig,
     relays: RelayConfigs,
+    outputs: spot_outputs::SpotOutputs,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let validation_level = pipeline.validation_level;
     // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
@@ -4724,6 +4726,22 @@ fn start_spot_server(
         .map(|r| {
             r.enabled
                 .then(|| relay_socket::bind_wsjtx_socket(r.listen))
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
+    // MAN-142 (D9, D13): the spot outputs' sockets are bound here too, for
+    // the same reason.
+    let pskreporter_socket = outputs
+        .pskreporter
+        .as_ref()
+        .map(|p| spot_outputs::bind_pskreporter_socket(&p.host))
+        .transpose()?;
+    let wsjtx_output_sockets = outputs
+        .wsjtx
+        .iter()
+        .map(|w| {
+            w.enabled
+                .then(|| spot_outputs::bind_wsjtx_output_socket(w.destination))
                 .transpose()
         })
         .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
@@ -4742,6 +4760,12 @@ fn start_spot_server(
     let station_location = cfg
         .station_location()
         .map_err(|e| anyhow!("[server]: {e}"))?;
+    // MAN-142: the grid the spot outputs name the station at (empty
+    // without a location).
+    let station_grid = station_location
+        .as_ref()
+        .map(|l| l.grid.clone())
+        .unwrap_or_default();
     let bus = std::sync::Arc::new(spot_bus_for(
         &cfg,
         source.sample_rate_hz,
@@ -5127,6 +5151,18 @@ fn start_spot_server(
                     (r, socket, stats)
                 })
                 .collect();
+            // MAN-142 (D15): the spot outputs' series, registered before the
+            // metrics endpoint spawns for MAN-44's reason: a configured
+            // table shows its zeros, enabled or not.
+            let pskreporter_stats = outputs
+                .pskreporter_registered
+                .then(|| metrics.register_pskreporter());
+            let wsjtx_outputs: Vec<_> = outputs
+                .wsjtx
+                .iter()
+                .zip(wsjtx_output_sockets)
+                .map(|(w, socket)| (w.clone(), socket, metrics.register_wsjtx_output(w.label())))
+                .collect();
             let metrics_ip_request_limiter =
                 manta_server::rate_limit::IpRateLimiter::new_with_override(
                     manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
@@ -5211,6 +5247,66 @@ fn start_spot_server(
                     stats,
                     shutdown_rx.clone(),
                 ));
+            }
+            // MAN-142 (D3): the spot outputs read the bus the uplinks read.
+            // Each receiver is subscribed here, before the decoder starts
+            // publishing, and each worker runs in the tracked task set, so
+            // the shutdown drain awaits its final flush.
+            if let (Some(p), Some(socket), Some(stats)) =
+                (outputs.pskreporter, pskreporter_socket, pskreporter_stats)
+            {
+                // `config::load` refused an enabled table without a grid.
+                let grid = station_grid.clone();
+                let call =
+                    manta_server::config::strip_ssid(&cfg.station_callsign).to_ascii_uppercase();
+                logging::note(&spot_outputs::pskreporter_startup_line(&p, &call, &grid));
+                let nonce = bus.session_nonce();
+                let worker = manta_server::pskreporter::run(
+                    manta_server::pskreporter::PskReporter {
+                        host: p.host.clone(),
+                        port: p.port,
+                        receiver: manta_server::pskreporter::ipfix::Receiver {
+                            callsign: call,
+                            locator: grid,
+                            software: format!("manta {}", build_info::VERSION),
+                            antenna: p.antenna.clone(),
+                        },
+                        spot_types: p.spot_types,
+                        flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        observation_domain: manta_server::pskreporter::observation_domain(nonce),
+                    },
+                    socket,
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
+            }
+            for (w, socket, stats) in wsjtx_outputs {
+                let Some(socket) = socket else {
+                    continue;
+                };
+                logging::note(&spot_outputs::wsjtx_output_startup_line(w.destination));
+                let worker = manta_server::wsjtx_output::run(
+                    manta_server::wsjtx_output::WsjtxOutput {
+                        label: w.label(),
+                        destination: w.destination,
+                        de_call: manta_server::config::strip_ssid(&cfg.station_callsign)
+                            .to_ascii_uppercase(),
+                        de_grid: station_grid.clone(),
+                        version: build_info::VERSION.to_string(),
+                        revision: build_info::GIT_SHA.to_string(),
+                        off_air: outputs.replay,
+                    },
+                    socket,
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
             }
             // MAN-301: the live comparator reads the same bus the uplinks do
             // and publishes grades back onto it. Its metric families were
@@ -7358,6 +7454,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        // MAN-142 (D10): a run counts as a replay when any
+                        // input is a file.
+                        outputs: spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            resolved.inputs.iter().any(|i| !i.spec.is_reconnectable()),
+                        ),
                         rbn_compare: resolved.rbn_compare.clone(),
                         replay_epoch: resolved.replay_epoch,
                     }),
@@ -7630,6 +7733,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            replay_path.is_some(),
+                        ),
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -9584,6 +9692,7 @@ mod tests {
                 ..Default::default()
             },
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -9630,6 +9739,7 @@ mod tests {
             lists.clone(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -10091,6 +10201,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -10154,6 +10265,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11252,6 +11364,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11316,6 +11429,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11378,6 +11492,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         );
         assert!(
             result.is_ok(),
@@ -11416,6 +11531,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11532,6 +11648,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -11565,6 +11682,7 @@ mod tests {
                 skimmer: loaded.skimmer_relay,
                 wsjtx: loaded.wsjtx_relay,
             },
+            spot_outputs::SpotOutputs::default(),
         )
     }
 
@@ -11669,6 +11787,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -14330,6 +14449,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -14382,6 +14502,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
