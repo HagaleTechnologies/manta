@@ -1,11 +1,9 @@
-<p align="center">
+<h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo-light.svg" alt="manta" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-lockup-dark.svg">
+    <img src="assets/logo-lockup-light.svg" alt="manta" width="400">
   </picture>
-</p>
-
-<h1 align="center">manta</h1>
+</h1>
 
 <p align="center">
   Open-source wideband CW skimmer. Every CW signal in an SDR passband, decoded at once,
