@@ -24,12 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
-<<<<<<< HEAD
 - MAN-200: a decode whose samples overlap a decode the repetition gate
   already counted, such as a replay or a second track on the same signal,
   no longer counts as another repetition, even when it arrives a whole
   message later on the same track.
-=======
 - MAN-112: frequency-anchored association keeps independently keyed close
   pairs on separate tracks. V7 returns to its specified 150 Hz spacing.
   Close-pair track identities, decoded text and spot frequencies change.
@@ -39,7 +37,6 @@ the git history and `docs/DECISIONS/`.
   louder carrier within two channels dominates or that sits 30 dB under
   the track's own key-down, so swept carriers still start no CW track.
 
->>>>>>> 0f3b046eed9cb73d97fbaebab20099b9ceeb23c1
 - MAN-201: manta now reads each decoded callsign as the sending station,
   the station called, a station mentioned, or uncertain, and spots only a
   sending station. `DE W1AW DE K1ABC K` spots K1ABC, not W1AW. A `CQ` types
