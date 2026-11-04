@@ -233,6 +233,122 @@ pub fn parse_rbn_spots(
     Ok(seen.into_values().collect())
 }
 
+/// One RBN row of an [`RbnEpisode`] (MAN-198).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RbnRow {
+    /// Seconds from the capture start; negative before it.
+    pub t_sec: f64,
+    pub snr_db: i32,
+    /// `None` when the row's speed column is empty or unparsable.
+    pub wpm: Option<f32>,
+}
+
+/// MAN-198: every row one spotter reported for one call on one 0.1 kHz
+/// bin, split where two consecutive rows are more than the episode gap
+/// apart. Rows outside the recording are kept, unlike
+/// [`parse_rbn_spots`]'s earliest-row dedupe, so the loss funnel can
+/// charge them to input coverage instead of hiding them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RbnEpisode {
+    pub call: String,
+    pub khz: f64,
+    /// Time order.
+    pub rows: Vec<RbnRow>,
+    pub first_s: f64,
+    pub last_s: f64,
+}
+
+/// MAN-198: the loss funnel's truth set -- [`RbnEpisode`]s from an RBN
+/// daily-dump CSV, restricted to `spotter`, split at gaps over `gap_s`.
+/// Sorted by (call, kHz bin, first row).
+pub fn parse_rbn_episodes(
+    csv_path: &Path,
+    spotter: &str,
+    capture_start_epoch_s: i64,
+    gap_s: f64,
+) -> Result<Vec<RbnEpisode>> {
+    let text = std::fs::read_to_string(csv_path)
+        .with_context(|| format!("read {}", csv_path.display()))?;
+    rbn_episodes_from_csv(&text, spotter, capture_start_epoch_s, gap_s)
+}
+
+/// [`parse_rbn_episodes`] over CSV text already in memory.
+pub fn rbn_episodes_from_csv(
+    text: &str,
+    spotter: &str,
+    capture_start_epoch_s: i64,
+    gap_s: f64,
+) -> Result<Vec<RbnEpisode>> {
+    if !gap_s.is_finite() || gap_s < 0.0 {
+        bail!("episode gap must be finite and non-negative, got {gap_s}");
+    }
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().context("empty csv")?.split(',').collect();
+    let col = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .with_context(|| format!("missing column {name}"))
+    };
+    let (c_sp, c_freq, c_dx, c_db, c_date, c_speed) = (
+        col("callsign")?,
+        col("freq")?,
+        col("dx")?,
+        col("db")?,
+        col("date")?,
+        col("speed")?,
+    );
+    let mut by_bin = std::collections::BTreeMap::<(String, i64), (f64, Vec<RbnRow>)>::new();
+    for line in lines {
+        let f: Vec<&str> = line.split(',').collect();
+        if f.len() <= c_speed || f[c_sp] != spotter {
+            continue;
+        }
+        let khz: f64 = f[c_freq].parse()?;
+        let t_sec = (parse_utc_timestamp(f[c_date])? - capture_start_epoch_s) as f64;
+        let row = RbnRow {
+            t_sec,
+            snr_db: f[c_db].parse().unwrap_or(0),
+            wpm: f[c_speed]
+                .trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|w| w.is_finite() && *w > 0.0),
+        };
+        let key = (f[c_dx].to_uppercase(), (khz * 10.0).round() as i64);
+        by_bin
+            .entry(key)
+            .or_insert_with(|| (khz, Vec::new()))
+            .1
+            .push(row);
+    }
+    let mut out = Vec::new();
+    for ((call, _), (khz, mut rows)) in by_bin {
+        rows.sort_by(|a, b| a.t_sec.total_cmp(&b.t_sec));
+        let mut current: Vec<RbnRow> = Vec::new();
+        for row in rows {
+            if current.last().is_some_and(|l| row.t_sec - l.t_sec > gap_s) {
+                out.push(episode(&call, khz, std::mem::take(&mut current)));
+            }
+            current.push(row);
+        }
+        if !current.is_empty() {
+            out.push(episode(&call, khz, current));
+        }
+    }
+    Ok(out)
+}
+
+fn episode(call: &str, khz: f64, rows: Vec<RbnRow>) -> RbnEpisode {
+    RbnEpisode {
+        call: call.to_string(),
+        khz,
+        first_s: rows[0].t_sec,
+        last_s: rows[rows.len() - 1].t_sec,
+        rows,
+    }
+}
+
 pub fn score_text(call: &str, text: &str) -> (bool, bool, bool) {
     let words: Vec<&str> = text.split_whitespace().collect();
     let as_word = words.contains(&call);
@@ -542,5 +658,105 @@ mod summarize_tests {
         let spots = vec![spot()];
         let summary = summarize(&spots, &results);
         assert_eq!(summary.wpm_ratio_median, None);
+    }
+}
+
+#[cfg(test)]
+mod episode_tests {
+    use super::*;
+
+    const HEAD: &str =
+        "callsign,de_pfx,de_cont,freq,band,dx,dx_pfx,dx_cont,mode,db,date,speed,tx_mode";
+    // 2025-11-29T00:00:00Z
+    const START: i64 = 1_764_374_400;
+
+    fn csv(rows: &[&str]) -> String {
+        let mut s = String::from(HEAD);
+        for r in rows {
+            s.push('\n');
+            s.push_str(r);
+        }
+        s
+    }
+
+    fn row(spotter: &str, khz: &str, dx: &str, db: &str, date: &str, speed: &str) -> String {
+        format!("{spotter},K,NA,{khz},20m,{dx},W,NA,CW,{db},{date},{speed},CW")
+    }
+
+    #[test]
+    fn episodes_keep_every_row_of_one_call_and_bin() {
+        let rows = [
+            row("K5TR", "14003.0", "W1AW", "20", "2025-11-29 00:00:30", "20"),
+            row("K5TR", "14003.0", "W1AW", "22", "2025-11-29 00:05:00", "21"),
+            row("K5TR", "14003.0", "w1aw", "24", "2025-11-29 00:10:00", "20"),
+        ];
+        let text = csv(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let eps = rbn_episodes_from_csv(&text, "K5TR", START, 900.0).unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].call, "W1AW");
+        assert_eq!(eps[0].rows.len(), 3);
+        assert_eq!((eps[0].first_s, eps[0].last_s), (30.0, 600.0));
+    }
+
+    #[test]
+    fn episodes_split_at_gaps_over_the_gap() {
+        let rows = [
+            row("K5TR", "14003.0", "W1AW", "20", "2025-11-29 00:00:00", "20"),
+            row("K5TR", "14003.0", "W1AW", "20", "2025-11-29 00:16:40", "20"),
+        ];
+        let text = csv(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let eps = rbn_episodes_from_csv(&text, "K5TR", START, 900.0).unwrap();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[1].first_s, 1000.0);
+    }
+
+    #[test]
+    fn episodes_filter_by_spotter_and_keep_rows_outside_the_recording() {
+        let rows = [
+            row("K5TR", "14003.0", "W1AW", "20", "2025-11-28 23:59:50", "20"),
+            row(
+                "K5TR",
+                "14024.0",
+                "W9LATE",
+                "20",
+                "2025-11-29 00:11:00",
+                "20",
+            ),
+            row(
+                "N0ONE",
+                "14003.0",
+                "W1AW",
+                "20",
+                "2025-11-29 00:00:10",
+                "20",
+            ),
+        ];
+        let text = csv(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let eps = rbn_episodes_from_csv(&text, "K5TR", START, 900.0).unwrap();
+        assert_eq!(eps.len(), 2);
+        assert_eq!(eps[0].first_s, -10.0);
+        assert_eq!(eps[1].call, "W9LATE");
+        assert_eq!(eps[1].first_s, 660.0);
+    }
+
+    #[test]
+    fn episodes_keep_snr_and_optional_wpm() {
+        let rows = [row(
+            "K5TR",
+            "14003.0",
+            "W1AW",
+            "17",
+            "2025-11-29 00:00:30",
+            "",
+        )];
+        let text = csv(&rows.iter().map(String::as_str).collect::<Vec<_>>());
+        let eps = rbn_episodes_from_csv(&text, "K5TR", START, 900.0).unwrap();
+        assert_eq!(eps[0].rows[0].snr_db, 17);
+        assert_eq!(eps[0].rows[0].wpm, None);
+    }
+
+    #[test]
+    fn episodes_reject_a_bad_gap() {
+        assert!(rbn_episodes_from_csv(HEAD, "K5TR", START, f64::NAN).is_err());
     }
 }
