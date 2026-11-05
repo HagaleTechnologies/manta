@@ -101,6 +101,9 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     // MAN-141: `MANTA_INPUT_SPECTRUM_NAME=20` is the string "20".
     ("input", "spectrum_udp"),
     ("input", "spectrum_name"),
+    // MAN-496: `MANTA_INPUT_DC_BLOCK=apply` is the string mode "apply".
+    ("input", "dc_block"),
+    ("input", "impulse_suppress"),
     ("input", "iq_format"),
     ("input", "host"),
     ("input", "mac"),
@@ -526,6 +529,12 @@ struct InputToml {
     iq_phase_deg: Option<f64>,
     iq_calibrated_center_hz: Option<f64>,
     freq_correction_ppm: Option<f64>,
+    /// MAN-496: the DC-removal conditioning stage's mode, written `off`,
+    /// `observe` or `apply` (default `off`, restart-only).
+    dc_block: Option<String>,
+    /// MAN-496: the impulse-suppression conditioning stage's mode, written
+    /// `off`, `observe` or `apply` (default `off`, restart-only).
+    impulse_suppress: Option<String>,
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
@@ -596,6 +605,10 @@ pub(crate) struct InputFile {
 pub(crate) struct SharedInput {
     pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
+    /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
+    pub dc_block: Option<manta_dsp::condition::StageMode>,
+    /// MAN-496: `input.impulse_suppress`, parsed (default `off`).
+    pub impulse_suppress: Option<manta_dsp::condition::StageMode>,
     pub center_freq_hz: Option<f64>,
     pub capture_rate_hz: Option<f64>,
     pub replay_epoch: Option<i64>,
@@ -604,6 +617,43 @@ pub(crate) struct SharedInput {
     /// MAN-141: `run` sends this input's spectrum to N1MM+'s Spectrum
     /// Display.
     pub spectrum: Option<SpectrumOut>,
+}
+
+impl SharedInput {
+    /// MAN-496: this entry's `[input]` conditioning keys as the engine's
+    /// config (every unset stage off).
+    pub fn conditioning(&self) -> manta_dsp::condition::ConditioningConfig {
+        manta_dsp::condition::ConditioningConfig {
+            impulse: self.impulse_suppress.unwrap_or_default(),
+            dc: self.dc_block.unwrap_or_default(),
+        }
+    }
+}
+
+/// MAN-496: one `[input]` conditioning key (`dc_block`, `impulse_suppress`)
+/// as the operator writes it: `off`, `observe` or `apply`.
+fn stage_mode(
+    key: &str,
+    text: &str,
+) -> std::result::Result<manta_dsp::condition::StageMode, String> {
+    match text {
+        "off" => Ok(manta_dsp::condition::StageMode::Off),
+        "observe" => Ok(manta_dsp::condition::StageMode::Observe),
+        "apply" => Ok(manta_dsp::condition::StageMode::Apply),
+        other => Err(format!(
+            "[input] {key} must be \"off\", \"observe\" or \"apply\", not {}",
+            crate::fmt::quoted(other)
+        )),
+    }
+}
+
+/// MAN-496: a conditioning stage mode as it is written and printed.
+pub(crate) fn stage_mode_str(mode: manta_dsp::condition::StageMode) -> &'static str {
+    match mode {
+        manta_dsp::condition::StageMode::Off => "off",
+        manta_dsp::condition::StageMode::Observe => "observe",
+        manta_dsp::condition::StageMode::Apply => "apply",
+    }
 }
 
 /// MAN-141: `input.spectrum_udp` and `input.spectrum_name`, checked.
@@ -1915,6 +1965,16 @@ fn validate_input(
             .freq_correction_ppm
             .map(crate::check_freq_correction_ppm)
             .transpose()?,
+        dc_block: t
+            .dc_block
+            .as_deref()
+            .map(|v| stage_mode("dc_block", v))
+            .transpose()?,
+        impulse_suppress: t
+            .impulse_suppress
+            .as_deref()
+            .map(|v| stage_mode("impulse_suppress", v))
+            .transpose()?,
         center_freq_hz: t
             .center_freq_hz
             .map(|v| crate::check_dial_freq_hz("input.center_freq_hz", v))
@@ -2870,6 +2930,83 @@ mod tests {
         assert_eq!(
             l.env_vars,
             vec!["MANTA_INPUT_FREQ_CORRECTION_PPM".to_string()]
+        );
+    }
+
+    // MAN-496: the `[input]` conditioning keys, shared like
+    // freq_correction_ppm (valid with any or no type, restart-only).
+    #[test]
+    fn conditioning_keys_parse_off_observe_apply() {
+        use manta_dsp::condition::StageMode;
+        let l = load_file(
+            "[[input]]\ntype = \"audio\"\ndc_block = \"observe\"\nimpulse_suppress = \"apply\"\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs[0].input.shared.dc_block, Some(StageMode::Observe));
+        assert_eq!(
+            l.inputs[0].input.shared.impulse_suppress,
+            Some(StageMode::Apply)
+        );
+        let off = load_file("[[input]]\ntype = \"audio\"\ndc_block = \"off\"\n").unwrap();
+        assert_eq!(off.inputs[0].input.shared.dc_block, Some(StageMode::Off));
+        assert_eq!(
+            off.inputs[0].input.shared.impulse_suppress, None,
+            "an unset key defaults to off, not to a written off"
+        );
+        assert_eq!(
+            l.inputs[0].input.shared.conditioning(),
+            manta_dsp::condition::ConditioningConfig {
+                impulse: StageMode::Apply,
+                dc: StageMode::Observe,
+            }
+        );
+    }
+
+    #[test]
+    fn bad_conditioning_mode_value_is_refused() {
+        let f = write_cfg("[input]\ntype = \"audio\"\ndc_block = \"on\"\n");
+        let err = match load(Some(f.path()), Env::Ignore) {
+            Ok(_) => panic!("dc_block = \"on\" loaded"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("[input] dc_block must be \"off\", \"observe\" or \"apply\", not \"on\""),
+            "{err}"
+        );
+        let f = write_cfg(&format!(
+            "{}\n[[input]]\nname = \"rig\"\ntype = \"file\"\npath = \"/x.wav\"\nimpulse_suppress = \"AGGRESSIVE\"\n",
+            file_entry("one", "")
+        ));
+        let err = match load(Some(f.path()), Env::Ignore) {
+            Ok(_) => panic!("impulse_suppress = \"AGGRESSIVE\" loaded"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("[[input]]"),
+            "a second entry's error carries the entry prefix: {err}"
+        );
+        assert!(
+            err.contains(
+                "[input] impulse_suppress must be \"off\", \"observe\" or \"apply\", \
+                 not \"AGGRESSIVE\""
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conditioning_env_overlay_reads_string_modes() {
+        use manta_dsp::condition::StageMode;
+        let v = vars(&[
+            ("MANTA_INPUT_DC_BLOCK", "apply"),
+            ("MANTA_INPUT_IMPULSE_SUPPRESS", "observe"),
+        ]);
+        let f = write_cfg("[[input]]\ntype = \"audio\"\n");
+        let l = load(Some(f.path()), Env::Read(&v)).unwrap();
+        assert_eq!(l.inputs[0].input.shared.dc_block, Some(StageMode::Apply));
+        assert_eq!(
+            l.inputs[0].input.shared.impulse_suppress,
+            Some(StageMode::Observe)
         );
     }
 

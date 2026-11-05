@@ -125,6 +125,8 @@ pub struct InputObservers {
     pub static_crashes: Option<Arc<AtomicU64>>,
     /// Input samples replaced as unusable on this input (MAN-234).
     pub bad_samples: Option<Arc<AtomicU64>>,
+    /// Exact input-conditioning counts across segments.
+    pub conditioned: Option<Arc<crate::ConditioningObserver>>,
     /// This input's marked RTTY signals.
     pub rtty: Option<Arc<RttyObserver>>,
     /// MAN-141: this input's spectrum tap (`ListenObservers::spectrum`,
@@ -146,6 +148,8 @@ pub struct InputSpec {
     pub open: InputOpener,
     /// This input's receiver correction (D4).
     pub freq_correction_ppm: f64,
+    /// This input's conditioning, overriding the shared pipeline setting.
+    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub observers: InputObservers,
     /// MAN-310: this input's share of a split band plan, Hz from its
     /// centre (an edge may be infinite); `None`: its whole band. Narrows
@@ -243,7 +247,11 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
+<<<<<<< HEAD
     conditioning: Vec<crate::ConditioningConfig>,
+=======
+    conditioning: Vec<manta_dsp::condition::ConditioningConfig>,
+>>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -493,7 +501,14 @@ pub fn listen_inputs(
         let mut input_cfg = cfg.clone();
         input_cfg.conditioning = opened.conditioning[index].clone();
         let go = Go {
+<<<<<<< HEAD
             cfg: input_cfg,
+=======
+            cfg: PipelineConfig {
+                conditioning: opened.conditioning[index].clone(),
+                ..cfg.clone()
+            },
+>>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],
@@ -504,6 +519,7 @@ pub fn listen_inputs(
                 active_tracks: opened.observers[index].active_tracks.clone(),
                 static_crashes: opened.observers[index].static_crashes.clone(),
                 bad_samples: opened.observers[index].bad_samples.clone(),
+                conditioned: opened.observers[index].conditioned.clone(),
                 rtty: opened.observers[index].rtty.clone(),
                 decode_latency: shared.decode_latency.clone(),
                 decode_quality: shared.decode_quality.clone(),

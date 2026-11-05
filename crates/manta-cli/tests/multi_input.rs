@@ -592,7 +592,12 @@ fn decode_refuses_several_inputs_without_a_correction() {
     assert!(!stderr.contains("cannot tell which"), "{stderr}");
     assert!(
         stderr.contains(
+<<<<<<< HEAD
             "note: decode applies freq_correction_ppm and IQ conditioning from the 2 [[input]]"
+=======
+            "note: decode applies only input.freq_correction_ppm, dc_block and \
+             impulse_suppress from the 2 [[input]]"
+>>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
         ),
         "{stderr}"
     );

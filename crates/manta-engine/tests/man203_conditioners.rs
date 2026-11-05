@@ -243,6 +243,7 @@ fn impulse_suppression_leaves_clean_scenes_alone() {
     }
 }
 
+<<<<<<< HEAD
 #[test]
 fn bypass_iq_imbalance_produces_a_bogus_mirror_spot() {
     for trial in 1..=2 {
@@ -366,5 +367,54 @@ fn iq_correction_is_withheld_without_a_matching_calibration() {
             log.count(Stage::Iq, Mark::Uncertain),
             scene.samples.len() as u64
         );
+=======
+/// MAN-496: decode reports the conditioning it ran: `inputConditioning`
+/// exists only when a stage is on, and its counts match the channelizer's
+/// own log over the same scene.
+#[test]
+fn decode_reports_input_conditioning_when_a_stage_is_on() {
+    use manta_engine::decode_samples;
+    use manta_testkit::sensitivity::{CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
+    let scene = near_centre_scene(NEAR_OFFSETS_HZ[0], NEAR_SNR_DB, DC, 1);
+    let on = decode_samples(&scene.samples, SAMPLE_RATE_HZ, CENTER_FREQ_HZ, &dc_apply()).unwrap();
+    let cond = on.input_conditioning.as_ref().unwrap();
+    assert_eq!(cond.dc.mode, "apply");
+    assert_eq!(cond.impulse.mode, "off");
+    let log = condition_log(
+        &scene.samples,
+        &ConditioningConfig {
+            dc: StageMode::Apply,
+            ..ConditioningConfig::default()
+        },
+    );
+    // Decode feeds `filter_len()` zeros of lead-in padding before the
+    // scene (the `condition_log` doc above), and the apply DC stage marks
+    // those corrected too.
+    let pad = manta_dsp::channelizer::Channelizer::with_conditioning(
+        SAMPLE_RATE_HZ,
+        CENTER_FREQ_HZ,
+        &ConditioningConfig::default(),
+    )
+    .unwrap()
+    .filter_len() as u64;
+    assert_eq!(
+        cond.dc.corrected_samples,
+        log.count(Stage::Dc, Mark::Corrected) + pad,
+        "the report sums the channelizer's exact corrected count"
+    );
+    assert!(
+        cond.dc.corrected_samples > 0,
+        "the apply DC stage marks its writes"
+    );
+    assert!(cond.dc.level_dbfs.is_some());
+    assert!(!cond.spans.is_empty());
+    // With every stage off the report is absent, whatever the decode found.
+    match decode_samples(&scene.samples, SAMPLE_RATE_HZ, CENTER_FREQ_HZ, &bypass()) {
+        Ok(off) => assert!(off.input_conditioning.is_none()),
+        Err(e) => assert!(
+            e.to_string().contains("no signal found"),
+            "unexpected bypass error: {e:#}"
+        ),
+>>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
     }
 }
