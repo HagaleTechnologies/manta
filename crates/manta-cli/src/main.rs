@@ -7076,11 +7076,27 @@ fn run_command() -> Result<std::process::ExitCode> {
                     path.display()
                 );
             }
+            // MAN-496: the conditioning keys follow the ppm rule: a
+            // recording came from one receiver, so entries that disagree
+            // are ambiguous, never silently the first one's.
+            let cond_of = |n: &config::NamedInput| n.input.shared.conditioning();
+            let conditioning = cond_of(&loaded.inputs[0]);
+            if several && loaded.inputs.iter().any(|n| cond_of(n) != conditioning) {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: set \
+                     dc_block and impulse_suppress alike in every [[input]] entry",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
             if several {
                 errln!(
-                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
-                     in {}",
+                    "note: decode applies only input.freq_correction_ppm, dc_block and \
+                     impulse_suppress from the {} [[input]] entries in {}",
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -7088,9 +7104,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
+                || shared.dc_block.is_some()
+                || shared.impulse_suppress.is_some()
             {
                 errln!(
-                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    "note: decode applies only input.freq_correction_ppm, dc_block and \
+                     impulse_suppress from [input] in {}",
                     loaded.origin
                 );
             }
@@ -7121,6 +7140,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 decode_cfg.engine,
             )?;
             note_pinned_lists(&spot, &lists_in_use);
+            // MAN-496: `[input] dc_block`/`impulse_suppress` turn the
+            // conditioning stages on for this decode.
+            cfg.conditioning = conditioning;
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an

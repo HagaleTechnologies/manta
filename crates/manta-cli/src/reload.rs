@@ -1009,6 +1009,14 @@ blocklist_path = \"bl.txt\"
         assert!(is_reloadable("spot.allowlist"));
     }
 
+    /// MAN-496: the `[input]` conditioning keys are restart-only, like
+    /// every other `[input]` key (only the four D6 leaf paths reload).
+    #[test]
+    fn conditioning_keys_are_restart_only() {
+        assert!(!is_reloadable("input.dc_block"));
+        assert!(!is_reloadable("input.impulse_suppress"));
+    }
+
     #[test]
     fn restart_only_changes_reports_a_spot_table_appearing_with_cty_path() {
         let new = table("[spot]\nallowlist = [\"K1A\"]\ncty_path = \"/a/cty.dat\"\n");
