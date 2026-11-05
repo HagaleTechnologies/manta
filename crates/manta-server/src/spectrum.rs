@@ -218,6 +218,12 @@ pub fn spawn(
     Ok((FrameSender { tx, stats }, handle))
 }
 
+/// Whether a frame dequeued at `now` waits: strictly less than
+/// [`MIN_INTERVAL`] since `last_send`; the first frame never waits.
+fn rate_limited(last_send: Option<Instant>, now: Instant) -> bool {
+    last_send.is_some_and(|t| now.duration_since(t) < MIN_INTERVAL)
+}
+
 fn run(
     socket: UdpSocket,
     dest: SocketAddr,
@@ -229,7 +235,7 @@ fn run(
     let mut on_first_error = Some(on_first_error);
     let mut last_send: Option<Instant> = None;
     while let Ok(frame) = rx.recv() {
-        if last_send.is_some_and(|t| t.elapsed() < MIN_INTERVAL) {
+        if rate_limited(last_send, Instant::now()) {
             stats.record_drop(SpectrumDrop::RateLimit);
             continue;
         }
@@ -317,5 +323,20 @@ mod tests {
         assert_eq!(stats.dropped(SpectrumDrop::QueueFull), 1);
         assert_eq!(stats.dropped(SpectrumDrop::RateLimit), 0);
         assert_eq!(stats.datagrams(), 0);
+    }
+
+    #[test]
+    fn the_rate_limit_boundary_is_strictly_inside_100_ms() {
+        let t0 = Instant::now();
+        assert!(!rate_limited(None, t0));
+        assert!(rate_limited(
+            Some(t0),
+            t0 + MIN_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(!rate_limited(Some(t0), t0 + MIN_INTERVAL));
+        assert!(!rate_limited(
+            Some(t0),
+            t0 + MIN_INTERVAL + Duration::from_millis(1)
+        ));
     }
 }

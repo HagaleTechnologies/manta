@@ -1232,6 +1232,7 @@ mod tests {
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,
+            input_conditioning: None,
             sample_rate_hz: 192_000.0,
         }
     }

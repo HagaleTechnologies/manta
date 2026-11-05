@@ -591,7 +591,10 @@ fn decode_refuses_several_inputs_without_a_correction() {
     let stderr = String::from_utf8_lossy(&agreed.stderr);
     assert!(!stderr.contains("cannot tell which"), "{stderr}");
     assert!(
-        stderr.contains("note: decode applies only freq_correction_ppm from the 2 [[input]]"),
+        stderr.contains(
+            "note: decode applies only input.freq_correction_ppm, dc_block and \
+             impulse_suppress from the 2 [[input]]"
+        ),
         "{stderr}"
     );
 }

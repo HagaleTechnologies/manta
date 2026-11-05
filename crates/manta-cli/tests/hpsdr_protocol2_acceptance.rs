@@ -6,7 +6,7 @@
 //! radio in this process binds `base..=base+3` and `base+11` on loopback,
 //! answers discovery as board 5 (Orion II), and once manta sends
 //! high-priority with run = 1 it streams a V1 fixture's samples in 238-pair
-//! datagrams from `base+11`, paced at 2x real time. A real `manta` child
+//! datagrams from `base+11`, paced at real time. A real `manta` child
 //! is pointed at `--hpsdr-port <base>`, with no `--hpsdr-protocol`.
 
 use manta_input::IqSource;
@@ -406,11 +406,15 @@ fn explain(stderr: &str, metrics: &str) -> String {
 }
 
 /// Run `manta run --hpsdr-host 127.0.0.1 --hpsdr-port <base> ... --json`
-/// (no `--hpsdr-protocol`) against a fake streaming `samples` at 2x,
+/// (no `--hpsdr-protocol`) against a fake streaming `samples` at real time,
 /// skipping `skip` and cutting the first connection after
 /// `first_connection_datagrams`. Returns every spot, a `/metrics` scrape
 /// taken once the stream has ended and `ready(metrics)` holds (or 10 s
 /// passed), and stderr.
+///
+/// Real-time pacing leaves CPU-starved runners room to drain the OS-capped
+/// receive buffer (about 425 KB on Linux despite the 4 MiB request).
+/// Faster pacing can lose W1AW in the first pass of `fifty_lost` (MAN-497).
 fn live_run(
     dir: &Path,
     samples: Arc<Vec<Complex32>>,
@@ -423,7 +427,7 @@ fn live_run(
     let fake = FakeP2Radio::start(
         Stream {
             samples,
-            speed: 2.0,
+            speed: 1.0,
             skip,
             looping: false,
             first_connection_datagrams,
@@ -819,7 +823,7 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
             FakeP2Radio::start(
                 Stream {
                     samples: samples.clone(),
-                    speed: 2.0,
+                    speed: 1.0,
                     skip: None,
                     looping: true,
                     first_connection_datagrams: None,
