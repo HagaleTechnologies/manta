@@ -2299,7 +2299,13 @@ flush_gap_dits = 7.0
 # MANTA_INPUT_FREQ_CORRECTION_PPM override it.
 freq_correction_ppm = 0.0
 
-<<<<<<< HEAD
+# Input-conditioning stages (MAN-496), each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
+
 # Fixed controlled-tone IQ calibration, per input. Restart required.
 # Off is the default. Observe never writes samples. Apply requires all three
 # calibration values, with actual receiver centre agreement within 1 Hz.
@@ -2309,14 +2315,6 @@ iq_correction = "off"
 # iq_gain_ratio = 1.05
 # iq_phase_deg = 2.0
 # iq_calibrated_center_hz = 14000000.0
-=======
-# Input-conditioning stages (MAN-496), each off | observe | apply:
-# "observe" measures and annotates without changing a sample, "apply"
-# corrects. Restart-only. `decode --json` reports what ran as
-# `inputConditioning`.
-#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
-#impulse_suppress = "off"  # short-impulse suppression
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
 
 # Target post-decimation capture rate, Hz (issue #169). Omit to use the
 # source's native rate unchanged. Must evenly divide the source's native

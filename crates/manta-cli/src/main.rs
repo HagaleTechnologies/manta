@@ -5775,6 +5775,7 @@ fn conditioned_metric_registration_matches_producible_marks() {
             &ConditioningConfig {
                 impulse: mode,
                 dc: mode,
+                ..Default::default()
             },
             &manta_engine::ConditioningObserver::default(),
         );
@@ -5837,7 +5838,6 @@ struct ResolvedInput {
     name: String,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
-    conditioning: manta_dsp::condition::ConditioningConfig,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     /// MAN-309: `run` records this input's IQ here (`record_iq`).
@@ -6037,7 +6037,6 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     bail!("[[input]] {} has no type", fmt::quoted(&n.name));
                 };
                 Ok(ResolvedInput {
-                    conditioning: n.input.shared.conditioning.clone(),
                     name: n.name.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
@@ -6078,7 +6077,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     };
     let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
-        conditioning: shared.conditioning.clone(),
+        conditioning: shared.conditioning(),
         spec,
         replay,
         freq_correction_ppm: freq_correction_ppm
@@ -7216,9 +7215,17 @@ fn run_command() -> Result<std::process::ExitCode> {
             // MAN-496: the conditioning keys follow the ppm rule: a
             // recording came from one receiver, so entries that disagree
             // are ambiguous, never silently the first one's.
-            let cond_of = |n: &config::NamedInput| n.input.shared.conditioning();
-            let conditioning = cond_of(&loaded.inputs[0]);
-            if several && loaded.inputs.iter().any(|n| cond_of(n) != conditioning) {
+            let cond_of = |n: &config::NamedInput| {
+                let c = n.input.shared.conditioning();
+                (c.dc, c.impulse)
+            };
+            let conditioning = loaded.inputs[0].input.shared.conditioning();
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| cond_of(n) != cond_of(&loaded.inputs[0]))
+            {
                 let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
                 bail!(
                     "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: set \
@@ -7243,13 +7250,8 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             if several {
                 errln!(
-<<<<<<< HEAD
-                    "note: decode applies freq_correction_ppm and IQ conditioning from the {} [[input]] entries \
+                    "note: decode applies freq_correction_ppm and dc_block, impulse_suppress and IQ conditioning from the {} [[input]] entries \
                      in {}",
-=======
-                    "note: decode applies only input.freq_correction_ppm, dc_block and \
-                     impulse_suppress from the {} [[input]] entries in {}",
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -7261,12 +7263,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.impulse_suppress.is_some()
             {
                 errln!(
-<<<<<<< HEAD
-                    "note: decode applies input.freq_correction_ppm and IQ conditioning from [input] in {}",
-=======
-                    "note: decode applies only input.freq_correction_ppm, dc_block and \
-                     impulse_suppress from [input] in {}",
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
+                    "note: decode applies input.freq_correction_ppm and dc_block, impulse_suppress and IQ conditioning from [input] in {}",
                     loaded.origin
                 );
             }
@@ -7297,13 +7294,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 decode_cfg.engine,
             )?;
             note_pinned_lists(&spot, &lists_in_use);
-<<<<<<< HEAD
-            cfg.conditioning = shared.conditioning.clone();
-=======
-            // MAN-496: `[input] dc_block`/`impulse_suppress` turn the
-            // conditioning stages on for this decode.
             cfg.conditioning = conditioning;
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an

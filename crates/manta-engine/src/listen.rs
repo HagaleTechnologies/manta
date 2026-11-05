@@ -56,7 +56,7 @@ fn conditioning_counts(
     use manta_dsp::condition::{Mark, Stage};
     let mut counts = base;
     if let Some(log) = ch.conditioning() {
-        for stage in Stage::ALL {
+        for stage in [Stage::Impulse, Stage::Dc] {
             for mark in Mark::ALL {
                 counts[stage as usize][mark as usize] += log.count(stage, mark);
             }

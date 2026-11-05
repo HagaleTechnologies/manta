@@ -626,6 +626,7 @@ impl SharedInput {
         manta_dsp::condition::ConditioningConfig {
             impulse: self.impulse_suppress.unwrap_or_default(),
             dc: self.dc_block.unwrap_or_default(),
+            ..self.conditioning.clone()
         }
     }
 }
@@ -2958,6 +2959,7 @@ mod tests {
             manta_dsp::condition::ConditioningConfig {
                 impulse: StageMode::Apply,
                 dc: StageMode::Observe,
+                ..Default::default()
             }
         );
     }

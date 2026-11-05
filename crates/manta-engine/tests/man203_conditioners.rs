@@ -243,7 +243,6 @@ fn impulse_suppression_leaves_clean_scenes_alone() {
     }
 }
 
-<<<<<<< HEAD
 #[test]
 fn bypass_iq_imbalance_produces_a_bogus_mirror_spot() {
     for trial in 1..=2 {
@@ -367,7 +366,9 @@ fn iq_correction_is_withheld_without_a_matching_calibration() {
             log.count(Stage::Iq, Mark::Uncertain),
             scene.samples.len() as u64
         );
-=======
+    }
+}
+
 /// MAN-496: decode reports the conditioning it ran: `inputConditioning`
 /// exists only when a stage is on, and its counts match the channelizer's
 /// own log over the same scene.
@@ -415,6 +416,5 @@ fn decode_reports_input_conditioning_when_a_stage_is_on() {
             e.to_string().contains("no signal found"),
             "unexpected bypass error: {e:#}"
         ),
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
     }
 }

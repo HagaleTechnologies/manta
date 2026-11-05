@@ -203,7 +203,6 @@ fn spec(name: &str, scene: &Scene, ppm: f64, fail_at: usize, fault: Fault) -> In
             }) as Box<dyn manta_input::IqSource>)
         }),
         freq_correction_ppm: ppm,
-        conditioning: Default::default(),
         observers: Default::default(),
         spawn_band_hz: None,
     }
@@ -466,7 +465,6 @@ fn live_merge_does_not_wait_for_a_stalled_input() {
                     as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -514,7 +512,6 @@ fn open_inputs_fails_fast_naming_the_input() {
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -545,7 +542,6 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
                 anyhow::bail!("a was never opened")
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -554,7 +550,6 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -605,7 +600,6 @@ fn open_inputs_fails_when_a_source_panics_reading_its_metadata() {
                 Ok(Box::new(PanickingMetadataSource) as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -910,7 +904,6 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
                 }) as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: manta_engine::InputObservers {
                 bad_samples: Some(counter),
                 ..Default::default()

@@ -65,11 +65,7 @@ listed here change what the command does.
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
-<<<<<<< HEAD
-| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` plus the IQ keys; entries that disagree on ppm need `--freq-correction-ppm`; conflicting IQ settings require a config for the recording's receiver | no |
-=======
-| `decode` | `[decode]` `[detector]` `[spot]`, `input.freq_correction_ppm`, `input.dc_block` and `input.impulse_suppress`; several `[[input]]` entries that disagree on them need `--freq-correction-ppm` (conditioning keys set alike in every entry) | no |
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
+| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` plus `input.dc_block`, `input.impulse_suppress` and the IQ keys; entries that disagree on ppm need `--freq-correction-ppm`; conflicting conditioning settings require a config for the recording's receiver | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 | `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |

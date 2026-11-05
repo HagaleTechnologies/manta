@@ -536,7 +536,6 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 conditioning: input.conditioning.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
-                conditioning: input.conditioning.clone(),
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
@@ -1341,7 +1340,6 @@ mod tests {
             name: "b".into(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             dial_freq_hz: None,
             capture_rate_hz: None,
             record_iq: None,

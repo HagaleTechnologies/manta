@@ -148,8 +148,6 @@ pub struct InputSpec {
     pub open: InputOpener,
     /// This input's receiver correction (D4).
     pub freq_correction_ppm: f64,
-    /// This input's conditioning, overriding the shared pipeline setting.
-    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub observers: InputObservers,
     /// MAN-310: this input's share of a split band plan, Hz from its
     /// centre (an edge may be infinite); `None`: its whole band. Narrows
@@ -247,11 +245,7 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
-<<<<<<< HEAD
     conditioning: Vec<crate::ConditioningConfig>,
-=======
-    conditioning: Vec<manta_dsp::condition::ConditioningConfig>,
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -501,14 +495,7 @@ pub fn listen_inputs(
         let mut input_cfg = cfg.clone();
         input_cfg.conditioning = opened.conditioning[index].clone();
         let go = Go {
-<<<<<<< HEAD
             cfg: input_cfg,
-=======
-            cfg: PipelineConfig {
-                conditioning: opened.conditioning[index].clone(),
-                ..cfg.clone()
-            },
->>>>>>> ada34927866dc16a7217d5f1910903a759682b2a
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],
