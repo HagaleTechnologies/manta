@@ -1158,8 +1158,18 @@ impl Validator {
             return Vec::new();
         };
         if refined.call != old_call {
-            self.gate
-                .move_occurrence(&old_call, &refined.call, track_id, span);
+            // A non-allowlisted Beacon word's occurrence was never
+            // recorded in the gate (`capture_pending_beacon` defers to
+            // close-time), so there is no repetition support to move --
+            // see the Beacon branch below.
+            let deferred_beacon =
+                spot_type == SpotType::Beacon && !self.allowlist.contains(&old_call);
+            if !deferred_beacon {
+                let is_active =
+                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
+                self.gate
+                    .move_occurrence(&old_call, &refined.call, track_id, span, is_active);
+            }
         }
         // The word now carries the refined reading: its text, confidences
         // and ambiguity signals are the re-decode's, so the window's later
@@ -1232,6 +1242,39 @@ impl Validator {
                 self.decide(at, Some(Reason::Cty), || withheld(Reason::Cty));
                 return Vec::new();
             }
+        }
+        // A non-allowlisted Beacon candidate is never evaluated on a
+        // live track (`evaluate_candidate`'s Beacon branch): it is
+        // captured once and judged exactly once at its track's true
+        // close, when a final WPM reading exists. A refinement re-reads
+        // the word; it does not change that contract (Codex review, PR
+        // #520). The permanent checks above have re-judged the refined
+        // call, so the captured reading is updated and the normal
+        // close-time validation (`resolve_pending_beacons`) still
+        // decides -- including its final-speed check.
+        if spot_type == SpotType::Beacon && !is_allowlisted {
+            let mut updated = false;
+            for pb in self
+                .tracks
+                .values_mut()
+                .flat_map(|t| t.pending_beacons.iter_mut())
+                .filter(|pb| pb.origin_track_id == track_id && pb.word_seq == word_seq)
+            {
+                pb.candidate = candidate.clone();
+                pb.char_confidences = refined.confidences.clone();
+                updated = true;
+            }
+            let reason = if updated {
+                Reason::BeaconPending
+            } else {
+                // Nothing is pending anymore (the capture was
+                // permanently rejected, or the pending beacon was lost
+                // to eviction): the refined reading has nothing to
+                // update and nowhere to be published.
+                Reason::BeaconDiscarded
+            };
+            self.decide(at, Some(reason), || withheld(reason));
+            return Vec::new();
         }
         if !confidence::has_acoustic_evidence(&refined.confidences) {
             self.decide(at, Some(Reason::NoEvidence), || {
@@ -6243,5 +6286,125 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             total,
             "repeated refinements conserve counted occurrences"
         );
+    }
+
+    /// A beacon-shaped transmission (`V V V` + call, twice) whose first
+    /// callsign word carries an unresolved per-character alternative --
+    /// the shape `refine_candidates` admits (the word is attempted, from
+    /// its `capture_pending_beacon`, and keeps alternatives) and the
+    /// scheduler re-decodes. The second cycle's clean repetition reads
+    /// the true call, which is also what makes the frame parse capture
+    /// the first, ambiguous reading.
+    fn beacon_events_with_an_alternative(
+        ambiguous: &str,
+        true_call: &str,
+        alt: char,
+    ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        for (cycle, call) in [ambiguous, true_call].into_iter().enumerate() {
+            for word in ["V", "V", "V"] {
+                let (mut w, next) = word_events(1, word, ts);
+                events.append(&mut w);
+                ts = next;
+            }
+            let damaged_at = call.chars().count() - 1;
+            for (i, c) in call.chars().enumerate() {
+                let damaged = cycle == 0 && i == damaged_at;
+                events.push(DecoderEvent::CharDecoded {
+                    track_id: 1,
+                    sample_ts: ts,
+                    glyph: Glyph::Char(c),
+                    confidence: if damaged { 0.45 } else { 0.95 },
+                    alternatives: if damaged {
+                        vec![(Glyph::Char(alt), 0.40)]
+                    } else {
+                        Vec::new()
+                    },
+                });
+                ts += 100;
+            }
+            events.push(DecoderEvent::word_boundary(1, ts));
+            ts += 100;
+        }
+        events
+    }
+
+    /// Codex review, PR #520: a non-allowlisted beacon word with decoder
+    /// alternatives is refinement-admitted (`capture_pending_beacon` marks
+    /// it attempted), but a refinement may not publish it: a beacon is
+    /// judged exactly once at its track's true close. The refinement
+    /// updates the captured pending beacon's reading; the normal
+    /// close-time validation still decides.
+    #[test]
+    fn a_refined_beacon_stays_pending_and_resolves_at_its_tracks_close() {
+        let mut v = recording(CTY_FIXTURE);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        assert!(
+            run(
+                &beacon_events_with_an_alternative("K5ARH", "K5ARW", 'W'),
+                &mut v
+            )
+            .is_empty(),
+            "captured pending, never emitted on a live track"
+        );
+        let (seq, span) = word_named(&v, 1, "K5ARH");
+        assert!(
+            v.refine_candidates(v.now_ts, 10 * FS as u64)
+                .iter()
+                .any(|c| c.word_seq == seq),
+            "the ambiguous beacon word is a refinement candidate"
+        );
+        let spots = v.apply_refinement(1, seq, refined("K5ARW", span, "engine:hsmm"), 500_000);
+        assert!(
+            spots.is_empty(),
+            "a refined beacon never emits while its track is active: {spots:?}"
+        );
+        let pending: Vec<&str> = v.tracks[&1]
+            .pending_beacons
+            .iter()
+            .map(|pb| pb.candidate.as_str())
+            .collect();
+        assert!(
+            pending.iter().all(|c| *c == "K5ARW"),
+            "the captured reading carries the refinement: {pending:?}"
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARW");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review, PR #520: the close-time validation a refinement must
+    /// not bypass includes the final-speed check -- a track that closes
+    /// with an implausibly fast WPM reading (> MAX_PLAUSIBLE_WPM) rejects
+    /// its pending beacons, refined or not.
+    #[test]
+    fn a_refined_beacon_on_a_track_that_closes_too_fast_never_spots() {
+        let mut v = recording(CTY_FIXTURE);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 55.0,
+        });
+        assert!(run(
+            &beacon_events_with_an_alternative("K5ARH", "K5ARW", 'W'),
+            &mut v
+        )
+        .is_empty());
+        let (seq, span) = word_named(&v, 1, "K5ARH");
+        let spots = v.apply_refinement(1, seq, refined("K5ARW", span, "engine:hsmm"), 500_000);
+        assert!(spots.is_empty(), "got {spots:?}");
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert!(v.suppression_counts().pending_beacon_rejected_wpm >= 1);
     }
 }
