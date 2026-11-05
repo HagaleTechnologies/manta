@@ -88,7 +88,8 @@ const RX_TX_SPECIFIC_EVERY: Duration = Duration::from_millis(200);
 const GENERAL_EVERY: Duration = Duration::from_millis(800);
 
 /// How many times `Drop` sends high-priority with run = 0 (D8).
-const STOP_REPEATS: usize = 2;
+/// Protocol 1 also uses this count in `HpsdrSession::retire`.
+pub(crate) const STOP_REPEATS: usize = 2;
 
 /// Production stall bound (D13): the same 40 x 250 ms budget as protocol 1,
 /// measured as elapsed time since the last valid IQ datagram.
@@ -831,6 +832,11 @@ pub(crate) mod fake {
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
 
+    /// The widest offset from `base` a test binds: the foreign socket at
+    /// `base + FOREIGN_PORT_OFFSET`, clear of the radio's `base..=base + 11`.
+    /// `bind` takes only a base whose whole span fits in a `u16` (MAN-497).
+    pub(crate) const FOREIGN_PORT_OFFSET: u16 = 40;
+
     /// One datagram the fake received: port offset from `base`, bytes,
     /// source.
     pub(crate) type Record = (u16, Vec<u8>, SocketAddr);
@@ -938,7 +944,7 @@ pub(crate) mod fake {
             for _ in 0..200 {
                 let first = UdpSocket::bind("127.0.0.1:0").unwrap();
                 let base = first.local_addr().unwrap().port();
-                if base > u16::MAX - 11 {
+                if base > u16::MAX - FOREIGN_PORT_OFFSET {
                     continue;
                 }
                 let mut cmd = vec![first];
@@ -1082,7 +1088,7 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{iq_datagram, FakeP2Radio};
+    use super::fake::{iq_datagram, FakeP2Radio, FOREIGN_PORT_OFFSET};
     use super::*;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -1397,7 +1403,7 @@ mod tests {
         let mut src = open(&fake);
         let to = fake.wait_for_run();
         fake.send_iq_bytes(&[0u8; 100]);
-        let foreign = UdpSocket::bind(("127.0.0.1", fake.base + 40))
+        let foreign = UdpSocket::bind(("127.0.0.1", fake.base + FOREIGN_PORT_OFFSET))
             .or_else(|_| UdpSocket::bind("127.0.0.1:0"))
             .unwrap();
         let fport = foreign.local_addr().unwrap().port();

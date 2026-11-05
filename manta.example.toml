@@ -304,6 +304,13 @@ station_callsign = "N0CALL"
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
 
+# Input-conditioning stages, each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
+
 # Your radio's dial frequency, Hz, for a sound card or WAV recording that
 # carries no frequency of its own. No default: without it, frequencies are
 # audio offsets, and `manta run` with [server] refuses to start.

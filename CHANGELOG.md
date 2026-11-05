@@ -144,6 +144,16 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-496: the `[input]` conditioning keys `dc_block` and
+  `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
+  restart-only), turning MAN-203's input-conditioning stages on for
+  `decode`, `run` and `soak`, with per-input settings for multiple receivers.
+  `run` publishes `manta_input_conditioned_samples_total` by source, stage
+  and mark, starting at zero for configured modes and summed across reconnects.
+  `decode --json` gains an `inputConditioning` object (omitted
+  when every stage is `off`) with exact per-stage counts and the bounded
+  span log; `manta config` prints a set stage in the input summary. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
 - MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
   by default) reports validated CQ and beacon spots (`spot_types = "all"`
   for every type) to PSKReporter's public map at
@@ -179,6 +189,16 @@ the git history and `docs/DECISIONS/`.
   `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
   stdout and every wire format are unchanged. See
   [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
+- MAN-198 first slice: `manta oracle --funnel PATH` runs the recording
+  once more through the production pipeline and writes a stage-attributed
+  loss funnel (JSON Lines): a header, one `lossFunnel` record per RBN
+  episode charged to exactly one earliest failed stage (or none when
+  delivered), and a `lossFunnelSummary` with candidate, confirmed and
+  leased track births kept apart. Diagnostic only: the oracle's stdout and
+  `--jsonl` are unchanged. `--funnel-bypass known-frequency` adds the
+  known-frequency oracle-bypass experiment after the production summary,
+  flagged `oracleAssisted`: an upper bound, never a score. See
+  docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -404,6 +424,11 @@ the git history and `docs/DECISIONS/`.
   on the same device instead of reopening. Hard failure bounds and
   reconnect policy are unchanged. See
   docs/DECISIONS/2026-11-04-man489-live-source-stall-settlement.md.
+- MAN-497: dropping a lone protocol-1 HPSDR receiver sends the stop command
+  twice, as protocol 2 does, so one lost UDP datagram no longer leaves the
+  radio streaming and refused as in use on rediscovery. Decoder output is
+  unchanged.
+
 - MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
   longer stamped late when the reopen thread stalls before it drains the
   data socket. The startup stash now stamps each packet with the last
