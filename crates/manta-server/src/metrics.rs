@@ -1088,6 +1088,7 @@ pub struct Metrics {
     /// with silence (NaN, infinite, or beyond `MAX_SAMPLE_MAGNITUDE`).
     /// Unlike `input_health`, every source publishes it, at 0 from startup.
     input_bad_samples: RwLock<BTreeMap<String, u64>>,
+    input_conditioned_samples: RwLock<BTreeMap<(String, String, String), u64>>,
     /// MAN-308: automatic attenuation per source, fed by `manta-cli`'s
     /// 1 Hz poller. Only an hpsdr input with `auto_attenuation` that opened
     /// as protocol 2 publishes, so every other source has no series.
@@ -1893,6 +1894,18 @@ impl Metrics {
         *entry = (*entry).max(count);
     }
 
+    /// Publish an input's cumulative conditioning count, never decreasing it.
+    pub fn set_input_conditioned_samples(&self, source: &str, stage: &str, mark: &str, count: u64) {
+        let mut map = self
+            .input_conditioned_samples
+            .write()
+            .expect("input_conditioned_samples lock poisoned");
+        let entry = map
+            .entry((source.to_string(), stage.to_string(), mark.to_string()))
+            .or_insert(0);
+        *entry = (*entry).max(count);
+    }
+
     /// MAN-14: publishes every input's hearing series at 0, in config
     /// order, so each exists from the first scrape. Rows already present
     /// keep their counts.
@@ -2680,6 +2693,19 @@ impl Metrics {
             "# HELP manta_input_bad_samples_total Input samples replaced with silence because a component was NaN, infinite, or larger than 1e17 in magnitude, per source.\n",
         );
         out.push_str("# TYPE manta_input_bad_samples_total counter\n");
+        out.push_str("# HELP manta_input_conditioned_samples_total Input samples an [input] conditioning stage changed, flagged or marked uncertain.\n");
+        out.push_str("# TYPE manta_input_conditioned_samples_total counter\n");
+        for ((source, stage, mark), n) in self
+            .input_conditioned_samples
+            .read()
+            .expect("input_conditioned_samples lock poisoned")
+            .iter()
+        {
+            let source = escape_label_value(source);
+            let stage = escape_label_value(stage);
+            let mark = escape_label_value(mark);
+            out.push_str(&format!("manta_input_conditioned_samples_total{{source=\"{source}\",stage=\"{stage}\",mark=\"{mark}\"}} {n}\n"));
+        }
         for (source, n) in self
             .input_bad_samples
             .read()
@@ -3665,6 +3691,22 @@ mod tests {
         assert!(m
             .render_prometheus_text()
             .contains("\nmanta_input_silent{source=\"deaf\"} 0\n"));
+    }
+
+    #[test]
+    fn input_conditioned_samples_total_is_labelled_and_never_goes_backwards() {
+        let m = Metrics::default();
+        m.set_input_conditioned_samples("rx\"\\\n", "dc", "corrected", 0);
+        let metric = r#"manta_input_conditioned_samples_total{source="rx\"\\\n",stage="dc",mark="corrected"}"#;
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# HELP manta_input_conditioned_samples_total "));
+        assert!(text.contains("# TYPE manta_input_conditioned_samples_total counter\n"));
+        assert!(text.contains(&format!("{metric} 0\n")), "{text}");
+        m.set_input_conditioned_samples("rx\"\\\n", "dc", "corrected", 9);
+        m.set_input_conditioned_samples("rx\"\\\n", "dc", "corrected", 3);
+        assert!(m
+            .render_prometheus_text()
+            .contains(&format!("{metric} 9\n")));
     }
 
     #[test]

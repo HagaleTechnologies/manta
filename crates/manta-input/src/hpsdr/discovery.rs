@@ -575,14 +575,47 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
     socket
         .set_read_timeout(Some(POLL))
         .with_context(|| format!("setting the HPSDR discovery read timeout for {host}:{port}"))?;
+    probe_loop(&mut UdpProbeIo(socket), radio, host, port, timing)
+}
+
+/// Clock and datagram operations used by the directed probe loop.
+trait ProbeIo {
+    fn now(&self) -> Instant;
+    fn send_to(&mut self, bytes: &[u8], destination: SocketAddr) -> std::io::Result<usize>;
+    fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
+}
+
+struct UdpProbeIo(UdpSocket);
+
+impl ProbeIo for UdpProbeIo {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn send_to(&mut self, bytes: &[u8], destination: SocketAddr) -> std::io::Result<usize> {
+        self.0.send_to(bytes, destination)
+    }
+
+    fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.0.recv_from(buf)
+    }
+}
+
+fn probe_loop(
+    io: &mut impl ProbeIo,
+    radio: SocketAddr,
+    host: &str,
+    port: u16,
+    timing: &ProbeTiming,
+) -> Result<Discovery> {
     let requests = [&protocol2_request()[..], &protocol1_request()[..]];
     let mut buf = [0u8; REPLY_BUF_LEN];
-    let start = Instant::now();
+    let start = io.now();
     let mut sent = 0u32;
     // A protocol-1 reply and the end of its grace window.
     let mut fallback: Option<(DiscoveryReply, Instant)> = None;
     loop {
-        let now = Instant::now();
+        let now = io.now();
         if let Some((reply, grace_end)) = fallback {
             // The grace runs to its end even past the window: the reply
             // itself arrived inside it.
@@ -595,7 +628,7 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
         // Send the pair at t = 0, interval, 2 * interval, ... (`tries` times).
         if sent < timing.tries && now.duration_since(start) >= timing.interval * sent {
             for request in requests {
-                match socket.send_to(request, radio) {
+                match io.send_to(request, radio) {
                     Ok(_) => {}
                     // Windows reports an earlier ICMP port-unreachable here.
                     Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
@@ -607,7 +640,7 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
             }
             sent += 1;
         }
-        let (n, src) = match socket.recv_from(&mut buf) {
+        let (n, src) = match io.recv_from(&mut buf) {
             Ok(got) => got,
             Err(e) if is_retry(e.kind()) => continue,
             Err(e) => {
@@ -629,8 +662,8 @@ pub fn probe(host: &str, port: u16, timing: &ProbeTiming) -> Result<Discovery> {
             // protocol-2 request or reply would otherwise settle a
             // dual-protocol radio on protocol 1 (D3, MAN-305 review).
             Some(reply @ DiscoveryReply::Protocol1 { .. }) if fallback.is_none() => {
-                fallback = Some((reply, Instant::now() + timing.grace));
-                match socket.send_to(&protocol2_request(), radio) {
+                fallback = Some((reply, io.now() + timing.grace));
+                match io.send_to(&protocol2_request(), radio) {
                     Ok(_) => {}
                     Err(e) if e.kind() == ErrorKind::ConnectionReset => {}
                     Err(e) => {
@@ -1174,14 +1207,128 @@ mod tests {
         assert_eq!(classify_reply(&[0xAB; 60]), None);
     }
 
+    // Instant is only an anchor: all progress comes from scripted receives,
+    // never from elapsed wall time or another thread.
+    struct ManualProbeIo {
+        origin: Instant,
+        elapsed: Duration,
+        timeout: ErrorKind,
+        receives: std::collections::VecDeque<(Duration, Option<Vec<u8>>)>,
+        sent: Vec<(Duration, Vec<u8>, SocketAddr)>,
+        radio: SocketAddr,
+    }
+
+    impl ManualProbeIo {
+        fn new(timeout: ErrorKind) -> Self {
+            Self {
+                origin: Instant::now(),
+                elapsed: Duration::ZERO,
+                timeout,
+                receives: Default::default(),
+                sent: Vec::new(),
+                radio: "127.0.0.1:1024".parse().unwrap(),
+            }
+        }
+    }
+
+    impl ProbeIo for ManualProbeIo {
+        fn now(&self) -> Instant {
+            self.origin + self.elapsed
+        }
+
+        fn send_to(&mut self, bytes: &[u8], destination: SocketAddr) -> std::io::Result<usize> {
+            self.sent.push((self.elapsed, bytes.to_vec(), destination));
+            Ok(bytes.len())
+        }
+
+        fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            let (advance, reply) = self.receives.pop_front().unwrap_or((POLL, None));
+            self.elapsed += advance;
+            match reply {
+                Some(reply) => {
+                    buf[..reply.len()].copy_from_slice(&reply);
+                    Ok((reply.len(), self.radio))
+                }
+                None => Err(std::io::Error::from(self.timeout)),
+            }
+        }
+    }
+
     #[test]
     fn auto_retries_discovery_four_times_within_the_window() {
-        let (result, took, seen) = probe_fake(fast(), |_, _, _| {});
-        assert_eq!(result, Discovery::NoAnswer);
-        assert!(took >= fast().window, "{took:?}");
-        assert_eq!(seen.iter().filter(|d| is_p2_request(d)).count(), 4);
-        assert_eq!(seen.iter().filter(|d| is_p1_request(d)).count(), 4);
-        assert_eq!(seen.len(), 8, "nothing but the two requests");
+        for timeout in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let mut io = ManualProbeIo::new(timeout);
+            let radio = io.radio;
+            let result = probe_loop(&mut io, radio, "127.0.0.1", radio.port(), &fast()).unwrap();
+            assert_eq!(result, Discovery::NoAnswer);
+            assert_eq!(io.elapsed, fast().window);
+            let expected: Vec<_> = [0, 50, 100, 150]
+                .into_iter()
+                .flat_map(|ms| {
+                    [protocol2_request().to_vec(), protocol1_request().to_vec()]
+                        .map(|bytes| (Duration::from_millis(ms), bytes, radio))
+                })
+                .collect();
+            assert_eq!(io.sent, expected, "{timeout:?}");
+            assert_eq!(
+                io.sent.iter().filter(|(_, d, _)| is_p2_request(d)).count(),
+                4
+            );
+            assert_eq!(
+                io.sent.iter().filter(|(_, d, _)| is_p1_request(d)).count(),
+                4
+            );
+            assert_eq!(io.sent.len(), 8);
+        }
+    }
+
+    #[test]
+    fn probe_deadline_jump_sends_no_late_pairs() {
+        for ms in [300, 450] {
+            let mut io = ManualProbeIo::new(ErrorKind::TimedOut);
+            io.receives.push_back((Duration::from_millis(ms), None));
+            let radio = io.radio;
+            assert_eq!(
+                probe_loop(&mut io, radio, "127.0.0.1", radio.port(), &fast()).unwrap(),
+                Discovery::NoAnswer
+            );
+            assert_eq!(io.elapsed, Duration::from_millis(ms));
+            assert_eq!(
+                io.sent,
+                vec![
+                    (Duration::ZERO, protocol2_request().to_vec(), radio),
+                    (Duration::ZERO, protocol1_request().to_vec(), radio),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn probe_p1_grace_crosses_window_without_extension() {
+        let mut io = ManualProbeIo::new(ErrorKind::WouldBlock);
+        // Receive the first P1 at 290 ms, and another at 310 ms. Only the
+        // first reply sets the 320 ms grace deadline and triggers a P2 send.
+        for _ in 0..28 {
+            io.receives.push_back((POLL, None));
+        }
+        io.receives.push_back((POLL, Some(p1_reply(STATUS_IDLE))));
+        io.receives
+            .push_back((POLL * 2, Some(p1_reply(STATUS_BUSY))));
+        let radio = io.radio;
+        assert_eq!(
+            probe_loop(&mut io, radio, "127.0.0.1", radio.port(), &fast()).unwrap(),
+            Discovery::Answered(classify_reply(&p1_reply(STATUS_IDLE)).unwrap())
+        );
+        assert_eq!(io.elapsed, Duration::from_millis(320));
+        assert_eq!(io.sent.len(), 9);
+        assert_eq!(
+            io.sent.last().unwrap(),
+            &(
+                Duration::from_millis(290),
+                protocol2_request().to_vec(),
+                radio
+            )
+        );
     }
 
     #[test]
