@@ -4419,6 +4419,7 @@ fn decode_quality_of(
     s: &manta_engine::DecodeQualitySnapshot,
 ) -> manta_server::metrics::DecodeQuality {
     manta_server::metrics::DecodeQuality {
+        refine: s.refine,
         chars_total: s.chars_total,
         garbles_total: s.garbles_total,
         rail_ratio: manta_server::metrics::ValueHistogram {

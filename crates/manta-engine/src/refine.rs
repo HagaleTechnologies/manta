@@ -214,12 +214,23 @@ pub struct RefineCounters {
 }
 
 /// The deterministic, budget-bounded refinement scheduler.
+struct ActiveReplay {
+    candidate: RefineCandidate,
+    entries: Vec<ReplayEntry>,
+    offset: usize,
+    decoder: TrackDecoder,
+    events: Vec<DecoderEvent>,
+    hypothesis: &'static str,
+}
+
 pub struct RefineScheduler {
+    active: Option<ActiveReplay>,
+    last_context: BTreeMap<(u32, u64), (u64, f32, f64)>,
     cfg: RefineConfig,
     fs: f64,
     /// `(track_id, word_seq)` -> refinements run so far; capped at
     /// `cfg.max_refinements_per_episode`.
-    per_episode_counts: BTreeMap<(u32, u64), u32>,
+    per_episode_counts: BTreeMap<(u32, u64), (u32, u64)>,
     /// Admitted, unrefined episodes in stable `(track_id, word_seq)`
     /// order. Overflow drops the oldest first and counts.
     queue: VecDeque<RefineCandidate>,
@@ -229,6 +240,8 @@ pub struct RefineScheduler {
 impl RefineScheduler {
     pub fn new(decode_cfg: &DecodeConfig, fs: f64) -> Self {
         RefineScheduler {
+            active: None,
+            last_context: BTreeMap::new(),
             cfg: decode_cfg.refine.clone(),
             fs,
             per_episode_counts: BTreeMap::new(),
@@ -261,9 +274,30 @@ impl RefineScheduler {
             return Vec::new();
         }
         let lookback_samples = (self.cfg.lookback_secs * self.fs) as u64;
+        let candidates = validator.refine_candidates(now_ts, lookback_samples);
+        // Only retained episodes need cap bookkeeping. This bounds a long
+        // running daemon by the validator's window rather than its uptime.
+        self.per_episode_counts
+            .retain(|_, (_, end_ts)| *end_ts >= now_ts.saturating_sub(lookback_samples));
+        self.queue.retain(|c| {
+            candidates
+                .iter()
+                .any(|live| (live.track_id, live.word_seq) == (c.track_id, c.word_seq))
+        });
+        if self.active.as_ref().is_some_and(|a| {
+            buffers
+                .replay_slice(a.candidate.track_id, a.candidate.span)
+                .is_none()
+                || a.candidate.span.1 < now_ts.saturating_sub(lookback_samples)
+        }) {
+            self.active = None;
+            self.counters.buffer_miss_total += 1;
+        }
+        self.last_context
+            .retain(|key, _| self.per_episode_counts.contains_key(key));
         // Stable order: `refine_candidates` iterates tracks and words in
         // key order, so admission order is `(track_id, word_seq)`.
-        for candidate in validator.refine_candidates(now_ts, lookback_samples) {
+        for candidate in candidates {
             let key = (candidate.track_id, candidate.word_seq);
             // A fresh episode needs a genuine ambiguity signal; an episode
             // already refined once stays on the hypothesis ladder until
@@ -271,17 +305,32 @@ impl RefineScheduler {
             // unresolved is itself the reason to try the next
             // configuration.
             let already_refined = self.per_episode_counts.contains_key(&key);
-            if !already_refined && !ambiguity_trigger(&candidate) {
+            let previous = self.last_context.get(&key);
+            let speed_changed = speed_trigger(
+                candidate.wpm,
+                previous.map_or(candidate.episode_wpm, |c| c.1),
+            );
+            let separated =
+                previous.is_some_and(|c| separability_trigger(c.2, candidate.neighbor_gap_hz));
+            let later_word = previous.is_some_and(|c| candidate.latest_word_seq > c.0);
+            if (!already_refined && !ambiguity_trigger(&candidate) && !speed_changed && !separated)
+                || (already_refined && !speed_changed && !separated && !later_word)
+            {
                 continue;
             }
             if self
                 .per_episode_counts
                 .get(&key)
-                .is_some_and(|n| *n >= self.cfg.max_refinements_per_episode)
+                .is_some_and(|(n, _)| *n >= self.cfg.max_refinements_per_episode)
             {
                 continue;
             }
-            if self.queue.iter().any(|c| (c.track_id, c.word_seq) == key) {
+            if self
+                .active
+                .as_ref()
+                .is_some_and(|a| (a.candidate.track_id, a.candidate.word_seq) == key)
+                || self.queue.iter().any(|c| (c.track_id, c.word_seq) == key)
+            {
                 continue;
             }
             self.queue.push_back(candidate);
@@ -294,41 +343,67 @@ impl RefineScheduler {
         }
         let mut spots = Vec::new();
         let mut budget = self.cfg.replay_hops_per_batch;
-        while let Some(candidate) = self.queue.front().cloned() {
-            let entries = match buffers.replay_slice(candidate.track_id, candidate.span) {
-                Some(entries) => entries,
-                None => {
-                    self.queue.pop_front();
+        loop {
+            if self.active.is_none() {
+                let Some(candidate) = self.queue.pop_front() else {
+                    break;
+                };
+                let Some(entries) = buffers.replay_slice(candidate.track_id, candidate.span) else {
                     self.counters.buffer_miss_total += 1;
                     self.per_episode_counts.insert(
                         (candidate.track_id, candidate.word_seq),
-                        self.cfg.max_refinements_per_episode,
+                        (self.cfg.max_refinements_per_episode, candidate.span.1),
                     );
                     continue;
-                }
-            };
-            let hops = entries.len() as u32;
-            if hops > budget {
-                // Deferred to a later batch, not raced against the clock.
+                };
+                self.active = Some(self.start_replay(decode_cfg, candidate, entries));
+            }
+            let active = self.active.as_mut().expect("initialized above");
+            let remaining = active.entries.len() - active.offset;
+            let hops = remaining.min(budget as usize);
+            for (amp, power, spectral_ref, ts, _, _) in
+                &active.entries[active.offset..active.offset + hops]
+            {
+                active
+                    .events
+                    .extend(active.decoder.push_hop(*amp, *power, *spectral_ref, *ts));
+            }
+            active.offset += hops;
+            budget -= hops as u32;
+            self.counters.replayed_hops_total += hops as u64;
+            if active.offset < active.entries.len() {
                 self.counters.budget_exhausted_total += 1;
                 break;
             }
-            budget -= hops;
-            self.counters.replayed_hops_total += hops as u64;
-            let refined = self.replay(decode_cfg, &candidate, &entries);
-            self.queue.pop_front();
-            let key = (candidate.track_id, candidate.word_seq);
-            let count = self.per_episode_counts.entry(key).or_insert(0);
-            *count += 1;
-            let Some(refined) = refined else {
+            let mut active = self.active.take().expect("initialized above");
+            active.events.extend(active.decoder.finish());
+            let candidate = active.candidate;
+            self.last_context.insert(
+                (candidate.track_id, candidate.word_seq),
+                (
+                    candidate.latest_word_seq,
+                    candidate.wpm,
+                    candidate.neighbor_gap_hz,
+                ),
+            );
+            self.per_episode_counts
+                .entry((candidate.track_id, candidate.word_seq))
+                .or_insert((0, candidate.span.1))
+                .0 += 1;
+            let Some(refined) = Self::read_word(&candidate, active.events, active.hypothesis)
+            else {
                 self.counters.no_reading_total += 1;
                 continue;
             };
+            let before = validator.observations().losses().orphaned_revisions;
             let rescued =
                 validator.apply_refinement(candidate.track_id, candidate.word_seq, refined, now_ts);
             self.counters.rescues_total += rescued.len() as u64;
-            self.counters.orphaned_revisions_total +=
-                validator.observations().losses().orphaned_revisions;
+            self.counters.orphaned_revisions_total += validator
+                .observations()
+                .losses()
+                .orphaned_revisions
+                .saturating_sub(before);
             spots.extend(rescued);
         }
         spots
@@ -340,21 +415,20 @@ impl RefineScheduler {
     /// (`TrackDecoder::set_initial_wpm`), alternating for further
     /// refinements. Deterministic: the configuration follows from the
     /// episode's refinement count and the base config, nothing else.
-    fn replay(
+    fn start_replay(
         &self,
         decode_cfg: &DecodeConfig,
-        candidate: &RefineCandidate,
-        entries: &[ReplayEntry],
-    ) -> Option<manta_spot::RefinedWord> {
+        candidate: RefineCandidate,
+        entries: Vec<ReplayEntry>,
+    ) -> ActiveReplay {
         let n = self
             .per_episode_counts
             .get(&(candidate.track_id, candidate.word_seq))
-            .copied()
-            .unwrap_or(0);
+            .map_or(0, |(n, _)| *n);
         let mut alt_cfg = decode_cfg.clone();
         let mut seed_wpm = None;
         let hypothesis: &'static str;
-        if n % 2 == 0 {
+        if n.is_multiple_of(2) {
             alt_cfg.engine = match decode_cfg.engine {
                 DecodeEngine::Legacy | DecodeEngine::EdgeLegacy => DecodeEngine::Hsmm,
                 DecodeEngine::Hsmm => DecodeEngine::Legacy,
@@ -376,11 +450,21 @@ impl RefineScheduler {
         if let Some(wpm) = seed_wpm {
             decoder.set_initial_wpm(wpm);
         }
-        let mut events = Vec::new();
-        for (amp, power, spectral_ref, ts, _, _) in entries {
-            events.extend(decoder.push_hop(*amp, *power, *spectral_ref, *ts));
+        ActiveReplay {
+            candidate,
+            entries,
+            offset: 0,
+            decoder,
+            events: Vec::new(),
+            hypothesis,
         }
-        events.extend(decoder.finish());
+    }
+
+    fn read_word(
+        candidate: &RefineCandidate,
+        events: Vec<DecoderEvent>,
+        hypothesis: &'static str,
+    ) -> Option<manta_spot::RefinedWord> {
         // Map the replay's words back to occurrences by span intersection:
         // a word whose first-character..boundary ts range touches the
         // candidate's span re-reads that occurrence.

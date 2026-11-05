@@ -433,3 +433,19 @@ For what each uplink state means and what to do about it, see
   warning.
 - [MAN-318](DECISIONS/2026-10-27-man318-callsign-lookup.md): the callsign
   lookup families.
+
+### Delayed refinement
+
+The decode-quality observer exports five counters without labels:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `manta_refine_admitted_total` | counter | Queued refinement attempts. |
+| `manta_refine_replayed_hops_total` | counter | Preserved hops actually replayed. |
+| `manta_refine_rescues_total` | counter | Spots emitted by refinement. |
+| `manta_refine_budget_exhausted_total` | counter | Batches that paused an unfinished replay. |
+| `manta_refine_orphaned_revisions_total` | counter | Revisions whose observation expired. |
+
+Counters accumulate deltas across input segments, including reconnects. The
+scheduler also counts backlog overflow, buffer misses and replays without a
+reading internally. A rescue counter is an emission count, not a truth score.

@@ -1311,3 +1311,22 @@ consecutive overflows surfaces, as a lost connection
 warning). Until the trigger fires the synchronous loop stays: it is
 deterministic by construction and has no thread boundary between pipeline
 stages to get wrong.
+
+### Delayed refinement (MAN-208)
+
+The single-input listen loop feeds decoder events to the validator, then asks
+`TrackManager::refine_step` to revisit retained ambiguous words. The manager
+records decoder inputs in per-track FIFOs before draining its decoder pool.
+Input gaps clear retention; closed tracks lose their FIFO. An 8 MiB estimated
+entry ceiling bounds all tracks together.
+
+`validator → refinement candidates → retained hops → scratch TrackDecoder →
+Validator::apply_refinement → spot sink` is a feedback path over preserved
+observations. Revisions keep the original occurrence and span. Moving support
+between callsigns never creates a repetition. The RF timestamp is the newest
+supporting occurrence's timestamp; the observation's decision timestamp is when
+the replay completes. The scheduler pauses its scratch decoder at the batch hop
+budget and resumes it next batch. It expires episode bookkeeping with the
+validator window. Metrics travel through the atomic decode-quality observer.
+See the [decision record](docs/DECISIONS/2026-11-05-man208-delayed-refinement.md)
+for the current scope and measurement limits.

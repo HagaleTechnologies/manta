@@ -141,3 +141,14 @@ No record is ever rewritten. A later decision about the same occurrence is
 a new line with its own `seq`, the same `observation`, and `supersedes` set
 to the latest earlier record's `seq`. Read an occurrence's history with
 `jq -c 'select(.observation=="t1.w2")' k5arh.jsonl`.
+
+### Live delayed revisions
+
+MAN-208 can produce `cause: "refined"` from the single-input listen loop. These
+records use the existing `manta-observations.v1` schema. `supersedes` names the
+prior record for the same observation id; start and end samples keep the original
+span. `decided_sample_ts` records replay completion, so readers can distinguish
+RF time from decision availability. The repetition gate moves the occurrence's
+support rather than adding a repetition. See
+[the measurement limits](DECISIONS/2026-11-05-man208-delayed-refinement.md) before
+comparing this delayed output with causal output.

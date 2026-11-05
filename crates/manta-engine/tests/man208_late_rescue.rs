@@ -278,6 +278,7 @@ fn a_late_clean_repetition_rescues_the_ambiguous_episode_end_to_end() {
     assert_eq!(c.admitted_total, 1);
     assert!(c.replayed_hops_total > 0);
     assert_eq!(c.rescues_total, 1);
+    println!("rescue=K3ABD rf_ts={} decision_ts={} replayed_hops={} admitted={} budget_pauses={} overflow={}", spots[0].sample_ts, now, c.replayed_hops_total, c.admitted_total, c.budget_exhausted_total, c.backlog_overflow_total);
 }
 
 #[test]
@@ -343,6 +344,12 @@ fn per_episode_cap_of_two_refinements_is_enforced() {
     // support is the moved occurrence: simply never let it reach two reps.
     let mut admitted = 0u64;
     for i in 0..3u64 {
+        if i == 1 {
+            s.validator.ingest(&DecoderEvent::SpeedUpdate {
+                track_id: 1,
+                wpm: 29.0,
+            });
+        }
         let now = s.span.1 + 50_000 + i * 32_000;
         s.scheduler
             .step(&mut s.buffers, &mut s.validator, &s.decode_cfg, now);
@@ -361,31 +368,27 @@ fn per_episode_cap_of_two_refinements_is_enforced() {
 #[test]
 fn replay_hops_per_batch_is_enforced_and_counted() {
     let mut s = scene("K3ABD", "K3ABC", true, true);
-    // A one-hop budget can never cover the replay: the episode is DEFERRED
-    // (never raced), and the exhaustion is counted. The budgets are fixed
-    // at scheduler construction, so rebuild it under the small budget.
-    s.decode_cfg.refine.replay_hops_per_batch = 1;
+    // A replay larger than one batch must make progress under a fixed
+    // budget, without resetting the scheduler or inventing a repetition.
+    s.decode_cfg.refine.replay_hops_per_batch = 17;
     s.scheduler = RefineScheduler::new(&s.decode_cfg, FS);
     let now = s.rep_boundary + 32_000;
-    let spots = s
-        .scheduler
-        .step(&mut s.buffers, &mut s.validator, &s.decode_cfg, now);
-    assert!(spots.is_empty());
-    let c = s.scheduler.counters();
-    assert_eq!(
-        c.replayed_hops_total, 0,
-        "nothing replayed under the budget"
-    );
-    assert!(c.budget_exhausted_total >= 1, "the deferral is counted");
-    // A later batch with the full budget completes the rescue.
-    s.decode_cfg.refine.replay_hops_per_batch = 1500;
-    s.scheduler = RefineScheduler::new(&s.decode_cfg, FS);
-    let spots = s.scheduler.step(
-        &mut s.buffers,
-        &mut s.validator,
-        &s.decode_cfg,
-        now + 32_000,
-    );
+    let mut spots = Vec::new();
+    for batch in 0..200 {
+        let before = s.scheduler.counters().replayed_hops_total;
+        spots.extend(s.scheduler.step(
+            &mut s.buffers,
+            &mut s.validator,
+            &s.decode_cfg,
+            now + batch * 256,
+        ));
+        let after = s.scheduler.counters().replayed_hops_total;
+        assert!(after - before <= 17);
+        if !spots.is_empty() {
+            break;
+        }
+    }
+    assert!(s.scheduler.counters().budget_exhausted_total > 0);
     assert_eq!(spots.len(), 1);
     assert_eq!(spots[0].sample_ts, s.rep_boundary);
 }

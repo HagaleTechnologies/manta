@@ -2394,6 +2394,7 @@ pub struct TrackManager {
     last_fed_hop: Vec<Option<u64>>,
     /// MAN-208: per-track retained decoder inputs for refinement replay.
     refine_buf: crate::refine::RefineBuffers,
+    refine_now_ts: u64,
     /// MAN-208: the deterministic, budget-bounded refinement scheduler.
     refine: crate::refine::RefineScheduler,
 }
@@ -2562,6 +2563,7 @@ impl TrackManager {
             comod_snr_buf: Vec::with_capacity(n_channels),
             confirmations: 0,
             refine_buf,
+            refine_now_ts: 0,
             refine,
         }
     }
@@ -3045,6 +3047,7 @@ impl TrackManager {
         Vec<DecoderEvent>,
         Vec<DecoderEvent>,
     ) {
+        self.refine_now_ts = self.refine_now_ts.max(sample_ts);
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         if self.funnel.is_some() {
             self.funnel_ts = sample_ts;
@@ -4454,8 +4457,22 @@ impl TrackManager {
         now_ts: u64,
     ) -> Vec<manta_spot::Spot> {
         let decode_cfg = self.decode_cfg.clone();
-        self.refine
-            .step(&mut self.refine_buf, validator, &decode_cfg, now_ts)
+        let now_ts = now_ts.max(self.refine_now_ts);
+        let before = *self.refine.counters();
+        let spots = self
+            .refine
+            .step(&mut self.refine_buf, validator, &decode_cfg, now_ts);
+        if let Some(observer) = &self.quality {
+            let after = self.refine.counters();
+            observer.add_refinements([
+                after.admitted_total - before.admitted_total,
+                after.replayed_hops_total - before.replayed_hops_total,
+                after.rescues_total - before.rescues_total,
+                after.budget_exhausted_total - before.budget_exhausted_total,
+                after.orphaned_revisions_total - before.orphaned_revisions_total,
+            ]);
+        }
+        spots
     }
 
     /// MAN-199: replay `depth` recorded hops at each lease instead of

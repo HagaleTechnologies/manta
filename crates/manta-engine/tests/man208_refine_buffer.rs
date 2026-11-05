@@ -121,6 +121,9 @@ fn a_span_without_preroll_still_replays_whole() {
 
 fn candidate(rival: Option<&str>, alternatives: usize) -> RefineCandidate {
     RefineCandidate {
+        episode_wpm: 20.0,
+        neighbor_gap_hz: f64::INFINITY,
+        latest_word_seq: 1,
         track_id: 1,
         word_seq: 0,
         call: "K3ABC".to_string(),

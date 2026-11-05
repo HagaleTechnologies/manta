@@ -194,6 +194,8 @@ impl From<Spot> for SpotJson {
 
 #[derive(Default)]
 struct Word {
+    refine_hypothesis: Option<&'static str>,
+    decoded_wpm: f32,
     text: String,
     confidences: Vec<f32>,
     /// MAN-200: each character's alternatives, parallel to `confidences`.
@@ -730,6 +732,9 @@ pub struct RefinedWord {
 /// anything stays with the validator.
 #[derive(Debug, Clone)]
 pub struct RefineCandidate {
+    pub episode_wpm: f32,
+    pub neighbor_gap_hz: f64,
+    pub latest_word_seq: u64,
     pub track_id: u32,
     pub word_seq: u64,
     /// The occurrence's currently decoded call.
@@ -741,7 +746,7 @@ pub struct RefineCandidate {
     pub reps: u32,
     /// What its pattern tier requires.
     pub required_reps: u32,
-    /// The track's speed when the occurrence was decoded.
+    /// The track's latest speed, used by a seeded replay.
     pub wpm: f32,
     /// The better-supported rival that withheld it, if any.
     pub rival: Option<String>,
@@ -1078,6 +1083,14 @@ impl Validator {
                     continue;
                 }
                 out.push(RefineCandidate {
+                    episode_wpm: word.decoded_wpm,
+                    latest_word_seq: track.next_word_seq,
+                    neighbor_gap_hz: self
+                        .tracks
+                        .iter()
+                        .filter(|(id, _)| **id != track_id)
+                        .map(|(_, other)| (other.freq_hz - track.freq_hz).abs())
+                        .fold(f64::INFINITY, f64::min),
                     track_id,
                     word_seq: word.seq,
                     call: word.text.clone(),
@@ -1154,6 +1167,7 @@ impl Validator {
         {
             let track = self.tracks.get_mut(&track_id).expect("track present above");
             if let Some(word) = track.words.iter_mut().find(|w| w.seq == word_seq) {
+                word.refine_hypothesis = Some(refined.hypothesis);
                 word.text = refined.call.clone();
                 word.confidences = refined.confidences.clone();
                 word.char_alternatives = Vec::new();
@@ -1391,7 +1405,7 @@ impl Validator {
                 draft.scores.word_confidence = Some(confidence::geo_mean(&word.confidences));
             }
             if self.observations.detail() == crate::observation::Detail::Text {
-                let context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
+                let mut context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
                     track
                         .words
                         .iter()
@@ -1399,6 +1413,11 @@ impl Validator {
                         .map(|w| w.text.as_str())
                         .collect()
                 });
+                if draft.cause == Cause::Refined {
+                    if let Some(hypothesis) = word.refine_hypothesis {
+                        context.push(hypothesis);
+                    }
+                }
                 draft.trace = Some(TextTrace::new(
                     &word.text,
                     &word.confidences,
@@ -1635,6 +1654,7 @@ impl Validator {
                     track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     word.end_ts = *sample_ts;
+                    word.decoded_wpm = track.wpm;
                     // MAN-207 D6: the previous word's `ends_turn` is final
                     // once a later word is pushed.
                     word.episode = track
@@ -6082,6 +6102,24 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             spots[0].sample_ts, 1_768_800,
             "the spot carries the later repetition's RF time, not the first decode's"
         );
+    }
+
+    #[test]
+    fn refine_candidates_are_read_only_and_expire_at_the_lookback() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let before = v.gate.counted_total();
+        let observations = v.observations().iter().count();
+        let candidates = v.refine_candidates(v.now_ts, 10 * FS as u64);
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .windows(2)
+            .all(|c| (c[0].track_id, c[0].word_seq) < (c[1].track_id, c[1].word_seq)));
+        assert_eq!(v.gate.counted_total(), before);
+        assert_eq!(v.observations().iter().count(), observations);
+        assert!(v
+            .refine_candidates(v.now_ts + 11 * FS as u64, 10 * FS as u64)
+            .is_empty());
     }
 
     #[test]

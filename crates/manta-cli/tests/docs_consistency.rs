@@ -4013,3 +4013,26 @@ fn public_docs_name_no_internal_machine() {
         found.join("\n")
     );
 }
+
+#[test]
+fn docs_consistency_lists_refine_options() {
+    let config = doc("docs/CONFIG.md");
+    let defaults = manta_decode::decoder::RefineConfig::default();
+    for setting in [
+        format!("enabled = {}", defaults.enabled),
+        format!("lookback_secs = {:.1}", defaults.lookback_secs),
+        format!(
+            "max_refinements_per_episode = {}",
+            defaults.max_refinements_per_episode
+        ),
+        format!("replay_hops_per_batch = {}", defaults.replay_hops_per_batch),
+        format!("backlog = {}", defaults.backlog),
+    ] {
+        assert!(
+            config.contains(&setting),
+            "missing config default: {setting}"
+        );
+    }
+    assert!(doc("ARCHITECTURE.md").contains("TrackManager::refine_step"));
+    assert!(doc("README.md").contains("[decode.refine]"));
+}
