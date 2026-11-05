@@ -828,6 +828,7 @@ the measured best values.
 | `spectral_min_bias_db` | `1.5` | live: edge-legacy and hsmm; not `oracle` | Neighbouring-channel noise correction, dB. |
 | `spectral_beta` | `0.5` | live: edge-legacy and hsmm; not `oracle` | Weight of the neighbouring-channel noise estimate; 0 or more. |
 | `refine_bw_hz` | `0.0` | live: every engine; not `oracle` | Narrowband refiner bandwidth before decoding, Hz; 0 or more, and `0` turns it off. The track manager applies it, and `oracle` decodes without one. |
+| `refine` | `{ enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }` | every engine | Delayed refinement of ambiguous decodes, as the `[decode.refine]` sub-table; an absent sub-table means these documented defaults, and `enabled = false` restores the pure causal baseline. |
 | `dur_sigma` | `0.22` | live: hsmm only | Element-length tolerance; at least 0.001. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
 | `mark_insert_penalty` | `-1.5` | live: hsmm only | Penalty against reading noise as an extra element. |
 | `beam` | `12` | live: hsmm only | Hypotheses kept per step; at least 1. |

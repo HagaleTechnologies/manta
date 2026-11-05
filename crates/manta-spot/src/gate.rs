@@ -520,6 +520,23 @@ pub struct RepetitionGate {
     /// counts over `REPETITION_BUCKETS` (`le`-inclusive, last slot the
     /// overflow), plus their sum. See `repetition_counts`.
     repetitions: RepetitionCounts,
+    /// MAN-208: refinements whose source occurrence was no longer held by
+    /// its entry (expired, swept, or never counted under that call). A
+    /// lost source touch makes `move_occurrence` an idempotent no-op, and
+    /// each one is counted here rather than silently dropped
+    /// (ARCHITECTURE §8: no silent loss).
+    lost_moves: u64,
+}
+
+/// MAN-208: where a refined candidate's repetition support stands after a
+/// refinement, read without recording anything.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SupportSnapshot {
+    /// The message-distinct occurrences still inside the window -- the
+    /// count a fresh `record` of this call would return.
+    pub counted: Vec<GateOccurrence>,
+    /// Every accepted occurrence still inside the window, counted or not.
+    pub accepted: Vec<GateOccurrence>,
 }
 
 /// MAN-118: upper bounds of the `manta_candidate_repetitions` histogram's
@@ -557,6 +574,7 @@ impl RepetitionGate {
             seen: BTreeMap::new(),
             records_total: 0,
             repetitions: RepetitionCounts::default(),
+            lost_moves: 0,
         }
     }
 
@@ -1059,6 +1077,163 @@ impl RepetitionGate {
             promote_orphaned_leader(&mut entry.accepted);
             !entry.accepted.is_empty() || !entry.last_seen_by_track.is_empty()
         });
+    }
+
+    /// MAN-208: moves one counted occurrence of `from` -- the touch whose
+    /// span is exactly `span` on `track_id` -- to `to`'s entry, keeping the
+    /// same bucket and anchor frequency so the support stays on the same
+    /// signal. A refinement is a re-decode of the SAME samples
+    /// (`ObservationLog::revise`'s "a re-decode adds no repetition"
+    /// contract): the occurrence's repetition support MOVES to the refined
+    /// call, it is never duplicated, and the losing call loses it. The
+    /// moved touch keeps its own `message_distinct` verdict (frozen once by
+    /// `classify_new_occurrence`, never re-derived -- see `accepted`'s
+    /// doc), and its span moves with it so a later touch of the same
+    /// samples under either call never counts again (the rule at `spans`).
+    ///
+    /// Returns whether the source touch was still retained; a lost source
+    /// touch (expired, swept, or never counted under `from`) is an
+    /// idempotent no-op counted in `lost_moves`, never an invented count.
+    pub fn move_occurrence(
+        &mut self,
+        from: &str,
+        to: &str,
+        track_id: u32,
+        span: (u64, u64),
+    ) -> bool {
+        let span = (span.0.min(span.1), span.1);
+        // Find the entry holding this occurrence: a `from` entry whose
+        // `spans` list holds exactly this span (the span is the occurrence's
+        // identity under MAN-200 D2) and whose `accepted` list still holds
+        // the touch. BTreeMap order makes the search deterministic.
+        let mut source_key = None;
+        let mut touch = None;
+        for (key, entry) in self.seen.iter() {
+            if key.1 != from
+                || !entry
+                    .spans
+                    .iter()
+                    .any(|&(s, e, _)| s == span.0 && e == span.1)
+            {
+                continue;
+            }
+            if let Some(found) = entry
+                .accepted
+                .iter()
+                .copied()
+                .find(|&(ts, _, tid, _, _)| tid == track_id && ts == span.1)
+            {
+                source_key = Some(key.clone());
+                touch = Some(found);
+                break;
+            }
+        }
+        let (Some(key), Some(found)) = (source_key, touch) else {
+            self.lost_moves += 1;
+            return false;
+        };
+        let (anchor_freq_hz, anchor_ts) = {
+            let entry = self.seen.get(&key).expect("key just found");
+            (entry.anchor_freq_hz, found.4)
+        };
+        {
+            let entry = self.seen.get_mut(&key).expect("key just found");
+            entry.accepted.retain(|&t| t != found);
+            entry
+                .spans
+                .retain(|&(s, e, _)| !(s == span.0 && e == span.1));
+        }
+        let dest_key = (key.0, to.to_string());
+        let dest = self
+            .seen
+            .entry(dest_key)
+            .or_insert_with(|| GateEntry::new(anchor_freq_hz));
+        dest.accepted.push(found);
+        dest.spans.push((span.0, span.1, anchor_ts));
+        true
+    }
+
+    /// MAN-208: the occurrences `callsign`'s entry holds at `freq_hz`,
+    /// pruned to the window ending at `now_ts`, without recording
+    /// anything. Entry selection mirrors `record`'s (home bucket first,
+    /// then the freshest adjacent-bucket neighbor within one channel), so
+    /// the snapshot reads the entry a fresh decode would have joined.
+    pub fn support_snapshot(
+        &self,
+        freq_hz: f64,
+        callsign: &str,
+        now_ts: u64,
+    ) -> Option<SupportSnapshot> {
+        if !freq_hz.is_finite() {
+            return None;
+        }
+        let cutoff = now_ts.saturating_sub(self.window_samples);
+        let b = bucket(freq_hz);
+        let home_key = (b, callsign.to_string());
+        let mut entry = self.seen.get(&home_key);
+        if entry.is_none() {
+            let matched = (b - 1..=b + 1)
+                .filter(|&candidate| candidate != b)
+                .map(|candidate| (candidate, callsign.to_string()))
+                .filter_map(|k| {
+                    let neighbor = self.seen.get(&k)?;
+                    if (freq_hz - neighbor.anchor_freq_hz).abs() >= SAME_SIGNAL_MAX_HZ {
+                        return None;
+                    }
+                    neighbor.most_recent().map(|ts| (k, ts))
+                })
+                .max_by_key(|(_, ts)| *ts);
+            entry = matched.and_then(|(k, _)| self.seen.get(&k));
+        }
+        entry.map(|e| SupportSnapshot {
+            counted: e
+                .accepted
+                .iter()
+                .filter(|&&(ts, ..)| ts >= cutoff)
+                .filter(|&&(_, _, _, distinct, _)| distinct)
+                .map(|&(sample_ts, word_seq, track_id, _, _)| GateOccurrence {
+                    track_id,
+                    word_seq,
+                    sample_ts,
+                    message_distinct: true,
+                })
+                .collect(),
+            accepted: e
+                .accepted
+                .iter()
+                .filter(|&&(ts, ..)| ts >= cutoff)
+                .map(
+                    |&(sample_ts, word_seq, track_id, message_distinct, _)| GateOccurrence {
+                        track_id,
+                        word_seq,
+                        sample_ts,
+                        message_distinct,
+                    },
+                )
+                .collect(),
+        })
+    }
+
+    /// See `lost_moves`' doc.
+    pub fn lost_moves(&self) -> u64 {
+        self.lost_moves
+    }
+
+    /// MAN-208: the total number of message-distinct occurrences held
+    /// across every entry -- the conservation quantity a refinement must
+    /// preserve (moves support, never adds it). Entries are pruned lazily,
+    /// so this counts what the entries currently hold, exactly as a fresh
+    /// `record` on each would see.
+    pub fn counted_total(&self) -> usize {
+        self.seen
+            .values()
+            .map(|e| {
+                e.accepted
+                    .iter()
+                    .filter(|&&(_, _, _, counted, _)| counted)
+                    .count()
+            })
+            .sum()
     }
 }
 

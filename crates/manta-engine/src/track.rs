@@ -2392,6 +2392,10 @@ pub struct TrackManager {
     /// MAN-199: per channel, the last hop at which a track centred there
     /// queued decoder input. A lead-in starts after it.
     last_fed_hop: Vec<Option<u64>>,
+    /// MAN-208: per-track retained decoder inputs for refinement replay.
+    refine_buf: crate::refine::RefineBuffers,
+    /// MAN-208: the deterministic, budget-bounded refinement scheduler.
+    refine: crate::refine::RefineScheduler,
 }
 
 /// MAN-312 (SPEC §2.7): the channels inside `rf_passband_hz` with one
@@ -2489,6 +2493,8 @@ impl TrackManager {
         detector_cfg: DetectorConfig,
         decode_cfg: DecodeConfig,
     ) -> Self {
+        let refine_buf = crate::refine::RefineBuffers::new(&decode_cfg.refine);
+        let refine = crate::refine::RefineScheduler::new(&decode_cfg, fs);
         TrackManager {
             floor: FloorBank::new(n_channels),
             gate: Gate::new(
@@ -2555,6 +2561,8 @@ impl TrackManager {
                 .then(|| CoModDetector::new(n_channels)),
             comod_snr_buf: Vec::with_capacity(n_channels),
             confirmations: 0,
+            refine_buf,
+            refine,
         }
     }
 
@@ -4092,6 +4100,8 @@ impl TrackManager {
         let Some(mut track) = self.tracks.remove(&id) else {
             return (None, Vec::new());
         };
+        // MAN-208: the track's retained replay inputs leave with it.
+        self.refine_buf.drop_track(id);
         // MAN-171: a track that ran the full GC window with zero decoded
         // characters is very likely a stationary artifact (birdie/spur),
         // not real CW -- bar its channels from immediately re-spawning a
@@ -4428,6 +4438,24 @@ impl TrackManager {
             }
         }
         self.input_gap_hops.push_back(first_hop);
+        // MAN-208: no hop recorded before an unknown-length loss is
+        // contiguous with what follows, for any track's refinement replay.
+        self.refine_buf.break_at_input_gap();
+    }
+
+    /// MAN-208: one refinement scheduler pass after a batch's decoder
+    /// events reached the validator. Returns any spots the pass rescued;
+    /// `now_ts` is the stream sample position at the pass (the rescued
+    /// decisions' availability time). A no-op returning nothing while
+    /// `[decode.refine] enabled = false`.
+    pub fn refine_step(
+        &mut self,
+        validator: &mut manta_spot::Validator,
+        now_ts: u64,
+    ) -> Vec<manta_spot::Spot> {
+        let decode_cfg = self.decode_cfg.clone();
+        self.refine
+            .step(&mut self.refine_buf, validator, &decode_cfg, now_ts)
     }
 
     /// MAN-199: replay `depth` recorded hops at each lease instead of
@@ -4556,6 +4584,28 @@ impl TrackManager {
     fn drain_pool(&mut self) -> Vec<DecoderEvent> {
         use rayon::prelude::*;
         let quality = self.quality.as_deref();
+        // MAN-208: the entries about to reach a decoder are exactly the
+        // observations a refinement replay needs -- record them (by
+        // track_id; `values_mut` below loses the key) before the parallel
+        // pass consumes them. Retention is off at `lookback_secs == 0`.
+        if self.decode_cfg.refine.enabled && self.decode_cfg.refine.lookback_secs > 0.0 {
+            let feed: Vec<(u32, crate::refine::ReplayEntry)> = self
+                .tracks
+                .iter()
+                .filter(|(_, t)| t.decoder.is_some())
+                .flat_map(|(id, t)| {
+                    t.pending.iter().map(move |e| {
+                        (
+                            *id,
+                            crate::refine::replay_entry((e.0, e.1, e.2, e.3, e.4, e.5, false)),
+                        )
+                    })
+                })
+                .collect();
+            for (id, entry) in feed {
+                self.refine_buf.record(id, entry);
+            }
+        }
         let mut events: Vec<DecoderEvent> = self
             .tracks
             .values_mut()
@@ -4705,9 +4755,10 @@ pub(crate) fn first_hop_after_gap(data_pos: u64, hop: u64) -> u64 {
 /// every `TrackMeta` ahead of its *entire* emitting batch, including
 /// earlier-hop `CharDecoded`/`WordBoundary` events from the same batch, so
 /// a just-reset/just-reported SNR value could retroactively attach to
-/// characters decoded before it -- with the magnitude depending on the
-/// caller's chunk size (`decode_samples` vs. `listen`/`soak_metrics`)).
-fn event_sample_ts(e: &DecoderEvent) -> u64 {
+/// characters decoded before it -- with the magnitude of the error
+/// depending on the caller's chunk size (`decode_samples` vs.
+/// `listen`/`soak_metrics`)).
+pub(crate) fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }

@@ -603,10 +603,18 @@ fn settle_lookups(
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
+    tm: Option<&mut crate::track::TrackManager>,
     ctx: &mut EmitCtx<'_>,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
 ) {
+    // MAN-208: the batch's stream position -- the rescued decisions'
+    // availability time, later than the RF time of anything they rescue.
+    let now_ts = events
+        .iter()
+        .map(crate::track::event_sample_ts)
+        .max()
+        .unwrap_or(0);
     // MAN-324: record decisions only while the live stream has a
     // subscriber, so an idle listener allocates nothing per decision.
     if let Some(tap) = ctx.live.as_ref() {
@@ -652,6 +660,18 @@ fn emit(
     // with their decisions, after the batch's own.
     for spot in validator.poll_lookups() {
         on_spot(&spot);
+    }
+    // MAN-208: the deterministic, budget-bounded refinement pass for this
+    // batch: re-run preserved observations of admitted ambiguous episodes
+    // under an alternate configuration and route any rescue through the
+    // same spot sink. Same single-ownership point as the `ingest` loop
+    // above; a no-op while `[decode.refine] enabled = false` (and not yet
+    // wired on the multi-input batch path, which owns its track managers
+    // per input elsewhere -- recorded as this ticket's known gap).
+    if let Some(tm) = tm {
+        for spot in tm.refine_step(validator, now_ts) {
+            on_spot(&spot);
+        }
     }
     if let Some(tap) = ctx.live.as_mut() {
         tap.decisions(validator.take_decisions());
@@ -962,6 +982,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -989,6 +1010,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1044,6 +1066,7 @@ pub fn listen_with_observers(
                 emit(
                     events,
                     &mut validator,
+                    Some(&mut seg.tm),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
@@ -1073,6 +1096,7 @@ pub fn listen_with_observers(
                 emit(
                     finish_events,
                     &mut validator,
+                    Some(&mut seg.tm),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
@@ -1113,6 +1137,7 @@ pub fn listen_with_observers(
             emit(
                 finish_events,
                 &mut validator,
+                Some(&mut seg.tm),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1158,6 +1183,7 @@ pub fn listen_with_observers(
             emit(
                 events,
                 &mut validator,
+                Some(&mut seg.tm),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1185,6 +1211,7 @@ pub fn listen_with_observers(
         emit(
             events,
             &mut validator,
+            Some(&mut seg.tm),
             &mut ctx,
             &mut on_event,
             &mut on_spot,
@@ -1227,6 +1254,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1379,6 +1407,7 @@ impl<'a> Back<'a> {
         emit(
             batch.events,
             &mut self.validator,
+            None,
             &mut self.ctx,
             on_event,
             on_spot,
@@ -1438,6 +1467,7 @@ impl<'a> Back<'a> {
             emit(
                 events,
                 &mut self.validator,
+                None,
                 &mut self.ctx,
                 on_event,
                 on_spot,

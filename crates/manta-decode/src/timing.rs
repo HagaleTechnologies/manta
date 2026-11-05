@@ -406,6 +406,28 @@ impl SpeedTracker {
             .map(|r| r.clamp(RATIO_MIN, RATIO_MAX));
     }
 
+    /// MAN-208: seed the mark clusters from an explicit WPM estimate
+    /// before any mark is observed, so a refinement replay under a
+    /// timing-hypothesis configuration classifies runs against the seeded
+    /// scale instead of bootstrapping from its own first five marks. A
+    /// no-op once the tracker is ready (the sender's own marks always win)
+    /// or for a non-finite estimate; the dit period is clamped to SPEC
+    /// §4.1's 60..8 WPM range, `mu_dah` to the ideal 3:1 ratio. The seed
+    /// makes `ready()` true with `confirmed` clusters, exactly as a
+    /// completed bootstrap would -- it invents no marks, only the scale.
+    pub fn seed_wpm(&mut self, wpm: f32) {
+        if self.pair.ready() || !wpm.is_finite() || wpm <= 0.0 {
+            return;
+        }
+        let dit = (1200.0 / wpm).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1);
+        self.pair.lo = dit;
+        self.pair.hi = 3.0 * dit;
+        self.pair.ready = true;
+        self.pair.confirmed = true;
+        self.pair.lo_n = 1;
+        self.wpm_ema = Some(1200.0 / dit);
+    }
+
     /// The mark-scale generation, bumped by a drift re-init (MAN-315 D7).
     pub fn regime(&self) -> u32 {
         self.regime

@@ -73,6 +73,86 @@ pub struct DecodeConfig {
     /// MAN-112 experimental Rust-only decoder frontend. Not a TOML option;
     /// promotion requires the carrier-offset and neighboring-signal gates.
     pub steered_frontend: bool,
+    /// MAN-208: the `[decode.refine]` table -- the deterministic,
+    /// budget-bounded delayed-refinement scheduler's tunables. Carried on
+    /// `DecodeConfig` so every consumer of a decoded `[decode]` table (the
+    /// engine's listen loop above all) sees the same refinement budgets.
+    pub refine: RefineConfig,
+}
+
+/// MAN-208: the `[decode.refine]` table's runtime form. A refinement
+/// re-runs a track's PRESERVED decoder inputs for a genuinely ambiguous,
+/// promising episode under an alternate configuration, inside fixed
+/// budgets -- admission and ordering are sample/operation counts, never
+/// wall clock, so identical input explores an identical hypothesis set on
+/// any hardware. `enabled = false` restores the pure causal baseline:
+/// no retention, no replay, byte-identical output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefineConfig {
+    /// `false`: no retention, no replay, baseline output.
+    pub enabled: bool,
+    /// Per-track retained hops for refinement, in seconds. The decision
+    /// record's experiment range is 4..=10 s; 0 disables retention.
+    pub lookback_secs: f64,
+    /// Refinement cap per episode (the decision record's experimental cap).
+    pub max_refinements_per_episode: u32,
+    /// Re-decode work per input batch, in hops (~4 s at 375 hops/s).
+    pub replay_hops_per_batch: u32,
+    /// Queued episodes; overflow drops deterministically (oldest first)
+    /// and is counted.
+    pub backlog: usize,
+}
+
+impl Default for RefineConfig {
+    fn default() -> Self {
+        RefineConfig {
+            enabled: true,
+            lookback_secs: 10.0,
+            max_refinements_per_episode: 2,
+            replay_hops_per_batch: 1500,
+            backlog: 16,
+        }
+    }
+}
+
+impl RefineConfig {
+    /// The lookback in whole hops at the engine's 375 hops/s rate.
+    pub fn lookback_hops(&self) -> usize {
+        (self.lookback_secs * 375.0).round() as usize
+    }
+
+    /// Range-checks the table, in the repo's unchanged error style. `Ok`
+    /// for the defaults and for every legal override; the note names the
+    /// offending key and its legal range.
+    pub fn validate(&self) -> Result<(), String> {
+        let lookback_ok = self.lookback_secs == 0.0
+            || (self.lookback_secs.is_finite() && (4.0..=10.0).contains(&self.lookback_secs));
+        if !self.lookback_secs.is_finite() || !lookback_ok {
+            return Err(format!(
+                "invalid value: decode.refine.lookback_secs = {}\n  note: must be 0 (off) or 4.0..=10.0 seconds",
+                self.lookback_secs
+            ));
+        }
+        if !(1..=4).contains(&self.max_refinements_per_episode) {
+            return Err(format!(
+                "invalid value: decode.refine.max_refinements_per_episode = {}\n  note: must be in 1..=4",
+                self.max_refinements_per_episode
+            ));
+        }
+        if !(1..=15_000).contains(&self.replay_hops_per_batch) {
+            return Err(format!(
+                "invalid value: decode.refine.replay_hops_per_batch = {}\n  note: must be in 1..=15000",
+                self.replay_hops_per_batch
+            ));
+        }
+        if !(1..=256).contains(&self.backlog) {
+            return Err(format!(
+                "invalid value: decode.refine.backlog = {}\n  note: must be in 1..=256",
+                self.backlog
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Manual impl: a derived Default would zero flush_gap_dits.
@@ -93,6 +173,7 @@ impl Default for DecodeConfig {
             hsmm: HsmmConfig::default(),
             refine_bw_hz: 0.0,
             steered_frontend: false,
+            refine: RefineConfig::default(),
         }
     }
 }
@@ -321,6 +402,16 @@ impl TrackDecoder {
     /// (MAN-102 review round 2, finding 2).
     pub fn hop_count(&self) -> u64 {
         self.hop_count
+    }
+
+    /// MAN-208: seeds the speed tracker with an explicit WPM estimate
+    /// before the first hop, so a refinement replay under a
+    /// timing-hypothesis configuration starts from the seeded scale
+    /// instead of the bootstrap (see `SpeedTracker::seed_wpm`). A no-op
+    /// once marks have made the tracker ready: the sender's own marks
+    /// always outrank the seed.
+    pub fn set_initial_wpm(&mut self, wpm: f32) {
+        self.tracker.seed_wpm(wpm);
     }
 
     /// MAN-202: how many unknown input gaps `note_input_gap` has applied to
@@ -4380,5 +4471,76 @@ mod tests {
         assert_eq!(alone.trim(), "CQ DE W1AW");
         let led = text(&mut TrackDecoder::new(1, DecodeConfig::default()), 120);
         assert_eq!(led, alone);
+    }
+
+    // ---- MAN-208: deterministic scratch replay and the speed seed ----
+
+    /// A refinement replay: a fresh `TrackDecoder` fed the same recorded
+    /// envelope, optionally under a seeded speed hypothesis.
+    fn replay_events(seed_wpm: Option<f32>, dit_hops: u32) -> Vec<DecoderEvent> {
+        let mut decoder = TrackDecoder::new(9, DecodeConfig::default());
+        if let Some(wpm) = seed_wpm {
+            decoder.set_initial_wpm(wpm);
+        }
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope("CQ DE W1AW K", dit_hops)
+            .into_iter()
+            .enumerate()
+        {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        events
+    }
+
+    #[test]
+    fn replay_of_the_same_hops_is_event_identical() {
+        let a = serde_json::to_vec(&replay_events(None, 23)).unwrap();
+        let b = serde_json::to_vec(&replay_events(None, 23)).unwrap();
+        assert_eq!(
+            a, b,
+            "two fresh decoders on the same hops must agree exactly"
+        );
+        let seeded_a = serde_json::to_vec(&replay_events(Some(25.0), 23)).unwrap();
+        let seeded_b = serde_json::to_vec(&replay_events(Some(25.0), 23)).unwrap();
+        assert_eq!(seeded_a, seeded_b, "a seeded replay is deterministic too");
+    }
+
+    #[test]
+    fn replayed_events_carry_the_preserved_sample_ts() {
+        let hops = rect_envelope("CQ DE W1AW K", 23);
+        let last_ts = (hops.len() as u64 - 1) * 256;
+        let events = replay_events(None, 23);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::WordBoundary { .. })));
+        for event in &events {
+            match event {
+                DecoderEvent::CharDecoded { sample_ts, .. }
+                | DecoderEvent::WordBoundary { sample_ts, .. } => {
+                    assert_eq!(sample_ts % 256, 0, "hop-aligned RF time, got {sample_ts}");
+                    assert!(
+                        *sample_ts <= last_ts,
+                        "replayed event at {sample_ts} beyond the preserved hops ({last_ts})"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn a_seeded_wpm_changes_timing_hypotheses_deterministically() {
+        // A fixture whose true speed (24 ms dits, ~50 WPM) differs from the
+        // seeded 25 WPM hypothesis: the seeded replay must be stable across
+        // runs and must differ from the unseeded bootstrap's reading.
+        let seeded_1 = serde_json::to_vec(&replay_events(Some(25.0), 9)).unwrap();
+        let seeded_2 = serde_json::to_vec(&replay_events(Some(25.0), 9)).unwrap();
+        assert_eq!(seeded_1, seeded_2, "the seeded hypothesis is deterministic");
+        let unseeded = serde_json::to_vec(&replay_events(None, 9)).unwrap();
+        assert_ne!(
+            seeded_1, unseeded,
+            "a seed off the true speed must change the timing reading"
+        );
     }
 }
