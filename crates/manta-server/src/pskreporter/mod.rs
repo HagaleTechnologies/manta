@@ -51,7 +51,7 @@ use crate::bus::{BusSpot, SpotBus};
 use crate::config::UplinkSpotTypes;
 use crate::metrics::PskReporterStats;
 use crate::rbn_compare::Clock;
-use batch::{Batcher, Datagram, Offer, FLUSH_INTERVAL};
+use batch::{Batcher, Datagram, Offer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +72,10 @@ pub struct PskReporter {
     /// Added to the first flush (D5), so stations started together do not
     /// send together.
     pub flush_offset: Duration,
+    /// How often a flush is due; the page's rule is 300 s
+    /// ([`batch::FLUSH_INTERVAL`]). Tests shorten it: they pace a real
+    /// socket in real time, which a paused clock cannot (MAN-478, MAN-506).
+    pub flush_interval: Duration,
     /// The header's observation domain ID (D7).
     pub observation_domain: u32,
 }
@@ -216,7 +220,7 @@ pub async fn run(
         warned_resolve: false,
         warned_send: false,
     };
-    let mut next_flush = Instant::now() + FLUSH_INTERVAL + cfg.flush_offset;
+    let mut next_flush = Instant::now() + cfg.flush_interval + cfg.flush_offset;
     loop {
         if *shutdown.borrow() {
             break;
@@ -228,7 +232,7 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep_until(next_flush) => {
-                next_flush += FLUSH_INTERVAL;
+                next_flush += cfg.flush_interval;
                 while let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
                     deliver(&mut batcher, &mut sender, d).await;
                 }
@@ -256,6 +260,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pskreporter::batch::FLUSH_INTERVAL;
     use manta_spot::{Spot, SpotType};
     use std::time::UNIX_EPOCH;
     use tokio::net::UdpSocket;
@@ -336,6 +341,7 @@ mod tests {
                     receiver: receiver(),
                     spot_types: UplinkSpotTypes::CqBeacon,
                     flush_offset: OFFSET,
+                    flush_interval: batch::FLUSH_INTERVAL,
                     observation_domain: 0x1234_ABCD,
                 },
                 socket,

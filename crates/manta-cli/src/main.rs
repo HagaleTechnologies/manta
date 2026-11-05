@@ -5320,6 +5320,7 @@ fn start_spot_server(
                         },
                         spot_types: p.spot_types,
                         flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        flush_interval: manta_server::pskreporter::batch::FLUSH_INTERVAL,
                         observation_domain: manta_server::pskreporter::observation_domain(nonce),
                     },
                     socket,
