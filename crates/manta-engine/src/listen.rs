@@ -509,8 +509,13 @@ fn new_segment(
     occupancy: bool,
     spectrum: Option<&SpectrumFeed>,
 ) -> Result<Segment> {
-    let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // MAN-203: the configured input-conditioning chain (off by default).
+    let ch = manta_dsp::channelizer::Channelizer::with_conditioning(
+        fs,
+        center_freq_hz,
+        &cfg.conditioning,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);

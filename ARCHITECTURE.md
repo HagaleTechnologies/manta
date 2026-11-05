@@ -204,6 +204,17 @@ remainders. Acquisition timing is captured at the radio's start command;
 buffered samples and discarded old-generation samples are accounted for once.
 See `docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md`.
 
+**Input conditioning** (MAN-203): `manta-dsp::condition` is an optional chain
+the channelizer runs on each new sample right after the MAN-234 sample guard
+(SPEC §1.3 step 0a), set by `PipelineConfig::conditioning`. Each stage is off
+(the default, bit-identical to no chain), observe or apply, records the
+samples it touched as spans with counters, and has an exact inverse. The
+stages are impulse suppression (isolated runs of up to 4 samples repaired by
+interpolation, with a 21-sample lookahead the channelizer's window watermark
+honours) and then DC removal (a 5 Hz blocker); `check` never conditions, so
+it reports the raw receiver. See
+`docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md`.
+
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as
 `manta-input::DecimatingSource`) sits between a live `IqSource` and the
