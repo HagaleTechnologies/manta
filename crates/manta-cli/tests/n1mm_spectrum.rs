@@ -212,10 +212,23 @@ fn frames_closer_than_100_ms_are_rate_limited() {
     assert_eq!(stats.dropped(SpectrumDrop::QueueFull), 0);
     // Real time, not paused time (MAN-478).
     std::thread::sleep(Duration::from_millis(150));
-    sender.offer(frame(14_000_000.0, 4));
-    // Receipt proves this frame was handed to the OS at least MIN_INTERVAL
-    // after the burst, whatever order the counters settle in.
-    n1mm.recv();
+    // A stretched burst may have sent a second datagram the recv above did
+    // not consume, so it still sits in the socket buffer. Give this frame
+    // contents no burst frame has and receive until it arrives: only its
+    // receipt proves transmission resumed at least MIN_INTERVAL after the
+    // burst, rather than a stale burst datagram (PR 515 review).
+    sender.offer(frame(14_000_050.0, 4));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = n1mm.recv();
+        if got.low_khz == 14_000.05 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the post-interval frame within 5 s; last received {got:?}"
+        );
+    }
 }
 
 #[test]
