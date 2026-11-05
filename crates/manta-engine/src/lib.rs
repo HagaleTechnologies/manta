@@ -404,6 +404,7 @@ impl ConditioningReport {
                 stage: match s.stage {
                     Stage::Impulse => "impulse",
                     Stage::Dc => "dc",
+                    Stage::Iq => "iq",
                 }
                 .to_string(),
                 mark: match s.mark {
@@ -735,8 +736,9 @@ pub fn decode_source_observed(
     let mut bad_samples = 0u64;
     // MAN-496: the conditioning report exists only when a stage is on; each
     // segment's log folds in as it closes, like `bad_samples`.
-    let mut input_conditioning =
-        (!cfg.conditioning.is_off()).then(|| ConditioningReport::for_config(&cfg.conditioning));
+    let mut input_conditioning = (cfg.conditioning.impulse != manta_dsp::condition::StageMode::Off
+        || cfg.conditioning.dc != manta_dsp::condition::StageMode::Off)
+        .then(|| ConditioningReport::for_config(&cfg.conditioning));
     let mut note_conditioning = |seg: &OfflineSegment| {
         if let (Some(report), Some(log)) = (input_conditioning.as_mut(), seg.ch.conditioning()) {
             report.add(log);
@@ -1297,6 +1299,7 @@ mod tests {
         let cfg = ConditioningConfig {
             impulse: StageMode::Apply,
             dc: StageMode::Apply,
+            ..Default::default()
         };
         let conditioned = |samples: &[Complex32]| -> InputConditioner {
             let mut c = InputConditioner::new(96_000.0, &cfg).expect("a stage is on");

@@ -141,13 +141,13 @@ pub type InputOpener = Box<dyn FnOnce() -> Result<Box<dyn IqSource>> + Send>;
 
 /// One input to open.
 pub struct InputSpec {
+    /// Fixed conditioning for this receiver, never borrowed from another input.
+    pub conditioning: crate::ConditioningConfig,
     /// The input's `[[input]]` name: thread name, log and error text.
     pub name: String,
     pub open: InputOpener,
     /// This input's receiver correction (D4).
     pub freq_correction_ppm: f64,
-    /// This input's conditioning, overriding the shared pipeline setting.
-    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub observers: InputObservers,
     /// MAN-310: this input's share of a split band plan, Hz from its
     /// centre (an edge may be infinite); `None`: its whole band. Narrows
@@ -245,7 +245,7 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
-    conditioning: Vec<manta_dsp::condition::ConditioningConfig>,
+    conditioning: Vec<crate::ConditioningConfig>,
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -492,11 +492,10 @@ pub fn listen_inputs(
             Outbox::Replay(tx)
         };
         let fs = opened.inputs[index].sample_rate_hz;
+        let mut input_cfg = cfg.clone();
+        input_cfg.conditioning = opened.conditioning[index].clone();
         let go = Go {
-            cfg: PipelineConfig {
-                conditioning: opened.conditioning[index].clone(),
-                ..cfg.clone()
-            },
+            cfg: input_cfg,
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],
