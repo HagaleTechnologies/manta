@@ -2282,6 +2282,12 @@ pub struct TrackManager {
     channel_spacing_hz: f64,
     /// Issue #26: per-`CloseReason` close counts, read via `close_counts`.
     close_counts: CloseCounts,
+    /// MAN-198: the loss funnel's trace; `None` (the default) records
+    /// nothing.
+    funnel: Option<std::sync::Arc<crate::funnel::FunnelTrace>>,
+    /// MAN-198: the current hop's `sample_ts`, kept only while `funnel` is
+    /// set, for close records made outside `step_hop`'s own scope.
+    funnel_ts: u64,
     /// MAN-171: channel -> hop_counter before which a new CANDIDATE may not
     /// spawn on that channel, set on a `CloseReason::Silent` closure (see
     /// `DetectorConfig::silent_respawn_cooldown_hops`). `0` (the default,
@@ -2503,6 +2509,8 @@ impl TrackManager {
             center_freq_hz,
             channel_spacing_hz: fs / n_channels as f64,
             close_counts: CloseCounts::default(),
+            funnel: None,
+            funnel_ts: 0,
             channel_cooldown_until: vec![0; n_channels],
             preroll_hops: 0,
             quality: None,
@@ -3030,6 +3038,9 @@ impl TrackManager {
         Vec<DecoderEvent>,
     ) {
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
+        if self.funnel.is_some() {
+            self.funnel_ts = sample_ts;
+        }
         assert_eq!(
             hop.power.len(),
             self.n_channels(),
@@ -3364,13 +3375,19 @@ impl TrackManager {
                     unreachable!("DORMANT entry and wake are handled before this match")
                 }
                 LifecycleEvent::Closed(reason) => {
-                    self.close_counts.record(reason);
+                    self.note_close(id, reason);
                     close_reasons.insert(id, reason);
                     closed.push(id);
                 }
                 LifecycleEvent::Promoted => {
                     // MAN-313: every detector confirmation, qualified or not.
                     self.confirmations += 1;
+                    if let Some(trace) = &self.funnel {
+                        trace.push(crate::funnel::TrackTraceRecord::Confirmed {
+                            track_id: id,
+                            sample_ts,
+                        });
+                    }
                     // MAN-112: an isolated promotion re-seeds its centre from
                     // the confirm window's agreeing phase positions. A birth
                     // on the carrier's skirt channel more than 0.6 channel
@@ -3679,6 +3696,13 @@ impl TrackManager {
             let n = self.n_channels();
             for (&id, track) in &self.tracks {
                 if !close_reasons.contains_key(&id) && fsk.in_hard_span(track.owned(n)[1]) {
+                    if let Some(trace) = &self.funnel {
+                        trace.push(crate::funnel::TrackTraceRecord::Closed {
+                            track_id: id,
+                            sample_ts,
+                            reason: CloseReason::Rtty.into(),
+                        });
+                    }
                     self.close_counts.record(CloseReason::Rtty);
                     close_reasons.insert(id, CloseReason::Rtty);
                     closed.push(id);
@@ -3709,6 +3733,27 @@ impl TrackManager {
         // trusted band, in both the k and k+1 slots -- the same-hop
         // adjacent-rise arbitration must not route around the veto.
         // MAN-273: likewise the analytic front end's DC/Nyquist guard.
+        // MAN-198: a new condition here also belongs in
+        // `trace_spawn_vetoes`, or the funnel reports its refusals as noRise.
+        // Each channel's owner and, MAN-112, the scan's admission verdict
+        // for a rising one, taken before this hop's spawns move ownership.
+        // Only with a trace.
+        let before: Option<Vec<(Option<u32>, Option<crate::funnel::SpawnVeto>)>> =
+            self.funnel.as_ref().map(|_| {
+                (0..self.n_channels())
+                    .map(|k| {
+                        let veto = if rise[k] {
+                            self.admission_veto(
+                                k,
+                                self.spawn_phase_position(k, hop, prev_hop.as_ref()),
+                            )
+                        } else {
+                            None
+                        };
+                        (self.owner_of[k], veto)
+                    })
+                    .collect()
+            });
         if past_warmup && !suppress {
             let n = self.n_channels();
             let mut k = 0;
@@ -3744,14 +3789,19 @@ impl TrackManager {
                         }
                         // both channels claimed by this decision; skip past k+1
                         // next iteration so we don't re-evaluate it as its own birth.
-                        self.spawn_positioned(winner, hop, prev_hop.as_ref());
+                        let id = self.spawn_positioned(winner, hop, prev_hop.as_ref());
+                        self.trace_spawn(id, winner, sample_ts);
                         k += 2;
                         continue;
                     }
-                    self.spawn_positioned(winner, hop, prev_hop.as_ref());
+                    let id = self.spawn_positioned(winner, hop, prev_hop.as_ref());
+                    self.trace_spawn(id, winner, sample_ts);
                 }
                 k += 1;
             }
+        }
+        if let Some(before) = before {
+            self.trace_spawn_vetoes(&rise, &before, past_warmup, suppress, &hop.power, sample_ts);
         }
         self.recompute_ownership();
         // MAN-199: `close_track` maps each reason to its `ClosureKind`
@@ -3838,6 +3888,25 @@ impl TrackManager {
                 }))
     }
 
+    /// MAN-198: why `spawn_admits` refuses `k`, or `None` when it admits:
+    /// a non-isolated rise whose phase position is a far sidelobe, else a
+    /// channel a track owns without a split. Same conditions, same order.
+    fn admission_veto(&self, k: usize, position: Option<f64>) -> Option<crate::funnel::SpawnVeto> {
+        use crate::funnel::SpawnVeto as V;
+        if self.spawn_admits(k, position) {
+            return None;
+        }
+        let sidelobe = !self.birth_isolated(k)
+            && position.is_some_and(|pos| {
+                channel_distance(pos, k as f64, self.n_channels()) > CENTROID_OUTLIER_CH
+            });
+        Some(if sidelobe {
+            V::SidelobePosition
+        } else {
+            V::OwnedByTrack
+        })
+    }
+
     /// MAN-112: no open track's centre is within `ISOLATION_CH` of `k`.
     fn birth_isolated(&self, k: usize) -> bool {
         let n = self.n_channels();
@@ -3868,18 +3937,18 @@ impl TrackManager {
     /// Bootstrap identity from the same two gated complex observations used
     /// for spawn admission. An integer-bin seed can lock a straddling birth
     /// onto a neighbor's skirt before the slow centroid EMA settles.
-    fn spawn_positioned(&mut self, k: usize, hop: &HopOutput, prev: Option<&HopOutput>) {
+    fn spawn_positioned(&mut self, k: usize, hop: &HopOutput, prev: Option<&HopOutput>) -> u32 {
         let position = if self.birth_isolated(k) {
             None
         } else {
             self.spawn_phase_position(k, hop, prev)
         };
-        let id = self.next_id;
-        self.spawn(k);
+        let id = self.spawn(k);
         if let Some(position) = position {
             self.tracks.get_mut(&id).unwrap().center = position;
             self.recompute_ownership();
         }
+        id
     }
 
     /// Birth a new CANDIDATE track on `birth_channel`. Its `current_snr_db`
@@ -3890,7 +3959,7 @@ impl TrackManager {
     /// `current_snr_db` and would otherwise always prefer any already-driven
     /// track over one that (correctly, but only from next hop on) hasn't
     /// had `current_snr_db` populated yet.
-    fn spawn(&mut self, birth_channel: usize) {
+    fn spawn(&mut self, birth_channel: usize) -> u32 {
         let id = self.next_id;
         // MAN-13 (D3): step by the input's stride; on overflow the input
         // wraps to its own first id, never into another input's ids.
@@ -3917,12 +3986,101 @@ impl TrackManager {
             self.owner_of[ch] = Some(id);
         }
         self.tracks.insert(id, track);
+        id
+    }
+
+    /// MAN-198: the trace's candidate-birth record; nothing without a trace.
+    fn trace_spawn(&self, id: u32, birth_channel: usize, sample_ts: u64) {
+        if let Some(trace) = &self.funnel {
+            let n = self.n_channels();
+            trace.push(crate::funnel::TrackTraceRecord::Spawned {
+                track_id: id,
+                freq_hz: self.center_freq_hz
+                    + wrapped_channel_offset(birth_channel, n) * self.channel_spacing_hz,
+                sample_ts,
+            });
+        }
+    }
+
+    /// MAN-198: the trace's spawn-veto census, run after the spawn scan.
+    /// A rising channel a track born this hop claimed (its owner differs
+    /// from the owner in `before`) was the scan's to spawn, not a refusal.
+    /// `before` also carries the scan's admission verdict. Every
+    /// other rising channel failed a scan condition; this names one, source
+    /// masks first, then the scan's own order. Reads state only.
+    fn trace_spawn_vetoes(
+        &self,
+        rise: &[bool],
+        before: &[(Option<u32>, Option<crate::funnel::SpawnVeto>)],
+        past_warmup: bool,
+        suppress: bool,
+        power: &[f32],
+        sample_ts: u64,
+    ) {
+        use crate::funnel::SpawnVeto as V;
+        let Some(trace) = &self.funnel else {
+            return;
+        };
+        let n = self.n_channels();
+        let fs = self.channel_spacing_hz * n as f64;
+        let second = (sample_ts as f64 / fs) as u64;
+        let refused = (0..n)
+            .filter(|&k| rise[k] && self.owner_of[k] == before[k].0)
+            .filter_map(|k| {
+                let veto = if self.trusted_vetoes_spawn(k) {
+                    V::TrustedBand
+                } else if self.guard_vetoes_spawn(k) {
+                    V::AnalyticGuard
+                } else if self.digital_vetoes_spawn(k) {
+                    V::DigitalWindow
+                } else if self.mirror_vetoes_spawn(k, power) {
+                    V::MirrorImage
+                } else if !past_warmup {
+                    V::Warmup
+                } else if suppress {
+                    V::StaticCrash
+                } else if let Some(v) = before[k].1 {
+                    v
+                } else if self.spawn_window_cooling_down(k) {
+                    V::CoolingDown
+                } else if !self.is_local_peak(k) {
+                    V::NotLocalPeak
+                } else if self.rtty_vetoes_spawn(k) {
+                    V::Rtty
+                } else if self.comod_vetoes_spawn(k) {
+                    V::CoModulated
+                } else {
+                    return None;
+                };
+                let f =
+                    self.center_freq_hz + wrapped_channel_offset(k, n) * self.channel_spacing_hz;
+                Some((second, (f * 100.0).round() as i64, veto))
+            });
+        trace.vetoes(refused);
+    }
+
+    /// Counts one close and, MAN-198, traces it when a trace is set.
+    fn note_close(&mut self, id: u32, reason: CloseReason) {
+        self.close_counts.record(reason);
+        if let Some(trace) = &self.funnel {
+            trace.push(crate::funnel::TrackTraceRecord::Closed {
+                track_id: id,
+                sample_ts: self.funnel_ts,
+                reason: reason.into(),
+            });
+        }
+    }
+
+    /// MAN-198: attach (or, with `None`, detach) the loss funnel's write-only
+    /// trace. Decoding is unchanged either way.
+    pub fn set_funnel_trace(&mut self, trace: Option<std::sync::Arc<crate::funnel::FunnelTrace>>) {
+        self.funnel = trace;
     }
 
     /// MAN-199: close one track by `reason` through `Track::close`: the
     /// shared body of `step_hop`'s closures, `merge_converged` and
     /// `evict_over_cap`. The caller has already counted the close in
-    /// `close_counts`. Returns the closed id with its `ClosureKind` iff the
+    /// `close_counts` and the MAN-198 funnel trace (`note_close`). Returns the closed id with its `ClosureKind` iff the
     /// track emitted a real event before or during this flush (MAN-19), plus
     /// the flush. `survivor` is a merge loser's surviving track.
     fn close_track(
@@ -4049,7 +4207,7 @@ impl TrackManager {
         let mut flush_events: Vec<DecoderEvent> = Vec::new();
         let mut ever_emitted_closed = Vec::new();
         for (loser, survivor) in to_close {
-            self.close_counts.record(CloseReason::Merged);
+            self.note_close(loser, CloseReason::Merged);
             let (kind, events) = self.close_track(loser, CloseReason::Merged, Some(survivor));
             flush_events.extend(events);
             ever_emitted_closed.extend(kind);
@@ -4074,7 +4232,7 @@ impl TrackManager {
                 .min_by(|(_, a), (_, b)| a.current_snr_db.partial_cmp(&b.current_snr_db).unwrap())
                 .map(|(id, _)| id)
                 .unwrap();
-            self.close_counts.record(CloseReason::Evicted);
+            self.note_close(loser, CloseReason::Evicted);
             // No survivor -- an eviction just stops tracking this identity,
             // with no successor to migrate deferred evidence to (round 9).
             let (kind, events) = self.close_track(loser, CloseReason::Evicted, None);
@@ -5878,6 +6036,23 @@ mod tests {
         assert!(!tm.spawn_admits(11, None));
         tm.tracks.get_mut(&1).unwrap().center = 10.5;
         assert!(!tm.spawn_admits(11, Some(11.07)));
+    }
+    /// MAN-198 after MAN-112: the funnel's spawn-veto census names what
+    /// `spawn_admits` refused, not bare ownership. A split-admitted owned
+    /// channel is no refusal, and a skirt rise is `sidelobePosition`.
+    #[test]
+    fn funnel_census_mirrors_spawn_admission() {
+        use crate::funnel::SpawnVeto as V;
+        let mut tm = close_merge_tracks();
+        tm.tracks.remove(&2);
+        assert_eq!(tm.admission_veto(12, Some(10.0)), Some(V::SidelobePosition));
+        assert_eq!(tm.admission_veto(11, Some(11.07)), Some(V::OwnedByTrack));
+        tm.tracks.get_mut(&1).unwrap().phase_z = Complex64::new(1.0, 0.0);
+        assert!(tm.owner_of[11].is_some());
+        assert_eq!(tm.admission_veto(11, Some(11.07)), None);
+        assert_eq!(tm.admission_veto(11, Some(10.0)), Some(V::SidelobePosition));
+        // Isolated and unowned: admitted whatever the position says.
+        assert_eq!(tm.admission_veto(40, Some(30.0)), None);
     }
     #[test]
     fn off_midpoint_neighbor_does_not_force_the_outer_straddle_channel() {

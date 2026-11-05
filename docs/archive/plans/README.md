@@ -17,9 +17,7 @@ They lived in `docs/superpowers/` until MAN-480 moved them here, per
 decision D12 of the
 [2026-09-06 broad review](../../DECISIONS/2026-09-06-broad-review-decisions.md).
 They are left as written, so paths inside them still say
-`docs/superpowers/` and may no longer resolve. Some files elsewhere in
-the repository still cite the old paths too, until a later MAN-150
-change updates them. Read any `docs/superpowers/` path as
+`docs/superpowers/` and may no longer resolve. Read any `docs/superpowers/` path as
 `docs/archive/plans/`: the layout below that prefix is unchanged. Git
 history has every earlier version.
 

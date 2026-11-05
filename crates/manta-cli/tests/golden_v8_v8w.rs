@@ -2,10 +2,10 @@
 //! callsign"/"ghost decode" are measured against the real
 //! `manta-spot::Validator`'s output (`report["spots"]`), wired into
 //! `decode_samples` in M3's engine-wiring sub-project -- see
-//! docs/superpowers/specs/2026-07-26-m3-engine-wiring-design.md. Previously
+//! docs/archive/plans/specs/2026-07-26-m3-engine-wiring-design.md. Previously
 //! approximated with text-substring heuristics against raw decoder text,
 //! the same way V5/V6 approximated "callsign validated" before this landed
-//! -- see docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
+//! -- see docs/archive/plans/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
 
 use std::collections::{BTreeMap, HashSet};
 use std::process::Command;
