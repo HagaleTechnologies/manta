@@ -11,7 +11,7 @@ stage-2 gate (§8.4) was measured before either was wired. That gate
 **failed** —
 `docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md` has the full
 result; `decode.engine` stays default `legacy`. Companion to
-`docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` (the
+`docs/archive/plans/specs/2026-09-09-decode-core-real-hf-design.md` (the
 rationale and evidence) and `docs/SPEC-decode-core.md` (v1).
 
 Relationship to v1: §1 (channelizer), §2.1–§2.5 (detection floor, gate,
@@ -513,6 +513,23 @@ B2/K5TR windows in ≤ 2 min on a laptop. Baseline to beat (legacy engine,
 2026-09-09): `as_word 27 %`, `framed 13 %`, `substring 48 %`,
 `wpm_ratio 0.82`.
 
+Loss funnel (MAN-198, `manta oracle --funnel PATH`): the recording also runs
+once through the production pipeline with a write-only track trace, and
+each RBN episode (one call on one 0.1 kHz bin, split at gaps over 900 s) is
+charged to exactly one earliest failed stage, in order: `inputCoverage`,
+`detectableEnergy`, `admittedTrack`, `usableTiming`, `textContainsCall`,
+`selfIdRecognized`, `sufficientEvidence`, `emitted`, `delivered`; or to none
+when a spot for the call was delivered. The file is JSON Lines (header,
+records, summary); the oracle's stdout and `--jsonl` do not change. Stage
+definitions and `detail` values:
+docs/DECISIONS/2026-11-03-man198-loss-funnel.md. Bypass rule: an
+oracle-bypass experiment (known frequency, transitions, timing or
+transcript) is an upper bound for one intervention, never a score; its
+lines carry `oracleAssisted: true` and follow the production summary, so
+the production lines stay a byte-identical prefix (the header's `bypasses`
+names what ran) and no gate reads them.
+Built so far: known frequency (`--funnel-bypass known-frequency`).
+
 ### 8.4 Gates (design §6)
 
 | stage | gate |
@@ -535,6 +552,7 @@ B2/K5TR windows in ≤ 2 min on a laptop. Baseline to beat (legacy engine,
 | §5 | `manta-decode::events` | additive |
 | §8.2 | `manta-testkit::vectors`, `keyer`, `scene` | additive |
 | §8.3 | `manta-testkit::oracle` + `crates/manta-cli` subcommand `oracle` | new |
+| §8.3 funnel | `manta-engine::funnel` (trace, attribution, `run_funnel`) + `manta-testkit::oracle::parse_rbn_episodes` | additive (MAN-198) |
 
 ## 10. CPU budget (design §5.6)
 

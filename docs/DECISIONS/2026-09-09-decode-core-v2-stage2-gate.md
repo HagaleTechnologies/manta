@@ -1,7 +1,7 @@
 # decode-core-v2 stage-2 gate (Hsmm engine) -- measured, FAIL
 
 SPEC v2 (`docs/SPEC-decode-core-v2.md`) §8.4 Task 12
-(`docs/superpowers/plans/2026-09-09-decode-core-v2.md`). This is the
+(`docs/archive/plans/plans/2026-09-09-decode-core-v2.md`). This is the
 measurement task for the redesign's stage-2 gate: does the fully-
 implemented, reviewed `Engine::Hsmm` (Tasks 1-8, CLI-reachable since Task
 11) actually clear the bars SPEC v2 §8.4 sets for it. It is not a tuning

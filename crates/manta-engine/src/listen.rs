@@ -120,6 +120,11 @@ pub struct ListenObservers {
     /// A source with no RF centre publishes nothing. `None` (the default)
     /// skips everything, so `listen()`'s existing callers pay nothing.
     pub spectrum: Option<Arc<dyn SpectrumSink>>,
+    /// MAN-198: the loss funnel's write-only track trace -- every candidate
+    /// birth, confirmation and close (`crate::funnel::FunnelTrace`). Set
+    /// only by `crate::funnel::run_funnel`; decoding and spots are
+    /// unchanged. `None` (the default) records nothing.
+    pub funnel_trace: Option<Arc<crate::funnel::FunnelTrace>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -858,6 +863,7 @@ pub fn listen_with_observers(
         occupancy,
         spectrum.as_ref(),
     )?;
+    seg.tm.set_funnel_trace(observers.funnel_trace.clone());
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -1127,6 +1133,7 @@ pub fn listen_with_observers(
                     return Err(e);
                 }
             };
+            seg.tm.set_funnel_trace(observers.funnel_trace.clone());
             let hops = seg.channelize(&padding);
             let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
@@ -1999,6 +2006,65 @@ mod tests {
             c.not_cw,
             c.unkeyed,
         ]
+    }
+
+    #[test]
+    fn funnel_trace_observer_leaves_events_and_spots_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers| {
+            let mut events = Vec::new();
+            let mut spots = Vec::new();
+            listen_with_observers(
+                Box::new(FixedFreqSource {
+                    samples: rendered.samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                }),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| events.push(ev.clone()),
+                |spot| spots.push(spot.clone()),
+                |_| {},
+            )
+            .unwrap();
+            (events, spots)
+        };
+        let expected = run(ListenObservers::default());
+        let trace = crate::funnel::FunnelTrace::new();
+        assert_eq!(
+            expected,
+            run(ListenObservers {
+                funnel_trace: Some(trace.clone()),
+                ..Default::default()
+            })
+        );
+        let log = trace.take();
+        let spawned = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Spawned { .. }))
+            .count();
+        let closed = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Closed { .. }))
+            .count();
+        assert!(spawned >= 1);
+        assert!(closed <= spawned);
+        assert!(log
+            .records
+            .iter()
+            .any(|r| matches!(r, crate::funnel::TrackTraceRecord::Confirmed { .. })));
+        // The census sees the strong station's own channels rise while its
+        // track owns them; no source mask applies to a complex-IQ file.
+        assert!(log
+            .vetoes
+            .keys()
+            .any(|(_, _, v)| *v == crate::funnel::SpawnVeto::OwnedByTrack));
+        assert!(log.vetoes.keys().all(|(_, _, v)| !v.is_source_mask()));
     }
 
     #[test]

@@ -32,6 +32,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod funnel_cmd;
 mod grade_cmd;
 mod grade_paired;
 mod grade_transcript;
@@ -51,6 +52,7 @@ mod reload;
 mod silent;
 mod source_check;
 mod spectrum_feed;
+mod spot_outputs;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
@@ -230,6 +232,34 @@ enum Command {
         /// summary always goes to stdout as well.
         #[arg(long)]
         jsonl: Option<PathBuf>,
+        /// Also run the full pipeline once and write a stage-attributed loss
+        /// funnel (JSON Lines) to PATH. Diagnostic only: stdout and --jsonl
+        /// are unchanged
+        #[arg(long, value_name = "PATH")]
+        funnel: Option<PathBuf>,
+        /// Add oracle-bypass experiments to the funnel file, comma-separated:
+        /// known-frequency. Each forces stages with truth and reports an
+        /// upper bound after the production summary; never a score.
+        /// Requires --funnel
+        #[arg(
+            long,
+            value_name = "BYPASS",
+            value_delimiter = ',',
+            requires = "funnel",
+            value_parser = parse_funnel_bypass
+        )]
+        funnel_bypass: Vec<manta_engine::funnel::Bypass>,
+        /// Frequency tolerance for matching a candidate or track to a truth
+        /// row, plus half a channel width
+        #[arg(long, value_name = "HZ", default_value_t = 150.0, value_parser = parse_funnel_tol)]
+        funnel_track_tol_hz: f64,
+        /// Frequency tolerance for matching a decision or spot to a truth row
+        #[arg(long, value_name = "HZ", default_value_t = 500.0, value_parser = parse_funnel_tol)]
+        funnel_spot_tol_hz: f64,
+        /// Time tolerance for matching a decision or spot to a truth row's
+        /// first and last report
+        #[arg(long, value_name = "SECONDS", default_value_t = 90.0, value_parser = parse_funnel_tol)]
+        funnel_spot_window_s: f64,
     },
     /// Generate a synthetic CW test recording.
     ///
@@ -2970,6 +3000,24 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
     Ok(window_s)
 }
 
+/// MAN-198: `--funnel-bypass` names. Only the bypasses RBN truth can feed
+/// are offered; known-frequency is the one built.
+fn parse_funnel_bypass(s: &str) -> std::result::Result<manta_engine::funnel::Bypass, String> {
+    match s {
+        "known-frequency" => Ok(manta_engine::funnel::Bypass::KnownFrequency),
+        _ => Err(format!("unknown bypass `{s}`: expected known-frequency")),
+    }
+}
+
+/// MAN-198: the oracle's `--funnel-*` tolerances: finite and non-negative.
+fn parse_funnel_tol(s: &str) -> std::result::Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("must be finite and non-negative, got {s}"));
+    }
+    Ok(v)
+}
+
 /// MAN-309: `--sample-rate-hz` for headerless IQ: finite, above 0 and at
 /// most `MAX_IQ_WAV_RATE_HZ`, before any rate-sized allocation.
 fn parse_iq_sample_rate_hz(s: &str) -> std::result::Result<f64, String> {
@@ -4738,6 +4786,7 @@ fn start_spot_server(
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
     pipeline: &PipelineConfig,
     relays: RelayConfigs,
+    outputs: spot_outputs::SpotOutputs,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let validation_level = pipeline.validation_level;
     // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
@@ -4749,6 +4798,22 @@ fn start_spot_server(
         .map(|r| {
             r.enabled
                 .then(|| relay_socket::bind_wsjtx_socket(r.listen))
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
+    // MAN-142 (D9, D13): the spot outputs' sockets are bound here too, for
+    // the same reason.
+    let pskreporter_socket = outputs
+        .pskreporter
+        .as_ref()
+        .map(|p| spot_outputs::bind_pskreporter_socket(&p.host))
+        .transpose()?;
+    let wsjtx_output_sockets = outputs
+        .wsjtx
+        .iter()
+        .map(|w| {
+            w.enabled
+                .then(|| spot_outputs::bind_wsjtx_output_socket(w.destination))
                 .transpose()
         })
         .collect::<Result<Vec<Option<std::net::UdpSocket>>>>()?;
@@ -4767,6 +4832,12 @@ fn start_spot_server(
     let station_location = cfg
         .station_location()
         .map_err(|e| anyhow!("[server]: {e}"))?;
+    // MAN-142: the grid the spot outputs name the station at (empty
+    // without a location).
+    let station_grid = station_location
+        .as_ref()
+        .map(|l| l.grid.clone())
+        .unwrap_or_default();
     let bus = std::sync::Arc::new(spot_bus_for(
         &cfg,
         source.sample_rate_hz,
@@ -5152,6 +5223,18 @@ fn start_spot_server(
                     (r, socket, stats)
                 })
                 .collect();
+            // MAN-142 (D15): the spot outputs' series, registered before the
+            // metrics endpoint spawns for MAN-44's reason: a configured
+            // table shows its zeros, enabled or not.
+            let pskreporter_stats = outputs
+                .pskreporter_registered
+                .then(|| metrics.register_pskreporter());
+            let wsjtx_outputs: Vec<_> = outputs
+                .wsjtx
+                .iter()
+                .zip(wsjtx_output_sockets)
+                .map(|(w, socket)| (w.clone(), socket, metrics.register_wsjtx_output(w.label())))
+                .collect();
             let metrics_ip_request_limiter =
                 manta_server::rate_limit::IpRateLimiter::new_with_override(
                     manta_server::metrics_http::MAX_METRICS_REQUESTS_PER_IP,
@@ -5236,6 +5319,66 @@ fn start_spot_server(
                     stats,
                     shutdown_rx.clone(),
                 ));
+            }
+            // MAN-142 (D3): the spot outputs read the bus the uplinks read.
+            // Each receiver is subscribed here, before the decoder starts
+            // publishing, and each worker runs in the tracked task set, so
+            // the shutdown drain awaits its final flush.
+            if let (Some(p), Some(socket), Some(stats)) =
+                (outputs.pskreporter, pskreporter_socket, pskreporter_stats)
+            {
+                // `config::load` refused an enabled table without a grid.
+                let grid = station_grid.clone();
+                let call =
+                    manta_server::config::strip_ssid(&cfg.station_callsign).to_ascii_uppercase();
+                logging::note(&spot_outputs::pskreporter_startup_line(&p, &call, &grid));
+                let nonce = bus.session_nonce();
+                let worker = manta_server::pskreporter::run(
+                    manta_server::pskreporter::PskReporter {
+                        host: p.host.clone(),
+                        port: p.port,
+                        receiver: manta_server::pskreporter::ipfix::Receiver {
+                            callsign: call,
+                            locator: grid,
+                            software: format!("manta {}", build_info::VERSION),
+                            antenna: p.antenna.clone(),
+                        },
+                        spot_types: p.spot_types,
+                        flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        observation_domain: manta_server::pskreporter::observation_domain(nonce),
+                    },
+                    socket,
+                    manta_server::rbn_compare::system_clock(),
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
+            }
+            for (w, socket, stats) in wsjtx_outputs {
+                let Some(socket) = socket else {
+                    continue;
+                };
+                logging::note(&spot_outputs::wsjtx_output_startup_line(w.destination));
+                let worker = manta_server::wsjtx_output::run(
+                    manta_server::wsjtx_output::WsjtxOutput {
+                        label: w.label(),
+                        destination: w.destination,
+                        de_call: manta_server::config::strip_ssid(&cfg.station_callsign)
+                            .to_ascii_uppercase(),
+                        de_grid: station_grid.clone(),
+                        version: build_info::VERSION.to_string(),
+                        revision: build_info::GIT_SHA.to_string(),
+                        off_air: outputs.replay,
+                    },
+                    socket,
+                    bus.clone(),
+                    bus.subscribe(),
+                    stats,
+                    shutdown_rx.clone(),
+                );
+                tasks.lock().await.spawn(worker);
             }
             // MAN-301: the live comparator reads the same bus the uplinks do
             // and publishes grades back onto it. Its metric families were
@@ -7159,6 +7302,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             engine,
             prior,
             jsonl,
+            funnel,
+            funnel_bypass,
+            funnel_track_tol_hz,
+            funnel_spot_tol_hz,
+            funnel_spot_window_s,
         } => {
             let loaded = config::load(config.as_deref(), config::Env::Ignore)?;
             note_ignored_tables(&loaded, "oracle", &["decode", "spot"]);
@@ -7196,7 +7344,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 build_pipeline_config(0.0, &spot, loaded.detector, decode.engine)?;
             pipeline.decode = decode;
             attach_language_prior(&mut pipeline, &spot, None)?;
-            let cfg = pipeline.decode;
+            let cfg = pipeline.decode.clone();
             let (results, summary) =
                 manta_testkit::oracle::run_oracle(&iq, fs, center, &spots, window_s, &cfg)?;
             if let Some(p) = jsonl {
@@ -7207,6 +7355,27 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
             }
             outln!("{}", serde_json::to_string_pretty(&summary)?)?;
+            // MAN-198: after stdout, so the oracle's own output is unchanged.
+            if let Some(out) = funnel {
+                let args = funnel_cmd::FunnelArgs {
+                    recording: &path,
+                    rbn_csv: &rbn_csv,
+                    spotter: &spotter,
+                    capture_start_unix_s: capture_start,
+                    config: config.as_deref(),
+                    out: &out,
+                    bypasses: &funnel_bypass,
+                    iq: &iq,
+                    tol: manta_engine::funnel::Tolerances {
+                        track_tol_hz: funnel_track_tol_hz,
+                        spot_tol_hz: funnel_spot_tol_hz,
+                        window_s,
+                        spot_window_s: funnel_spot_window_s,
+                        ..Default::default()
+                    },
+                };
+                funnel_cmd::run(&args, &pipeline, iq.len() as f64 / fs)?;
+            }
         }
         Command::Gen { vector, out } => {
             let spec = match vector.as_str() {
@@ -7439,6 +7608,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        // MAN-142 (D10): a run counts as a replay when any
+                        // input is a file.
+                        outputs: spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            resolved.inputs.iter().any(|i| !i.spec.is_reconnectable()),
+                        ),
                         rbn_compare: resolved.rbn_compare.clone(),
                         replay_epoch: resolved.replay_epoch,
                     }),
@@ -7711,6 +7887,11 @@ fn run_command() -> Result<std::process::ExitCode> {
                             skimmer: loaded.skimmer_relay.clone(),
                             wsjtx: loaded.wsjtx_relay.clone(),
                         },
+                        spot_outputs::SpotOutputs::for_run(
+                            loaded.pskreporter.as_ref(),
+                            &loaded.wsjtx_output,
+                            replay_path.is_some(),
+                        ),
                     )?;
                     // MAN-45 (round-9 finding): the daemon's own copy of the
                     // gauge `manta_engine::listen_with_observers` updates as
@@ -8099,6 +8280,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     detector_confirmations: None,
                     track_lifecycle: None,
                     spectrum: spectrum_sink,
+                    funnel_trace: None,
                 },
                 |ev| {
                     if json {
@@ -9665,6 +9847,7 @@ mod tests {
                 ..Default::default()
             },
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -9711,6 +9894,7 @@ mod tests {
             lists.clone(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
         let cty = server.lists.cty.load();
@@ -10172,6 +10356,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -10235,6 +10420,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11333,6 +11519,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11397,6 +11584,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11459,6 +11647,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         );
         assert!(
             result.is_ok(),
@@ -11497,6 +11686,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -11613,6 +11803,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         ) else {
             panic!("half a lat/lon pair must not start the servers");
         };
@@ -11646,6 +11837,7 @@ mod tests {
                 skimmer: loaded.skimmer_relay,
                 wsjtx: loaded.wsjtx_relay,
             },
+            spot_outputs::SpotOutputs::default(),
         )
     }
 
@@ -11750,6 +11942,7 @@ mod tests {
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -14411,6 +14604,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 
@@ -14463,6 +14657,7 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             bundled_reference_lists(),
             &PipelineConfig::default(),
             RelayConfigs::default(),
+            spot_outputs::SpotOutputs::default(),
         )
         .unwrap();
 

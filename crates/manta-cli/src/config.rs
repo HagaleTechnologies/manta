@@ -16,7 +16,8 @@ use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
 use manta_server::config::{
-    RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig, WsjtxRelayConfig,
+    PskReporterConfig, RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig,
+    WsjtxOutputConfig, WsjtxRelayConfig,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -30,6 +31,8 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "rbn_compare",
     "skimmer_relay",
     "wsjtx_relay",
+    "pskreporter",
+    "wsjtx_output",
     "callsign_lookup",
     "input",
     "spot",
@@ -168,6 +171,12 @@ pub(crate) struct Loaded {
     /// MAN-320: `[[wsjtx_relay]]` blocks as written, validated (disabled
     /// ones included). Restart-only.
     pub wsjtx_relay: Vec<WsjtxRelayConfig>,
+    /// MAN-142: `[pskreporter]` as written, validated (`None` when the
+    /// table is absent; present even when `enabled = false`). Restart-only.
+    pub pskreporter: Option<PskReporterConfig>,
+    /// MAN-142: `[[wsjtx_output]]` blocks as written, validated (disabled
+    /// ones included). Restart-only.
+    pub wsjtx_output: Vec<WsjtxOutputConfig>,
     /// MAN-318: `[callsign_lookup]` as written, validated (`None` when the
     /// table is absent; present even when `enabled = false`).
     pub callsign_lookup: Option<CallsignLookupConfig>,
@@ -942,6 +951,14 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         &skimmer_relay,
         &wsjtx_relay,
     )?;
+    let pskreporter = take_typed::<PskReporterConfig>(&doc, "pskreporter", &origin, &overlay)?;
+    let wsjtx_output = take_relays::<WsjtxOutputConfig>(&doc, "wsjtx_output", &origin)?;
+    check_spot_outputs(
+        &origin,
+        server.as_ref(),
+        pskreporter.as_ref(),
+        &wsjtx_output,
+    )?;
     let mut notes = Vec::new();
     let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
     if let Some(rc) = &rbn_compare {
@@ -1059,6 +1076,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         rbn_compare,
         skimmer_relay,
         wsjtx_relay,
+        pskreporter,
+        wsjtx_output,
         callsign_lookup,
         decode,
         detector,
@@ -1091,7 +1110,7 @@ fn known_tables_list() -> String {
     KNOWN_TABLES
         .iter()
         .map(|t| match *t {
-            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" => format!("[[{t}]]"),
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output" => format!("[[{t}]]"),
             _ => format!("[{t}]"),
         })
         .collect::<Vec<_>>()
@@ -1133,8 +1152,11 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
             );
         }
         match (key.as_str(), value) {
-            ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay", toml::Value::Array(_)) => {}
-            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay"), _) => {
+            (
+                "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output",
+                toml::Value::Array(_),
+            ) => {}
+            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output"), _) => {
                 bail!("{origin}: {name} must be written [[{name}]] (an array of tables)")
             }
             // MAN-13: several receivers, one entry each.
@@ -1265,6 +1287,53 @@ fn check_relays(
         }
         if r.enabled && !uplink_on {
             return Err(needs_uplink("wsjtx_relay", &label));
+        }
+    }
+    Ok(())
+}
+
+/// MAN-142 (D3, D8, D13): the cross-table rules for `[pskreporter]` and
+/// `[[wsjtx_output]]`. Both read the spots the servers publish, so an
+/// enabled one needs `[server]`; PSKReporter also needs the station's
+/// locator, because every report is placed at it.
+fn check_spot_outputs(
+    origin: &str,
+    server: Option<&ServerConfig>,
+    pskreporter: Option<&PskReporterConfig>,
+    wsjtx_output: &[WsjtxOutputConfig],
+) -> Result<()> {
+    if let Some(p) = pskreporter {
+        p.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+        if p.enabled {
+            let Some(server) = server else {
+                bail!(
+                    "{origin}: [pskreporter] needs a [server] table (it reports the spots the \
+                     servers publish)"
+                );
+            };
+            // `station_location` already ran in `load` for `[server]`, so
+            // only "absent" is left to refuse here.
+            if !matches!(server.station_location(), Ok(Some(_))) {
+                bail!(
+                    "{origin}: [pskreporter] is enabled but [server] has no location -- set \
+                     [server].operator_grid (e.g. \"EM10dh\") or operator_lat and operator_lon; \
+                     PSKReporter places every report at the receiver's locator"
+                );
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for w in wsjtx_output {
+        w.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+        let label = w.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[wsjtx_output]] {label} is listed twice");
+        }
+        if w.enabled && server.is_none() {
+            bail!(
+                "{origin}: [[wsjtx_output]] needs a [server] table (it sends the spots the \
+                 servers publish)"
+            );
         }
     }
     Ok(())
@@ -2132,13 +2201,15 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
             bail!("{name}: [[rbn_uplink]] cannot be set from the environment; use the config file");
         }
         for (prefix, table) in [
-            ("SKIMMER_RELAY_", "skimmer_relay"),
-            ("WSJTX_RELAY_", "wsjtx_relay"),
+            ("SKIMMER_RELAY_", "[[skimmer_relay]]"),
+            ("WSJTX_RELAY_", "[[wsjtx_relay]]"),
+            // MAN-142 (D1): a switch that publishes the station's spots
+            // belongs in the reviewed file, like `[[rbn_uplink]]`.
+            ("PSKREPORTER_", "[pskreporter]"),
+            ("WSJTX_OUTPUT_", "[[wsjtx_output]]"),
         ] {
             if rest.starts_with(prefix) {
-                bail!(
-                    "{name}: [[{table}]] cannot be set from the environment; use the config file"
-                );
+                bail!("{name}: {table} cannot be set from the environment; use the config file");
             }
         }
         let Some((table, key)) = ENV_TABLES.iter().find_map(|(prefix, table)| {
@@ -3344,7 +3415,8 @@ mod tests {
         let err = err_of("[relay_source]\nx = 1\n");
         assert!(
             err.contains(
-                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], \
+                 [callsign_lookup], [input], "
             ),
             "{err}"
         );
@@ -3394,6 +3466,230 @@ mod tests {
                 err.contains("cannot be set from the environment; use the config file"),
                 "{err}"
             );
+        }
+    }
+
+    // ---- MAN-142: [pskreporter] / [[wsjtx_output]]
+
+    const GRID: &str = "operator_grid = \"EM10dh\"\n";
+    const PSK_ON: &str = "[pskreporter]\nenabled = true\n";
+
+    #[test]
+    fn pskreporter_defaults_load_off() {
+        let loaded = load_file("[pskreporter]\n").unwrap();
+        let p = loaded.pskreporter.expect("the table is present");
+        assert!(!p.enabled);
+        assert_eq!(p.host, "report.pskreporter.info");
+        assert_eq!(p.port, 4739);
+        assert_eq!(p.antenna, "");
+        assert_eq!(
+            p.spot_types,
+            manta_server::config::UplinkSpotTypes::CqBeacon
+        );
+        assert!(load_file(SERVER).unwrap().pskreporter.is_none());
+    }
+
+    #[test]
+    fn an_enabled_pskreporter_needs_a_server() {
+        let err = err_of(PSK_ON);
+        assert!(
+            err.ends_with(
+                ": [pskreporter] needs a [server] table (it reports the spots the servers \
+                 publish)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_pskreporter_needs_a_station_location() {
+        let err = err_of(&format!("{SERVER}{PSK_ON}"));
+        assert!(
+            err.ends_with(
+                ": [pskreporter] is enabled but [server] has no location -- set \
+                 [server].operator_grid (e.g. \"EM10dh\") or operator_lat and operator_lon; \
+                 PSKReporter places every report at the receiver's locator"
+            ),
+            "{err}"
+        );
+        for location in [
+            "operator_grid = \"EM10\"\n",
+            GRID,
+            "operator_lat = 30.3\noperator_lon = -97.7\n",
+        ] {
+            let loaded = load_file(&format!("{SERVER}{location}{PSK_ON}"))
+                .unwrap_or_else(|e| panic!("{location:?}: {e:#}"));
+            assert!(loaded.pskreporter.unwrap().enabled, "{location:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_pskreporter_needs_neither() {
+        let loaded = load_file("[pskreporter]\nenabled = false\n").unwrap();
+        assert!(!loaded.pskreporter.unwrap().enabled);
+        let loaded = load_file(&format!("{SERVER}[pskreporter]\n")).unwrap();
+        assert!(!loaded.pskreporter.unwrap().enabled);
+    }
+
+    #[test]
+    fn pskreporter_rejects_an_empty_host_an_ipv6_host_port_0_and_a_long_antenna() {
+        let long = "a".repeat(300);
+        for (key, msg) in [
+            (
+                "host = \"\"".to_string(),
+                ": [pskreporter]: host is empty -- set PSKReporter's host name \
+                 (\"report.pskreporter.info\") or a test listener's IPv4 address"
+                    .to_string(),
+            ),
+            (
+                "host = \"::1\"".to_string(),
+                ": [pskreporter]: host \"::1\" is an IPv6 address -- PSKReporter has no IPv6 \
+                 address; use a host name or an IPv4 address"
+                    .to_string(),
+            ),
+            (
+                "port = 0".to_string(),
+                ": [pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 (14739 \
+                 for its test listener)"
+                    .to_string(),
+            ),
+            (
+                format!("antenna = \"{long}\""),
+                ": [pskreporter]: antenna is 300 bytes; PSKReporter keeps at most 254".to_string(),
+            ),
+        ] {
+            // Checked whether or not the table is enabled.
+            for enabled in ["true", "false"] {
+                let err = err_of(&format!(
+                    "{SERVER}{GRID}[pskreporter]\nenabled = {enabled}\n{key}\n"
+                ));
+                assert!(err.ends_with(&msg), "{key}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn pskreporter_must_be_a_single_table() {
+        let err = err_of(&format!("{SERVER}{GRID}[[pskreporter]]\nenabled = true\n"));
+        assert!(
+            err.ends_with(": [[pskreporter]] is not supported -- use a single [pskreporter] table"),
+            "{err}"
+        );
+    }
+
+    const OUTPUT: &str = "[[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n";
+
+    #[test]
+    fn wsjtx_output_loads_enabled_with_its_destination() {
+        let loaded = load_file(&format!("{SERVER}{OUTPUT}")).unwrap();
+        assert_eq!(loaded.wsjtx_output.len(), 1);
+        assert!(loaded.wsjtx_output[0].enabled);
+        assert_eq!(loaded.wsjtx_output[0].label(), "192.168.1.255:2237");
+        let loaded = load_file(&format!("{SERVER}{OUTPUT}enabled = false\n")).unwrap();
+        assert!(!loaded.wsjtx_output[0].enabled);
+        let err = err_of(&format!("{SERVER}[[wsjtx_output]]\nenabled = true\n"));
+        assert!(err.contains("missing field `destination`"), "{err}");
+    }
+
+    #[test]
+    fn wsjtx_output_needs_a_server() {
+        let err = err_of(OUTPUT);
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_output]] needs a [server] table (it sends the spots the servers \
+                 publish)"
+            ),
+            "{err}"
+        );
+        // A disabled block sends nothing, so it needs none.
+        let loaded = load_file(&format!("{OUTPUT}enabled = false\n")).unwrap();
+        assert_eq!(loaded.wsjtx_output.len(), 1);
+    }
+
+    #[test]
+    fn wsjtx_output_rejects_unspecified_port_0_and_ipv6_multicast() {
+        for dest in ["0.0.0.0:2237", "[::]:2237", "192.168.1.255:0"] {
+            let err = err_of(&format!(
+                "{SERVER}[[wsjtx_output]]\ndestination = \"{dest}\"\n"
+            ));
+            assert!(
+                err.ends_with(&format!(
+                    ": [[wsjtx_output]]: destination \"{}\" is not an address manta can send \
+                     to -- use a logger's address, a broadcast address such as \
+                     \"192.168.1.255:2237\", or a multicast group such as \"224.0.0.1:2237\"",
+                    dest.parse::<std::net::SocketAddr>().unwrap()
+                )),
+                "{dest}: {err}"
+            );
+        }
+        let err = err_of(&format!(
+            "{SERVER}[[wsjtx_output]]\ndestination = \"[ff02::1]:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_output]]: destination \"[ff02::1]:2237\" is an IPv6 multicast group \
+                 -- use an IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_is_listed_twice() {
+        let err = err_of(&format!("{SERVER}{OUTPUT}{OUTPUT}"));
+        assert!(
+            err.ends_with(": [[wsjtx_output]] 192.168.1.255:2237 is listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_must_be_an_array() {
+        let err = err_of(&format!(
+            "{SERVER}[wsjtx_output]\ndestination = \"127.0.0.1:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(": wsjtx_output must be written [[wsjtx_output]] (an array of tables)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_accepts_unicast_broadcast_and_multicast() {
+        for dest in [
+            "127.0.0.1:2237",
+            "192.168.1.255:2237",
+            "255.255.255.255:2237",
+            "224.0.0.1:2237",
+            "[::1]:2237",
+        ] {
+            let loaded = load_file(&format!(
+                "{SERVER}[[wsjtx_output]]\ndestination = \"{dest}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{dest}: {e:#}"));
+            assert_eq!(
+                loaded.wsjtx_output[0].destination,
+                dest.parse::<std::net::SocketAddr>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_cannot_set_the_new_tables() {
+        for (var, msg) in [
+            (
+                "MANTA_PSKREPORTER_ENABLED",
+                "MANTA_PSKREPORTER_ENABLED: [pskreporter] cannot be set from the environment; \
+                 use the config file",
+            ),
+            (
+                "MANTA_WSJTX_OUTPUT_DESTINATION",
+                "MANTA_WSJTX_OUTPUT_DESTINATION: [[wsjtx_output]] cannot be set from the \
+                 environment; use the config file",
+            ),
+        ] {
+            let err = format!("{:#}", load_env(None, &[(var, "x")]).unwrap_err());
+            assert!(err.contains(msg), "{err}");
         }
     }
 
@@ -5145,7 +5441,8 @@ mod tests {
         assert!(
             err.ends_with(
                 "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [[skimmer_relay]], \
-                 [[wsjtx_relay]], [callsign_lookup], [input], [spot], [detector], [decode]"
+                 [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], [callsign_lookup], [input], [spot], \
+                 [detector], [decode]"
             ),
             "{err}"
         );

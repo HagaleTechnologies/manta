@@ -29,7 +29,7 @@ fn v1_passes_end_to_end_from_wav() {
     // char accuracy: under the old ~2.05 s warmup(750 hops)+confirm(19
     // hops) floor this 120 s scene lost its leading "CQ " before the
     // detector promoted a track (Task 11 Step 0: CER 0.0155, see
-    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md).
+    // docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md).
     // MAN-115 (25 ms warmup after the pre-roll, SPEC §2.2 "Startup")
     // promotes at 0.072 s; only the first character, keyed before
     // promotion, still decodes wrong ("FQ CQ DE ..."), so the measured CER
@@ -56,7 +56,7 @@ fn v1_passes_end_to_end_from_wav() {
     // clearing the original 10 Hz bound (reproduced identically across 3
     // runs). See docs/DECISIONS/2026-07-18-m2-pfb-channelizer-pins.md pin 9
     // for the original widening's rationale and
-    // docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md for this
+    // docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md for this
     // re-measurement.
     let freq = report["frequency"].as_f64().unwrap();
     assert!(
