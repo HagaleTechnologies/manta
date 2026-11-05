@@ -103,11 +103,26 @@ impl From<crate::track::CloseReason> for TrackCloseReason {
             C::HangExpired => Self::HangExpired,
             C::Silent => Self::Silent,
             C::Merged => Self::Merged,
-            C::Evicted => Self::Evicted,
+            // A coverage restriction is a policy eviction, not an observed
+            // end of signal. Keep the existing public trace categories.
+            C::Evicted | C::Restricted => Self::Evicted,
             C::Rtty => Self::Rtty,
             C::NotCw => Self::NotCw,
             C::Unkeyed => Self::Unkeyed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TrackCloseReason;
+
+    #[test]
+    fn restricted_close_is_traced_as_a_policy_eviction() {
+        assert_eq!(
+            TrackCloseReason::from(crate::track::CloseReason::Restricted),
+            TrackCloseReason::Evicted
+        );
     }
 }
 
