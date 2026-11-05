@@ -177,6 +177,7 @@ fn digital_window_each_service_input_uses_its_own_rf_center() {
             .map(|(index, (center, samples))| {
                 let (center, samples) = (*center, samples.clone());
                 InputSpec {
+                    conditioning: Default::default(),
                     name: format!("receiver-{index}"),
                     open: Box::new(move || {
                         Ok(Box::new(MemorySource {
@@ -186,7 +187,6 @@ fn digital_window_each_service_input_uses_its_own_rf_center() {
                         }) as Box<dyn IqSource>)
                     }),
                     freq_correction_ppm: 0.0,
-                    conditioning: Default::default(),
                     observers: Default::default(),
                     spawn_band_hz: None,
                 }

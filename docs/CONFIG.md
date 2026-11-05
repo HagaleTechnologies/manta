@@ -65,7 +65,7 @@ listed here change what the command does.
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
-| `decode` | `[decode]` `[detector]` `[spot]`, `input.freq_correction_ppm`, `input.dc_block` and `input.impulse_suppress`; several `[[input]]` entries that disagree on them need `--freq-correction-ppm` (conditioning keys set alike in every entry) | no |
+| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` plus `input.dc_block`, `input.impulse_suppress` and the IQ keys; entries that disagree on ppm need `--freq-correction-ppm`; conflicting conditioning settings require a config for the recording's receiver | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 | `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |
@@ -473,12 +473,25 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
 | `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
+| `iq_correction` | `"off"` | live: `decode`, `run`, `soak`; restart required | `off`, `observe` or `apply`. Observe never changes samples. Apply requires the complete controlled-tone calibration triple below. |
+| `iq_gain_ratio` | none; example `1.05` | per input; restart required | Finite gain ratio, 0.5 through 2.0. Supply all three calibration values together. |
+| `iq_phase_deg` | none; example `2.0` | per input; restart required | Finite phase error, -45 through 45 degrees, from a controlled tone. Remeasure after a receiver gain change. |
+| `iq_calibrated_center_hz` | none; example `14000000.0` | per input; restart required | Finite positive receiver centre in Hz when measured. Apply requires actual source centre agreement within 1 Hz. A mismatch leaves samples unchanged and warns once per input, including reconnects. Calibration is refused with `bands`. |
 | `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
 | `dc_block` | `"off"` | live: `decode`, `run`, `soak`; restart required | The DC-removal input-conditioning stage's mode: `off`, `observe` (measure and annotate, never write a sample) or `apply` (correct the samples and annotate them). MAN-496; `decode --json` reports what ran as `inputConditioning`. See [docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md](DECISIONS/2026-11-03-man203-reversible-input-conditioning.md). |
 | `impulse_suppress` | `"off"` | live: `decode`, `run`, `soak`; restart required | The short-impulse-suppression conditioning stage's mode: `off`, `observe` or `apply` (repair isolated runs of a few samples, keeping the originals in the log). MAN-496. |
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+The IQ keys also work in each `[[input]]` entry. Each input keeps its own
+calibration. A recording decoded with multiple entries must have identical IQ
+settings in every entry, or `decode` refuses the ambiguous configuration.
+`MANTA_INPUT_IQ_CORRECTION=observe` and the three numeric environment overlays
+use the same validation as the file. All four keys require a restart.
+`check` and frequency `calibrate` inspect raw samples. IQ values come from a
+controlled tone capture, never from a suspected mirror in ordinary traffic.
+The doctor measurement command is separate work in MAN-495.
 
 ### HPSDR protocol 2
 
