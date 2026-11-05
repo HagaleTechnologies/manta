@@ -28,6 +28,43 @@ const CHUNK_SAMPLES: usize = 2048;
 /// steady-state reads (MAN-374), and its events emitted as one batch.
 const CALIBRATION_SECONDS: f64 = 2.0;
 
+/// Exact per-stage, per-mark counts published by one input across segments.
+#[derive(Default)]
+pub struct ConditioningObserver {
+    counts: [[AtomicU64; 4]; 2],
+}
+
+impl ConditioningObserver {
+    /// Snapshot indexed by `Stage as usize`, then `Mark as usize`.
+    pub fn snapshot(&self) -> [[u64; 4]; 2] {
+        std::array::from_fn(|s| std::array::from_fn(|m| self.counts[s][m].load(Ordering::Relaxed)))
+    }
+
+    fn report(&self, counts: [[u64; 4]; 2]) {
+        for (stage, row) in counts.iter().enumerate() {
+            for (mark, &count) in row.iter().enumerate() {
+                self.counts[stage][mark].fetch_max(count, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn conditioning_counts(
+    ch: &manta_dsp::channelizer::Channelizer,
+    base: [[u64; 4]; 2],
+) -> [[u64; 4]; 2] {
+    use manta_dsp::condition::{Mark, Stage};
+    let mut counts = base;
+    if let Some(log) = ch.conditioning() {
+        for stage in Stage::ALL {
+            for mark in Mark::ALL {
+                counts[stage as usize][mark as usize] += log.count(stage, mark);
+            }
+        }
+    }
+    counts
+}
+
 /// Optional live handles into a running `listen()` loop, for a caller that
 /// needs to observe engine-owned state the callbacks can't see.
 ///
@@ -84,6 +121,8 @@ pub struct ListenObservers {
     /// discontinuity starts), stored with `fetch_max` after each processed
     /// chunk so it never goes backwards. `None` (the default) skips it.
     pub bad_samples: Option<Arc<AtomicU64>>,
+    /// Exact conditioning counts summed across reconnect segments.
+    pub conditioned: Option<Arc<ConditioningObserver>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -862,6 +901,7 @@ pub fn listen_with_observers(
         }
     };
     // MAN-234: samples replaced by segments a discontinuity already replaced.
+    let mut conditioned_base = [[0; 4]; 2];
     let mut bad_base: u64 = 0;
     let report_bad_samples = |n: u64| {
         if let Some(counter) = &observers.bad_samples {
@@ -992,6 +1032,9 @@ pub fn listen_with_observers(
     report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if let Some(obs) = lifecycle {
         obs.publish_counts(
@@ -1020,6 +1063,9 @@ pub fn listen_with_observers(
     report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if let Some(obs) = lifecycle {
         obs.publish_counts(
@@ -1150,6 +1196,7 @@ pub fn listen_with_observers(
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
+            conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -1221,6 +1268,9 @@ pub fn listen_with_observers(
         report_confirmations(confirmations_base + seg.tm.confirmations());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         report_bad_samples(bad_base + seg.ch.bad_samples());
+        if let Some(observer) = &observers.conditioned {
+            observer.report(conditioning_counts(&seg.ch, conditioned_base));
+        }
         rtty.update(&seg.tm);
         if let Some(obs) = lifecycle {
             obs.publish_counts(
@@ -1262,6 +1312,9 @@ pub fn listen_with_observers(
     settle_lookups(&mut validator, &mut ctx, &mut on_spot);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -1485,6 +1538,7 @@ pub(crate) struct FrontObservers {
     pub(crate) active_tracks: Option<Arc<AtomicU64>>,
     pub(crate) static_crashes: Option<Arc<AtomicU64>>,
     pub(crate) bad_samples: Option<Arc<AtomicU64>>,
+    pub(crate) conditioned: Option<Arc<ConditioningObserver>>,
     pub(crate) rtty: Option<Arc<RttyObserver>>,
     pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
     pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
@@ -1566,6 +1620,7 @@ pub(crate) fn run_input_front(
     };
     // MAN-234: samples replaced by segments a discontinuity already
     // replaced, as `listen_with_observers` counts them.
+    let mut conditioned_base = [[0; 4]; 2];
     let mut bad_base: u64 = 0;
     let report_bad_samples = |n: u64| {
         if let Some(counter) = &observers.bad_samples {
@@ -1689,6 +1744,9 @@ pub(crate) fn run_input_front(
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if !send(b) {
         return Ok(());
@@ -1699,6 +1757,9 @@ pub(crate) fn run_input_front(
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if !send(b) {
         return Ok(());
@@ -1753,6 +1814,7 @@ pub(crate) fn run_input_front(
             let next_id = seg.tm.next_track_id();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
+            conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
@@ -1795,6 +1857,9 @@ pub(crate) fn run_input_front(
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         report_bad_samples(bad_base + seg.ch.bad_samples());
+        if let Some(observer) = &observers.conditioned {
+            observer.report(conditioning_counts(&seg.ch, conditioned_base));
+        }
         rtty.update(&seg.tm);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
@@ -1822,6 +1887,9 @@ pub(crate) fn run_input_front(
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     report_active_tracks(0);
     rtty.restart(seg_base + seg_consumed);
     send(last);
@@ -2300,6 +2368,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -2841,6 +2910,95 @@ mod tests {
         assert_eq!(readings.last(), Some(&2), "{readings:?}");
     }
 
+    #[test]
+    fn conditioning_observer_counts_exactly_across_reconnects_and_per_input_overrides() {
+        use manta_dsp::condition::{ConditioningConfig, Mark, Stage, StageMode};
+        let (spec, iq) = v1_6s();
+        let cfg = PipelineConfig {
+            conditioning: ConditioningConfig {
+                dc: StageMode::Apply,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let padding = manta_dsp::channelizer::Channelizer::new(spec.fs, spec.center_freq_hz)
+            .unwrap()
+            .filter_len();
+        let expected = 2 * (iq.len() + padding) as u64;
+        let counter = Arc::new(ConditioningObserver::default());
+        let mut readings = Vec::new();
+        listen_with_observers(
+            Box::new(GapSource::new(
+                iq.clone(),
+                spec.fs,
+                spec.center_freq_hz,
+                48_000,
+            )),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                conditioned: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.snapshot()[Stage::Dc as usize][Mark::Corrected as usize]),
+        )
+        .unwrap();
+        let final_count = counter.snapshot()[Stage::Dc as usize][Mark::Corrected as usize];
+        assert_eq!(final_count, expected);
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]));
+        // Per-input settings override the shared default, without leaking to a sibling.
+        let counters: Vec<_> = (0..2)
+            .map(|_| Arc::new(ConditioningObserver::default()))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let inputs = (0..2)
+            .map(|i| {
+                let samples = iq.clone();
+                crate::InputSpec {
+                    name: format!("rx{i}"),
+                    open: Box::new(move || {
+                        Ok(Box::new(GapSource::new(
+                            samples,
+                            spec.fs,
+                            spec.center_freq_hz,
+                            48_000,
+                        )))
+                    }),
+                    freq_correction_ppm: 0.0,
+                    conditioning: if i == 0 {
+                        cfg.conditioning.clone()
+                    } else {
+                        Default::default()
+                    },
+                    observers: crate::InputObservers {
+                        conditioned: Some(counters[i].clone()),
+                        ..Default::default()
+                    },
+                    spawn_band_hz: None,
+                }
+            })
+            .collect();
+        let opened = crate::open_inputs(inputs, stop).unwrap();
+        crate::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::SessionClock::Replay,
+            crate::SharedObservers::default(),
+            |_| {},
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            counters[0].snapshot()[Stage::Dc as usize][Mark::Corrected as usize],
+            expected
+        );
+        assert_eq!(counters[1].snapshot(), [[0; 4]; 2]);
+    }
+
     /// Runs `listen_with_observers` with a bad-sample observer, returning
     /// the value it held at every `on_tracks` call and once more at the end.
     fn bad_sample_readings(src: Box<dyn manta_input::IqSource>) -> Vec<u64> {
@@ -3269,6 +3427,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3409,6 +3568,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3644,6 +3804,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -4141,6 +4302,7 @@ mod tests {
                     }) as Box<dyn IqSource>)
                 }),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -5580,6 +5742,7 @@ mod tests {
                         }) as Box<dyn IqSource>)
                     }),
                     freq_correction_ppm: 0.0,
+                    conditioning: Default::default(),
                     observers: Default::default(),
                     spawn_band_hz: None,
                 }],

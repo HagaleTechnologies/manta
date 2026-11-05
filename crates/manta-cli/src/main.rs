@@ -5678,6 +5678,89 @@ impl ReplayMode {
     }
 }
 
+/// Register configured conditioning series at zero, then publish exact running counts.
+fn publish_conditioned(
+    metrics: &manta_server::metrics::Metrics,
+    source: &str,
+    cfg: &manta_dsp::condition::ConditioningConfig,
+    observer: &manta_engine::ConditioningObserver,
+) {
+    use manta_dsp::condition::{Mark, Stage, StageMode};
+    let counts = observer.snapshot();
+    for (stage, name, mode) in [
+        (Stage::Impulse, "impulse", cfg.impulse),
+        (Stage::Dc, "dc", cfg.dc),
+    ] {
+        for (mark, label) in [
+            (Mark::Repaired, "repaired"),
+            (Mark::Flagged, "flagged"),
+            (Mark::Corrected, "corrected"),
+            (Mark::Uncertain, "uncertain"),
+        ] {
+            let enabled = matches!(
+                (stage, mode, mark),
+                (Stage::Dc, StageMode::Apply, Mark::Corrected)
+                    | (Stage::Impulse, StageMode::Apply, Mark::Repaired)
+                    | (
+                        Stage::Impulse,
+                        StageMode::Observe | StageMode::Apply,
+                        Mark::Flagged | Mark::Uncertain
+                    )
+            );
+            if enabled {
+                metrics.set_input_conditioned_samples(
+                    source,
+                    name,
+                    label,
+                    counts[stage as usize][mark as usize],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn conditioned_metric_registration_matches_producible_marks() {
+    use manta_dsp::condition::{ConditioningConfig, StageMode};
+    for (mode, impulse_marks, dc_marks) in [
+        (StageMode::Off, 0, 0),
+        (StageMode::Observe, 2, 0),
+        (StageMode::Apply, 3, 1),
+    ] {
+        let metrics = manta_server::metrics::Metrics::new();
+        publish_conditioned(
+            &metrics,
+            "rx",
+            &ConditioningConfig {
+                impulse: mode,
+                dc: mode,
+            },
+            &manta_engine::ConditioningObserver::default(),
+        );
+        let text = metrics.render_prometheus_text();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_input_conditioned_samples_total{"))
+            .collect();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|l| l.contains("stage=\"impulse\""))
+                .count(),
+            impulse_marks
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|l| l.contains("stage=\"dc\""))
+                .count(),
+            dc_marks
+        );
+        assert!(samples.iter().all(|l| l.ends_with(" 0")));
+    }
+}
+
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
     spec: LiveSourceSpec,
@@ -5712,6 +5795,7 @@ struct ResolvedInput {
     name: String,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
+    conditioning: manta_dsp::condition::ConditioningConfig,
     dial_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     /// MAN-309: `run` records this input's IQ here (`record_iq`).
@@ -5913,6 +5997,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     name: n.name.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
+                    conditioning: n.input.shared.conditioning(),
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
                     record_iq: n.input.shared.record_iq.clone(),
@@ -7082,11 +7167,27 @@ fn run_command() -> Result<std::process::ExitCode> {
                     path.display()
                 );
             }
+            // MAN-496: the conditioning keys follow the ppm rule: a
+            // recording came from one receiver, so entries that disagree
+            // are ambiguous, never silently the first one's.
+            let cond_of = |n: &config::NamedInput| n.input.shared.conditioning();
+            let conditioning = cond_of(&loaded.inputs[0]);
+            if several && loaded.inputs.iter().any(|n| cond_of(n) != conditioning) {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: set \
+                     dc_block and impulse_suppress alike in every [[input]] entry",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
             if several {
                 errln!(
-                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
-                     in {}",
+                    "note: decode applies only input.freq_correction_ppm, dc_block and \
+                     impulse_suppress from the {} [[input]] entries in {}",
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -7094,9 +7195,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
+                || shared.dc_block.is_some()
+                || shared.impulse_suppress.is_some()
             {
                 errln!(
-                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    "note: decode applies only input.freq_correction_ppm, dc_block and \
+                     impulse_suppress from [input] in {}",
                     loaded.origin
                 );
             }
@@ -7127,6 +7231,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 decode_cfg.engine,
             )?;
             note_pinned_lists(&spot, &lists_in_use);
+            // MAN-496: `[input] dc_block`/`impulse_suppress` turn the
+            // conditioning stages on for this decode.
+            cfg.conditioning = conditioning;
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an
@@ -8155,8 +8262,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // it is published at 0 from startup.
             let bad_samples = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let mut bad_samples_warned: u64 = 0;
+            cfg.conditioning = if resolved.replaced_file_source.is_some() {
+                Default::default()
+            } else {
+                loaded.input.shared.conditioning()
+            };
+            let conditioned = std::sync::Arc::new(manta_engine::ConditioningObserver::default());
             if let Some(server) = &spot_server {
                 server.metrics.set_input_bad_samples(source_name, 0);
+                publish_conditioned(
+                    &server.metrics,
+                    source_name,
+                    &cfg.conditioning,
+                    &conditioned,
+                );
             }
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
@@ -8189,6 +8308,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                     callsign_lookup,
                     static_crashes: Some(static_crashes.clone()),
                     bad_samples: Some(bad_samples.clone()),
+                    conditioned: Some(conditioned.clone()),
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -8291,6 +8411,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                     if let Some(server) = &spot_server {
                         server.metrics.set_input_bad_samples(source_name, n_bad);
+                        publish_conditioned(
+                            &server.metrics,
+                            source_name,
+                            &cfg.conditioning,
+                            &conditioned,
+                        );
                     }
                     if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
                         if let Some(server) = &spot_server {
@@ -8577,6 +8703,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     name: input.as_deref(),
                 }),
             )?;
+            let mut cfg = cfg;
+            cfg.conditioning = if resolved.replaced_file_source.is_some() {
+                Default::default()
+            } else {
+                loaded.input.shared.conditioning()
+            };
             if loaded.server.is_some() {
                 errln!(
                     "note: soak does not start the spot servers; ignoring [server] from {}",

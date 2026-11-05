@@ -216,6 +216,15 @@ why they are node-wide, with no `track_id` label.
 
 ## Bad input samples (MAN-234)
 
+`manta_input_conditioned_samples_total{source,stage,mark}` shows what
+`dc_block` and `impulse_suppress` did to the input. DC `apply` counts
+`corrected` samples. Impulse `observe` counts `flagged` and `uncertain`
+samples; `apply` also counts `repaired` samples. These counters start at
+zero for configured modes and include every reconnect segment. Off stages
+and DC `observe` produce no series. Compare rates per source when checking
+receiver DC or impulsive interference; these counts describe conditioning,
+not lost samples or rejected spots. The keys require a restart.
+
 `manta_input_bad_samples_total{source}` counts input samples manta
 replaced with silence because a component was NaN, infinite, or larger
 than 1e17 in magnitude. Sources deliver full scale at 1.0, so any count
