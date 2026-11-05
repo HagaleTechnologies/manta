@@ -6,8 +6,8 @@ pub mod check;
 pub mod config_file;
 pub mod listen;
 pub use listen::{
-    listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
-    RttyObserver, SuppressionObserver,
+    listen, listen_with_observers, ConditioningObserver, ListenObservers, OperatorLists,
+    OperatorListsUpdate, RttyObserver, SuppressionObserver,
 };
 pub mod latency;
 pub mod live;

@@ -147,7 +147,10 @@ the git history and `docs/DECISIONS/`.
 - MAN-496: the `[input]` conditioning keys `dc_block` and
   `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
   restart-only), turning MAN-203's input-conditioning stages on for
-  `decode`. `decode --json` gains an `inputConditioning` object (omitted
+  `decode`, `run` and `soak`, with per-input settings for multiple receivers.
+  `run` publishes `manta_input_conditioned_samples_total` by source, stage
+  and mark, starting at zero for configured modes and summed across reconnects.
+  `decode --json` gains an `inputConditioning` object (omitted
   when every stage is `off`) with exact per-stage counts and the bounded
   span log; `manta config` prints a set stage in the input summary. See
   docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.

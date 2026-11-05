@@ -13,8 +13,12 @@
 mod support;
 
 use manta_testkit::sensitivity::{CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use support::near_centre_scene;
 
@@ -174,4 +178,106 @@ fn bad_conditioning_mode_is_refused_by_config_check() {
         stderr.contains("[input] dc_block must be \"off\", \"observe\" or \"apply\", not \"on\""),
         "stderr:\n{stderr}"
     );
+}
+
+/// `N` distinct ports nothing listens on right now. All `N` listeners are
+/// held until every port is read (MAN-371), as `node_health_acceptance.rs`
+/// does.
+fn free_ports<const N: usize>() -> [u16; N] {
+    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    held.map(|l| l.local_addr().unwrap().port())
+}
+
+/// Kills and reaps the daemon child on drop, including on a failing assert.
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// `GET <path>` over a raw TCP connection; returns the body.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .ok()?;
+    stream
+        .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+        .ok()?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok()?;
+    resp.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+}
+
+/// The value trailing a Prometheus sample line starting with
+/// `metric_with_labels`.
+fn metric_value(body: &str, metric_with_labels: &str) -> Option<f64> {
+    let prefix = format!("{metric_with_labels} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+#[test]
+fn run_daemon_publishes_the_conditioned_samples_metric_from_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (wav, _, _) = fixtures(tmp.path());
+    for multi in [false, true] {
+        let [telnet_port, json_port, metrics_port] = free_ports();
+        let cfg = tmp.path().join("daemon.toml");
+        let mut inputs = format!("[{}]\n{}type = \"file\"\npath = {:?}\niq = true\nrealtime = true\nloop = true\ndc_block = \"apply\"\n",
+            if multi { "[input]" } else { "input" },
+            if multi { "name = \"rx1\"\n" } else { "" }, wav);
+        if multi {
+            inputs.push_str(&format!("[[input]]\nname = \"rx2\"\ntype = \"file\"\npath = {:?}\niq = true\nrealtime = true\nloop = true\n", wav));
+        }
+        std::fs::write(&cfg, format!("{inputs}\n[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n")).unwrap();
+        let log = tmp.path().join("daemon.stderr");
+        let child = Command::new(env!("CARGO_BIN_EXE_manta"))
+            .args(["run", "--config"])
+            .arg(&cfg)
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&log).unwrap()))
+            .spawn()
+            .unwrap();
+        let _guard = ChildGuard(child);
+        let source = if multi { "rx1" } else { "file" };
+        let metric = format!("manta_input_conditioned_samples_total{{source=\"{source}\",stage=\"dc\",mark=\"corrected\"}}");
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut seen = None;
+        while Instant::now() < deadline {
+            if let Some(body) = http_get(metrics_port, "/metrics") {
+                assert!(
+                    body.contains("# TYPE manta_input_conditioned_samples_total counter"),
+                    "{body}"
+                );
+                if multi {
+                    assert!(
+                        !body.contains("manta_input_conditioned_samples_total{source=\"rx2\""),
+                        "off input must have no conditioning series"
+                    );
+                }
+                if let Some(n) = metric_value(&body, &metric) {
+                    if seen.is_none() {
+                        assert_eq!(n, 0.0, "configured stage starts at zero");
+                    }
+                    seen = Some(n);
+                    if n > 0.0 {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            seen.is_some_and(|n| n > 0.0),
+            "{metric}: {seen:?}; {}",
+            std::fs::read_to_string(&log).unwrap()
+        );
+    }
 }
