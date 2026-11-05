@@ -41,9 +41,9 @@ coppa-channel = { git = "https://github.com/HagaleTechnologies/coppa.git", rev =
 # features only). Pin rule (decision D1 in
 # docs/DECISIONS/2026-11-01-man323-ft8-ft4-from-band-streams.md): a
 # `pancetta-ft8-v*` tag when one exists, else PR #550's merge commit, else its
-# head. This is PR #550's head (open on 2026-11-01): move it to the tag before
-# merging.
-pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "390d7860315d5086eb52b834605a0a7ff4b741c5" }
+# head. MAN-485 moves this to PR #550's merge commit (merged untagged;
+# no pancetta-ft8-v* tag exists as of 2026-11-05).
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "7f8078b19d759e24f50adb1efd0b3fd75371a39d" }
 
 cpal = "0.18"
 ctrlc = "3"

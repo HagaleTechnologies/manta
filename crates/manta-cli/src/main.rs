@@ -32,6 +32,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod ftx_run;
 mod funnel_cmd;
 mod grade_cmd;
 mod grade_paired;
@@ -5787,6 +5788,7 @@ struct Resolved {
 #[derive(Clone)]
 struct ResolvedInput {
     name: String,
+    digital_modes: Vec<manta_engine::ftx::FtxMode>,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
     conditioning: manta_dsp::condition::ConditioningConfig,
@@ -5989,6 +5991,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                 };
                 Ok(ResolvedInput {
                     name: n.name.clone(),
+                    digital_modes: n.input.shared.digital_modes.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
                     conditioning: n.input.shared.conditioning(),
@@ -7835,6 +7838,36 @@ fn run_command() -> Result<std::process::ExitCode> {
             } else {
                 None
             };
+            // Coverage is reported before the server's listening banner.
+            let digital_modes = if resolved.replaced_file_source.is_none() {
+                loaded.input.shared.digital_modes.as_slice()
+            } else {
+                &[]
+            };
+            let ftx = (!digital_modes.is_empty()).then(|| {
+                std::sync::Arc::new(ftx_run::Session::new(vec![(
+                    source_name.to_string(),
+                    resolved.freq_correction_ppm,
+                )]))
+            });
+            if ftx.is_some() {
+                let (windows, lines) = ftx_run::plan(
+                    source_name,
+                    digital_modes,
+                    first.center_freq_hz(),
+                    first.rf_passband_hz(),
+                    first.trusted_band_hz(),
+                    first.sample_rate(),
+                );
+                for line in lines {
+                    logging::note(&line);
+                }
+                if replay_path.is_none() && !windows.is_empty() {
+                    if let Some(line) = ftx_run::clock_line(clock_check::kernel_synced()) {
+                        logging::note(&line);
+                    }
+                }
+            }
             let (
                 server_runtime,
                 spot_server,
@@ -8219,6 +8252,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
                 None => (src, None),
             };
+            let src = if let Some(ftx) = &ftx {
+                if let Some(server) = &spot_server {
+                    ftx.bind(server.bus.clone(), server.metrics.clone());
+                }
+                ftx.wrap(
+                    0,
+                    src,
+                    session_epoch.context("FTx needs a session epoch")?,
+                    digital_modes,
+                    replay_path.is_none(),
+                )
+            } else {
+                src
+            };
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -8458,6 +8505,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // reload holds while it applies) and setting `stop` tell the
             // reload thread to ignore SIGHUP instead of flipping `dry_run`
             // mid-drain.
+            if let Some(ftx) = &ftx {
+                ftx.stop();
+            }
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             // MAN-309: the source is gone, so the queue is closed; the

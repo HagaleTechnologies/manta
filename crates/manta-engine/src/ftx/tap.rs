@@ -182,6 +182,8 @@ pub fn attach(src: Box<dyn IqSource>, spec: TapSpec) -> Box<dyn IqSource> {
         sink: spec.sink,
         pending_gap: None,
         pending_missing: None,
+        pending_stalled: false,
+        pending_unknown_gap: false,
         audio: Vec::new(),
         slots: Vec::new(),
         ended: false,
@@ -204,6 +206,8 @@ struct FtxTap {
     sink: Arc<dyn FtxSink>,
     pending_gap: Option<u64>,
     pending_missing: Option<u64>,
+    pending_stalled: bool,
+    pending_unknown_gap: bool,
     audio: Vec<f32>,
     slots: Vec<Slot>,
     ended: bool,
@@ -274,6 +278,10 @@ impl IqSource for FtxTap {
         // to the engine unchanged (as RecordingSource does).
         let gap = self.inner.take_discontinuity();
         let missing = self.inner.take_missing_samples();
+        let stalled = self.inner.take_stalled();
+        let unknown_gap = self.inner.take_unknown_gap();
+        self.pending_stalled = stalled;
+        self.pending_unknown_gap = unknown_gap;
         self.pending_gap = gap;
         self.pending_missing = missing;
         if self.ended {
@@ -286,6 +294,11 @@ impl IqSource for FtxTap {
             if let Some(g) = gap {
                 chain.demod.reset();
                 chain.slicer.gap(g, fs, |s| slots.push(s));
+            }
+            if unknown_gap {
+                chain.demod.reset();
+                // As with CW, invalidate continuity without inventing elapsed time.
+                chain.slicer.gap(0, fs, |s| slots.push(s));
             }
             if let Some(m) = missing {
                 // Zero IQ through the demodulator, so its decimation phase
@@ -304,13 +317,13 @@ impl IqSource for FtxTap {
                 self.audio.clear();
                 chain.demod.process(&buf[..n], &mut self.audio);
                 chain.slicer.push(&self.audio, |s| slots.push(s));
-            } else {
+            } else if !stalled {
                 chain.slicer.finish(|s| slots.push(s));
             }
             self.slots = slots;
             self.dispatch(c);
         }
-        if n == 0 {
+        if n == 0 && !stalled {
             self.ended = true;
             self.sink.input_ended(self.input);
         }
@@ -327,6 +340,14 @@ impl IqSource for FtxTap {
 
     fn take_missing_samples(&mut self) -> Option<u64> {
         self.pending_missing.take()
+    }
+
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.pending_stalled)
+    }
+
+    fn take_unknown_gap(&mut self) -> bool {
+        std::mem::take(&mut self.pending_unknown_gap)
     }
 
     fn acquisition_start_offset(&self) -> std::time::Duration {
@@ -625,6 +646,76 @@ mod tests {
         fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
             Some(Arc::clone(&self.health))
         }
+    }
+
+    #[test]
+    fn reconnect_stalls_and_unknown_gaps_survive_the_tap() {
+        struct Stalling {
+            inner: Scripted,
+            reads: usize,
+            stalled: bool,
+            unknown: bool,
+        }
+        impl IqSource for Stalling {
+            fn sample_rate(&self) -> f64 {
+                self.inner.sample_rate()
+            }
+            fn center_freq_hz(&self) -> f64 {
+                self.inner.center_freq_hz()
+            }
+            fn rf_passband_hz(&self) -> (f64, f64) {
+                self.inner.rf_passband_hz()
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    self.stalled = true;
+                    return Ok(0);
+                }
+                self.unknown = self.reads == 3;
+                self.inner.read(buf)
+            }
+            fn take_stalled(&mut self) -> bool {
+                std::mem::take(&mut self.stalled)
+            }
+            fn take_unknown_gap(&mut self) -> bool {
+                std::mem::take(&mut self.unknown)
+            }
+        }
+        let source = Stalling {
+            inner: Scripted::zeros(48_000.0, 2.0, 48_000),
+            reads: 0,
+            stalled: false,
+            unknown: false,
+        };
+        let sink = Arc::new(Recorder::default());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tap = attach(
+            Box::new(source),
+            spec(
+                vec![FT8_20M],
+                Placement::Replay,
+                sink.clone(),
+                fake_factory(calls.clone()),
+                BOUNDARY_MS,
+            ),
+        );
+        let mut buf = vec![Complex32::new(0.0, 0.0); 48_000];
+        assert_eq!(tap.read(&mut buf).unwrap(), 48_000);
+        let before_stall = sink.slots.lock().unwrap().len();
+        assert_eq!(tap.read(&mut buf).unwrap(), 0);
+        assert!(tap.take_stalled());
+        assert!(!tap.take_stalled());
+        assert!(sink.ended.lock().unwrap().is_empty());
+        assert_eq!(sink.slots.lock().unwrap().len(), before_stall);
+        assert_eq!(tap.read(&mut buf).unwrap(), 48_000);
+        assert!(tap.take_unknown_gap());
+        assert!(!tap.take_unknown_gap());
+        assert!(sink.ended.lock().unwrap().is_empty());
+        assert_eq!(tap.read(&mut buf).unwrap(), 0);
+        assert!(!tap.take_stalled());
+        assert_eq!(*sink.ended.lock().unwrap(), [0]);
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     fn spec(
