@@ -191,20 +191,44 @@ fn the_sender_delivers_a_frame_n1mm_accepts() {
 fn frames_closer_than_100_ms_are_rate_limited() {
     let n1mm = FakeN1mm::bind();
     let (sender, _handle, stats) = spawn_to(n1mm.addr(), "manta a");
-    for _ in 0..3 {
+    // Four frames fill the queue exactly (QUEUE_FRAMES), so however the
+    // sender thread is scheduled, none is lost to a full queue (MAN-504).
+    for _ in 0..4 {
         sender.offer(frame(14_000_000.0, 4));
     }
     n1mm.recv();
-    wait_until("two rate-limited frames", || {
-        stats.dropped(SpectrumDrop::RateLimit) == 2
+    // Both counters only grow and the burst holds four frames, so the sum
+    // reaching four proves both reads are final, in any atomic ordering:
+    // one send plus three drops when tight, more sends and fewer drops if
+    // a loaded runner stretches one dequeue past 100 ms.
+    wait_until("the burst accounted", || {
+        stats.datagrams() + stats.dropped(SpectrumDrop::RateLimit) == 4
     });
-    // record_sent() runs after send_to returns, so the datagram can arrive first.
-    wait_until("the first send", || stats.datagrams() == 1);
+    assert!(
+        stats.dropped(SpectrumDrop::RateLimit) >= 2,
+        "burst accounted with {:?}",
+        stats
+    );
+    assert_eq!(stats.dropped(SpectrumDrop::QueueFull), 0);
     // Real time, not paused time (MAN-478).
     std::thread::sleep(Duration::from_millis(150));
-    sender.offer(frame(14_000_000.0, 4));
-    n1mm.recv();
-    wait_until("the second send", || stats.datagrams() == 2);
+    // A stretched burst may have sent a second datagram the recv above did
+    // not consume, so it still sits in the socket buffer. Give this frame
+    // contents no burst frame has and receive until it arrives: only its
+    // receipt proves transmission resumed at least MIN_INTERVAL after the
+    // burst, rather than a stale burst datagram (PR 515 review).
+    sender.offer(frame(14_000_050.0, 4));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = n1mm.recv();
+        if got.low_khz == 14_000.05 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the post-interval frame within 5 s; last received {got:?}"
+        );
+    }
 }
 
 #[test]
