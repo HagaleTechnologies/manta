@@ -212,6 +212,12 @@ pub struct TrackDecoder {
     after_gap: bool,
     /// MAN-202: unknown input gaps this decoder has been told about.
     continuity_epoch: u32,
+    /// MAN-199: set only inside `push_lead_in_hop`, so `tick_meta` neither
+    /// counts the hop nor moves the SPEC §5 report cadence.
+    lead_in: bool,
+    /// MAN-199: a mark run has reached `on_run`. A space before it is a
+    /// truncation (the decoder started inside it) and teaches nothing.
+    mark_seen: bool,
     /// MAN-202: the shortest mark fed to the tracker before readiness. The
     /// tracker's dit centroid is 0 until then, so the post-gap resync
     /// measures spaces in this instead. A complete post-gap mark lowers it
@@ -274,6 +280,8 @@ impl TrackDecoder {
             snr_2500_db: None,
             after_gap: false,
             continuity_epoch: 0,
+            lead_in: false,
+            mark_seen: false,
             warmup_min_mark_ms: None,
             post_gap_mark_seen: false,
             last_char_ts: 0,
@@ -476,6 +484,25 @@ impl TrackDecoder {
         }
     }
 
+    /// MAN-199: one hop recorded before this decoder's track was promoted
+    /// (or, for a woken DORMANT track, before the wake). It feeds the front
+    /// end, timing and character assembly exactly as `push_hop` does, but is
+    /// not counted in `hop_count`: the SPEC §5 report cadence and the
+    /// engine's peak-hold window stay anchored to the track's
+    /// post-promotion hops.
+    pub fn push_lead_in_hop(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+    ) -> Vec<DecoderEvent> {
+        self.lead_in = true;
+        let events = self.push_hop(amp, power, spectral_ref_power, sample_ts);
+        self.lead_in = false;
+        events
+    }
+
     /// One hop: linear amplitude, linear power, optional spectral noise
     /// reference power (SPEC v2 §2.2), input sample counter.
     pub fn push_hop(
@@ -649,6 +676,10 @@ impl TrackDecoder {
     /// MAN-102's own miscalibration for those two engines (Codex review,
     /// PR #134 round 2).
     fn tick_meta(&mut self, events: &mut Vec<DecoderEvent>) {
+        // MAN-199: a lead-in hop is not one of the track's reporting hops.
+        if self.lead_in {
+            return;
+        }
         self.hop_count += 1;
         if self.hop_count.is_multiple_of(META_INTERVAL_HOPS) {
             let snr = if self.cfg.engine == Engine::Legacy {
@@ -1000,6 +1031,16 @@ impl TrackDecoder {
                 self.after_gap = false;
             }
             return; // nothing learned, nothing assembled
+        }
+        // MAN-199: the decoder started inside this space (a lead-in begins
+        // at an arbitrary recorded hop), so its length is a truncation, not
+        // the sender's gap: it is neither classified nor learned, as
+        // `finish` treats the trailing space (MAN-315).
+        if !run.mark && !self.mark_seen {
+            return;
+        }
+        if run.mark {
+            self.mark_seen = true;
         }
         if !self.tracker.ready() {
             if run.mark {
@@ -4184,5 +4225,160 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, DecoderEvent::TimingUpdate { .. })));
+    }
+
+    // ---- MAN-199: lead-in entry point and the leading-space rule ----
+
+    /// MAN-199: lead-in hops feed the decoder but do not advance
+    /// `hop_count`, so every `TrackMeta`/`TimingUpdate` still lands on a
+    /// live hop's reporting boundary.
+    #[test]
+    fn lead_in_hops_do_not_advance_the_report_cadence() {
+        let env = rect_envelope("PARIS PARIS", 20);
+        let lead = 64u64;
+        let live_ts = |i: usize| lead + i as u64;
+        let mut a = TrackDecoder::new(1, DecodeConfig::default());
+        let mut b = TrackDecoder::new(2, DecodeConfig::default());
+        let mut a_events = Vec::new();
+        let mut b_events = Vec::new();
+        for i in 0..lead {
+            a_events.extend(a.push_lead_in_hop(0.0, 0.0, None, i));
+        }
+        for (i, &x) in env.iter().enumerate() {
+            a_events.extend(a.push_hop(x, x * x, None, live_ts(i)));
+            b_events.extend(b.push_hop(x, x * x, None, live_ts(i)));
+        }
+        assert_eq!(a.hop_count(), env.len() as u64);
+        assert_eq!(a.hop_count(), b.hop_count());
+        let boundaries: Vec<u64> = (1..=env.len())
+            .filter(|j| (*j as u64).is_multiple_of(META_INTERVAL_HOPS))
+            .map(|j| live_ts(j - 1))
+            .collect();
+        assert!(
+            boundaries.len() >= 2,
+            "the envelope spans two reporting boundaries"
+        );
+        let report_ts = |events: &[DecoderEvent]| -> Vec<u64> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::TrackMeta { sample_ts, .. }
+                    | DecoderEvent::TimingUpdate { sample_ts, .. } => Some(*sample_ts),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert!(
+            !report_ts(&b_events).is_empty(),
+            "control reports: {b_events:?}"
+        );
+        for ts in report_ts(&a_events) {
+            assert!(
+                boundaries.contains(&ts),
+                "report at {ts} is off the live cadence {boundaries:?}"
+            );
+        }
+    }
+
+    /// MAN-199: a space before the decoder's first mark is a truncation
+    /// (the decoder started inside it). It teaches the tracker and gap
+    /// classifier nothing and emits nothing, whatever its length.
+    #[test]
+    fn a_space_before_the_first_mark_teaches_nothing() {
+        let body: Vec<(bool, u32)> = vec![
+            (true, 15),
+            (false, 15),
+            (true, 45),
+            (false, 45),
+            (true, 45),
+            (false, 15),
+            (true, 15),
+            (false, 105),
+            (true, 15),
+            (false, 15),
+            (true, 15),
+            (false, 45),
+            (true, 45),
+            (false, 15),
+            (true, 15),
+            (false, 105),
+        ];
+        let feed = |lead: Option<u32>| {
+            let mut dec = TrackDecoder::new(1, DecodeConfig::default());
+            let mut events = Vec::new();
+            for (mark, hops) in lead.map(|h| (false, h)).into_iter().chain(body.clone()) {
+                dec.on_run(
+                    Run {
+                        mark,
+                        start_ts: 0,
+                        hops,
+                    },
+                    &mut events,
+                );
+            }
+            (dec, events)
+        };
+        let (control, control_events) = feed(None);
+        assert!(
+            control.tracker.ready(),
+            "fixture: the body bootstraps the tracker"
+        );
+        for lead in [15u32, 45, 120] {
+            let (dec, events) = feed(Some(lead));
+            assert_eq!(events, control_events, "lead {lead}");
+            assert_eq!(
+                dec.tracker.mu_dit_ms(),
+                control.tracker.mu_dit_ms(),
+                "lead {lead}"
+            );
+            assert_eq!(
+                dec.tracker.mu_dah_ms(),
+                control.tracker.mu_dah_ms(),
+                "lead {lead}"
+            );
+            assert_eq!(
+                dec.tracker.mu_egap_ms(),
+                control.tracker.mu_egap_ms(),
+                "lead {lead}"
+            );
+            for probe in [15.0f32, 45.0, 105.0, 300.0] {
+                let ms = probe * HOP_MS as f32;
+                assert_eq!(
+                    dec.gaps.clone().classify(ms, dec.gap_unit_ms()),
+                    control.gaps.clone().classify(ms, control.gap_unit_ms()),
+                    "lead {lead}, probe {probe} hops"
+                );
+            }
+        }
+    }
+
+    /// MAN-199: a lead-in of noise ahead of the text decodes exactly as the
+    /// text alone; without the leading-space rule a 120-hop leading space
+    /// at a 12-hop dit reads as a word gap.
+    #[test]
+    fn lead_in_noise_then_text_decodes_like_the_text_alone() {
+        let text = |dec: &mut TrackDecoder, lead: usize| -> String {
+            let env = rect_envelope("CQ DE W1AW", 12);
+            let mut events = Vec::new();
+            for i in 0..lead {
+                events.extend(dec.push_lead_in_hop(0.0, 0.0, None, i as u64));
+            }
+            for (i, &x) in env.iter().enumerate() {
+                events.extend(dec.push_hop(x, x * x, None, (lead + i) as u64));
+            }
+            events.extend(dec.finish());
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    DecoderEvent::CharDecoded { glyph, .. } => glyph.text_char(),
+                    DecoderEvent::WordBoundary { .. } => Some(' '),
+                    _ => None,
+                })
+                .collect()
+        };
+        let alone = text(&mut TrackDecoder::new(1, DecodeConfig::default()), 0);
+        assert_eq!(alone.trim(), "CQ DE W1AW");
+        let led = text(&mut TrackDecoder::new(1, DecodeConfig::default()), 120);
+        assert_eq!(led, alone);
     }
 }

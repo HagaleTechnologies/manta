@@ -402,6 +402,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-497: dropping a lone protocol-1 HPSDR receiver sends the stop command
+  twice, as protocol 2 does, so one lost UDP datagram no longer leaves the
+  radio streaming and refused as in use on rediscovery. Decoder output is
+  unchanged.
+
 - MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
   longer stamped late when the reopen thread stalls before it drains the
   data socket. The startup stash now stamps each packet with the last

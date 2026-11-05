@@ -411,6 +411,29 @@ is later (0.5–1.5 s of stream on the golden vectors). A track that never
 qualifies emits nothing, including at end of input. `NotCw`, `Unkeyed` and
 the garbage-collect close each start the MAN-171 respawn cooldown on their
 channels. `non_cw_filter = false` leases at promotion, as before.
+
+**Lead-in (MAN-199).** The detector keeps the power spectrum of the last
+64 hops it stepped (171 ms), indexed by hop and stamped with each hop's
+original `sample_ts`. When a track is promoted, or a DORMANT track wakes,
+it takes a *lead-in*: the recorded hops before that hop, on the owned
+channel the live decoder feed would select (excluding a close
+neighbour's channel, MAN-112) and through the §2.7 crash hold, minus
+every hop a decoder on the same channels already consumed. A lead-in
+never reaches back past the segment's first recorded hop (stream start,
+pre-roll, a discontinuity) or an unknown-length input gap, and it never
+contains a synthetic hop: a hop that was not recorded is absent, with its reason,
+and one that has not arrived is "not yet known". The decoder replays the
+lead-in ahead of its queued input, when it is leased. Lead-in hops do not
+count toward the §5 report cadence or the SNR peak-hold window, and §2.8
+qualification reads only the post-promotion queue. The refiner (v2 §3)
+is not fed from the lead-in: its entries carry the recorded amplitude.
+
+**One close routine (MAN-199).** Every close of a track (end of stream, a
+discontinuity, DORMANT entry, and every close reason) drains the refiner
+backlog, the lead-in and the queued input through the decoder, then
+finishes the decoder: forced for `HangExpired`, DORMANT entry and end of
+stream (an observed RF gap may resolve an open mark), speed-only for
+every other close. The §5 `TrackClosed` gate runs after that flush.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
@@ -1232,7 +1255,7 @@ dahs (`TT`) has no element gaps and keeps the dit assumption. See
 docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
 
 **[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
-(stream EOF, or a HangExpired/Silent closure, where a sustained real
+(stream EOF, a HangExpired closure, or DORMANT entry, where a sustained real
 on-air gap has been observed), a tracker that saw **2–4 marks**
 initializes from them with exactly the split rule above, and the runs
 buffered while the quorum was unfilled replay through the ordinary
@@ -1376,6 +1399,10 @@ uses the same unit):
 - `u < 2.0` → **inter-element** (within a character)
 - `2.0 ≤ u < 5.0` → **inter-character**
 - `u ≥ 5.0` → **inter-word**
+
+A space before the decoder's first mark (MAN-199) is a truncation: the
+decoder started inside it, as at the start of a §2.4 lead-in. It is
+neither classified nor learned, like the trailing space at `finish()`.
 
 The implementation matches this nominal `2.0` boundary (`CHAR_GAP_DITS` in
 `crates/manta-decode/src/timing.rs`). It was lowered to `1.6` for a period
@@ -1765,7 +1792,8 @@ TrackClosed    { track_id, closure: SignalEnded
                  (added post-freeze, MAN-19; `closure` PR #154 round 9,
                  MAN-174 — a track has closed and will never emit another
                  event under this track_id. Emitted only for a track that
-                 produced at least one other event first, or that a
+                 produced at least one other event first (on every close
+                 path that includes the close's own flush, MAN-199), or that a
                  merged-away track named as its `survivor_track_id`. The
                  `closure` kind says what a consumer holding deferred
                  per-track evidence, such as manta-spot's pending Beacon
@@ -1904,8 +1932,10 @@ rules:
 6. **Pool scheduling must not affect output:** decoder workers may run in any
    order, but each track's decoder is a pure function of its own input queue;
    emitted events are sequenced by `(sample_ts, track_id)` before the
-   validator sees them. `TrackClosed` events sort after every other event of
-   their batch; a merge loser's `TrackClosed` precedes its survivor's own
+   validator sees them. Within a batch, a track's events sort no earlier
+   than its same-batch `TrackPromoted` (MAN-199: a lead-in's output is
+   stamped before the promotion hop). `TrackClosed` events sort after
+   every other event of their batch; a merge loser's `TrackClosed` precedes its survivor's own
    `TrackClosed` in the same batch; other closures stay in `track_id` order
    (MAN-174).
 7. **Several inputs (MAN-13):** each `[[input]]` runs rules 1–6 on its own
