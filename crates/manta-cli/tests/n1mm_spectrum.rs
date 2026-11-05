@@ -204,7 +204,6 @@ fn frames_closer_than_100_ms_are_rate_limited() {
     wait_until("the burst accounted", || {
         stats.datagrams() + stats.dropped(SpectrumDrop::RateLimit) == 4
     });
-<<<<<<< HEAD
     assert!(
         stats.dropped(SpectrumDrop::RateLimit) >= 2,
         "burst accounted with {:?}",
@@ -230,15 +229,6 @@ fn frames_closer_than_100_ms_are_rate_limited() {
             "the post-interval frame within 5 s; last received {got:?}"
         );
     }
-=======
-    // record_sent() runs after send_to returns, so the datagram can arrive first.
-    wait_until("the first send", || stats.datagrams() == 1);
-    // Real time, not paused time (MAN-478).
-    std::thread::sleep(Duration::from_millis(150));
-    sender.offer(frame(14_000_000.0, 4));
-    n1mm.recv();
-    wait_until("the second send", || stats.datagrams() == 2);
->>>>>>> 18eaa0d5a924bf608c0e39bcf7c382aa21545355
 }
 
 #[test]
