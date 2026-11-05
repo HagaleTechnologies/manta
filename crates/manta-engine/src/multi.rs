@@ -125,6 +125,8 @@ pub struct InputObservers {
     pub static_crashes: Option<Arc<AtomicU64>>,
     /// Input samples replaced as unusable on this input (MAN-234).
     pub bad_samples: Option<Arc<AtomicU64>>,
+    /// Exact input-conditioning counts across segments.
+    pub conditioned: Option<Arc<crate::ConditioningObserver>>,
     /// This input's marked RTTY signals.
     pub rtty: Option<Arc<RttyObserver>>,
     /// MAN-141: this input's spectrum tap (`ListenObservers::spectrum`,
@@ -144,6 +146,8 @@ pub struct InputSpec {
     pub open: InputOpener,
     /// This input's receiver correction (D4).
     pub freq_correction_ppm: f64,
+    /// This input's conditioning, overriding the shared pipeline setting.
+    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub observers: InputObservers,
     /// MAN-310: this input's share of a split band plan, Hz from its
     /// centre (an edge may be infinite); `None`: its whole band. Narrows
@@ -241,6 +245,7 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
+    conditioning: Vec<manta_dsp::condition::ConditioningConfig>,
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -292,6 +297,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     let mut pending = Vec::with_capacity(n);
     let mut ppm = Vec::with_capacity(n);
+    let mut conditioning = Vec::with_capacity(n);
     let mut observers = Vec::with_capacity(n);
     // One shared completion channel, so the first failure is observed the
     // moment it arrives instead of after every earlier opener has returned
@@ -310,6 +316,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
             .spawn(move || input_thread(name, open, spawn_band_hz, index, done_tx, go_rx, stop))
             .map_err(|e| anyhow!("input \"{}\": cannot start its thread: {e}", spec.name))?;
         ppm.push(spec.freq_correction_ppm);
+        conditioning.push(spec.conditioning);
         observers.push(spec.observers);
         pending.push(Parked { go: go_tx, handle });
     }
@@ -320,6 +327,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let mut opened = OpenedInputs {
         inputs: Vec::new(),
         ppm,
+        conditioning,
         observers,
         parked: pending,
         common_rate_hz: 0.0,
@@ -485,7 +493,10 @@ pub fn listen_inputs(
         };
         let fs = opened.inputs[index].sample_rate_hz;
         let go = Go {
-            cfg: cfg.clone(),
+            cfg: PipelineConfig {
+                conditioning: opened.conditioning[index].clone(),
+                ..cfg.clone()
+            },
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],
@@ -496,6 +507,7 @@ pub fn listen_inputs(
                 active_tracks: opened.observers[index].active_tracks.clone(),
                 static_crashes: opened.observers[index].static_crashes.clone(),
                 bad_samples: opened.observers[index].bad_samples.clone(),
+                conditioned: opened.observers[index].conditioned.clone(),
                 rtty: opened.observers[index].rtty.clone(),
                 decode_latency: shared.decode_latency.clone(),
                 decode_quality: shared.decode_quality.clone(),

@@ -454,6 +454,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // thread after each of its batches, as the one-input path reads one
     // counter; `bad_warned` holds what the one-time warning already named.
     let bad: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let conditioned: Vec<_> = (0..n)
+        .map(|_| Arc::new(manta_engine::ConditioningObserver::default()))
+        .collect();
     let bad_warned: Vec<std::cell::Cell<u64>> = (0..n).map(|_| std::cell::Cell::new(0)).collect();
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
@@ -529,10 +532,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             InputSpec {
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
+                conditioning: input.conditioning.clone(),
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
                     bad_samples: Some(bad),
+                    conditioned: Some(conditioned[index].clone()),
                     rtty: Some(rtty_observers[index].clone()),
                     spectrum: spectrum_late[index]
                         .clone()
@@ -800,13 +805,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             // Health edges from here on reach `Metrics` directly; each
             // input's state so far is copied in once.
             let _ = metrics_slot.set(server.metrics.clone());
-            for (name, up) in names.iter().zip(healthy.iter()) {
+            for (index, (name, up)) in names.iter().zip(healthy.iter()).enumerate() {
                 server
                     .metrics
                     .set_source_health(name, up.load(Ordering::Relaxed));
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    name,
+                    &m.inputs[index].conditioning,
+                    &conditioned[index],
+                );
             }
             // MAN-14: every input's hearing series, at 0, in config order.
             server.metrics.register_input_hearing(&names);
@@ -996,6 +1007,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_input_bad_samples(&names[input], n_bad);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    &names[input],
+                    &m.inputs[input].conditioning,
+                    &conditioned[input],
+                );
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
@@ -1297,6 +1314,7 @@ mod tests {
             name: "b".into(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,
+            conditioning: Default::default(),
             dial_freq_hz: None,
             capture_rate_hz: None,
             record_iq: None,
