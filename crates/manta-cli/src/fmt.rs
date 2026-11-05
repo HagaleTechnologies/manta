@@ -154,21 +154,24 @@ fn conditioning_report_lines(
              second looked like impulses, so they are probably signal\n"
         ));
     } else if marked > 0 {
-        // The span log counts runs (one span per contiguous impulse, the
-        // final segment's), the counters count samples exactly.
-        let runs: u64 = cond
+        // Spans are bounded and cover only the final reconnect segment.
+        // Name a run total only when they account for every marked sample.
+        let (runs, retained_samples) = cond
             .spans
             .iter()
             .filter(|s| s.stage == "impulse" && (s.mark == "flagged" || s.mark == "repaired"))
-            .count() as u64;
-        let runs = if runs == 0 { marked } else { runs };
-        let (count, impulse_noun, sample_noun) = if marked == 1 {
-            (1, "impulse", "sample")
+            .fold((0u64, 0u64), |(runs, samples), s| {
+                (runs + 1, samples + s.samples)
+            });
+        let summary = if retained_samples != marked {
+            format!("short impulses affected {marked} samples")
         } else {
-            (runs, "impulses", "samples")
+            let impulse_noun = if runs == 1 { "impulse" } else { "impulses" };
+            let sample_noun = if marked == 1 { "sample" } else { "samples" };
+            format!("{runs} short {impulse_noun} ({marked} {sample_noun})")
         };
         out.push_str(&format!(
-            "input: {count} short {impulse_noun} ({marked} {sample_noun}); [input] \
+            "input: {summary}; [input] \
              impulse_suppress = \"apply\" repairs impulses of up to 4 samples\n"
         ));
     }
@@ -696,6 +699,30 @@ repairs impulses of up to 4 samples\n"
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn doctor_does_not_count_incomplete_impulse_spans_as_run_totals() {
+        // A full ring after 300 isolated impulses, then a final reconnect
+        // segment containing only one of those impulses.
+        for retained in [256, 1, 0] {
+            let mut cond = observed_clean();
+            cond.impulse.flagged_samples = 300;
+            cond.spans_dropped = if retained == 256 { 44 } else { 0 };
+            cond.spans = (0..retained)
+                .map(|i| manta_engine::ConditioningSpan {
+                    stage: "impulse".into(),
+                    mark: "flagged".into(),
+                    start_sample: i * 1000,
+                    samples: 1,
+                })
+                .collect();
+            let out = conditioning_report_lines(&cond, 48_000.0);
+            assert!(
+                out.contains("input: short impulses affected 300 samples;"),
+                "{out}"
+            );
+        }
     }
 
     /// MAN-495: a stage that paused itself replaces the impulse line --

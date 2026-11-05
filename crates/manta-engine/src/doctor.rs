@@ -378,9 +378,9 @@ impl IqSource for SampleBoundedSource {
 }
 
 /// How much input doctor's floor pre-pass measures: the first
-/// `FLOOR_TAP_SECONDS` of source time, enough for the per-channel floor
-/// histograms' lower quartile to settle, bounded so the measurement cannot
-/// outlast the run.
+/// `FLOOR_TAP_SECONDS` of source time after leading digital silence.
+/// This lets the per-channel floor histograms' lower quartile settle.
+/// The measurement cannot outlast the run.
 const FLOOR_TAP_SECONDS: f64 = 1.0;
 
 /// MAN-495: the reference `dc.overChannelNoiseDb` needs. A DC offset is
@@ -389,8 +389,8 @@ const FLOOR_TAP_SECONDS: f64 = 1.0;
 /// and a loud one carry the same offset at very different over-floor
 /// levels. `manta check` already summarizes per-channel floors
 /// (`check.rs`); doctor measures the same thing through a tee so the
-/// decode itself is untouched: every sample `listen()` reads is also fed
-/// to a raw `Channelizer::new` + `FloorBank` for the first
+/// decode itself is untouched. After leading digital silence, samples
+/// are also fed to a raw `Channelizer::new` + `FloorBank` for up to
 /// `FLOOR_TAP_SECONDS` of source time, then the tap goes quiet. The
 /// channelizer is raw on purpose (D9, like `check`): the floor is a
 /// property of the receiver, not of any conditioning doctor is judging.
@@ -484,14 +484,25 @@ impl IqSource for FloorTapSource {
 
     fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
         let n = self.inner.read(buf)?;
-        let take = (self
+        let state = &mut *self.state.lock().unwrap_or_else(|e| e.into_inner());
+        // A receiver can deliver digital silence before it starts. Do not
+        // spend the reference budget until actual input arrives. The tee
+        // still returns all samples unchanged to the listening pipeline.
+        let start = if state.fed == 0 {
+            buf[..n]
+                .iter()
+                .position(|s| s.re != 0.0 || s.im != 0.0)
+                .unwrap_or(n)
+        } else {
+            0
+        };
+        let take = self
             .max_samples
-            .saturating_sub(self.state.lock().unwrap_or_else(|e| e.into_inner()).fed))
-        .min(n as u64) as usize;
+            .saturating_sub(state.fed)
+            .min((n - start) as u64) as usize;
         if take > 0 {
-            let state = &mut *self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.fed += take as u64;
-            for hop in state.ch.process(&buf[..take]) {
+            for hop in state.ch.process(&buf[start..start + take]) {
                 for (value, &power) in state.db.iter_mut().zip(&hop.power) {
                     *value = manta_dsp::channelizer::power_db(power);
                 }
@@ -1432,6 +1443,34 @@ mod tests {
         )
         .unwrap();
         (promoted, chars)
+    }
+
+    #[test]
+    fn floor_tap_waits_for_noise_after_leading_digital_silence() {
+        use manta_testkit::sensitivity::{render_noise, CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
+        let noise = render_noise(2.0, 203, 1).unwrap();
+        let measure = |silence: usize| {
+            let samples = std::iter::repeat_n(Complex32::new(0.0, 0.0), silence)
+                .chain(noise.iter().copied())
+                .collect();
+            let (mut tap, shared) = FloorTapSource::new(Box::new(RawIqSource {
+                samples,
+                cursor: 0,
+                fs: SAMPLE_RATE_HZ,
+                center_freq_hz: CENTER_FREQ_HZ,
+            }))
+            .unwrap();
+            let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+            while tap.read(&mut buf).unwrap() != 0 {}
+            let state = shared.lock().unwrap();
+            median_floor_db(&state, [-SAMPLE_RATE_HZ / 2.0, SAMPLE_RATE_HZ / 2.0]).unwrap()
+        };
+        let immediate = measure(0);
+        let delayed = measure((SAMPLE_RATE_HZ * 1.5) as usize);
+        assert!(
+            (immediate - delayed).abs() < 0.1,
+            "immediate={immediate}, delayed={delayed}"
+        );
     }
 
     /// MAN-495: doctor observes every stage it does not keep applied (an
