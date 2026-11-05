@@ -204,6 +204,17 @@ remainders. Acquisition timing is captured at the radio's start command;
 buffered samples and discarded old-generation samples are accounted for once.
 See `docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md`.
 
+**Input conditioning** (MAN-203): `manta-dsp::condition` is an optional chain
+the channelizer runs on each new sample right after the MAN-234 sample guard
+(SPEC §1.3 step 0a), set by `PipelineConfig::conditioning`. Each stage is off
+(the default, bit-identical to no chain), observe or apply, records the
+samples it touched as spans with counters, and has an exact inverse. The
+stages are impulse suppression (isolated runs of up to 4 samples repaired by
+interpolation, with a 21-sample lookahead the channelizer's window watermark
+honours) and then DC removal (a 5 Hz blocker); `check` never conditions, so
+it reports the raw receiver. See
+`docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md`.
+
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as
 `manta-input::DecimatingSource`) sits between a live `IqSource` and the
@@ -762,6 +773,23 @@ sample time. See
   Relayed spots skip manta's validator, keep the source's SNR verbatim and
   are timed by arrival. `docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md`
   records the design.
+- **Spot outputs to PSKReporter and LAN loggers (MAN-142).** Two opt-in
+  `SpotBus::subscribe()` readers, each one tokio task in the tracked
+  `ClientTasks` set, so the shutdown drain awaits its final send.
+  `pskreporter::run` (`[pskreporter]`) batches validated spots into IPFIX
+  datagrams for `report.pskreporter.info:4739` (`pskreporter::ipfix` writes
+  the bytes, `pskreporter::batch` applies PSKReporter's pacing rules: one
+  report per call per band per 300 s, one datagram per 300 s unless it
+  fills). `wsjtx_output::run` (`[[wsjtx_output]]`) sends each spot to a LAN
+  address as WSJT-X `Heartbeat`/`Status`/`Decode`/`Close` datagrams, one
+  instance per band (`manta-<band>`); `relay::wsjtx` drops datagrams with
+  that `Id` prefix as `own_output`. Neither blocks `publish`: a reader that
+  falls behind counts the spots it lost as `lagged` and carries on, and
+  every other loss is counted by reason too. `manta-cli` binds both sockets
+  before anything is spawned (`spot_outputs.rs`), and a file replay reports
+  to PSKReporter only at a loopback host.
+  `docs/DECISIONS/2026-11-03-man142-pskreporter-and-wsjtx-udp-outputs.md`
+  records the design.
 - Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -802,7 +830,7 @@ sample time. See
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with eight
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with twelve
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
@@ -810,7 +838,9 @@ sample time. See
   `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
   feed; needs `[server]`), `[[skimmer_relay]]` and `[[wsjtx_relay]]`
   (MAN-320: relay a local skimmer's or WSJT-X's spots through an enabled
-  `[[rbn_uplink]]`), `[input]` (source type and its keys, dial frequency,
+  `[[rbn_uplink]]`), `[pskreporter]` and `[[wsjtx_output]]` (MAN-142:
+  spots to PSKReporter and to WSJT-X-aware LAN loggers), `[callsign_lookup]`
+  (MAN-318: withhold calls QRZ.com does not list), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
@@ -1194,8 +1224,9 @@ non-blocking send plus shared atomics and short locks between them.
   input that fails or panics ends only its own thread.
 - **Decoder pool.** Inside `process_hops` the per-hop work (detector,
   ownership, promotion, eviction) is sequential. Then one rayon parallel pass
-  on rayon's global pool drains each active track's `pending` buffer through
-  its decoder: tracks are work items, decoders are independent `Send` state
+  on rayon's global pool drains each active track's lead-in (MAN-199: the
+  recorded hops before its promotion, replayed once) and then its `pending`
+  buffer through its decoder: tracks are work items, decoders are independent `Send` state
   machines with no shared state. The pass is joined before `process_hops`
   returns and its events are sequenced by `(sample_ts, track_id)` (SPEC §6
   rule 6), so thread scheduling never reaches the output. `close_all` runs
@@ -1207,15 +1238,16 @@ non-blocking send plus shared atomics and short locks between them.
   entries, the oldest are dropped back down to `MAX_UNQUALIFIED_BACKLOG`
   (SPEC §2.8; at the default cap of 7500, a 9375-entry high-water mark).
 - **tokio.** `start_spot_server` builds its own multi-thread runtime for
-  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink and
-  the `[rbn_compare]` feed. Only `manta-cli` and `manta-server` depend on
+  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink,
+  the `[rbn_compare]` feed, the relays and the MAN-142 spot outputs
+  (`[pskreporter]`, `[[wsjtx_output]]`). Only `manta-cli` and `manta-server` depend on
   tokio.
 - **Bridge.** The decode thread never awaits. Spots and live-state records
   cross through `SpotBus` (§7): a short `std::sync::Mutex` section and a
   `tokio::sync::broadcast` send, which does not block, so no subscriber
   back-pressures the loop. A lagging telnet, JSON Lines or WebSocket client
-  is disconnected; the internal subscribers (the RBN uplink's forward loop
-  and `[rbn_compare]`) count the missed records and carry on. Counters and
+  is disconnected; the internal subscribers (the RBN uplink's forward loop,
+  `[rbn_compare]` and the MAN-142 spot outputs) count the missed records and carry on. Counters and
   gauges are atomics, plus short `Mutex` sections for RTTY marks and
   per-band maps, that the decode thread writes: server tasks poll
   `ListenObservers` every `ACTIVE_TRACKS_POLL_INTERVAL` (MAN-118 D6), and

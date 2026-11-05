@@ -148,6 +148,8 @@ fn check_source_with_clock(
         fs >= 4.0 * 93.75,
         "stream sample rate requires fewer than four channels"
     );
+    // MAN-203 D9: `check` reports the receiver's own level and floor, so it
+    // never runs the [input] conditioning chain.
     let mut ch = Channelizer::new(fs, center)
         .map_err(anyhow::Error::msg)
         .context("channelizer")?;

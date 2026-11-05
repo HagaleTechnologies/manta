@@ -187,6 +187,7 @@ fn different_inputs_keep_independent_coverage() {
                 .unwrap(),
                 open: Box::new(move || Ok(Box::new(src) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }

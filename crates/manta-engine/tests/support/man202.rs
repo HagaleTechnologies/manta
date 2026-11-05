@@ -196,6 +196,7 @@ pub fn listen_inputs_events(src: Chunked) -> Vec<DecoderEvent> {
             Ok(Box::new(slot.lock().unwrap().take().expect("opened once")) as Box<dyn IqSource>)
         }),
         freq_correction_ppm: 0.0,
+        conditioning: Default::default(),
         observers: Default::default(),
         spawn_band_hz: None,
     };

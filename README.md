@@ -1,11 +1,9 @@
-<p align="center">
+<h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo-light.svg" alt="manta" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-lockup-dark.svg">
+    <img src="assets/logo-lockup-light.svg" alt="manta" width="400">
   </picture>
-</p>
-
-<h1 align="center">manta</h1>
+</h1>
 
 <p align="center">
   Open-source wideband CW skimmer. Every CW signal in an SDR passband, decoded at once,
@@ -754,6 +752,14 @@ the live-state stream only if it sets `[server].live_port`.
   publishes nothing about what its ingest accepts, so the login and line
   format are manta's assumption, and the uplink ships in dry-run. To reach
   RBN today, let an RBN Aggregator read the telnet server above.
+- **PSKReporter (opt-in, public)** — with `[pskreporter] enabled = true`,
+  manta reports CQ and beacon spots to pskreporter.info's public map, each
+  call at most once per band every 5 minutes. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
+- **WSJT-X UDP for LAN loggers (opt-in)** — a `[[wsjtx_output]]` block sends
+  every spot to a LAN address as WSJT-X `Status` and `Decode` messages, so
+  loggers that listen for WSJT-X, such as GridTracker, can read them. Same
+  [guide](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
@@ -934,6 +940,8 @@ researchers each start, and lists every runbook.
 (a ka9q-radio (radiod) channel over multicast) ·
 [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md)
 (a receiver's spectrum in N1MM+'s Spectrum Display) ·
+[docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md)
+(spots to PSKReporter and to WSJT-X-aware LAN loggers) ·
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what

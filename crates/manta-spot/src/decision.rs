@@ -66,6 +66,31 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// The reason's wire label, as the live-state stream spells it
+    /// (`manta_server::live_state::reason_label` delegates here). MAN-198:
+    /// the loss funnel's `detail` strings reuse it, and the engine cannot
+    /// read `manta-server`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Reason::Blocklist => "blocklist",
+            Reason::Notch => "notch",
+            Reason::Grammar => "grammar",
+            Reason::Cty => "cty",
+            Reason::Repetition => "repetition",
+            Reason::Variant => "variant",
+            Reason::Dedupe => "dedupe",
+            Reason::PowerStepGuard => "powerStepGuard",
+            Reason::BeaconNoEvidence => "beaconNoEvidence",
+            Reason::BeaconPending => "beaconPending",
+            Reason::BeaconSpeed => "beaconSpeed",
+            Reason::BeaconOverflow => "beaconOverflow",
+            Reason::BeaconDiscarded => "beaconDiscarded",
+            Reason::NoEvidence => "noEvidence",
+            Reason::LookupPending => "lookupPending",
+            Reason::LookupNotFound => "lookupNotFound",
+        }
+    }
+
     /// Every reason, in declaration order (MAN-207's counters index by it).
     pub const ALL: [Reason; 16] = [
         Reason::Blocklist,
@@ -247,4 +272,34 @@ impl Decision {
 pub struct CandidateSupport {
     pub call: String,
     pub support: Support,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reason;
+
+    #[test]
+    fn reason_labels_match_the_live_state_wire() {
+        let all = [
+            (Reason::Blocklist, "blocklist"),
+            (Reason::Notch, "notch"),
+            (Reason::Grammar, "grammar"),
+            (Reason::Cty, "cty"),
+            (Reason::Repetition, "repetition"),
+            (Reason::Variant, "variant"),
+            (Reason::Dedupe, "dedupe"),
+            (Reason::PowerStepGuard, "powerStepGuard"),
+            (Reason::BeaconNoEvidence, "beaconNoEvidence"),
+            (Reason::BeaconPending, "beaconPending"),
+            (Reason::BeaconSpeed, "beaconSpeed"),
+            (Reason::BeaconOverflow, "beaconOverflow"),
+            (Reason::BeaconDiscarded, "beaconDiscarded"),
+            (Reason::NoEvidence, "noEvidence"),
+            (Reason::LookupPending, "lookupPending"),
+            (Reason::LookupNotFound, "lookupNotFound"),
+        ];
+        for (r, label) in all {
+            assert_eq!(r.label(), label);
+        }
+    }
 }

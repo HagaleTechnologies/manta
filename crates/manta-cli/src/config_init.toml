@@ -190,6 +190,37 @@
 #enabled = true                       # false keeps the block but does not listen
 
 
+# --- Report spots to PSKReporter ----------------------------------------------
+# Sends validated spots to PSKReporter (pskreporter.info), where anyone can
+# see them on the public map under [server].station_callsign at its
+# operator_grid. Each call is reported at most once per band every 5 minutes,
+# in at most one datagram every 5 minutes. Needs [server] with operator_grid
+# (or operator_lat/operator_lon). A file replay reports only to a loopback
+# host. Do not also report the same call from WSJT-X, JTDX or CW Skimmer.
+# Restart-only.
+
+#[pskreporter]
+
+#enabled = false                      # true reports spots publicly to PSKReporter
+#host = "report.pskreporter.info"     # PSKReporter's collector, or a local test listener's IPv4 address
+#port = 4739                          # 14739 is PSKReporter's packet-analysis test listener
+#antenna = ""                         # shown on PSKReporter's map, e.g. "Inverted V at 12 m"; at most 254 bytes
+#spot_types = "cq_beacon"             # cq_beacon or all, as for [[rbn_uplink]]
+
+
+# --- Send spots to LAN loggers as WSJT-X UDP ------------------------------------
+# Sends every validated spot as WSJT-X UDP messages (Status, Decode) for
+# loggers that listen for WSJT-X, such as GridTracker or JTAlert. Each band
+# appears as its own WSJT-X instance, "manta-20m" and so on. Anyone on the
+# network who can receive `destination` can read the spots. Needs [server].
+# Restart-only.
+
+#[[wsjtx_output]]
+
+#destination = "127.0.0.1:2237"       # no default: a logger's UDP port, a broadcast such as 192.168.1.255:2237, or a multicast group such as 224.0.0.1:2237
+#enabled = true                       # false keeps the block but sends nothing
+
+
 # --- Callsign lookup (QRZ.com) ------------------------------------------------
 # Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
 # spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
@@ -269,12 +300,19 @@
 # An empty list pauses CW decoding. Daily entries and dated overrides replace
 # the base ranges. See docs/CONFIG.md for the complete scheduling example.
 #cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
-#cw_schedule = []
-#cw_overrides = []
+#cw_schedule = []                   # no default: daily UTC entries that replace the base ranges
+#cw_overrides = []                  # no default: dated entries that replace the base and daily ranges
 
 
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
+
+# Input-conditioning stages, each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
 
 # Your radio's dial frequency, Hz, for a sound card or WAV recording that
 # carries no frequency of its own. No default: without it, frequencies are

@@ -6,7 +6,7 @@
 //! group, and this bench isn't wired into CI (GitHub-hosted runners aren't
 //! Mac-series or Pi4 hardware, and perf assertions on shared CI runners
 //! are flaky). See
-//! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
+//! docs/archive/plans/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use manta_engine::PipelineConfig;

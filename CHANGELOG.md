@@ -144,6 +144,34 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-496: the `[input]` conditioning keys `dc_block` and
+  `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
+  restart-only), turning MAN-203's input-conditioning stages on for
+  `decode`, `run` and `soak`, with per-input settings for multiple receivers.
+  `run` publishes `manta_input_conditioned_samples_total` by source, stage
+  and mark, starting at zero for configured modes and summed across reconnects.
+  `decode --json` gains an `inputConditioning` object (omitted
+  when every stage is `off`) with exact per-stage counts and the bounded
+  span log; `manta config` prints a set stage in the input summary. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
+- MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
+  by default) reports validated CQ and beacon spots (`spot_types = "all"`
+  for every type) to PSKReporter's public map at
+  `report.pskreporter.info:4739` as IPFIX over UDP, each call at most once
+  per band every 5 minutes, in at most one datagram every 5 minutes. It
+  needs `[server]` with a grid, and a file replay reports only to a loopback
+  host. `[[wsjtx_output]]` sends every validated spot to a LAN address
+  (unicast, broadcast or multicast) as WSJT-X `Heartbeat`, `Status`,
+  `Decode` and `Close` messages, one instance per band (`manta-20m`), with
+  `Off air` set on a file replay. `[[wsjtx_relay]]` now ignores datagrams
+  from manta's own output (`manta_relay_dropped_total{reason="own_output"}`).
+  With `[server]`, `/metrics` gains `manta_pskreporter_reports_total`,
+  `manta_pskreporter_datagrams_total`, `manta_pskreporter_dropped_total`,
+  `manta_wsjtx_output_spots_total`, `manta_wsjtx_output_datagrams_total`
+  and `manta_wsjtx_output_dropped_total`. Spots are unchanged. Tested
+  against fake local listeners; a live PSKReporter report and a real
+  logger are still to be checked. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
   copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
   `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
@@ -161,6 +189,16 @@ the git history and `docs/DECISIONS/`.
   `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
   stdout and every wire format are unchanged. See
   [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
+- MAN-198 first slice: `manta oracle --funnel PATH` runs the recording
+  once more through the production pipeline and writes a stage-attributed
+  loss funnel (JSON Lines): a header, one `lossFunnel` record per RBN
+  episode charged to exactly one earliest failed stage (or none when
+  delivered), and a `lossFunnelSummary` with candidate, confirmed and
+  leased track births kept apart. Diagnostic only: the oracle's stdout and
+  `--jsonl` are unchanged. `--funnel-bypass known-frequency` adds the
+  known-frequency oracle-bypass experiment after the production summary,
+  flagged `oracleAssisted`: an upper bound, never a score. See
+  docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -373,6 +411,11 @@ the git history and `docs/DECISIONS/`.
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
 
 ### Fixed
+
+- MAN-497: dropping a lone protocol-1 HPSDR receiver sends the stop command
+  twice, as protocol 2 does, so one lost UDP datagram no longer leaves the
+  radio streaming and refused as in use on rediscovery. Decoder output is
+  unchanged.
 
 - MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
   longer stamped late when the reopen thread stalls before it drains the
