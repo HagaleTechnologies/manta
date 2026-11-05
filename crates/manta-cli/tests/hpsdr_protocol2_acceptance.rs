@@ -412,8 +412,14 @@ fn explain(stderr: &str, metrics: &str) -> String {
 /// taken once the stream has ended and `ready(metrics)` holds (or 10 s
 /// passed), and stderr.
 ///
+<<<<<<< HEAD
 /// Accelerated finite streams can lose the first-pass decode under runner
 /// load, triggering a reconnect and a second-pass timestamp shift (MAN-505).
+=======
+/// Real-time pacing leaves CPU-starved runners room to drain the OS-capped
+/// receive buffer (about 425 KB on Linux despite the 4 MiB request).
+/// Faster pacing can lose W1AW in the first pass of `fifty_lost` (MAN-497).
+>>>>>>> 18eaa0d5a924bf608c0e39bcf7c382aa21545355
 fn live_run(
     dir: &Path,
     samples: Arc<Vec<Complex32>>,
