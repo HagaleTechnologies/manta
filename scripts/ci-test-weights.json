@@ -1,0 +1,14 @@
+{
+  "source": "MAN-498 supplied Ubuntu baseline run 41726268369; estimates for placement, default 30 seconds for every new target",
+  "weights": {
+    "golden_v8_v8w": 626,
+    "manta_engine": 425,
+    "determinism_hsmm": 239,
+    "multi_input_hpsdr": 180,
+    "listen_inputs": 122,
+    "rtty": 120,
+    "soak_ci": 120,
+    "multi_input": 118,
+    "rtty_detector": 102
+  }
+}
