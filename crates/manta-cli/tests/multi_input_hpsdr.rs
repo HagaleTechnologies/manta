@@ -860,7 +860,8 @@ fn failed_startup_retires_another_groups_completed_radio() {
     assert!(unknown.sessions.lock().unwrap().is_empty());
     wait_until(
         Duration::from_secs(2),
-        || opened.generations().iter().any(|s| s.stops == 1),
+        // One retirement sends two stops; double retirement would send four.
+        || opened.generations().iter().any(|s| s.stops == 2),
         || format!("{:?}", opened.generations()),
     );
     assert_eq!(opened.generations().len(), 1);
