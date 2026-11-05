@@ -90,7 +90,7 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    stage runs, so output is bit-identical to an unconditioned
    channelizer), `observe` (measures, never writes a sample) or `apply`
    (corrects, and records each corrected run of samples as a span with a
-   per-stage counter). The stages run in the order impulse, then DC. The
+   per-stage counter). The stages run in the order impulse, DC, then IQ. The
    impulse stage flags a sample whose power exceeds `12² = 144` times the
    reference power of the 33 samples centred on it (fewer at the stream
    start): their mean power once the 8 strongest are left out. A zero
@@ -111,7 +111,12 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    (full scale); exact-zero samples before the first nonzero one (the
    lead-in padding) leave the state untouched, so `n` counts from the
    first real sample. It reads only `y`, so `x[n] = y[n] + dc[n]` inverts
-   it exactly. Every stage is a per-sample state machine with a fixed
+   it exactly. The IQ stage (MAN-494) applies `y = m - rho*conj(m)` only
+   with a validated, fixed controlled-tone calibration whose receiver centre
+   agrees within 1 Hz. A sample-domain tone meter reads after DC and before
+   IQ. A hop-domain mirror monitor reports five-second windows and never
+   changes coefficients. Suspected windows without correction are uncertain.
+   Every correction stage is a per-sample state machine with a fixed
    release delay, so the hops do not depend on how the input is split into
    `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
@@ -2294,6 +2299,16 @@ flush_gap_dits = 7.0
 # MANTA_INPUT_FREQ_CORRECTION_PPM override it.
 freq_correction_ppm = 0.0
 
+# Fixed controlled-tone IQ calibration, per input. Restart required.
+# Off is the default. Observe never writes samples. Apply requires all three
+# calibration values, with actual receiver centre agreement within 1 Hz.
+# All values must be finite; gain 0.5..2, phase -45..45 degrees, centre > 0.
+# Refused with bands. Remeasure after a receiver gain change.
+iq_correction = "off"
+# iq_gain_ratio = 1.05
+# iq_phase_deg = 2.0
+# iq_calibrated_center_hz = 14000000.0
+
 # Target post-decimation capture rate, Hz (issue #169). Omit to use the
 # source's native rate unchanged. Must evenly divide the source's native
 # rate by a power of two, and must itself satisfy fs/93.75 being a power
@@ -2478,7 +2493,7 @@ values of `crates/manta-cli/build.rs`, never read at run time, and
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and
-`input.freq_correction_ppm`, `oracle` applies `[decode]`, and both
+`input.freq_correction_ppm` plus the four IQ keys, `oracle` applies `[decode]`, and both
 validate the whole file.
 
 `SPEC-decode-core-v2.md` §7 adds `[decode]` keys beyond `engine` (`"legacy"`

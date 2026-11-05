@@ -139,6 +139,8 @@ pub type InputOpener = Box<dyn FnOnce() -> Result<Box<dyn IqSource>> + Send>;
 
 /// One input to open.
 pub struct InputSpec {
+    /// Fixed conditioning for this receiver, never borrowed from another input.
+    pub conditioning: crate::ConditioningConfig,
     /// The input's `[[input]]` name: thread name, log and error text.
     pub name: String,
     pub open: InputOpener,
@@ -241,6 +243,7 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
+    conditioning: Vec<crate::ConditioningConfig>,
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -292,6 +295,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     let mut pending = Vec::with_capacity(n);
     let mut ppm = Vec::with_capacity(n);
+    let mut conditioning = Vec::with_capacity(n);
     let mut observers = Vec::with_capacity(n);
     // One shared completion channel, so the first failure is observed the
     // moment it arrives instead of after every earlier opener has returned
@@ -310,6 +314,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
             .spawn(move || input_thread(name, open, spawn_band_hz, index, done_tx, go_rx, stop))
             .map_err(|e| anyhow!("input \"{}\": cannot start its thread: {e}", spec.name))?;
         ppm.push(spec.freq_correction_ppm);
+        conditioning.push(spec.conditioning);
         observers.push(spec.observers);
         pending.push(Parked { go: go_tx, handle });
     }
@@ -320,6 +325,7 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let mut opened = OpenedInputs {
         inputs: Vec::new(),
         ppm,
+        conditioning,
         observers,
         parked: pending,
         common_rate_hz: 0.0,
@@ -484,8 +490,10 @@ pub fn listen_inputs(
             Outbox::Replay(tx)
         };
         let fs = opened.inputs[index].sample_rate_hz;
+        let mut input_cfg = cfg.clone();
+        input_cfg.conditioning = opened.conditioning[index].clone();
         let go = Go {
-            cfg: cfg.clone(),
+            cfg: input_cfg,
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],

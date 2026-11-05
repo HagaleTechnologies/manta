@@ -1131,7 +1131,7 @@ pub fn listen_with_observers(
             seg_consumed = 0;
             seg = match new_segment(
                 fs,
-                center_freq_hz,
+                src.center_freq_hz(),
                 rf_passband_hz,
                 trusted_band_hz,
                 guard_hz,
@@ -1728,7 +1728,7 @@ pub(crate) fn run_input_front(
             seg_consumed = 0;
             seg = new_segment(
                 fs,
-                center_freq_hz,
+                src.center_freq_hz(),
                 rf_passband_hz,
                 trusted_band_hz,
                 guard_hz,
@@ -2270,6 +2270,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3239,6 +3240,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3379,6 +3381,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3614,6 +3617,7 @@ mod tests {
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -4111,6 +4115,7 @@ mod tests {
                     }) as Box<dyn IqSource>)
                 }),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -5550,6 +5555,7 @@ mod tests {
                         }) as Box<dyn IqSource>)
                     }),
                     freq_correction_ppm: 0.0,
+                    conditioning: Default::default(),
                     observers: Default::default(),
                     spawn_band_hz: None,
                 }],

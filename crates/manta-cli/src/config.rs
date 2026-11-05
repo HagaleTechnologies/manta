@@ -94,6 +94,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("callsign_lookup", "qrz_password"),
     ("callsign_lookup", "qrz_url"),
     ("input", "type"),
+    ("input", "iq_correction"),
     ("input", "device"),
     ("input", "path"),
     ("input", "record_iq"),
@@ -520,6 +521,10 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
+    iq_correction: Option<String>,
+    iq_gain_ratio: Option<f64>,
+    iq_phase_deg: Option<f64>,
+    iq_calibrated_center_hz: Option<f64>,
     freq_correction_ppm: Option<f64>,
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
@@ -589,6 +594,7 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
+    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
     pub center_freq_hz: Option<f64>,
     pub capture_rate_hz: Option<f64>,
@@ -1454,7 +1460,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         if group.members.len() > 1
             && matches!(group.protocol, manta_input::hpsdr::HpsdrProtocol::Two)
         {
-            bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
+            bail!(
+                "{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\""
+            );
         }
         // MAN-308 D1: several receivers on one radio run protocol 1, which
         // has no attenuator manta drives.
@@ -1469,7 +1477,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
                 )
             }) {
                 let name = &inputs[index].name;
-                bail!("{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta");
+                bail!(
+                    "{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta"
+                );
             }
         }
         for &index in group.members.iter().skip(1) {
@@ -1482,19 +1492,30 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             }) = &inputs[index].input.source
             {
                 if receivers.is_some() {
-                    bail!("{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")"
+                    );
                 }
                 if *protocol != group.protocol {
-                    bail!("{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")"
+                    );
                 }
                 if *rate_hz != group.rate {
-                    bail!("{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")", group.rate);
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")",
+                        group.rate
+                    );
                 }
             }
         }
         if let Some(capacity) = group.receivers {
             if group.members.len() > capacity {
-                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured", group.endpoint(), group.members.len());
+                bail!(
+                    "{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured",
+                    group.endpoint(),
+                    group.members.len()
+                );
             }
         }
         manta_input::HpsdrConfig {
@@ -1538,6 +1559,7 @@ fn take_entry(
         };
         return Ok((vec![one], Vec::new()));
     };
+    iq_conditioning(&t)?;
     if t.freq_hz.is_some() {
         return Err(
             "input.bands and input.freq_hz both set the receiver's centre; keep one".to_string(),
@@ -1553,7 +1575,7 @@ fn take_entry(
                     .map(|x| float_hz(*x))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ))
+            ));
         }
     };
     let texts = band_item_texts(&bands)?;
@@ -1842,11 +1864,53 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
+/// IQ correction is always a fixed, receiver-specific calibration.
+fn iq_conditioning(
+    t: &InputToml,
+) -> std::result::Result<manta_dsp::condition::ConditioningConfig, String> {
+    use manta_dsp::condition::{iq::IqCalibration, ConditioningConfig, StageMode};
+    let mode = match t.iq_correction.as_deref().unwrap_or("off") {
+        "off" => StageMode::Off,
+        "observe" => StageMode::Observe,
+        "apply" => StageMode::Apply,
+        value => {
+            return Err(format!(
+                "iq_correction must be \"off\", \"observe\" or \"apply\", not {}",
+                crate::fmt::quoted(value)
+            ));
+        }
+    };
+    let calibration = match (t.iq_gain_ratio, t.iq_phase_deg, t.iq_calibrated_center_hz) {
+        (None, None, None) if mode == StageMode::Apply => return Err("iq_correction = \"apply\" needs iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz".to_string()),
+        (None, None, None) => None,
+        (Some(gain_ratio), Some(phase_deg), Some(center_freq_hz)) => {
+            for (key, value, valid, range) in [
+                ("iq_gain_ratio", gain_ratio, (0.5..=2.0).contains(&gain_ratio), "0.5 through 2.0"),
+                ("iq_phase_deg", phase_deg, (-45.0..=45.0).contains(&phase_deg), "-45 through 45 degrees"),
+                ("iq_calibrated_center_hz", center_freq_hz, center_freq_hz > 0.0, "positive Hz"),
+            ] {
+                if !value.is_finite() || !valid { return Err(format!("{key} must be finite and {range}")); }
+            }
+            if t.bands.is_some() { return Err("IQ calibration cannot be used with bands; each stream needs its own calibration".to_string()); }
+            let calibration = IqCalibration { gain_ratio, phase_deg, center_freq_hz };
+            calibration.validate()?;
+            Some(calibration)
+        }
+        _ => return Err("iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz must be supplied together".to_string()),
+    };
+    Ok(ConditioningConfig {
+        iq: mode,
+        iq_calibration: calibration,
+        ..Default::default()
+    })
+}
+
 fn validate_input(
     t: InputToml,
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
+        conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
             .map(crate::check_freq_correction_ppm)
@@ -1913,7 +1977,7 @@ fn validate_input(
             rate_hz: finite_positive("rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
             gain_db: match t.gain_db {
                 Some(g) if !g.is_finite() => {
-                    return Err(format!("input.gain_db must be finite, got {g}"))
+                    return Err(format!("input.gain_db must be finite, got {g}"));
                 }
                 g => g,
             },
@@ -2706,7 +2770,9 @@ mod tests {
     #[test]
     fn hpsdr_hostless_inputs_with_different_selectors_are_separate_radios() {
         let entry = |name: &str, selector: &str| {
-            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}"
+            )
         };
         // Distinct MACs, or a pinned entry beside an unqualified one: two
         // radios offline. The run refuses the pair if both resolve to one
@@ -2935,7 +3001,9 @@ mod tests {
     }
 
     fn hpsdr_entry(name: &str, host: &str, extra: &str) -> String {
-        format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}")
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}"
+        )
     }
 
     #[test]
@@ -3988,6 +4056,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iq_keys_validate_modes_and_complete_calibrations() {
+        load_file("[input]\niq_correction = \"observe\"\n").unwrap();
+        for mode in ["off", "observe", "apply"] {
+            load_file(&format!("[input]\niq_correction = \"{mode}\"\niq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n")).unwrap();
+        }
+        for (body, message) in [
+            ("iq_correction = \"on\"", "iq_correction must be"),
+            ("iq_correction = \"apply\"", "needs iq_gain_ratio"),
+            ("iq_gain_ratio = 1.05", "must be supplied together"),
+        ] {
+            let err = err_of(&format!("[input]\n{body}\n"));
+            assert!(err.contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn iq_calibration_ranges_environment_and_bands() {
+        let triple =
+            "iq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n";
+        for (key, value) in [
+            ("iq_gain_ratio", "0.49"),
+            ("iq_gain_ratio", "2.01"),
+            ("iq_gain_ratio", "nan"),
+            ("iq_phase_deg", "45.1"),
+            ("iq_phase_deg", "inf"),
+            ("iq_calibrated_center_hz", "0.0"),
+            ("iq_calibrated_center_hz", "nan"),
+        ] {
+            let mut doc: toml::Table = toml::from_str(triple).unwrap();
+            doc.insert(
+                key.into(),
+                toml::from_str::<toml::Table>(&format!("v = {value}"))
+                    .unwrap()
+                    .remove("v")
+                    .unwrap(),
+            );
+            let err = err_of(&format!("[input]\n{}", toml::to_string(&doc).unwrap()));
+            assert!(err.contains(key), "{err}");
+        }
+        let err = err_of(&format!(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = \"20m\"\n{triple}"
+        ));
+        assert!(
+            err.contains("IQ calibration cannot be used with bands"),
+            "{err}"
+        );
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_IQ_CORRECTION", "observe"),
+                ("MANTA_INPUT_IQ_GAIN_RATIO", "1.05"),
+                ("MANTA_INPUT_IQ_PHASE_DEG", "2.0"),
+                ("MANTA_INPUT_IQ_CALIBRATED_CENTER_HZ", "14000000.0"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        assert_eq!(
+            loaded
+                .input
+                .shared
+                .conditioning
+                .iq_calibration
+                .unwrap()
+                .gain_ratio,
+            1.05
+        );
+        let loaded = load_file(&format!("[[input]]\nname = \"a\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"apply\"\n{triple}[[input]]\nname = \"b\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"observe\"\n")).unwrap();
+        assert_eq!(
+            loaded.inputs[0].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Apply
+        );
+        assert_eq!(
+            loaded.inputs[1].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        let invalid = "[[input]]\nname = \"ok\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\n[[input]]\nname = \"rx1\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"on\"\n";
+        let err = err_of(invalid);
+        assert!(
+            err.contains("rx1") && err.contains("iq_correction"),
+            "{err}"
+        );
+    }
+
     // ---- Phase 3: [input]
 
     #[test]
@@ -4085,8 +4241,7 @@ mod tests {
         );
     }
 
-    const HPSDR_BODY: &str =
-        "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+    const HPSDR_BODY: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
 
     fn hpsdr_protocol_of(source: &Option<SourceFromFile>) -> manta_input::hpsdr::HpsdrProtocol {
         match source {

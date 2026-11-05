@@ -211,7 +211,10 @@ the channelizer runs on each new sample right after the MAN-234 sample guard
 samples it touched as spans with counters, and has an exact inverse. The
 stages are impulse suppression (isolated runs of up to 4 samples repaired by
 interpolation, with a 21-sample lookahead the channelizer's window watermark
-honours) and then DC removal (a 5 Hz blocker); `check` never conditions, so
+honours), DC removal (a 5 Hz blocker), then fixed calibrated IQ correction
+(MAN-494). The tone meter reads final post-DC samples before correction; the
+mirror monitor reads each hop and never supplies coefficients. Each input
+carries its own calibration. `check` never conditions, so
 it reports the raw receiver. See
 `docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md`.
 

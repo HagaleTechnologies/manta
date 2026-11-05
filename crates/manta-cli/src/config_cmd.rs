@@ -1876,7 +1876,10 @@ mod tests {
              scp_url = \"http://mirror.lan:8080/MASTER.SCP\"\n",
         );
         assert!(
-            has(&n, "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"),
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"
+            ),
             "{n:?}"
         );
         let n = notes_of(
@@ -2071,6 +2074,9 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("input", "iq_gain_ratio"),
+        ("input", "iq_phase_deg"),
+        ("input", "iq_calibrated_center_hz"),
         ("server", "live_port"),
         ("server", "rtty_telnet_port"),
         ("server", "station_callsign"),

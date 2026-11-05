@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-494: optional per-input IQ correction uses a controlled-tone calibration
+  to remove receiver images. It defaults to off. Observe and a centre mismatch
+  preserve samples; mirror evidence never enables correction by itself.
+
 - MAN-200: a decode whose samples overlap a decode the repetition gate
   already counted, such as a replay or a second track on the same signal,
   no longer counts as another repetition, even when it arrives a whole
