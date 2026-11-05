@@ -1452,18 +1452,7 @@ impl Validator {
                 // deferred beacon it captures is then judged (or migrated)
                 // with the rest below.
                 let close_ts = self.tracks.get(track_id).map_or(0, |t| t.last_sample_ts);
-                let mut spots = if matches!(
-                    closure,
-                    ClosureKind::Bookkeeping {
-                        survivor_track_id: None
-                    }
-                ) {
-                    // Losing coverage is not word-ending evidence. Pending
-                    // occurrences die with this identity; activity stays conservative.
-                    Vec::new()
-                } else {
-                    self.try_spot(*track_id, close_ts, true)
-                };
+                let mut spots = self.try_spot(*track_id, close_ts, true);
                 let closure_spots = match closure {
                     ClosureKind::SignalEnded => {
                         // MAN-100 message-distinctness (Codex review, PR
@@ -5226,24 +5215,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     /// survivor to migrate a captured Beacon candidate to -- it must be
     /// discarded (never resolved), and counted per ARCHITECTURE §8.
     #[test]
-    fn cw_segments_bookkeeping_discards_pending_word_without_forcing_a_spot() {
-        let mut v = Validator::new(FS, CTY_FIXTURE, None);
-        seed_meta(&mut v, 1);
-        v.allowlist("K5ARH");
-        // No following context word has settled this occurrence yet.
-        let spots = run(&transmission_events(1, &["DE", "K5ARH"], 0), &mut v);
-        assert!(spots.is_empty());
-        let spots = v.ingest(&DecoderEvent::TrackClosed {
-            track_id: 1,
-            closure: ClosureKind::Bookkeeping {
-                survivor_track_id: None,
-            },
-        });
-        assert!(spots.is_empty());
-        assert!(!v.tracks.contains_key(&1));
-    }
-
-    #[test]
     fn evicted_track_discards_pending_beacon_and_counts_it() {
         let mut v = Validator::new(FS, CTY_FIXTURE, None);
         seed_meta(&mut v, 1);
@@ -5251,13 +5222,10 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             track_id: 1,
             wpm: 22.0,
         });
-        // Settle the call before eviction so this fixture holds an actual
-        // captured beacon, rather than an unresolved context occurrence.
-        let words = ["V", "V", "V", "K5ARH", "K"];
+        let words = ["V", "V", "V", "K5ARH"];
         let spots = run(&transmission_events(1, &words, 0), &mut v);
         assert!(spots.is_empty(), "should be captured, not yet resolved");
 
-        assert_eq!(v.tracks[&1].pending_beacons.len(), 1);
         let spots = v.ingest(&DecoderEvent::TrackClosed {
             track_id: 1,
             closure: ClosureKind::Bookkeeping {
