@@ -254,7 +254,8 @@ pub fn run_bypass(
 
 /// Runs one synthetic bypass (`known-transitions` or `known-transcript`)
 /// for the one opportunity `op` names, against the production record of
-/// the same call. Keying truth the production pipeline does not have
+/// the same opportunity. Missing or ambiguous production matches are
+/// errors. Keying truth unavailable to the production pipeline
 /// crosses as plain data (`SyntheticTruth`, built by
 /// `manta_testkit::funnel_truth`); the stages past the bypass's forced
 /// ones are honestly evaluated through the production validator.
@@ -270,9 +271,26 @@ pub fn run_synthetic_bypass(
     if !matches!(bypass, Bypass::KnownTransitions | Bypass::KnownTranscript) {
         anyhow::bail!("bypass {} is RBN-fed; call run_bypass", bypass.label());
     }
-    let Some(prod) = production.iter().find(|r| r.call == op.call) else {
+    // These fields are copied unchanged from the opportunity by attribute.
+    // Calls alone are not unique across episodes in a recording.
+    let mut matches = production.iter().filter(|r| {
+        r.call == op.call
+            && r.frequency_hz == op.freq_hz
+            && r.first_s == op.first_s
+            && r.last_s == op.last_s
+            && r.rows == op.rows
+            && r.snr_db == op.snr_db
+            && r.wpm == op.wpm
+    });
+    let Some(prod) = matches.next() else {
         anyhow::bail!("no production record for synthetic opportunity {}", op.call);
     };
+    if matches.next().is_some() {
+        anyhow::bail!(
+            "ambiguous production records for synthetic opportunity {}",
+            op.call
+        );
+    }
     let mut line = blank_line(bypass, prod);
     if bypass == Bypass::KnownTransitions
         && matches!(cfg.decode.engine, manta_decode::decoder::Engine::Hsmm)
@@ -685,6 +703,59 @@ mod tests {
             &Tolerances::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn synthetic_bypass_matches_exact_production_episode() {
+        let geo = Geometry {
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+            duration_s: 2100.0,
+            passband_hz: (13_952_000.0, 14_048_000.0),
+            channel_width_hz: 93.75,
+            freq_correction_ppm: 0.0,
+        };
+        let early = Opportunity {
+            call: "W1AW".into(),
+            freq_hz: 14_012_300.0,
+            first_s: 25.0,
+            last_s: 25.0,
+            rows: 1,
+            snr_db: 20,
+            wpm: Some(20.0),
+        };
+        let mut later = early.clone();
+        later.freq_hz += 10_000.0;
+        later.first_s = 2025.0;
+        later.last_s = 2026.0;
+        let tol = Tolerances::default();
+        let mut early_record = attribute(&early, &Evidence::default(), &geo, &tol);
+        early_record.lost_at = None;
+        let later_record = attribute(&later, &Evidence::default(), &geo, &tol);
+        let mut cfg = PipelineConfig::default();
+        cfg.decode.engine = manta_decode::decoder::Engine::Hsmm;
+        let truth = SyntheticTruth {
+            wpm: 20.0,
+            words: vec![((2025.0 * geo.sample_rate_hz) as u64, "CQ".into())],
+            ..SyntheticTruth::default()
+        };
+        let run = |bypass, records: &[Record]| {
+            run_synthetic_bypass(bypass, &later, &truth, &cfg, records, &geo, &tol)
+        };
+        for bypass in [Bypass::KnownTransitions, Bypass::KnownTranscript] {
+            let (line, summary) =
+                run(bypass, &[early_record.clone(), later_record.clone()]).unwrap();
+            assert_eq!(line.first_s, later.first_s);
+            assert_eq!(line.frequency_hz, later.freq_hz);
+            assert_eq!(line.production_lost_at, later_record.lost_at);
+            assert_eq!(summary.upper_bound, 0);
+            assert!(run(bypass, std::slice::from_ref(&early_record)).is_err());
+            assert!(run(bypass, &[later_record.clone(), later_record.clone()]).is_err());
+            // First timestamp alone is not the full episode identity.
+            let mut wrong_end = later_record.clone();
+            wrong_end.last_s += 1.0;
+            assert!(run(bypass, &[wrong_end]).is_err());
+        }
     }
 
     #[test]

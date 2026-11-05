@@ -138,11 +138,17 @@ fn scene(
     }
 
     // The two keying-truth bypasses for the scene's own signal.
-    let sig_op = op(signal_call(signal_text), center_hz + 12_340.0, 25.0);
+    let mut signal_ops = ops.iter().filter(|op| op.call == signal_call(signal_text));
+    let sig_op = signal_ops
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("scene has no signal opportunity"))?;
+    if signal_ops.next().is_some() {
+        anyhow::bail!("scene has ambiguous signal opportunities");
+    }
     let truth = truth_for(signal_text, 10.0, fs);
     for b in [Bypass::KnownTransitions, Bypass::KnownTranscript] {
         let (line, summary) =
-            run_synthetic_bypass(b, &sig_op, &truth, &cfg, &report.records, &geo, &tol)?;
+            run_synthetic_bypass(b, sig_op, &truth, &cfg, &report.records, &geo, &tol)?;
         println!("{}", serde_json::to_string(&line)?);
         println!("{}", serde_json::to_string(&summary)?);
         check_bound(b, summary.upper_bound, report.summary.delivered)?;

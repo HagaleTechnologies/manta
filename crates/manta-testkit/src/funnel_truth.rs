@@ -97,13 +97,13 @@ pub fn envelope_at_hops(
     t0_s: f64,
     duration_s: f64,
 ) -> Vec<(u64, f32)> {
-    let t_end_ms = t0_s * 1000.0 + duration_s * 1000.0;
+    let t_end_ms = duration_s * 1000.0;
     let samples_per_hop = fs / hop_hz;
     let t0 = t0_s * fs;
     let mut out = Vec::new();
     let mut i = 0u64;
     loop {
-        let t_ms = t0_s * 1000.0 + i as f64 * 1000.0 / hop_hz;
+        let t_ms = i as f64 * 1000.0 / hop_hz;
         if t_ms >= t_end_ms {
             break;
         }
@@ -180,6 +180,19 @@ mod tests {
 
     const FS: f64 = 96_000.0;
     const HOP_HZ: f64 = 375.0;
+
+    #[test]
+    fn envelope_offset_preserves_keying() {
+        let segs = keying_segments("CQ CQ DE W1AW W1AW K", &KeyerSpec::new(20.0)).unwrap();
+        let duration_s = segs.iter().map(|s| s.1).sum::<f64>() / 1000.0 + 1.0;
+        let base = envelope_at_hops(&segs, HOP_HZ, FS, 0.0, duration_s);
+        let shifted = envelope_at_hops(&segs, HOP_HZ, FS, 10.0, duration_s);
+        assert_eq!(base.len(), shifted.len());
+        for ((ts, amp), (shifted_ts, shifted_amp)) in base.iter().zip(&shifted) {
+            assert_eq!(*shifted_ts, ts + 960_000);
+            assert_eq!(amp, shifted_amp, "amplitude changed at sample {ts}");
+        }
+    }
 
     /// The reconstructed timeline recovers `keyer::key_text`'s keyed
     /// characters and word gaps at the right hops: every >0.5 stretch of
