@@ -433,7 +433,7 @@ def main(argv=None):
     precision, recall = r["precision"], r["recall"]
 
     # Codex review, PR #161 round 19: the implementation plan
-    # (docs/superpowers/plans/2026-09-09-decode-core-v2.md lines 135-147)
+    # (docs/archive/plans/plans/2026-09-09-decode-core-v2.md lines 135-147)
     # requires printing the resolved truth filter in the header --
     # otherwise runs with different --spotter/--min-spotters values are
     # indistinguishable except by their resulting counts, making the

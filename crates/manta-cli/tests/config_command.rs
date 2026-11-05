@@ -480,6 +480,8 @@ fn check_prints_one_summary_line_per_table() {
             "rbn_compare",
             "skimmer_relay",
             "wsjtx_relay",
+            "pskreporter",
+            "wsjtx_output",
             "callsign_lookup",
             "input",
             "spot",
@@ -1510,6 +1512,36 @@ const SKIMMER_TOML: &str =
     "[[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1ABC-2\"\n";
 const WSJTX_TOML: &str = "[[wsjtx_relay]]\nlisten = \"127.0.0.1:2237\"\ncallsign = \"W1ABC\"\n";
 
+/// MAN-142: both spot-output tables print one summary line each, after
+/// the relays and before `callsign_lookup:`.
+#[test]
+fn check_prints_the_spot_output_summary_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[server]\nstation_callsign = \"W5AU\"\noperator_grid = \"EM10dh\"\n\
+         [pskreporter]\nenabled = true\nantenna = \"Inverted V at 12 m\"\n\
+         [[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n",
+    );
+    let out = succeeds(&check_file(&path));
+    let lines: Vec<&str> = out.lines().collect();
+    let at = |line: &str| {
+        lines
+            .iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {out}"))
+    };
+    let psk = at(
+        "pskreporter: enabled=true host=report.pskreporter.info port=4739 \
+                  spot_types=cq_beacon antenna=\"Inverted V at 12 m\"",
+    );
+    let wsjtx = at("wsjtx_output: destination=192.168.1.255:2237 enabled=true");
+    assert_eq!(psk, at("wsjtx_relay: none") + 1, "{out}");
+    assert_eq!(wsjtx, psk + 1, "{out}");
+    assert_eq!(at("callsign_lookup: none"), wsjtx + 1, "{out}");
+}
+
 #[test]
 fn check_prints_the_relay_summary_lines() {
     let dir = tempfile::tempdir().unwrap();
@@ -1530,8 +1562,10 @@ fn check_prints_the_relay_summary_lines() {
     let skimmer = at("skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true");
     let wsjtx = at("wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true");
     assert_eq!((skimmer, wsjtx), (compare + 1, compare + 2), "{out}");
-    assert_eq!(lines[wsjtx + 1], "callsign_lookup: none", "{out}");
-    assert!(lines[wsjtx + 2].starts_with("input: "), "{out}");
+    assert_eq!(lines[wsjtx + 1], "pskreporter: none", "{out}");
+    assert_eq!(lines[wsjtx + 2], "wsjtx_output: none", "{out}");
+    assert_eq!(lines[wsjtx + 3], "callsign_lookup: none", "{out}");
+    assert!(lines[wsjtx + 4].starts_with("input: "), "{out}");
 
     let path = write_cfg(dir.path(), "plain.toml", RELAY_BASE);
     let out = succeeds(&check_file(&path));
@@ -1613,7 +1647,8 @@ fn check_rejects_each_relay_error_with_its_message() {
     let err = fails(&check_file(&path));
     assert!(
         err.contains(
-            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], \
+                 [callsign_lookup], [input], "
         ),
         "{err}"
     );

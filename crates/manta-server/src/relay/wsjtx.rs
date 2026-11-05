@@ -14,11 +14,17 @@
 //! own dedupe uses). State is per instance `Id`, bounded to
 //! [`MAX_INSTANCES`] (the oldest-heard is evicted).
 //!
+//! MAN-142 D14: ahead of the chain, a datagram of any type whose `Id`
+//! starts with [`crate::wsjtx_output::ID_PREFIX`] (`manta-`) comes from
+//! manta's own `[[wsjtx_output]]`. It is counted as `own_output` and is not
+//! "heard": it creates no instance and never marks the relay up, so an
+//! output and a relay sharing one multicast group never loop.
+//!
 //! The spot's frequency is the instance's dial plus the decode's audio
 //! offset; its SNR is WSJT-X's own 2500 Hz figure, forwarded verbatim
 //! (D8); its time is arrival time from the injected clock (D9).
-//! `manta_relay_up` is 1 while any WSJT-X datagram (heartbeats included)
-//! arrived within [`UP_WINDOW`]. See
+//! `manta_relay_up` is 1 while any WSJT-X datagram (heartbeats included,
+//! manta's own output excluded) arrived within [`UP_WINDOW`]. See
 //! `docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md`.
 
 use super::wsjtx_proto::{self, Decode, Message, Status};
@@ -194,11 +200,15 @@ impl Relay {
                 return false;
             }
         };
+        if msg.id().starts_with(crate::wsjtx_output::ID_PREFIX) {
+            self.stats.record_dropped(DropReason::OwnOutput);
+            return false;
+        }
         self.seq += 1;
         match msg {
             Message::Status(s) => self.status(s),
             Message::Decode(d) => self.decode(d),
-            Message::Other(_) => {}
+            Message::Other { .. } => {}
         }
         true
     }
@@ -359,7 +369,8 @@ pub async fn run(
             }
             received = socket.recv_from(&mut buf) => match received {
                 Ok((n, _from)) => {
-                    // Any decodable datagram, heartbeats included, is "heard".
+                    // Any decodable datagram, heartbeats included, is
+                    // "heard"; manta's own output is not (D14).
                     if relay.handle(&buf[..n]) {
                         relay.stats.set_up(true);
                         last_heard = Some(Instant::now());
@@ -421,6 +432,90 @@ mod tests {
         assert!(d.admit("K1ABC", RelayMode::Ft4, "20m", 1_600));
         assert!(d.admit("K1ABC", RelayMode::Ft8, "40m", 1_600));
         assert!(!d.admit("K1ABC", RelayMode::Ft8, "40m", 1_601));
+    }
+
+    fn relay() -> Relay {
+        let metrics = crate::metrics::Metrics::default();
+        Relay {
+            cfg: WsjtxRelay {
+                label: "127.0.0.1:2237".to_string(),
+                callsign: "W1AW".to_string(),
+            },
+            spotter: Arc::from("W1AW"),
+            clock: Arc::new(|| 1_793_650_021),
+            bus: Arc::new(SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 1)),
+            stats: metrics.register_relay(
+                "127.0.0.1:2237".to_string(),
+                crate::metrics::RelayKind::Wsjtx,
+            ),
+            instances: HashMap::new(),
+            seq: 0,
+            dedupe: Dedupe::default(),
+        }
+    }
+
+    /// A `Heartbeat`, `Status` and `Decode` from `[[wsjtx_output]]`'s own
+    /// encoder, under instance `id`.
+    fn output_sequence(id: &str) -> Vec<Vec<u8>> {
+        use crate::wsjtx_output as out;
+        vec![
+            out::heartbeat(id, "0.1.0", "d1ddf99a36ce"),
+            out::status(&out::StatusFields {
+                id: id.to_string(),
+                dial_freq_hz: 14_074_000,
+                mode: "FT8".to_string(),
+                de_call: "W5AU".to_string(),
+                de_grid: "EM10dh".to_string(),
+            }),
+            out::decode(&out::DecodeFields {
+                id: id.to_string(),
+                new: true,
+                time_ms: 72_421_000,
+                snr: 21,
+                delta_time_s: 0.0,
+                delta_freq_hz: 1_520,
+                mode: "~".to_string(),
+                message: "CQ K1ABC FN42".to_string(),
+                low_confidence: false,
+                off_air: false,
+            }),
+        ]
+    }
+
+    #[test]
+    fn mantas_own_output_is_counted_and_never_marks_the_relay_up() {
+        let mut r = relay();
+        let mut relay_rx = r.bus.subscribe_relay();
+        for datagram in output_sequence("manta-20m") {
+            assert!(!r.handle(&datagram), "own output is not heard");
+        }
+        assert_eq!(r.stats.dropped_total(DropReason::OwnOutput), 3);
+        assert!(r.instances.is_empty(), "no instance for manta-20m");
+        assert_eq!(r.seq, 0);
+        assert_eq!(r.stats.spots_total(), 0);
+        assert!(relay_rx.try_recv().is_err(), "nothing reached the uplink");
+    }
+
+    #[test]
+    fn a_real_wsjtx_instance_still_marks_the_relay_up() {
+        let mut r = relay();
+        // Keep a relay receiver so the forwarded spot has somewhere to go.
+        let mut relay_rx = r.bus.subscribe_relay();
+        for datagram in output_sequence("WSJT-X") {
+            assert!(r.handle(&datagram), "a WSJT-X datagram is heard");
+        }
+        assert_eq!(r.stats.dropped_total(DropReason::OwnOutput), 0);
+        assert!(r.instances.contains_key("WSJT-X"));
+        assert_eq!(r.stats.spots_total(), 1);
+        assert_eq!(relay_rx.try_recv().unwrap().callsign, "K1ABC");
+    }
+
+    #[test]
+    fn own_output_applies_to_wsjtx_relays_only() {
+        use crate::metrics::RelayKind;
+        assert!(!DropReason::OwnOutput.applies_to(RelayKind::Skimmer));
+        assert!(DropReason::OwnOutput.applies_to(RelayKind::Wsjtx));
+        assert_eq!(DropReason::OwnOutput.label(), "own_output");
     }
 
     #[test]

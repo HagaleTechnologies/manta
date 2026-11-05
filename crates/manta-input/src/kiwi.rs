@@ -2,7 +2,7 @@
 //! over its WebSocket protocol, requests raw complex-IQ mode (`mod=iq`), and
 //! rational-resamples the receiver's native (device-specific, non-round)
 //! sample rate up to 96000 Hz before handing samples to the rest of the
-//! pipeline. ARCHITECTURE §3, docs/superpowers/specs/2026-07-25-m2-kiwisdr-input-design.md.
+//! pipeline. ARCHITECTURE §3, docs/archive/plans/specs/2026-07-25-m2-kiwisdr-input-design.md.
 //!
 //! Protocol notes (real, live-verified against several public receivers
 //! during implementation -- see docs/DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md

@@ -32,8 +32,9 @@ apply them only when `--config` or `MANTA_CONFIG` names a file. Given
 variable: they dial that address even when `MANTA_CONFIG` names a missing or
 invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
-the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
-set from the environment. `[callsign_lookup]` can, through
+the environment, so their output does not depend on it. `[[rbn_uplink]]`,
+`[[skimmer_relay]]`, `[[wsjtx_relay]]`, `[pskreporter]` and `[[wsjtx_output]]`
+cannot be set from the environment. `[callsign_lookup]` can, through
 `MANTA_CALLSIGN_LOOKUP_*`, so the QRZ.com password can stay out of the file. An unknown table, key or `MANTA_*` variable is an
 error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
 variables and are skipped at run time.
@@ -57,10 +58,10 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all ten | yes |
+| `run` (alias `listen`) | all twelve | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all ten, resolved exactly as `run` resolves them | yes |
+| `config check` | all twelve, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
@@ -291,6 +292,107 @@ Load errors (exit 1, from the same entry points as `[[skimmer_relay]]`'s):
 manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 forwards spots only through [[rbn_uplink]] -- add an enabled [[rbn_uplink]] block, or set enabled = false on this relay
 manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 is listed twice
 manta.toml: [[wsjtx_relay]]: listen "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
+```
+
+## [pskreporter]
+
+Reports validated spots to PSKReporter (pskreporter.info) as IPFIX datagrams
+over UDP, in the format PSKReporter's developer page describes (MAN-142).
+Each report carries the spotted call, its RF frequency in whole Hz, the SNR
+(manta's 2500 Hz figure, rounded), the mode (`CW`, or `RTTY`) and the spot's
+time. The receiver is `[server].station_callsign` without its `-N` SSID, at
+the `[server]` locator, with decoding software `manta <version>` and
+`antenna`. PSKReporter's own rules set the pace: each call is reported at
+most once per band every 300 s, and manta sends at most one datagram every
+300 s (sooner only when a datagram would pass 1400 bytes), never when nothing
+is pending. The first datagram goes out 300 to 329 s after startup. At
+shutdown manta sends what is still pending.
+
+An enabled table needs `[server]` with a location: `operator_grid`, or
+`operator_lat` and `operator_lon`. The environment cannot set these keys.
+Every key needs a restart; a SIGHUP never applies them. `doctor` does not
+check this table.
+
+**Reports are public.** Anyone can see them on PSKReporter's map and
+statistics pages, under the station call at its locator. That is why
+`enabled` defaults to `false`. Do not also report the same call from WSJT-X,
+JTDX or CW Skimmer: PSKReporter would get every spot twice.
+
+**File replay.** A file replay reports only to a loopback `host`
+(`127.0.0.0/8` or `localhost`), so a recording's spots never reach the public
+map. With any other host, `manta run` prints this note and starts no
+reporter (the metric families still show, at 0):
+
+```
+note: [pskreporter] is off for file replay: report.pskreporter.info is not a loopback address, and a recording's spots must not reach PSKReporter's public map
+```
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `false` | live: `run` with `[server]` | `true` reports spots publicly to PSKReporter. |
+| `host` | `"report.pskreporter.info"` | live: `run` with `[server]` | PSKReporter's collector, or a local test listener's IPv4 address. Resolved when the first datagram is due and again hourly; never at startup. IPv6 addresses are rejected: PSKReporter has none. |
+| `port` | `4739` | live: `run` with `[server]` | PSKReporter's IPFIX port. `14739` is PSKReporter's packet-analysis test listener. |
+| `antenna` | `""` | live: `run` with `[server]` | Shown on PSKReporter's map, e.g. `"Inverted V at 12 m"`. At most 254 bytes, no control characters; empty sends an empty field. |
+| `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `cq_beacon` (CQ and beacon spots) or `all`, as for `[[rbn_uplink]]`. |
+
+Load errors (exit 1, from `config check`, `run`, `doctor` and a SIGHUP
+reload alike):
+
+```
+manta.toml: [pskreporter] needs a [server] table (it reports the spots the servers publish)
+manta.toml: [pskreporter] is enabled but [server] has no location -- set [server].operator_grid (e.g. "EM10dh") or operator_lat and operator_lon; PSKReporter places every report at the receiver's locator
+manta.toml: [pskreporter]: host is empty -- set PSKReporter's host name ("report.pskreporter.info") or a test listener's IPv4 address
+manta.toml: [pskreporter]: host "::1" is an IPv6 address -- PSKReporter has no IPv6 address; use a host name or an IPv4 address
+manta.toml: [pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 (14739 for its test listener)
+manta.toml: [pskreporter]: antenna is 300 bytes; PSKReporter keeps at most 254
+manta.toml: [[pskreporter]] is not supported -- use a single [pskreporter] table
+MANTA_PSKREPORTER_ENABLED: [pskreporter] cannot be set from the environment; use the config file
+```
+
+## [[wsjtx_output]]
+
+Sends every validated spot to `destination` as WSJT-X UDP `NetworkMessage`
+datagrams (schema 3), for loggers that already listen for WSJT-X, such as
+GridTracker or JTAlert (MAN-142). Each band is its own WSJT-X instance,
+`manta-20m`, `manta-40m` and so on (`manta-unknown` outside the amateur
+bands). manta sends a `Heartbeat` when an instance first appears and every
+15 s after, a `Status` (dial frequency, mode `CW` or `RTTY`, the station call
+and grid) before a spot on a new kHz or mode and after each heartbeat, one
+`Decode` per spot (`CQ <call>` for a CQ spot, `DE <call>` for every other
+type; the 2500 Hz SNR; `Low confidence` for a tentative spot), and a `Close`
+per instance at shutdown. It never sends `QSO Logged` or `Logged ADIF`, and
+never reads from the socket.
+
+Every block may be repeated with another `destination`. An enabled block
+needs `[server]`; the environment cannot set these keys. Every key needs a
+restart; a SIGHUP never applies them. `doctor` does not check this table. A
+file replay runs it, with WSJT-X's `Off air` flag set on every `Decode`.
+
+**Anyone on the network can read it.** A unicast `destination` reaches one
+host. A broadcast address (manta sets `SO_BROADCAST`) or a multicast group
+(TTL 1, loopback on) reaches every host on the local segment. See
+[RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md).
+
+**Sharing a multicast group.** If WSJT-X, a logger and manta's own
+`[[wsjtx_relay]]` already share a group such as `224.0.0.1:2237` (see the
+`[[wsjtx_relay]]` section above), point `destination` at the same group.
+`[[wsjtx_relay]]` ignores every datagram whose `Id` starts with `manta-`,
+counts it as `own_output`, and never forwards it to the uplink.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `destination` | none; example `"127.0.0.1:2237"`; required | live: `run` with `[server]` | A logger's `IP:port`, an IPv4 broadcast address such as `192.168.1.255:2237`, or an IPv4 multicast group such as `224.0.0.1:2237`. Port `0`, `0.0.0.0`, `::` and IPv6 multicast are rejected. |
+| `enabled` | `true` | live: `run` with `[server]` | `false` keeps the block but sends nothing. |
+
+Load errors (exit 1, from the same entry points as `[pskreporter]`'s):
+
+```
+manta.toml: [[wsjtx_output]] needs a [server] table (it sends the spots the servers publish)
+manta.toml: [[wsjtx_output]] 192.168.1.255:2237 is listed twice
+manta.toml: [[wsjtx_output]]: destination "0.0.0.0:2237" is not an address manta can send to -- use a logger's address, a broadcast address such as "192.168.1.255:2237", or a multicast group such as "224.0.0.1:2237"
+manta.toml: [[wsjtx_output]]: destination "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
+manta.toml: wsjtx_output must be written [[wsjtx_output]] (an array of tables)
+MANTA_WSJTX_OUTPUT_DESTINATION: [[wsjtx_output]] cannot be set from the environment; use the config file
 ```
 
 ## [callsign_lookup]

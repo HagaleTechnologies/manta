@@ -173,7 +173,7 @@ dev/test tools, unaffected.
 
 ### D12 — AI-process artifacts: archived publicly, not moved to `thoughts/`
 
-`docs/superpowers/` (agent planning/task content, currently linked from ROADMAP.md as if it were
+The agent planning/task content (currently linked from ROADMAP.md as if it were
 design documentation) moves to a clearly-labeled, still-public archive directory (e.g.
 `docs/archive/plans/`) with a provenance note — not to `thoughts/`, which is reserved for a different
 purpose and shouldn't be mixed with this (MAN-150). `.catalyst/config.json` stops being tracked. The
