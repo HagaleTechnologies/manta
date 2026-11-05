@@ -4441,6 +4441,165 @@ mod tests {
         assert_eq!(stalled, run(false));
     }
 
+    /// A source reports each tail as stalled, then waits for the test to
+    /// observe its spot before allowing any more samples or EOF.
+    struct GatedStallSource {
+        segments: std::collections::VecDeque<FixedFreqSource>,
+        gate: std::sync::mpsc::Receiver<()>,
+        phase: Arc<AtomicU64>,
+        waiting: bool,
+        stalled: bool,
+        fs: f64,
+        center: f64,
+    }
+
+    impl IqSource for GatedStallSource {
+        fn sample_rate(&self) -> f64 {
+            self.fs
+        }
+        fn center_freq_hz(&self) -> f64 {
+            self.center
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if self.waiting {
+                if self
+                    .gate
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_err()
+                {
+                    anyhow::bail!("spot did not release resume gate");
+                }
+                self.waiting = false;
+            }
+            let Some(segment) = self.segments.front_mut() else {
+                return Ok(0);
+            };
+            let n = segment.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            self.segments.pop_front();
+            self.waiting = true;
+            self.stalled = true;
+            self.phase.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+        fn take_stalled(&mut self) -> bool {
+            std::mem::take(&mut self.stalled)
+        }
+    }
+
+    fn check_stall_settles_before_resume(multi: bool) {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 4.0;
+        spec.signals[0].wpm = 40.0;
+        spec.signals[0].loop_text = false;
+        let segments = ["DE W1AW", "DE K1ABC"]
+            .into_iter()
+            .map(|text| {
+                spec.signals[0].text = text.into();
+                FixedFreqSource {
+                    samples: manta_testkit::vectors::render(&spec).unwrap().samples,
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                }
+            })
+            .collect();
+        let (resume, gate) = std::sync::mpsc::channel();
+        let (send_spot, spots) = std::sync::mpsc::channel();
+        let phase = Arc::new(AtomicU64::new(0));
+        let source = GatedStallSource {
+            segments,
+            gate,
+            phase: phase.clone(),
+            waiting: false,
+            stalled: false,
+            fs: spec.fs,
+            center: spec.center_freq_hz,
+        };
+        let worker = std::thread::spawn(move || {
+            let cfg = PipelineConfig {
+                allowlist: vec!["W1AW".into(), "K1ABC".into()],
+                ..Default::default()
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let on_spot = |spot: &manta_spot::Spot| {
+                send_spot
+                    .send((
+                        spot.callsign.clone(),
+                        phase.load(Ordering::SeqCst),
+                        spot.sample_ts,
+                    ))
+                    .unwrap();
+            };
+            if multi {
+                let opened = crate::multi::open_inputs(
+                    vec![crate::multi::InputSpec {
+                        name: "gated".into(),
+                        open: Box::new(move || Ok(Box::new(source) as Box<dyn IqSource>)),
+                        freq_correction_ppm: 0.0,
+                        observers: Default::default(),
+                        spawn_band_hz: None,
+                    }],
+                    stop,
+                )
+                .unwrap();
+                crate::multi::listen_inputs(
+                    opened,
+                    &cfg,
+                    crate::multi::SessionClock::Replay,
+                    crate::multi::SharedObservers::default(),
+                    |_| {},
+                    on_spot,
+                    |_, _| {},
+                    |_| {},
+                )
+                .map(|_| ())
+            } else {
+                listen_with_observers(
+                    Box::new(source),
+                    &cfg,
+                    stop,
+                    ListenObservers::default(),
+                    |_| {},
+                    on_spot,
+                    |_| {},
+                )
+                .map(|_| ())
+            }
+        });
+        let first = spots.recv_timeout(std::time::Duration::from_secs(20));
+        // Dropping the gate on an assertion failure releases the worker.
+        let first = first.expect("held call must spot while resume is blocked");
+        assert_eq!(
+            (first.0.as_str(), first.1),
+            ("W1AW", 1),
+            "no spot before the first stall"
+        );
+        assert!(spots.try_recv().is_err(), "one spot per held call");
+        resume.send(()).unwrap();
+        let second = spots
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("resumed call must spot at the next stall");
+        assert_eq!((second.0.as_str(), second.1), ("K1ABC", 2));
+        assert!(second.2 > first.2, "resume retains the sample clock");
+        assert!(spots.try_recv().is_err());
+        resume.send(()).unwrap();
+        worker.join().unwrap().unwrap();
+        assert!(spots.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn a_single_input_stall_settles_the_held_call_before_resume() {
+        check_stall_settles_before_resume(false);
+    }
+
+    #[test]
+    fn a_multi_input_stall_settles_the_held_call_before_resume() {
+        check_stall_settles_before_resume(true);
+    }
+
     /// Delivers its samples, then fails: a dead receiver.
     struct FailingSource(FixedFreqSource);
 

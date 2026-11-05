@@ -516,12 +516,20 @@ mod tests {
     /// second outage the same way. Zero-valued samples count as delivery.
     #[test]
     fn a_delivering_device_reports_stalls_and_resumes_on_the_same_ring() {
+        check_ring_outages(Duration::from_millis(80));
+    }
+
+    #[test]
+    fn production_duration_audio_stall_reports_within_five_seconds() {
+        check_ring_outages(crate::stall::SOFT_STALL_AFTER);
+    }
+
+    fn check_ring_outages(soft: Duration) {
         const HARD: Duration = Duration::from_secs(5);
         let (mut aiq, feeder) = scripted_ring(&[(256, 0.25)], HARD);
         // Shorten only the soft deadline; the hard bound stays, so the
         // guard (`hard > soft`) keeps the report ahead of the error.
-        aiq.live.as_mut().unwrap().stall =
-            crate::stall::StallEpisode::new(Duration::from_millis(80));
+        aiq.live.as_mut().unwrap().stall = crate::stall::StallEpisode::new(soft);
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         assert_eq!(aiq.read(&mut buf).unwrap(), 256);
         // The ring goes empty; no device reopen, no error -- one report.

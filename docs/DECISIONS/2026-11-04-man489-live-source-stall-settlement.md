@@ -37,11 +37,13 @@ hard-failure bound:
 - **Each source's clock follows usable samples only.** Kiwi stamps the
   last non-empty `SND` payload (ping/MSG/unknown frames cannot hide the
   outage). HPSDR protocol 1 stamps the last valid Metis packet on the
-  shared `Inner`; protocol 2 keeps its `last_valid_iq.max(entered)` clock,
+  shared `Inner`; protocol 2 keeps its `last_valid_iq.max(entered)` clock with the active
+  wait entry retained across a soft return,
   so a parked consumer still cannot look stalled. Audio's wait episode
   (`waiting_since`) survives the soft report, so its 5 s device-loss bound
   cannot restart mid-outage; Soapy's retry counters likewise persist
-  across the soft return.
+  across the soft return. Native zero reads consume the same bounded
+  retry budget as timeouts.
 - **Hard limits stay**: ~10 s Kiwi/HPSDR (protocol 1's bound is now wall
   clock since the last valid packet — the same budget the old 40 x 250 ms
   consecutive-timeout count expressed — and the malformed-datagram bound
@@ -98,13 +100,39 @@ forwarding without retire/reopen, sibling continuity, pre-wait failure
 reports and no duplicate after loss; `reconnect.rs` proves the wrapper
 forwards a source stall without opening a replacement. Timing note: the
 5 s promise assumes an actively read source and normal OS scheduling;
-this program is not a hard real-time system. Soapy's loop could not be
-compiled or run in the implementing container (no native `libsoapysdr`);
-its code and tests are written against the pinned crate and await the
-`test-soapy` CI job.
+this program is not a hard real-time system.
 
-Deferred to a follow-up (declared in the run's deviations): the
-engine-level held-call emission tests (`listen.rs` gate), the child-process
-protocol-2/Kiwi acceptance latency measurements, and the
-production-duration timing smoke tests per source family; the shared
-5 s bound they would measure is otherwise pinned by the unit suites above.
+The remediation adds these acceptance proofs, all using synthetic sources:
+
+- `listen.rs` tests `a_single_input_stall_settles_the_held_call_before_resume`
+  and `a_multi_input_stall_settles_the_held_call_before_resume` block the
+  source after each report. The spot callback must deliver W1AW while the
+  first gate is closed and K1ABC after resume while the second gate is
+  closed. Each call appears once, neither appears before its stall, and
+  the resumed call retains an advancing sample timestamp.
+- `hpsdr_protocol2_acceptance.rs` and `kiwi_stall_acceptance.rs` run real
+  daemon children against same-session fakes. Each fake sends `DE W1AW`,
+  stops IQ, waits for its JSON spot, then resumes with `DE K1ABC` and stops
+  again. Both spots must arrive within five seconds of the final IQ send,
+  with resume blocked and no loss/reconnect diagnostic. Kiwi continues
+  pings during each pause. Protocol 2 also checks each held word's timestamp
+  lies inside its delivered segment.
+- `production_duration_*` source tests use the production soft durations
+  for Kiwi, both HPSDR protocols, audio and the native Soapy retry loop.
+  Each measures a flagged zero before five seconds. Protocol 1 includes
+  both concurrently active DDC readers. Short-duration tests retain repeated
+  episode and hard-loss coverage. The source matrix's protocol-1 hard-loss
+  check uses its ten-second hard limit, separately from the five-second
+  soft-report assertion.
+- The silent Kiwi hard-budget regression failed at 14.84 s before the fix.
+  Its timeout count now survives the soft return, retaining the original
+  40 receive-timeout budget. Protocol 2's one-second hard-budget regression
+  failed at 1.265 s before retaining the active wait entry. Native Soapy
+  startup and post-report zero-read tests reached the watchdog before zero
+  reads consumed the timeout budget. The overflow test now performs both
+  reads, consuming the overflow between the two sample deliveries.
+
+Native Soapy tests run with extracted Ubuntu `libsoapysdr-dev`,
+`libsoapysdr0.8`, `soapysdr0.8-module-rtlsdr`, `librtlsdr2` and `libusb-1.0-0`
+packages. They exercise the actual retry loop and null-device paths without
+radio hardware. No live hardware acceptance is claimed.

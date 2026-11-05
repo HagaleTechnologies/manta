@@ -323,6 +323,8 @@ pub struct KiwiIqSource {
     last_usable_iq: Instant,
     /// MAN-489: the one-shot soft-stall episode behind `take_stalled`.
     stall: StallEpisode,
+    /// Retained across soft returns; any received frame resets it.
+    consecutive_timeouts: u32,
 }
 
 impl KiwiIqSource {
@@ -485,6 +487,7 @@ impl KiwiIqSource {
             acquisition_start_offset,
             last_usable_iq: Instant::now(),
             stall: StallEpisode::new(SOFT_STALL_AFTER),
+            consecutive_timeouts: 0,
         })
     }
 
@@ -724,7 +727,6 @@ impl IqSource for KiwiIqSource {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut consecutive_timeouts = 0u32;
         loop {
             let n = self.pending.len().min(buf.len());
             if n > 0 {
@@ -755,15 +757,15 @@ impl IqSource for KiwiIqSource {
 
             let msg = match self.socket.read() {
                 Ok(m) => {
-                    consecutive_timeouts = 0;
+                    self.consecutive_timeouts = 0;
                     m
                 }
                 Err(tungstenite::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    consecutive_timeouts += 1;
-                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                    self.consecutive_timeouts += 1;
+                    if self.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
                         bail!(
                             "KiwiSDR connection stalled: no data for {} consecutive read timeouts",
                             MAX_CONSECUTIVE_TIMEOUTS
@@ -1113,6 +1115,15 @@ mod tests {
     /// surfaced at any latency.
     #[test]
     fn a_ping_fed_iq_outage_reports_a_stall_once_and_resumes() {
+        check_ping_fed_outages(Duration::from_millis(250));
+    }
+
+    #[test]
+    fn production_duration_kiwi_stall_reports_within_five_seconds() {
+        check_ping_fed_outages(SOFT_STALL_AFTER);
+    }
+
+    fn check_ping_fed_outages(soft: Duration) {
         use std::sync::mpsc;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1139,7 +1150,7 @@ mod tests {
         let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
         // Shorten only the soft deadline (the production hard bound stays
         // at ~10 s of no frames at all, which the pings outrun).
-        src.stall = StallEpisode::new(Duration::from_millis(250));
+        src.stall = StallEpisode::new(soft);
         let pinger = tx.clone();
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let finished = Arc::clone(&done);
@@ -1171,7 +1182,7 @@ mod tests {
         assert!(delivered > 0, "the frames must deliver samples");
         let reported = started.elapsed();
         assert!(
-            reported >= Duration::from_millis(250) && reported < Duration::from_secs(5),
+            reported >= soft && reported < Duration::from_secs(5),
             "report due at the soft deadline, got {reported:?}"
         );
         assert!(src.take_stalled());
@@ -1190,6 +1201,39 @@ mod tests {
         pings.join().unwrap();
         drop(tx);
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_soft_report_preserves_the_silent_connections_hard_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            ws.read().unwrap();
+            ws.send(Message::binary(b"MSG sample_rate=12000".to_vec()))
+                .unwrap();
+            for seq in 0..40 {
+                ws.send(snd_frame(seq, 512)).unwrap();
+            }
+            let _ = wait.recv_timeout(Duration::from_secs(20));
+        });
+        let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+        let mut buf = vec![Complex32::default(); 65536];
+        assert!(src.read(&mut buf).unwrap() > 0);
+        let started = Instant::now();
+        while src.read(&mut buf).unwrap() > 0 {}
+        assert!(src.take_stalled());
+        let err = src.read(&mut buf).unwrap_err().to_string();
+        let elapsed = started.elapsed();
+        drop(done);
+        server.join().unwrap();
+        assert!(err.contains("connection stalled"), "{err}");
+        assert!(
+            elapsed < Duration::from_secs(11),
+            "hard budget restarted: {elapsed:?}"
+        );
     }
 
     #[test]

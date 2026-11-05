@@ -150,7 +150,11 @@ impl RetryState {
         let mut us = TIMEOUT_US;
         if let Some(since) = self.waiting_since {
             if self.stall.is_delivering() {
-                let remaining = self.stall.soft_after().saturating_sub(since.elapsed());
+                let remaining = self.stall.clamp_wait(
+                    Duration::from_micros(TIMEOUT_US as u64),
+                    since,
+                    Instant::now(),
+                );
                 us = us.min(remaining.as_micros() as i64);
             }
         }
@@ -180,8 +184,7 @@ impl RetryState {
                 // A native `Ok(0)` means the stream is waiting, not that
                 // it ended: it must not leak as an unflagged EOF while the
                 // live stream may still deliver (MAN-489).
-                ReadAttempt::Samples(_) => self.note_wait(),
-                ReadAttempt::Timeout => {
+                ReadAttempt::Samples(_) | ReadAttempt::Timeout => {
                     self.note_wait();
                     self.timeout_retries += 1;
                     if self.timeout_retries >= MAX_TIMEOUT_RETRIES {
@@ -478,12 +481,14 @@ mod tests {
     /// plan's "scripted timed reads").
     const SCRIPT_POLL: Duration = Duration::from_millis(20);
 
-    fn retry_parts() -> (
+    type RetryParts = (
         Arc<InputHealthCounters>,
         Option<Box<dyn Fn() + Send + Sync>>,
         Option<Instant>,
         UnknownGapLatch,
-    ) {
+    );
+
+    fn retry_parts() -> RetryParts {
         (
             Arc::new(InputHealthCounters::new()),
             None,
@@ -620,6 +625,87 @@ mod tests {
         assert!(state.stall.take());
     }
 
+    #[test]
+    fn production_duration_soapy_stall_reports_within_five_seconds() {
+        let mut state = RetryState::new();
+        let (health, notice, mut warn, mut gap) = retry_parts();
+        state
+            .run(
+                &mut |_| ReadAttempt::Samples(64),
+                &health,
+                &notice,
+                &mut warn,
+                &mut gap,
+            )
+            .unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            state
+                .run(
+                    &mut |us| {
+                        std::thread::sleep(Duration::from_micros(us as u64));
+                        ReadAttempt::Timeout
+                    },
+                    &health,
+                    &notice,
+                    &mut warn,
+                    &mut gap
+                )
+                .unwrap(),
+            0
+        );
+        assert!(
+            started.elapsed() >= SOFT_STALL_AFTER && started.elapsed() < Duration::from_secs(5)
+        );
+        assert!(state.stall.take());
+    }
+
+    #[test]
+    fn permanent_native_zero_reads_have_a_hard_exit() {
+        for delivered in [false, true] {
+            let mut state = RetryState::new();
+            state.stall = StallEpisode::new(Duration::from_millis(1));
+            let (health, notice, mut warn, mut gap) = retry_parts();
+            if delivered {
+                state
+                    .run(
+                        &mut |_| ReadAttempt::Samples(64),
+                        &health,
+                        &notice,
+                        &mut warn,
+                        &mut gap,
+                    )
+                    .unwrap();
+            }
+            let mut attempts = 0;
+            loop {
+                let result = state.run(
+                    &mut |_| {
+                        attempts += 1;
+                        std::thread::sleep(Duration::from_millis(2));
+                        if attempts > MAX_TIMEOUT_RETRIES {
+                            ReadAttempt::Fatal(anyhow::anyhow!("watchdog"))
+                        } else {
+                            ReadAttempt::Samples(0)
+                        }
+                    },
+                    &health,
+                    &notice,
+                    &mut warn,
+                    &mut gap,
+                );
+                match result {
+                    Ok(0) => assert!(state.stall.take()),
+                    Err(e) => {
+                        assert!(e.to_string().contains("timed out"), "{e}");
+                        break;
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+
     /// MAN-489/pinned MAN-202/233 behaviour through the same loop: an
     /// overflow is counted and latched as an unknown gap; a fatal error
     /// propagates.
@@ -632,6 +718,18 @@ mod tests {
             ReadAttempt::Overflow,
             ReadAttempt::Samples(64),
         ]);
+        assert_eq!(
+            state
+                .run(
+                    &mut |_| ops.pop_front().expect("initial samples"),
+                    &health,
+                    &notice,
+                    &mut last_warn,
+                    &mut unknown
+                )
+                .unwrap(),
+            64
+        );
         let n = state
             .run(
                 &mut |_| ops.pop_front().expect("scripted attempt"),

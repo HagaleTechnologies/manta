@@ -1956,6 +1956,15 @@ mod tests {
     /// hard failure when the outage is permanent.
     #[test]
     fn concurrent_ddcs_each_report_a_stalled_shared_stream_and_re_arm() {
+        check_concurrent_ddc_outages(Duration::from_millis(300), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn production_duration_protocol1_stalls_report_within_five_seconds() {
+        check_concurrent_ddc_outages(SOFT_STALL_AFTER, Duration::from_secs(10));
+    }
+
+    fn check_concurrent_ddc_outages(soft: Duration, hard: Duration) {
         let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let device_addr = device_socket.local_addr().unwrap();
         device_socket
@@ -1977,8 +1986,6 @@ mod tests {
         // Shorten both knobs through the same private fields production
         // fills: the soft episode per member, the hard bound on the
         // shared `Inner`.
-        let soft = Duration::from_millis(300);
-        let hard = Duration::from_secs(2);
         for src in &mut sources {
             src.stall = StallEpisode::new(soft);
         }
@@ -2026,7 +2033,7 @@ mod tests {
         drop(tx);
 
         let pkt = synth_metis_packet(2, |rx| Complex32::new(0.1 * (rx as f32 + 1.0), 0.0));
-        let next = |what: &str| rx.recv_timeout(Duration::from_secs(10)).expect(what);
+        let next = |what: &str| rx.recv_timeout(hard + Duration::from_secs(5)).expect(what);
         // A: one packet delivers to both queues.
         device_socket.send_to(&pkt, client_addr).unwrap();
         for _ in 0..2 {
@@ -2059,7 +2066,7 @@ mod tests {
             match next("failure") {
                 Step::Failed(err, elapsed) => {
                     assert!(err.contains("no data for"), "{err}");
-                    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+                    assert!(elapsed < hard + Duration::from_secs(1), "{elapsed:?}");
                 }
                 other => panic!("expected the hard failure, got {other:?}"),
             }

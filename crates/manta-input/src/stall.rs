@@ -67,13 +67,6 @@ impl StallEpisode {
         self.delivering
     }
 
-    /// The configured soft deadline (test introspection and receive-wait
-    /// capping; SoapySDR caps its native read timeout with it).
-    #[cfg_attr(not(feature = "soapy"), allow(dead_code))]
-    pub(crate) fn soft_after(&self) -> Duration {
-        self.soft_after
-    }
-
     /// Whether the soft report is due at `now`, given the last accepted
     /// sample at `last_sample`. `hard` is the source's own hard-failure
     /// bound: when it is not longer than the soft deadline (a test with

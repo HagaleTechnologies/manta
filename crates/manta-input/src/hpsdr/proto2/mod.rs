@@ -247,6 +247,8 @@ pub struct Protocol2IqSource {
     /// the 5 s bound, before this hard failure and without losing the
     /// session. `stall_after` stays the hard bound.
     pub(crate) stall: StallEpisode,
+    /// Active receive wait, retained across a soft return and cleared by IQ.
+    waiting_since: Option<Instant>,
     /// Consecutive malformed datagrams before `read()` errors (D13).
     pub(crate) max_consecutive_malformed: u32,
     /// MAN-308: `Some` with `input.auto_attenuation`.
@@ -317,6 +319,7 @@ impl Protocol2IqSource {
             health_counters: Arc::new(InputHealthCounters::new()),
             stall_after: STALL_AFTER,
             stall: StallEpisode::new(SOFT_STALL_AFTER),
+            waiting_since: None,
             max_consecutive_malformed: MAX_CONSECUTIVE_MALFORMED,
             // Engaged before the bring-up sends, so a reopen's restored
             // level goes out with run = 1 (MAN-308 D6).
@@ -660,7 +663,7 @@ impl Protocol2IqSource {
         // spent not reading (a multi-input run parks sources until every
         // opener finishes) is not the radio's silence, and the IQ it sent
         // meanwhile is still queued on the socket (MAN-305 review).
-        let entered = Instant::now();
+        let entered = *self.waiting_since.get_or_insert_with(Instant::now);
         while self.queue_pos >= self.queue.len() {
             // MAN-489: a delivering radio whose IQ datagrams stopped --
             // status traffic keeps flowing -- reports the stop once inside
@@ -721,6 +724,7 @@ impl Protocol2IqSource {
                 self.malformed()?;
             }
         }
+        self.waiting_since = None;
         Ok(true)
     }
 }
@@ -1477,10 +1481,19 @@ mod tests {
     /// the original hard bound.
     #[test]
     fn a_stopped_radio_reports_a_soft_stall_once_re_arms_and_still_fails_hard() {
+        check_stopped_radio(Duration::from_millis(250), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn production_duration_protocol2_stall_reports_within_five_seconds() {
+        check_stopped_radio(SOFT_STALL_AFTER, STALL_AFTER);
+    }
+
+    fn check_stopped_radio(soft: Duration, hard: Duration) {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
-        src.stall = StallEpisode::new(Duration::from_millis(250));
-        src.stall_after = Duration::from_secs(1);
+        src.stall = StallEpisode::new(soft);
+        src.stall_after = hard;
         let _status = fake.stream_status(Duration::from_millis(20));
         fake.send_iq(0);
         assert_eq!(read_one(&mut src), (0, 238));
@@ -1489,7 +1502,10 @@ mod tests {
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
         assert_eq!(src.read(&mut buf).unwrap(), 0);
         let reported = started.elapsed();
-        assert!(reported < Duration::from_secs(1), "{reported:?}");
+        assert!(
+            reported >= soft && reported < Duration::from_secs(5),
+            "{reported:?}"
+        );
         assert!(src.take_stalled());
         assert!(!src.take_stalled());
         // The same session resumes without a reconnect.
@@ -1498,10 +1514,16 @@ mod tests {
         assert!(!src.take_stalled());
         // A second outage reports again, and a permanent one still errors
         // at the hard bound (the soft return did not reset it).
+        let started = Instant::now();
         assert_eq!(src.read(&mut buf).unwrap(), 0);
         assert!(src.take_stalled());
         let err = src.read(&mut buf).unwrap_err().to_string();
-        assert!(err.contains("stalled: no IQ datagram for 1 s"), "{err}");
+        assert!(err.contains("stalled: no IQ datagram"), "{err}");
+        assert!(
+            started.elapsed() < hard + Duration::from_millis(150),
+            "hard budget restarted: {:?}",
+            started.elapsed()
+        );
     }
 
     /// MAN-308: a handle whose notice records every change.
