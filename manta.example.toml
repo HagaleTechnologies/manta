@@ -513,3 +513,15 @@ station_callsign = "N0CALL"
 #speed_alpha = 0.2                   # how quickly the speed estimate follows the sender
 #seed_units_hops = [9.0, 13.0, 18.0, 26.0, 38.0]  # starting dot lengths tried
 #conf_kappa = 6.0                    # confidence scale
+
+# Delayed refinement of ambiguous decodes: re-running a track's
+# preserved decoder inputs under an alternate configuration, inside fixed
+# budgets. enabled = false restores the pure causal baseline. The keys
+# live in the [decode.refine] sub-table (an absent sub-table means the
+# documented defaults):
+#    enabled = true                   # false: no retention, no replay
+#    lookback_secs = 10.0             # per-track retained hops; 0 (off) or 4.0..=10.0 s
+#    max_refinements_per_episode = 2  # hypothesis cap per episode, 1 through 4
+#    replay_hops_per_batch = 1500     # re-decode work per input batch, in hops
+#    backlog = 16                     # queued episodes, 1 through 256
+#refine = { enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }
