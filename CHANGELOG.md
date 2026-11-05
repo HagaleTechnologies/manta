@@ -22,6 +22,17 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Added
+
+- MAN-493: the three remaining oracle-bypass experiments for
+  `manta oracle --funnel`. `--funnel-bypass known-timing` seeds the bypass
+  decoder at the truth speed, forcing the `usableTiming` stage (unavailable
+  `noRbnWpm`/`hsmmEngine` without a truth speed or on the hsmm engine);
+  `known-transitions` and `known-transcript` take synthetic keying truth
+  through the engine API (`run_synthetic_bypass`, the
+  `loss_funnel_synthetic` example) and stay off the CLI. No production
+  decode path changes.
+
 ### Decoder output
 
 - MAN-200: a decode whose samples overlap a decode the repetition gate

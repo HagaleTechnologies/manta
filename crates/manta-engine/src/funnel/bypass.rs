@@ -1,9 +1,15 @@
-//! MAN-198: oracle-bypass experiments. Each forces one intervention with
-//! truth the production pipeline does not have, reruns the stages after it,
-//! and reports an upper bound for that one intervention. Side paths only:
-//! no production code path changes, and nothing here is a recall score.
-//! Every line carries `oracleAssisted: true` and is written after the
-//! production summary (plan P12, P13).
+//! MAN-198/MAN-493: oracle-bypass experiments. Each forces one
+//! intervention with truth the production pipeline does not have, reruns
+//! the stages after it, and reports an upper bound for that one
+//! intervention. Side paths only: no production code path changes, and
+//! nothing here is a recall score. Every line carries `oracleAssisted:
+//! true` and is written after the production summary (plan P12, P13).
+//!
+//! Four experiments (MAN-493 built the last three): the two RBN-fed ones
+//! (`known-frequency`, `known-timing`) run through [`run_bypass`] and are
+//! CLI flag values; the two keying-truth ones (`known-transitions`,
+//! `known-transcript`) run through [`run_synthetic_bypass`] and are
+//! engine-API/example-only -- the CLI keeps rejecting their names.
 
 use super::attribute::{
     attribute, DecisionFact, Evidence, Geometry, Opportunity, Record, SpotFact, Stage, Tolerances,
@@ -14,6 +20,7 @@ use crate::PipelineConfig;
 use anyhow::Result;
 use manta_decode::decoder::TrackDecoder;
 use manta_decode::events::{ClosureKind, DecoderEvent};
+use manta_decode::tree::Glyph;
 use num_complex::Complex32;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -25,6 +32,23 @@ pub enum Bypass {
     /// fed the strongest of the three channels around it (the oracle's own
     /// channel selection), then the production validator.
     KnownFrequency,
+    /// `known-frequency` plus the truth speed seeded into the decoder
+    /// (`TrackDecoder::seed_speed_wpm`), so the speed gate the production
+    /// decode failed is forced by construction. Needs the truth layer's
+    /// own WPM: an opportunity with none, or an hsmm engine (whose speed
+    /// never passes through `SpeedTracker`), is unavailable.
+    KnownTiming,
+    /// The exact on/off keying timeline of the truth text, fed hop by hop
+    /// to a fresh decoder (`TrackDecoder::push_envelope`): detection,
+    /// admission and timing are forced by construction, everything from
+    /// the text stages on is honestly evaluated. Synthetic truth; engine
+    /// API and example only.
+    KnownTransitions,
+    /// The truth transcript synthesized straight into decoder events, so
+    /// every decode stage is forced and only the validator's own gates
+    /// (self-ID, evidence, policy) are honestly evaluated. Synthetic
+    /// truth; engine API and example only.
+    KnownTranscript,
 }
 
 impl Bypass {
@@ -32,6 +56,9 @@ impl Bypass {
     pub fn label(self) -> &'static str {
         match self {
             Bypass::KnownFrequency => "knownFrequency",
+            Bypass::KnownTiming => "knownTiming",
+            Bypass::KnownTransitions => "knownTransitions",
+            Bypass::KnownTranscript => "knownTranscript",
         }
     }
 
@@ -39,8 +66,29 @@ impl Bypass {
     pub fn forced_stages(self) -> &'static [Stage] {
         match self {
             Bypass::KnownFrequency => &[Stage::DetectableEnergy, Stage::AdmittedTrack],
+            Bypass::KnownTiming | Bypass::KnownTransitions | Bypass::KnownTranscript => &[
+                Stage::DetectableEnergy,
+                Stage::AdmittedTrack,
+                Stage::UsableTiming,
+            ],
         }
     }
+}
+
+/// The synthetic keying truth one synthetic bypass runs on
+/// (`manta-testkit::funnel_truth` builds this as plain data; the engine
+/// cannot name testkit types outside its dev-dependencies).
+#[derive(Debug, Clone, Default)]
+pub struct SyntheticTruth {
+    /// The truth speed, WPM. Seeds the decoder for `KnownTransitions`
+    /// and is reported for `KnownTranscript`.
+    pub wpm: f32,
+    /// The exact keying envelope at the decoder's hop rate: (input
+    /// sample timestamp, amplitude 0..1). `KnownTransitions`.
+    pub envelope: Vec<(u64, f32)>,
+    /// The known words with their leading input-sample timestamps.
+    /// `KnownTranscript`.
+    pub words: Vec<(u64, String)>,
 }
 
 /// One `lossFunnelBypass` line. Deliberately no `dxCall`, `frequency` or
@@ -97,9 +145,33 @@ fn unavailable_reason(production: &Record) -> Option<&str> {
     }
 }
 
+/// The same blank line every runner starts from: flagged oracle-assisted,
+/// forcing its stages, unavailable until a runner fills it in.
+fn blank_line(bypass: Bypass, prod: &Record) -> BypassRecord {
+    BypassRecord {
+        kind: "lossFunnelBypass",
+        bypass: bypass.label(),
+        oracle_assisted: true,
+        forced_stages: bypass.forced_stages().to_vec(),
+        call: prod.call.clone(),
+        frequency_hz: prod.frequency_hz,
+        first_s: prod.first_s,
+        available: false,
+        reached: None,
+        lost_at: None,
+        detail: None,
+        production_lost_at: prod.lost_at,
+        speed_wpm: None,
+        track_text: None,
+        decisions: Vec::new(),
+    }
+}
+
 /// Runs `bypass` for every production record, in the records' order.
 /// `iq` is the whole recording, sampled at `geo.sample_rate_hz` around the
 /// uncalibrated `center_hz`; `geo` and `tol` are the production run's.
+/// The RBN-fed bypasses only: the synthetic ones take their truth as
+/// data ([`run_synthetic_bypass`]).
 pub fn run_bypass(
     bypass: Bypass,
     iq: &[Complex32],
@@ -109,27 +181,21 @@ pub fn run_bypass(
     geo: &Geometry,
     tol: &Tolerances,
 ) -> Result<(Vec<BypassRecord>, BypassSummary)> {
-    let factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let input = ChannelInput {
+        iq,
+        center_hz,
+        factor: manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+            .map_err(|e| anyhow::anyhow!(e))?,
+    };
+    if matches!(bypass, Bypass::KnownTransitions | Bypass::KnownTranscript) {
+        anyhow::bail!(
+            "bypass {} takes synthetic truth; call run_synthetic_bypass",
+            bypass.label()
+        );
+    }
     let mut records = Vec::with_capacity(production.len());
     for prod in production {
-        let mut line = BypassRecord {
-            kind: "lossFunnelBypass",
-            bypass: bypass.label(),
-            oracle_assisted: true,
-            forced_stages: bypass.forced_stages().to_vec(),
-            call: prod.call.clone(),
-            frequency_hz: prod.frequency_hz,
-            first_s: prod.first_s,
-            available: false,
-            reached: None,
-            lost_at: None,
-            detail: None,
-            production_lost_at: prod.lost_at,
-            speed_wpm: None,
-            track_text: None,
-            decisions: Vec::new(),
-        };
+        let mut line = blank_line(bypass, prod);
         let covered = match (unavailable_reason(prod), prod.covered_s) {
             (None, Some(c)) => c,
             (reason, _) => {
@@ -147,7 +213,31 @@ pub fn run_bypass(
             snr_db: prod.snr_db,
             wpm: prod.wpm,
         };
-        let ev = known_frequency_evidence(iq, center_hz, factor, cfg, geo, &op, covered)?;
+        // `known-timing` needs a truth speed and a seedable engine; both
+        // unavailable reasons are the bypass's own honest report, not an
+        // error.
+        let seed = match bypass {
+            Bypass::KnownFrequency => None,
+            Bypass::KnownTiming => {
+                if matches!(cfg.decode.engine, manta_decode::decoder::Engine::Hsmm) {
+                    line.detail = Some("hsmmEngine".to_string());
+                    records.push(line);
+                    continue;
+                }
+                match op.wpm {
+                    Some(w) => Some(w),
+                    None => {
+                        line.detail = Some("noRbnWpm".to_string());
+                        records.push(line);
+                        continue;
+                    }
+                }
+            }
+            Bypass::KnownTransitions | Bypass::KnownTranscript => {
+                unreachable!("rejected before the loop");
+            }
+        };
+        let ev = channel_evidence(&input, cfg, geo, &op, covered, seed)?;
         let r = attribute(&op, &ev, geo, tol);
         line.available = true;
         line.reached = r.reached;
@@ -162,25 +252,84 @@ pub fn run_bypass(
     Ok((records, summary))
 }
 
-/// Decodes the truth frequency's channel over `covered` with a fresh
-/// decoder and validator, and returns that one track's evidence.
-fn known_frequency_evidence(
-    iq: &[Complex32],
+/// Runs one synthetic bypass (`known-transitions` or `known-transcript`)
+/// for the one opportunity `op` names, against the production record of
+/// the same call. Keying truth the production pipeline does not have
+/// crosses as plain data (`SyntheticTruth`, built by
+/// `manta_testkit::funnel_truth`); the stages past the bypass's forced
+/// ones are honestly evaluated through the production validator.
+pub fn run_synthetic_bypass(
+    bypass: Bypass,
+    op: &Opportunity,
+    truth: &SyntheticTruth,
+    cfg: &PipelineConfig,
+    production: &[Record],
+    geo: &Geometry,
+    tol: &Tolerances,
+) -> Result<(BypassRecord, BypassSummary)> {
+    if !matches!(bypass, Bypass::KnownTransitions | Bypass::KnownTranscript) {
+        anyhow::bail!("bypass {} is RBN-fed; call run_bypass", bypass.label());
+    }
+    let Some(prod) = production.iter().find(|r| r.call == op.call) else {
+        anyhow::bail!("no production record for synthetic opportunity {}", op.call);
+    };
+    let mut line = blank_line(bypass, prod);
+    if bypass == Bypass::KnownTransitions
+        && matches!(cfg.decode.engine, manta_decode::decoder::Engine::Hsmm)
+    {
+        // The transitions feed needs the speed seed; the hsmm engine's
+        // speed never passes through it.
+        line.detail = Some("hsmmEngine".to_string());
+        let summary = summarize_bypass(bypass, &[line.clone()]);
+        return Ok((line, summary));
+    }
+    let ev = match bypass {
+        Bypass::KnownTransitions => transitions_evidence(truth, op, cfg, geo)?,
+        Bypass::KnownTranscript => transcript_evidence(truth, op, cfg, geo)?,
+        _ => unreachable!("checked above"),
+    };
+    let r = attribute(op, &ev, geo, tol);
+    line.available = true;
+    line.reached = r.reached;
+    line.lost_at = r.lost_at;
+    line.detail = r.detail;
+    line.speed_wpm = r.speed_wpm;
+    line.track_text = r.track_text;
+    line.decisions = r.decisions;
+    let summary = summarize_bypass(bypass, &[line.clone()]);
+    Ok((line, summary))
+}
+
+/// The recording a channel decode runs over: the whole IQ, its
+/// uncalibrated center, and the calibration factor.
+struct ChannelInput<'a> {
+    iq: &'a [Complex32],
     center_hz: f64,
     factor: f64,
+}
+
+/// Decodes the truth frequency's channel over `covered` with a fresh
+/// decoder and validator, and returns that one track's evidence. With
+/// `seed_wpm`, the decoder is seeded at that truth speed first (the
+/// `known-timing` experiment) -- one more stage forced by construction.
+fn channel_evidence(
+    input: &ChannelInput<'_>,
     cfg: &PipelineConfig,
     geo: &Geometry,
     op: &Opportunity,
     covered: [f64; 2],
+    seed_wpm: Option<f32>,
 ) -> Result<Evidence> {
     const TRACK_ID: u32 = 1;
+    let iq = input.iq;
     let fs = geo.sample_rate_hz;
-    let raw_freq_hz = op.freq_hz / factor;
-    let mut ch =
-        manta_dsp::channelizer::Channelizer::new(fs, center_hz).map_err(anyhow::Error::msg)?;
+    let raw_freq_hz = op.freq_hz / input.factor;
+    let mut ch = manta_dsp::channelizer::Channelizer::new(fs, input.center_hz)
+        .map_err(anyhow::Error::msg)?;
     let n = ch.n_channels();
     let delta = fs / n as f64;
-    let k0 = (((raw_freq_hz - center_hz) / delta).round() as i64).rem_euclid(n as i64) as usize;
+    let k0 =
+        (((raw_freq_hz - input.center_hz) / delta).round() as i64).rem_euclid(n as i64) as usize;
     let s0 = ((covered[0] * fs) as usize).min(iq.len());
     let s1 = ((covered[1] * fs) as usize).clamp(s0, iq.len());
     // `manta oracle`'s rule (`manta_testkit::oracle::run_oracle`): the
@@ -207,6 +356,9 @@ fn known_frequency_evidence(
     dec.set_freq_hz(raw_freq_hz);
     // A placeholder: bypass lines carry no SNR.
     dec.set_snr_2500_db(0.0);
+    if let Some(w) = seed_wpm {
+        dec.seed_speed_wpm(w);
+    }
     let mut events = vec![DecoderEvent::TrackPromoted {
         track_id: TRACK_ID,
         sample_ts: s0 as u64,
@@ -221,7 +373,110 @@ fn known_frequency_evidence(
         track_id: TRACK_ID,
         closure: ClosureKind::SignalEnded,
     });
+    evidence_from_events(events, TRACK_ID, cfg, fs, op.freq_hz, covered)
+}
 
+/// `known-transitions`: the exact keying envelope, hop by hop, into a
+/// fresh seeded decoder. Detection, admission and timing are forced by
+/// construction; the text and every validator gate stay honest.
+fn transitions_evidence(
+    truth: &SyntheticTruth,
+    op: &Opportunity,
+    cfg: &PipelineConfig,
+    geo: &Geometry,
+) -> Result<Evidence> {
+    const TRACK_ID: u32 = 1;
+    let fs = geo.sample_rate_hz;
+    let mut dec = TrackDecoder::new(TRACK_ID, cfg.decode.clone());
+    dec.set_freq_hz(op.freq_hz);
+    dec.set_snr_2500_db(0.0);
+    if !dec.seed_speed_wpm(truth.wpm) {
+        anyhow::bail!("known-transitions needs a seedable engine");
+    }
+    let start_ts = truth.envelope.first().map(|&(ts, _)| ts).unwrap_or(0);
+    let end_ts = truth.envelope.last().map(|&(ts, _)| ts).unwrap_or(0);
+    let mut events = vec![DecoderEvent::TrackPromoted {
+        track_id: TRACK_ID,
+        sample_ts: start_ts,
+        freq_hz: op.freq_hz,
+    }];
+    for &(ts, a) in &truth.envelope {
+        events.extend(dec.push_envelope(a, ts));
+    }
+    events.extend(dec.finish());
+    events.push(DecoderEvent::TrackClosed {
+        track_id: TRACK_ID,
+        closure: ClosureKind::SignalEnded,
+    });
+    let span = [start_ts as f64 / fs, end_ts as f64 / fs];
+    evidence_from_events(events, TRACK_ID, cfg, fs, op.freq_hz, span)
+}
+
+/// `known-transcript`: decoder events synthesized straight from the known
+/// words, at the known speed. Everything up to and including the text
+/// stages is forced; the validator's self-ID and evidence gates are
+/// evaluated exactly as production would.
+fn transcript_evidence(
+    truth: &SyntheticTruth,
+    op: &Opportunity,
+    cfg: &PipelineConfig,
+    geo: &Geometry,
+) -> Result<Evidence> {
+    const TRACK_ID: u32 = 1;
+    let fs = geo.sample_rate_hz;
+    if truth.words.is_empty() {
+        anyhow::bail!("known-transcript needs at least one known word");
+    }
+    // Character spacing only orders events; every window the attributor
+    // applies is measured in seconds. Five dits (mark + gaps) per
+    // character at the truth speed.
+    let char_step_ts = (5.0 * 1200.0 / f64::from(truth.wpm) / 1000.0 * fs).round() as u64;
+    let start_ts = truth.words[0].0;
+    let mut events = vec![DecoderEvent::TrackPromoted {
+        track_id: TRACK_ID,
+        sample_ts: start_ts,
+        freq_hz: op.freq_hz,
+    }];
+    let mut end_ts = start_ts;
+    for &(ts, ref word) in &truth.words {
+        let mut t = ts;
+        for c in word.chars() {
+            events.push(DecoderEvent::char_decoded(
+                TRACK_ID,
+                t,
+                Glyph::Char(c.to_ascii_uppercase()),
+                1.0,
+            ));
+            t += char_step_ts;
+        }
+        events.push(DecoderEvent::word_boundary(TRACK_ID, t));
+        end_ts = end_ts.max(t);
+    }
+    events.push(DecoderEvent::SpeedUpdate {
+        track_id: TRACK_ID,
+        wpm: truth.wpm,
+    });
+    events.push(DecoderEvent::TrackClosed {
+        track_id: TRACK_ID,
+        closure: ClosureKind::SignalEnded,
+    });
+    let span = [start_ts as f64 / fs, end_ts as f64 / fs];
+    evidence_from_events(events, TRACK_ID, cfg, fs, op.freq_hz, span)
+}
+
+/// The shared tail of every bypass runner: one track's decoder events
+/// through the production validator and observer, folded into the
+/// evidence `attribute` takes. The track is confirmed and leased by
+/// construction (that is what the forced stages mean); `span` is its
+/// `[born_s, end_s]`.
+fn evidence_from_events(
+    events: Vec<DecoderEvent>,
+    track_id: u32,
+    cfg: &PipelineConfig,
+    fs: f64,
+    spawn_freq_hz: f64,
+    span: [f64; 2],
+) -> Result<Evidence> {
     let mut validator = cfg.validator(fs)?;
     validator.record_decisions(true);
     let mut tracks: BTreeMap<u32, EventTrack> = BTreeMap::new();
@@ -236,13 +491,13 @@ fn known_frequency_evidence(
     decisions.extend(validator.take_decisions());
 
     let secs = |ts: u64| ts as f64 / fs;
-    let t = tracks.remove(&TRACK_ID).unwrap_or_default();
+    let t = tracks.remove(&track_id).unwrap_or_default();
     let track = TrackFacts {
-        track_id: TRACK_ID,
-        spawn_freq_hz: op.freq_hz,
-        freq_hz: op.freq_hz,
-        born_s: covered[0],
-        end_s: Some(covered[1]),
+        track_id,
+        spawn_freq_hz,
+        freq_hz: spawn_freq_hz,
+        born_s: span[0],
+        end_s: Some(span[1]),
         confirmed: true,
         leased: true,
         close: None,
@@ -345,6 +600,91 @@ mod tests {
             track_text: None,
             decisions: Vec::new(),
         }
+    }
+
+    /// MAN-493: the four experiments' labels and forced stages.
+    #[test]
+    fn bypass_labels_and_forced_stages() {
+        assert_eq!(Bypass::KnownFrequency.label(), "knownFrequency");
+        assert_eq!(
+            Bypass::KnownFrequency.forced_stages(),
+            &[Stage::DetectableEnergy, Stage::AdmittedTrack]
+        );
+        for (b, label) in [
+            (Bypass::KnownTiming, "knownTiming"),
+            (Bypass::KnownTransitions, "knownTransitions"),
+            (Bypass::KnownTranscript, "knownTranscript"),
+        ] {
+            assert_eq!(b.label(), label);
+            assert_eq!(
+                b.forced_stages(),
+                &[
+                    Stage::DetectableEnergy,
+                    Stage::AdmittedTrack,
+                    Stage::UsableTiming
+                ]
+            );
+        }
+        // Every variant is distinct.
+        assert_eq!(
+            [
+                Bypass::KnownFrequency,
+                Bypass::KnownTiming,
+                Bypass::KnownTransitions,
+                Bypass::KnownTranscript
+            ]
+            .map(Bypass::label),
+            [
+                "knownFrequency",
+                "knownTiming",
+                "knownTransitions",
+                "knownTranscript"
+            ]
+        );
+    }
+
+    /// MAN-493: the synthetic runner refuses RBN-fed bypasses, and vice
+    /// versa, instead of silently running the wrong experiment.
+    #[test]
+    fn synthetic_and_rbn_runners_reject_the_wrong_bypass() {
+        let geo = Geometry {
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+            duration_s: 45.0,
+            passband_hz: (13_952_000.0, 14_048_000.0),
+            channel_width_hz: 93.75,
+            freq_correction_ppm: 0.0,
+        };
+        let op = Opportunity {
+            call: "W1AW".into(),
+            freq_hz: 14_012_300.0,
+            first_s: 25.0,
+            last_s: 25.0,
+            rows: 1,
+            snr_db: 20,
+            wpm: Some(20.0),
+        };
+        let cfg = PipelineConfig::default();
+        assert!(run_synthetic_bypass(
+            Bypass::KnownFrequency,
+            &op,
+            &SyntheticTruth::default(),
+            &cfg,
+            &[],
+            &geo,
+            &Tolerances::default()
+        )
+        .is_err());
+        assert!(run_bypass(
+            Bypass::KnownTransitions,
+            &[],
+            14_000_000.0,
+            &cfg,
+            &[],
+            &geo,
+            &Tolerances::default()
+        )
+        .is_err());
     }
 
     #[test]
