@@ -9,13 +9,13 @@
 //! `listen --json` output) against a real SDRplay RSP1B -- see
 //! docs/DECISIONS/2026-09-08-first-live-rsp1b-run.md.
 
-use crate::{listen_with_observers, ListenObservers, PipelineConfig};
+use crate::{listen_with_observers, ConditioningReport, ListenObservers, PipelineConfig};
 use anyhow::Result;
 use manta_decode::events::DecoderEvent;
 use manta_input::IqSource;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A run whose STRONGEST `TrackMeta.snr_2500_db` (the max, not the median --
@@ -182,6 +182,13 @@ pub struct DoctorReport {
     /// the replaced samples are silence, so the verdict judges what remains.
     #[serde(skip_serializing_if = "crate::is_zero")]
     pub bad_samples: u64,
+    /// MAN-495: what the input-conditioning chain observed, every stage
+    /// doctor did not keep applied running as `observe`. `inputConditioning`
+    /// in `doctor --json`, always present when a receiver ran (doctor
+    /// forces the stages on so diagnostics exist even on an all-off
+    /// config), absent in checks-only output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_conditioning: Option<ConditioningReport>,
 }
 
 /// `DoctorReport::duration` as a number of seconds (MAN-139), the value the
@@ -370,6 +377,166 @@ impl IqSource for SampleBoundedSource {
     }
 }
 
+/// How much input doctor's floor pre-pass measures: the first
+/// `FLOOR_TAP_SECONDS` of source time, enough for the per-channel floor
+/// histograms' lower quartile to settle, bounded so the measurement cannot
+/// outlast the run.
+const FLOOR_TAP_SECONDS: f64 = 1.0;
+
+/// MAN-495: the reference `dc.overChannelNoiseDb` needs. A DC offset is
+/// only worth naming when it stands over the channel noise floor, and the
+/// DC estimate alone (dBFS) says nothing about that -- a quiet receiver
+/// and a loud one carry the same offset at very different over-floor
+/// levels. `manta check` already summarizes per-channel floors
+/// (`check.rs`); doctor measures the same thing through a tee so the
+/// decode itself is untouched: every sample `listen()` reads is also fed
+/// to a raw `Channelizer::new` + `FloorBank` for the first
+/// `FLOOR_TAP_SECONDS` of source time, then the tap goes quiet. The
+/// channelizer is raw on purpose (D9, like `check`): the floor is a
+/// property of the receiver, not of any conditioning doctor is judging.
+struct FloorTapShared {
+    ch: manta_dsp::channelizer::Channelizer,
+    floor: manta_dsp::floor::FloorBank,
+    db: Vec<f64>,
+    fed: u64,
+    any_hop: bool,
+}
+
+/// The tap's read-side half; the shared state is kept so `doctor()` can
+/// read the measurement after `listen()` has consumed and dropped the
+/// source itself (the same shape `SampleBoundedSource`'s `samples_read`
+/// counter takes).
+struct FloorTapSource {
+    inner: Box<dyn IqSource>,
+    state: Arc<Mutex<FloorTapShared>>,
+    max_samples: u64,
+}
+
+impl FloorTapSource {
+    /// The tap for `src` at its own negotiated rate.
+    fn new(src: Box<dyn IqSource>) -> Result<(Self, Arc<Mutex<FloorTapShared>>)> {
+        let fs = src.sample_rate();
+        let center = src.center_freq_hz();
+        let ch = manta_dsp::channelizer::Channelizer::new(fs, center)
+            .map_err(anyhow::Error::msg)
+            .map_err(|e| e.context("floor tap channelizer"))?;
+        let n = ch.n_channels();
+        let state = Arc::new(Mutex::new(FloorTapShared {
+            floor: manta_dsp::floor::FloorBank::new(n),
+            db: vec![0.0; n],
+            ch,
+            fed: 0,
+            any_hop: false,
+        }));
+        Ok((
+            FloorTapSource {
+                inner: src,
+                state: state.clone(),
+                max_samples: (fs * FLOOR_TAP_SECONDS).round() as u64,
+            },
+            state,
+        ))
+    }
+}
+
+/// The tap's median floor over the eligible passband channels, in dBFS,
+/// once it saw at least one hop. MAN-203 D8: channels within two of the
+/// centre and within two of either Nyquist edge are excluded -- exactly
+/// where a DC offset (or its images) lifts the floor the measurement
+/// exists to compare against.
+fn median_floor_db(state: &FloorTapShared, passband: [f64; 2]) -> Option<f64> {
+    if !state.any_hop {
+        return None;
+    }
+    let n = state.ch.n_channels() as i64;
+    let center = state.ch.channel_freq_hz(0);
+    let mut values: Vec<f64> = (0..state.ch.n_channels())
+        .filter(|&k| {
+            let signed = ((k as i64 + n / 2) % n) - n / 2;
+            if signed.abs() <= 2 || signed.abs() >= n / 2 - 2 {
+                return false;
+            }
+            let offset = state.ch.channel_freq_hz(k) - center;
+            offset >= passband[0] && offset < passband[1]
+        })
+        .map(|k| state.floor.channel_floor_db(k))
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    Some(if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    })
+}
+
+impl IqSource for FloorTapSource {
+    fn sample_rate(&self) -> f64 {
+        self.inner.sample_rate()
+    }
+
+    fn center_freq_hz(&self) -> f64 {
+        self.inner.center_freq_hz()
+    }
+
+    fn read(&mut self, buf: &mut [num_complex::Complex32]) -> Result<usize> {
+        let n = self.inner.read(buf)?;
+        let take = (self
+            .max_samples
+            .saturating_sub(self.state.lock().unwrap_or_else(|e| e.into_inner()).fed))
+        .min(n as u64) as usize;
+        if take > 0 {
+            let state = &mut *self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.fed += take as u64;
+            for hop in state.ch.process(&buf[..take]) {
+                for (value, &power) in state.db.iter_mut().zip(&hop.power) {
+                    *value = manta_dsp::channelizer::power_db(power);
+                }
+                state.floor.update(&state.db);
+                state.any_hop = true;
+            }
+        }
+        Ok(n)
+    }
+
+    fn confirmed_live_handle(&self) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        self.inner.confirmed_live_handle()
+    }
+
+    fn rf_passband_hz(&self) -> (f64, f64) {
+        self.inner.rf_passband_hz()
+    }
+
+    fn trusted_band_hz(&self) -> Option<(f64, f64)> {
+        self.inner.trusted_band_hz()
+    }
+
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.inner.take_discontinuity()
+    }
+
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.inner.take_missing_samples()
+    }
+
+    fn take_unknown_gap(&mut self) -> bool {
+        self.inner.take_unknown_gap()
+    }
+
+    /// MAN-201: forwarded as the gap hooks are.
+    fn take_stalled(&mut self) -> bool {
+        self.inner.take_stalled()
+    }
+
+    /// MAN-273: forwarded with `trusted_band_hz`.
+    fn analytic_guard_hz(&self) -> f64 {
+        self.inner.analytic_guard_hz()
+    }
+}
+
 /// Run `listen()` against `src` for `duration`, tabulating its event/spot
 /// stream into a `DoctorReport` instead of printing or serving it. Reuses
 /// the real pipeline verbatim (same channelizer, same `TrackManager`, same
@@ -400,6 +567,21 @@ pub fn doctor(
 
     let sample_rate_hz = src.sample_rate();
     let center_freq_hz = src.center_freq_hz();
+    let (lo, hi) = src.rf_passband_hz();
+    // Clamped to Nyquist the way `check.rs` clamps its own floor summary,
+    // so `median_floor_db`'s eligibility filter can compare against
+    // channel offsets, which never leave +/-fs/2.
+    let passband = [lo.max(-sample_rate_hz / 2.0), hi.min(sample_rate_hz / 2.0)];
+    // MAN-495: doctor always observes every conditioning stage that is
+    // not set to `apply` -- an `off` stage becomes `observe` so diagnostics
+    // exist even on a default config, and an `apply` stage stays applied
+    // because the operator asked for the correction (observe never writes
+    // a sample, so a forced-observe run decodes byte-identically to an
+    // unconditioned one).
+    let cfg = PipelineConfig {
+        conditioning: cfg.conditioning.observing(),
+        ..cfg.clone()
+    };
     // A file-replay source (`--source`) delivers samples as fast as
     // processing allows, not paced to real time -- unlike a live source,
     // which naturally can't outrun its own sample clock. Left unbounded,
@@ -418,6 +600,15 @@ pub fn doctor(
         max_samples,
         samples_read: samples_read.clone(),
     });
+    // MAN-495: the floor tee beside the sample bound, and the conditioning
+    // report observer the run publishes into (pre-seeded with the forced
+    // config's modes, so the report reads `observe`/`apply` for what
+    // doctor itself ran).
+    let (floor_src, floor_tap) = FloorTapSource::new(src)?;
+    let src: Box<dyn IqSource> = Box::new(floor_src);
+    let conditioning_slot = Arc::new(Mutex::new(ConditioningReport::for_config(
+        &cfg.conditioning,
+    )));
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop_watchdog = stop.clone();
@@ -452,11 +643,12 @@ pub fn doctor(
     let bad_samples = Arc::new(AtomicU64::new(0));
     let result = listen_with_observers(
         src,
-        cfg,
+        &cfg,
         stop.clone(),
         ListenObservers {
             detector_confirmations: Some(confirmations.clone()),
             bad_samples: Some(bad_samples.clone()),
+            conditioning_report: Some(conditioning_slot.clone()),
             ..ListenObservers::default()
         },
         |ev| match ev {
@@ -499,6 +691,29 @@ pub fn doctor(
     });
     let snr_db_median = median(snrs);
 
+    // MAN-495: the observer holds the run's folded conditioning report;
+    // `overChannelNoiseDb` is doctor's own measurement, filled in from the
+    // floor tee once the run gives it a DC level to compare (both sides
+    // are dBFS, so their difference is the over-floor dB the report and
+    // the `input:` DC line print).
+    let mut input_conditioning = Some(
+        conditioning_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    );
+    if let Some(report) = input_conditioning.as_mut() {
+        if let (Some(level), Some(floor)) = (
+            report.dc.level_dbfs,
+            median_floor_db(
+                &floor_tap.lock().unwrap_or_else(|e| e.into_inner()),
+                passband,
+            ),
+        ) {
+            report.dc.over_channel_noise_db = Some(level - floor);
+        }
+    }
+
     Ok(DoctorReport {
         sample_rate_hz,
         center_freq_hz,
@@ -515,6 +730,7 @@ pub fn doctor(
         distinct_chars: distinct_chars.len(),
         spots_confirmed,
         bad_samples: bad_samples.load(Ordering::Relaxed),
+        input_conditioning,
     })
 }
 
@@ -783,6 +999,7 @@ mod tests {
             distinct_chars: 2,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::NoisyNoDecode);
     }
@@ -804,6 +1021,7 @@ mod tests {
             distinct_chars: 20,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -829,6 +1047,7 @@ mod tests {
             distinct_chars: 3,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -854,6 +1073,7 @@ mod tests {
             distinct_chars: 3,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -879,6 +1099,7 @@ mod tests {
             distinct_chars: 0,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -908,6 +1129,7 @@ mod tests {
             distinct_chars: 0,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -1021,6 +1243,7 @@ mod tests {
             distinct_chars: 0,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         }
     }
 
@@ -1163,5 +1386,198 @@ mod tests {
     #[test]
     fn median_returns_none_for_empty_input() {
         assert_eq!(median(vec![]), None);
+    }
+
+    /// A noise fixture at the testkit rate with a constant receiver DC
+    /// offset added, for the conditioning doctor tests.
+    fn dc_offset_source(dc: (f32, f32), seconds: f64) -> Box<dyn IqSource> {
+        use manta_testkit::sensitivity::{render_noise, CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
+        let noise = render_noise(seconds, 203, 1).expect("render the noise");
+        let samples: Vec<Complex32> = noise
+            .into_iter()
+            .map(|s| s + Complex32::new(dc.0, dc.1))
+            .collect();
+        Box::new(RawIqSource {
+            samples,
+            cursor: 0,
+            fs: SAMPLE_RATE_HZ,
+            center_freq_hz: CENTER_FREQ_HZ,
+        })
+    }
+
+    /// Runs the same pipeline doctor runs, but with every conditioning
+    /// stage off (a plain `listen_with_observers` over exactly the samples
+    /// doctor's `SampleBoundedSource` would deliver), counting the events
+    /// doctor tabulates. Doctor's forced-observe stages never write a
+    /// sample, so its counts must equal these.
+    fn unconditioned_counts(samples: &[Complex32], fs: f64, center: f64) -> (usize, usize) {
+        let (mut promoted, mut chars) = (0usize, 0usize);
+        listen_with_observers(
+            Box::new(RawIqSource {
+                samples: samples.to_vec(),
+                cursor: 0,
+                fs,
+                center_freq_hz: center,
+            }),
+            &PipelineConfig::default(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers::default(),
+            |ev| match ev {
+                DecoderEvent::TrackPromoted { .. } => promoted += 1,
+                DecoderEvent::CharDecoded { .. } => chars += 1,
+                _ => {}
+            },
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        (promoted, chars)
+    }
+
+    /// MAN-495: doctor observes every stage it does not keep applied (an
+    /// all-off config runs them as observe) and reports the DC offset over
+    /// the channel noise, so the impairment a `dc_block = "apply"` would
+    /// remove is named instead of silently degrading the decode.
+    #[test]
+    fn doctor_reports_a_dc_offset_over_the_channel_noise() {
+        let report = doctor(
+            dc_offset_source((0.01, 0.007), 4.0),
+            &PipelineConfig::default(),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let cond = report
+            .input_conditioning
+            .as_ref()
+            .expect("a receiver ran, so the report exists");
+        assert_eq!(cond.impulse.mode, "observe", "{cond:?}");
+        assert_eq!(cond.dc.mode, "observe", "{cond:?}");
+        // 20*log10(|(0.01, 0.007)|) = -38.3 dBFS.
+        let level = cond.dc.level_dbfs.expect("a DC level was measured");
+        assert!((-45.0..=-30.0).contains(&level), "{cond:?}");
+        let over = cond
+            .dc
+            .over_channel_noise_db
+            .expect("the floor tap measured a reference");
+        assert!(over >= 12.0, "{over} dB over the channel noise: {cond:?}");
+        // Observe never writes: the DC offset is still in the audio and
+        // nothing was repaired or corrected.
+        assert_eq!(cond.dc.corrected_samples, 0, "{cond:?}");
+        assert_eq!(cond.impulse.repaired_samples, 0, "{cond:?}");
+    }
+
+    /// MAN-495: doctor counts an injected impulse without repairing it
+    /// (observe measures, never writes), and its decode tabulation equals
+    /// an unconditioned run's over the same samples.
+    #[test]
+    fn doctor_counts_a_flagged_impulse_without_repairing_it() {
+        let spec = manta_testkit::vectors::VectorSpec {
+            duration_s: 6.0,
+            ..manta_testkit::vectors::v1()
+        };
+        let mut samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        // One huge single-sample impulse, the MAN-203 fixture amplitude.
+        samples[200_000] = Complex32::new(1e8, 0.0);
+        let bounded = &samples[..(spec.fs * 5.0).round() as usize];
+        let report = doctor(
+            Box::new(RawIqSource {
+                samples: samples.clone(),
+                cursor: 0,
+                fs: spec.fs,
+                center_freq_hz: spec.center_freq_hz,
+            }),
+            &PipelineConfig::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let cond = report.input_conditioning.as_ref().expect("observed");
+        assert_eq!(
+            cond.impulse.flagged_samples, 1,
+            "the injected impulse was not flagged exactly: {cond:?}"
+        );
+        assert_eq!(cond.impulse.repaired_samples, 0, "{cond:?}");
+        assert_eq!(cond.impulse.paused_samples, 0, "{cond:?}");
+        // Observe never writes: doctor's decode counts are exactly an
+        // unconditioned run's over the same samples.
+        let (promoted, chars) = unconditioned_counts(bounded, spec.fs, spec.center_freq_hz);
+        assert_eq!(report.tracks_promoted, promoted, "{report:?}");
+        assert_eq!(report.chars_decoded, chars, "{report:?}");
+    }
+
+    /// MAN-495: a stage the operator set to `apply` stays applied in
+    /// doctor's run -- doctor only adds observation, it never takes a
+    /// configured correction away.
+    #[test]
+    fn doctor_keeps_apply_stages_applied() {
+        let cfg = PipelineConfig {
+            conditioning: crate::ConditioningConfig {
+                dc: manta_dsp::condition::StageMode::Apply,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = doctor(
+            dc_offset_source((0.01, 0.007), 4.0),
+            &cfg,
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        let cond = report.input_conditioning.as_ref().expect("observed");
+        assert_eq!(cond.dc.mode, "apply", "{cond:?}");
+        assert!(
+            cond.dc.corrected_samples > 0,
+            "the apply DC stage corrected nothing: {cond:?}"
+        );
+        // The off impulse stage was forced to observe, not left off.
+        assert_eq!(cond.impulse.mode, "observe", "{cond:?}");
+    }
+
+    /// MAN-495: `doctor --json` carries `inputConditioning` right after
+    /// `badSamples`, and a report with none (checks-only) keeps it absent.
+    #[test]
+    fn doctor_json_is_camel_case_and_carries_input_conditioning() {
+        let mut report = no_promotion_report(1);
+        report.bad_samples = 1;
+        report.input_conditioning = Some(ConditioningReport {
+            impulse: crate::ImpulseConditioning {
+                mode: "observe".into(),
+                ..Default::default()
+            },
+            dc: crate::DcConditioning {
+                mode: "observe".into(),
+                level_dbfs: Some(-40.1),
+                over_channel_noise_db: Some(18.2),
+                corrected_samples: 0,
+            },
+            spans: Vec::new(),
+            spans_dropped: 0,
+        });
+        let s = serde_json::to_string(&report).unwrap();
+        assert_eq!(
+            crate::json_keys_in_order(&s)[..],
+            [
+                "sampleRateHz",
+                "centerFreqHz",
+                "durationS",
+                "tracksPromoted",
+                "detectorConfirmations",
+                "trackMetaCount",
+                "tracksClosed",
+                "snrMin",
+                "snrMedian",
+                "snrMax",
+                "charsDecoded",
+                "distinctChars",
+                "spotsConfirmed",
+                "badSamples",
+                "inputConditioning",
+            ][..]
+        );
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["inputConditioning"]["dc"]["overChannelNoiseDb"], 18.2);
+        report.input_conditioning = None;
+        assert!(!serde_json::to_string(&report)
+            .unwrap()
+            .contains("inputConditioning"));
     }
 }

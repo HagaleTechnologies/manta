@@ -8303,6 +8303,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     static_crashes: Some(static_crashes.clone()),
                     bad_samples: Some(bad_samples.clone()),
                     conditioned: Some(conditioned.clone()),
+                    // MAN-495: the full-report observer is doctor's; the
+                    // daemon's metric reads the counts observer above.
+                    conditioning_report: None,
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server

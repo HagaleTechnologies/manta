@@ -56,6 +56,23 @@ impl ConditioningConfig {
     pub fn is_off(&self) -> bool {
         self.impulse == StageMode::Off && self.dc == StageMode::Off
     }
+
+    /// The same stages with every non-`apply` stage forced to
+    /// [`StageMode::Observe`] (`Off` becomes `Observe`; `Apply` stays
+    /// `Apply`). What a diagnostic command runs so it measures every
+    /// stage while never writing a sample the operator did not ask to
+    /// have corrected (MAN-203: `manta doctor` always observes every
+    /// stage that is not set to `apply`).
+    pub fn observing(&self) -> Self {
+        let force = |mode: StageMode| match mode {
+            StageMode::Off | StageMode::Observe => StageMode::Observe,
+            StageMode::Apply => StageMode::Apply,
+        };
+        ConditioningConfig {
+            impulse: force(self.impulse),
+            dc: force(self.dc),
+        }
+    }
 }
 
 /// A conditioning stage, for span and counter labels.
@@ -414,5 +431,25 @@ mod tests {
     #[test]
     fn all_off_builds_no_conditioner() {
         assert!(InputConditioner::new(48_000.0, &ConditioningConfig::default()).is_none());
+    }
+
+    #[test]
+    fn observing_maps_off_to_observe_and_keeps_apply() {
+        for (impulse, dc) in [
+            (StageMode::Off, StageMode::Off),
+            (StageMode::Observe, StageMode::Off),
+            (StageMode::Off, StageMode::Apply),
+            (StageMode::Apply, StageMode::Observe),
+        ] {
+            let observed = ConditioningConfig { impulse, dc }.observing();
+            let expect = |mode: StageMode| match mode {
+                StageMode::Off | StageMode::Observe => StageMode::Observe,
+                StageMode::Apply => StageMode::Apply,
+            };
+            assert_eq!(observed.impulse, expect(impulse), "{impulse:?}/{dc:?}");
+            assert_eq!(observed.dc, expect(dc), "{impulse:?}/{dc:?}");
+        }
+        // The mapped default is a real run of the chain, not "nothing".
+        assert!(!ConditioningConfig::default().observing().is_off());
     }
 }
