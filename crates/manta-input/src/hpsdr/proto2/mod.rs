@@ -783,7 +783,8 @@ impl IqSource for Protocol2IqSource {
         Ok(n)
     }
 
-    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    /// MAN-489: consumed once per sample outage; see the private
+    /// `StallEpisode` episode state.
     fn take_stalled(&mut self) -> bool {
         self.stall.take()
     }

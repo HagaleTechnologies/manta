@@ -122,9 +122,11 @@ pub(crate) const MAX_CONSECUTIVE_MALFORMED: u32 = 10_000;
 
 /// MAN-489: the hard stall bound the new soft report must precede -- the
 /// same 40 x 250 ms budget `MAX_CONSECUTIVE_TIMEOUTS` bounds, measured as
-/// elapsed time since the last valid Metis packet (protocol 2's D13 made
-/// the same move). Also the soft report's guard: when a test shortens this
-/// below the soft deadline, the hard failure owns the outage.
+/// elapsed time since the last received datagram of any kind, malformed
+/// ones included (the counter it replaces only advanced on a read timeout,
+/// so arriving datagrams did not consume that budget). Also the soft report's
+/// guard: when a test shortens this below the soft deadline, the hard
+/// failure owns the outage.
 pub(crate) const HARD_STALL_AFTER: Duration =
     Duration::from_millis(READ_TIMEOUT.as_millis() as u64 * MAX_CONSECUTIVE_TIMEOUTS as u64);
 
@@ -783,16 +785,25 @@ struct Inner {
     /// every C&C send, mirroring piHPSDR's own per-frame sequence counter.
     cc_seq: u32,
     /// MAN-489: time of the last valid Metis packet (or of the open). The
-    /// shared outage evidence every DDC's soft report and the hard stall
-    /// failure both measure from; one member taking its one-shot report
-    /// never clears it, so siblings measure the same outage.
+    /// shared outage evidence every DDC's soft report measures from; one
+    /// member taking its one-shot report never clears it, so siblings
+    /// measure the same outage. Malformed datagrams do not move it: they
+    /// carry no samples, so they must not hide an IQ outage from the soft
+    /// report.
     last_valid_packet: Instant,
+    /// MAN-489: time of the last received datagram of any kind, malformed
+    /// included (or of the open). The hard stall failure below measures
+    /// from this, not from `last_valid_packet`: the timeout count it
+    /// replaced only advanced while the socket stayed silent, so a
+    /// garbage-only stream a caller still wants (the acceptance fake's
+    /// start-up mode) must not hard-fail each bound and reconnect-loop.
+    last_datagram: Instant,
     /// MAN-489: consecutive malformed datagrams with no valid packet
     /// between, kept on `Inner` (not per pump call) so bounded receive
     /// windows cannot reset the bound `MAX_CONSECUTIVE_MALFORMED` pins.
     consecutive_malformed: u32,
     /// MAN-489: hard stall bound (test knob; `HARD_STALL_AFTER` in
-    /// production) since `last_valid_packet`.
+    /// production) since `last_datagram`.
     hard_stall_after: Duration,
     /// The socket read timeout currently installed, so clamping a receive
     /// window only touches the socket when the value actually changes.
@@ -851,10 +862,11 @@ impl Inner {
             self.send_keepalive_if_due()?;
             // Hard stall bound (MAN-489: was 40 consecutive read timeouts
             // inside one unbounded pump call; the same budget as elapsed
-            // time since the last valid packet, which a bounded pump call
-            // can no longer accumulate). A stream that never delivered
-            // measures from the open.
-            if self.last_valid_packet.elapsed() >= self.hard_stall_after {
+            // silence since the last received datagram of any kind, which
+            // a bounded pump call can no longer accumulate -- malformed
+            // arrivals kept the old counter from accumulating too). A
+            // stream that never delivered measures from the open.
+            if self.last_datagram.elapsed() >= self.hard_stall_after {
                 bail!(
                     "HPSDR device stalled: no data for {} s",
                     self.hard_stall_after.as_secs_f64()
@@ -880,6 +892,10 @@ impl Inner {
 
             match self.socket.recv(&mut self.recv_buf) {
                 Ok(n) if n == METIS_PACKET_LEN => {
+                    // MAN-489: any datagram is "data" for the hard stall
+                    // bound above, valid or malformed -- the timeout count
+                    // it replaced never advanced while packets arrived.
+                    self.last_datagram = Instant::now();
                     let mut demuxed = vec![Vec::new(); self.num_receivers];
                     match demux_metis_packet(&self.recv_buf[..n], self.num_receivers, &mut demuxed)
                     {
@@ -937,6 +953,7 @@ impl Inner {
                     // Length mismatch -- too short, or too long (now always
                     // reported as a length mismatch rather than truncated
                     // or WSAEMSGSIZE'd, per RECV_BUF_LEN's doc comment).
+                    self.last_datagram = Instant::now();
                     self.gap.record_malformed();
                     self.consecutive_malformed += 1;
                 }
@@ -1066,6 +1083,7 @@ impl HpsdrDevice {
             cc_cursor: 0,
             cc_seq: 0,
             last_valid_packet: Instant::now(),
+            last_datagram: Instant::now(),
             consecutive_malformed: 0,
             hard_stall_after: HARD_STALL_AFTER,
             read_timeout: READ_TIMEOUT,
@@ -1384,7 +1402,8 @@ impl IqSource for HpsdrIqSource {
         }
     }
 
-    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    /// MAN-489: consumed once per sample outage; see the private
+    /// `StallEpisode` episode state.
     fn take_stalled(&mut self) -> bool {
         self.stall.take()
     }
@@ -2048,6 +2067,68 @@ mod tests {
         for reader in readers {
             reader.join().expect("reader thread must not panic");
         }
+    }
+
+    /// MAN-489 remediation: the hard stall bound is the old "40
+    /// consecutive read timeouts" budget, and *any* arriving datagram --
+    /// malformed ones included -- kept that counter from accumulating. Its
+    /// time-domain translation must therefore measure from the last
+    /// received datagram, not the last valid one: a stream that only ever
+    /// sends garbage (the multi-input acceptance fake's start-up mode)
+    /// stays tolerated on the same session, as before, until the
+    /// `MAX_CONSECUTIVE_MALFORMED` bound owns it. Anchoring on the last
+    /// valid packet instead made such a source hard-fail every bound and
+    /// reconnect-loop (`multi_input_hpsdr`'s radio-outage acceptance).
+    #[test]
+    fn a_malformed_only_stream_survives_the_hard_stall_bound() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        let mut src = sources.remove(0);
+        let client_addr = drain_initial_open_packets(&device_socket, 1);
+        let hard = Duration::from_millis(700);
+        src.inner.lock().unwrap().hard_stall_after = hard;
+
+        // The acceptance fake's malformed cadence (one 0xff datagram per
+        // 20 ms) for well past the hard bound, then one valid packet.
+        let sender = std::thread::spawn(move || {
+            for index in 0..100 {
+                // Exercise both malformed-content and malformed-length arrivals.
+                let packet = [0xFFu8; METIS_PACKET_LEN];
+                let len = if index % 2 == 0 { packet.len() } else { 1 };
+                let _ = device_socket.send_to(&packet[..len], client_addr);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let pkt = synth_metis_packet(1, |_| Complex32::new(0.25, 0.0));
+            device_socket.send_to(&pkt, client_addr).unwrap();
+        });
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let started = Instant::now();
+        let n = src.read(&mut buf).unwrap();
+        sender.join().unwrap();
+        assert!(
+            n > 0,
+            "the session must survive to deliver the valid packet"
+        );
+        assert!(
+            started.elapsed() >= hard + hard,
+            "the read must have outlasted the hard bound, got {:?}",
+            started.elapsed()
+        );
+        assert!((buf[0].re - 0.25).abs() < 1e-4);
     }
 
     #[test]

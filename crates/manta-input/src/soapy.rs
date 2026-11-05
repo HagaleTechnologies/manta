@@ -383,7 +383,8 @@ impl IqSource for SoapySdrIqSource {
         outcome
     }
 
-    /// MAN-489: consumed once per sample outage; see [`StallEpisode`].
+    /// MAN-489: consumed once per sample outage; see the private
+    /// `StallEpisode` episode state.
     fn take_stalled(&mut self) -> bool {
         self.retry.stall.take()
     }
