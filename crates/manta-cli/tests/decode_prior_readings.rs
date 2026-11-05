@@ -155,7 +155,11 @@ fn clean_unknown_call_spots_identically_with_and_without_prior() {
 fn cli_ambiguous_word_uses_calls_heard_and_reports_readings() {
     let dir = tempfile::tempdir().unwrap();
     let fs = 96_000.0;
-    let env = ambiguous_envelope_at(98.0, fs);
+    // MAN-199: through the full pipeline the decoder now replays the
+    // recorded lead-in, so it hears the opening `D` whole and its mark
+    // threshold for this scene sits just under 98 ms (98 reads `W` with the
+    // prior off). 94 ms is ambiguous again: `R1AW` off, `W1AW` on.
+    let env = ambiguous_envelope_at(94.0, fs);
     let amplitude = manta_testkit::noise::amplitude_for_snr_2500(20.0, fs);
     let mut iq: Vec<_> = env
         .into_iter()

@@ -1030,23 +1030,36 @@ pub fn listen_with_observers(
         let n = match src.read(&mut chunk) {
             Ok(n) => n,
             Err(e) => {
-                report_active_tracks(0);
+                // MAN-199: the segment's tracks close through the same
+                // routine as every other close, so their queued evidence is
+                // flushed and each emitting track gets its `TrackClosed`. A
+                // read error is not evidence the signal ended, so this is
+                // the bookkeeping close `run_input_front` takes too.
                 if let Some(obs) = lifecycle {
-                    obs.clear_active();
+                    obs.observe_peak(seg.tm.active_track_count());
                 }
                 // MAN-201: a call that was held for its role is decided now;
-                // nothing later will settle it. Not evidence the signal
-                // ended, so the outage teardown.
-                let finish_events = seg.tm.finish_for_discontinuity();
+                // nothing later will settle it.
+                let events = seg.tm.finish_for_discontinuity();
                 emit(
-                    finish_events,
+                    events,
                     &mut validator,
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
                 );
+                report_active_tracks(0);
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
+                // The final close moved the close and gate counts.
+                if let Some(obs) = lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        validator.gate_records_total(),
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                    obs.clear_active();
+                }
                 on_tracks(0);
                 return Err(e);
             }
@@ -5321,6 +5334,51 @@ mod tests {
             counts.last().copied(),
             Some(0),
             "a failed read must publish 0 before propagating, or the gauge stays frozen through shutdown drain, got {counts:?}"
+        );
+    }
+
+    /// MAN-199: a read error closes the segment's tracks through the same
+    /// routine as every other close before the error propagates, so each
+    /// emitting track gets its bookkeeping `TrackClosed` (a read error is
+    /// not evidence the signal ended) instead of vanishing silently.
+    #[test]
+    fn listen_closes_its_tracks_before_propagating_a_read_error() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FailsAtEndSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut events: Vec<DecoderEvent> = Vec::new();
+        let err = listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |ev| events.push(ev.clone()),
+            |_spot| {},
+            |_n| {},
+        )
+        .expect_err("the source fails instead of reaching EOF");
+        assert!(
+            err.to_string().contains("source disconnected"),
+            "the original read error must be propagated unchanged, got {err}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DecoderEvent::TrackClosed {
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None
+                    },
+                    ..
+                }
+            )),
+            "V1's emitting track must be closed (bookkeeping, no survivor) before the error \
+             propagates, got {events:?}"
         );
     }
 

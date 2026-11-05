@@ -1224,8 +1224,9 @@ non-blocking send plus shared atomics and short locks between them.
   input that fails or panics ends only its own thread.
 - **Decoder pool.** Inside `process_hops` the per-hop work (detector,
   ownership, promotion, eviction) is sequential. Then one rayon parallel pass
-  on rayon's global pool drains each active track's `pending` buffer through
-  its decoder: tracks are work items, decoders are independent `Send` state
+  on rayon's global pool drains each active track's lead-in (MAN-199: the
+  recorded hops before its promotion, replayed once) and then its `pending`
+  buffer through its decoder: tracks are work items, decoders are independent `Send` state
   machines with no shared state. The pass is joined before `process_hops`
   returns and its events are sequenced by `(sample_ts, track_id)` (SPEC §6
   rule 6), so thread scheduling never reaches the output. `close_all` runs
