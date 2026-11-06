@@ -524,14 +524,11 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
-<<<<<<< HEAD
     digital_modes: Option<Vec<String>>,
-=======
     iq_correction: Option<String>,
     iq_gain_ratio: Option<f64>,
     iq_phase_deg: Option<f64>,
     iq_calibrated_center_hz: Option<f64>,
->>>>>>> 8b24d471cf4426e7a2465273d1a362af69a93c32
     freq_correction_ppm: Option<f64>,
     /// MAN-496: the DC-removal conditioning stage's mode, written `off`,
     /// `observe` or `apply` (default `off`, restart-only).
@@ -607,12 +604,9 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
-<<<<<<< HEAD
     /// MAN-485: enabled FT8/FT4 modes, in startup-summary order.
     pub digital_modes: Vec<manta_engine::ftx::FtxMode>,
-=======
     pub conditioning: manta_dsp::condition::ConditioningConfig,
->>>>>>> 8b24d471cf4426e7a2465273d1a362af69a93c32
     pub freq_correction_ppm: Option<f64>,
     /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
     pub dc_block: Option<manta_dsp::condition::StageMode>,
@@ -1944,7 +1938,6 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
-<<<<<<< HEAD
 /// MAN-485 D4: accept exact wire spellings and normalize to the mode order.
 fn digital_modes(
     texts: Option<&[String]>,
@@ -1969,7 +1962,8 @@ fn digital_modes(
         .into_iter()
         .filter(|mode| modes.contains(mode))
         .collect())
-=======
+}
+
 /// IQ correction is always a fixed, receiver-specific calibration.
 fn iq_conditioning(
     t: &InputToml,
@@ -2009,7 +2003,6 @@ fn iq_conditioning(
         iq_calibration: calibration,
         ..Default::default()
     })
->>>>>>> 8b24d471cf4426e7a2465273d1a362af69a93c32
 }
 
 fn validate_input(
@@ -2017,11 +2010,8 @@ fn validate_input(
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
-<<<<<<< HEAD
         digital_modes: digital_modes(t.digital_modes.as_deref())?,
-=======
         conditioning: iq_conditioning(&t)?,
->>>>>>> 8b24d471cf4426e7a2465273d1a362af69a93c32
         freq_correction_ppm: t
             .freq_correction_ppm
             .map(crate::check_freq_correction_ppm)
