@@ -274,14 +274,9 @@ const READ_TIMEOUT: Duration = Duration::from_millis(250);
 /// timeout, 40 gives a ~10 s bound: long enough to ride out a single slow
 /// frame or a burst of keepalive-only traffic, short enough that a truly
 /// dead connection surfaces an error instead of hanging the caller forever.
+/// MAN-489: this is also the hard bound (as 40 x 250 ms of elapsed time)
+/// the soft stall report must precede; see `max_consecutive_timeouts`.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 40;
-
-/// MAN-489: the hard bound the soft stall report must precede -- the same
-/// 40 x 250 ms of *no messages at all* `MAX_CONSECUTIVE_TIMEOUTS` bounds,
-/// as elapsed time. Kept as a duration so the soft report's guard can
-/// compare against it.
-const HARD_STALL_AFTER: Duration =
-    Duration::from_millis(READ_TIMEOUT.as_millis() as u64 * MAX_CONSECUTIVE_TIMEOUTS as u64);
 
 /// How often `SET keepalive` must be resent or the server stops streaming
 /// `SND` frames (confirmed live: an initial send is not enough).
@@ -317,12 +312,21 @@ pub struct KiwiIqSource {
     acquisition_start_offset: Duration,
     /// MAN-489: time of the last *usable SND sample payload* -- a wall
     /// clock ping/MSG/unknown frames cannot move, unlike the consecutive
-    /// timeout counter above, which any WebSocket frame resets. A peer
+    /// timeout counter below, which any WebSocket frame resets. A peer
     /// that keeps the transport alive while sending no IQ must still
     /// report its stopped stream inside the 5 s bound.
     last_usable_iq: Instant,
     /// MAN-489: the one-shot soft-stall episode behind `take_stalled`.
     stall: StallEpisode,
+    /// MAN-489 review: consecutive no-frame read timeouts, persisted on
+    /// the source so the soft stall's `Ok(0)` return cannot restart the
+    /// hard budget mid-outage (a permanently silent connection must
+    /// still fail after the original 40 x 250 ms, not 4.5 s + another
+    /// 10 s). Any WebSocket frame resets it, as before.
+    consecutive_timeouts: u32,
+    /// The consecutive-timeout bound: `MAX_CONSECUTIVE_TIMEOUTS` in
+    /// production, a private knob so a test can shorten the hard budget.
+    max_consecutive_timeouts: u32,
 }
 
 impl KiwiIqSource {
@@ -485,6 +489,8 @@ impl KiwiIqSource {
             acquisition_start_offset,
             last_usable_iq: Instant::now(),
             stall: StallEpisode::new(SOFT_STALL_AFTER),
+            consecutive_timeouts: 0,
+            max_consecutive_timeouts: MAX_CONSECUTIVE_TIMEOUTS,
         })
     }
 
@@ -724,7 +730,11 @@ impl IqSource for KiwiIqSource {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut consecutive_timeouts = 0u32;
+        // MAN-489 review: the hard bound follows `max_consecutive_timeouts`
+        // so a test can shorten it; the soft report must always precede it.
+        let hard_after = Duration::from_millis(
+            READ_TIMEOUT.as_millis() as u64 * u64::from(self.max_consecutive_timeouts),
+        );
         loop {
             let n = self.pending.len().min(buf.len());
             if n > 0 {
@@ -745,7 +755,7 @@ impl IqSource for KiwiIqSource {
             // engine settles each track's last call and reads again.
             if self
                 .stall
-                .due(self.last_usable_iq, Instant::now(), HARD_STALL_AFTER)
+                .due(self.last_usable_iq, Instant::now(), hard_after)
             {
                 self.stall.report();
                 return Ok(0);
@@ -755,18 +765,18 @@ impl IqSource for KiwiIqSource {
 
             let msg = match self.socket.read() {
                 Ok(m) => {
-                    consecutive_timeouts = 0;
+                    self.consecutive_timeouts = 0;
                     m
                 }
                 Err(tungstenite::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    consecutive_timeouts += 1;
-                    if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                    self.consecutive_timeouts += 1;
+                    if self.consecutive_timeouts >= self.max_consecutive_timeouts {
                         bail!(
                             "KiwiSDR connection stalled: no data for {} consecutive read timeouts",
-                            MAX_CONSECUTIVE_TIMEOUTS
+                            self.max_consecutive_timeouts
                         );
                     }
                     continue;
@@ -1188,6 +1198,117 @@ mod tests {
         assert!(src.take_stalled());
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         pings.join().unwrap();
+        drop(tx);
+        server.join().unwrap();
+    }
+
+    /// MAN-489 review: a permanently silent connection keeps its original
+    /// hard budget across the soft report -- the soft `Ok(0)` return must
+    /// not restart the consecutive-timeout count, or a dead peer would
+    /// wait the soft interval plus a whole fresh hard bound (about
+    /// 4.5 s + 10 s in production) before `read()` errors.
+    #[test]
+    fn a_silent_connection_keeps_its_hard_budget_across_the_soft_report() {
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<FakeOp>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read(); // SET auth
+            let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
+            // Serve the script; a closed channel ends the session.
+            for op in rx {
+                let frame = match op {
+                    FakeOp::Samples(seq) => snd_frame(seq, 512),
+                    FakeOp::Ping => Message::Ping(Vec::new().into()),
+                };
+                if ws.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+        // Shorten both bounds: the soft deadline to 1 s, the hard budget
+        // to 8 x 250 ms = 2 s. A regression that restarts the count after
+        // the soft return waits 1 s + a whole 2 s budget; the preserved
+        // budget errors by about 2 s from the last delivery.
+        src.stall = StallEpisode::new(Duration::from_secs(1));
+        src.max_consecutive_timeouts = 8;
+        let mut buf = vec![Complex32::default(); 1024];
+        for seq in 0..40 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        // Deliver every queued sample until the outage surfaces: the last
+        // read times out on a silent socket and returns the report.
+        let started = Instant::now();
+        loop {
+            if src.read(&mut buf).unwrap() == 0 {
+                break;
+            }
+        }
+        assert!(src.take_stalled());
+        // The outage is permanent: the hard error must arrive within the
+        // ORIGINAL budget, not soft + a restarted budget.
+        let err = src.read(&mut buf).unwrap_err().to_string();
+        let total = started.elapsed();
+        assert!(
+            err.contains("no data for 8 consecutive read timeouts"),
+            "{err}"
+        );
+        assert!(
+            total < Duration::from_millis(2_600),
+            "hard budget must not restart after the soft report, took {total:?}"
+        );
+        drop(tx);
+        server.join().unwrap();
+    }
+
+    /// MAN-489 phase 5: at production durations the report lands inside
+    /// the ticket's 5 s bound. No shortened knob: the episode runs with
+    /// the real `SOFT_STALL_AFTER` and the real poll cadence.
+    #[test]
+    fn a_stopped_stream_reports_within_the_production_five_second_bound() {
+        use std::sync::mpsc;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel::<FakeOp>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read(); // SET auth
+            let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
+            for op in rx {
+                let frame = match op {
+                    FakeOp::Samples(seq) => snd_frame(seq, 512),
+                    FakeOp::Ping => Message::Ping(Vec::new().into()),
+                };
+                if ws.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+        let mut buf = vec![Complex32::default(); 1024];
+        for seq in 0..40 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        let started = Instant::now();
+        loop {
+            if src.read(&mut buf).unwrap() == 0 {
+                break;
+            }
+        }
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(5), "{reported:?}");
+        assert!(src.take_stalled());
         drop(tx);
         server.join().unwrap();
     }
