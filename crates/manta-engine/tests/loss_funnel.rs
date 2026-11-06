@@ -466,14 +466,11 @@ fn known_transcript_keeps_role_and_evidence_losses() {
     .unwrap();
     assert!(line.available, "{line:?}");
     assert!(line.reached >= Some(Stage::TextContainsCall), "{line:?}");
-    // The plan predicted sufficientEvidence here; the run pins the
-    // observed earlier stop: the validator never even assesses a call it
-    // has seen once (no decision at all), which the funnel charges to the
-    // self-ID stage. The honest point stands -- the bypass forces every
-    // decode stage and the validator's repetition gate still bites.
-    assert_eq!(line.lost_at, Some(Stage::SelfIdRecognized), "{line:?}");
-    assert_eq!(line.detail.as_deref(), Some("noDecision"));
-    assert!(line.decisions.is_empty());
+    // With track metadata present, the validator recognizes the self-ID
+    // but withholds the spot because one occurrence needs a repetition.
+    assert_eq!(line.lost_at, Some(Stage::SufficientEvidence), "{line:?}");
+    assert_eq!(line.detail.as_deref(), Some("repetition 1/2"));
+    assert_eq!(line.decisions, ["repetition"]);
 
     // An addressed call: the text names it, but only as the addressee --
     // the same honest stop, for the role the text gives it.
