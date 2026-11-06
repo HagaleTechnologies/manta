@@ -489,7 +489,7 @@ impl Segment {
 /// position, so only hops at or after a loss's boundary carry it, however
 /// the reads were split.
 #[derive(Debug, Default)]
-struct HeldLosses(std::collections::VecDeque<(u64, u64)>);
+pub(crate) struct HeldLosses(std::collections::VecDeque<(u64, u64)>);
 
 impl HeldLosses {
     /// A loss of `k` samples just before segment sample `at`, read when
@@ -497,7 +497,7 @@ impl HeldLosses {
     /// every hop still to come is past (`at + filter_len <= processed`) are
     /// dropped first; the calibration fill processes nothing until it is
     /// full, so its losses are all kept.
-    fn record(&mut self, at: u64, k: u64, processed: u64, filter_len: u64) {
+    pub(crate) fn record(&mut self, at: u64, k: u64, processed: u64, filter_len: u64) {
         while self
             .0
             .front()
@@ -510,7 +510,7 @@ impl HeldLosses {
 
     /// Hop `m`'s sample clock: its segment position on `seg_base`, less the
     /// held losses whose boundary lies after that position.
-    fn hop_ts(&self, seg_base: u64, pad_hops: u64, hop: u64, m: u64) -> u64 {
+    pub(crate) fn hop_ts(&self, seg_base: u64, pad_hops: u64, hop: u64, m: u64) -> u64 {
         let pos = m.saturating_sub(pad_hops) * hop;
         let ahead: u64 = self
             .0
@@ -574,6 +574,7 @@ fn new_segment(
     );
     // MAN-13 (D3): each input numbers its tracks in its own residue class.
     tm.set_track_id_space(ids);
+    tm.set_cw_policy(cfg);
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
@@ -2378,6 +2379,7 @@ mod tests {
         });
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
@@ -2980,6 +2982,7 @@ mod tests {
                         )))
                     }),
                     freq_correction_ppm: 0.0,
+                    cw_policy: Default::default(),
                     conditioning: if i == 0 {
                         cfg.conditioning.clone()
                     } else {
@@ -3490,6 +3493,7 @@ mod tests {
         let mut src = Some(src);
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
@@ -3631,6 +3635,7 @@ mod tests {
         let mut src = Some(src);
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
@@ -3867,6 +3872,7 @@ mod tests {
         let mut src = Some(LossThenGapSource::v1_192k(1.0, 11_900, 1.7, gap));
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
@@ -4355,6 +4361,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || {
                     Ok(Box::new(EndsWithGapSource {
@@ -5799,6 +5806,7 @@ mod tests {
             let src_stop = stop.clone();
             let opened = crate::multi::open_inputs(
                 vec![crate::multi::InputSpec {
+                    cw_policy: Default::default(),
                     name: "a".into(),
                     open: Box::new(move || {
                         Ok(Box::new(EndsDuringCalibrationSource {

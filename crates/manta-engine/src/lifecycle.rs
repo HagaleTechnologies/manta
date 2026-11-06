@@ -35,6 +35,7 @@ pub struct TrackLifecycleObserver {
     spawns: AtomicU64,
     active_tracks: AtomicU64,
     peak_active_tracks: AtomicU64,
+    restricted: AtomicU64,
     unconfirmed: AtomicU64,
     hang_expired: AtomicU64,
     silent: AtomicU64,
@@ -56,6 +57,7 @@ impl TrackLifecycleObserver {
             active_tracks: self.active_tracks.load(Ordering::Relaxed),
             peak_active_tracks: self.peak_active_tracks.load(Ordering::Relaxed),
             close_counts: CloseCounts {
+                restricted: self.restricted.load(Ordering::Relaxed),
                 unconfirmed: self.unconfirmed.load(Ordering::Relaxed),
                 hang_expired: self.hang_expired.load(Ordering::Relaxed),
                 silent: self.silent.load(Ordering::Relaxed),
@@ -71,6 +73,7 @@ impl TrackLifecycleObserver {
     }
 
     pub(crate) fn publish_counts(&self, closes: CloseCounts, gate_records_total: u64, spawns: u64) {
+        self.restricted.store(closes.restricted, Ordering::Relaxed);
         self.spawns.store(spawns, Ordering::Relaxed);
         self.unconfirmed
             .store(closes.unconfirmed, Ordering::Relaxed);
@@ -115,6 +118,7 @@ mod tests {
         let obs = TrackLifecycleObserver::default();
         assert_eq!(obs.snapshot(), TrackLifecycleSnapshot::default());
         let closes = CloseCounts {
+            restricted: 0,
             unconfirmed: 1,
             hang_expired: 2,
             silent: 3,

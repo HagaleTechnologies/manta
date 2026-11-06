@@ -549,6 +549,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let iq_cfg = input.conditioning.clone();
             let iq_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
             InputSpec {
+                cw_policy: input.cw_policy.clone(),
                 conditioning: input.conditioning.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
@@ -1395,6 +1396,7 @@ mod tests {
     #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
+            cw_policy: Default::default(),
             conditioning: Default::default(),
             name: "b".into(),
             digital_modes: Vec::new(),
