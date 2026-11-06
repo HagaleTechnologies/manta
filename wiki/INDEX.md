@@ -116,3 +116,4 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
 
 - [How is IQ correction calibrated and withheld?](../docs/DECISIONS/2026-11-05-man494-calibrated-iq-conditioning.md) MAN-494 fixes coefficients per stream and requires receiver-centre agreement.
+- [How does the WSJT-X multicast relay share a port with other consumers?](../docs/DECISIONS/2026-11-06-man471-multicast-relay-port-sharing.md) MAN-471 sets address reuse before the wildcard bind; unicast remains exclusive.

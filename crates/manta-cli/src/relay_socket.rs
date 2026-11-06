@@ -4,15 +4,9 @@
 //! `0.0.0.0:port` and joins the group; a unicast address is a plain bind,
 //! so a taken port is a clear startup error rather than a silently shared
 //! one.
-//!
-//! `socket2` is only a dev-dependency of `manta-cli` and D11 forbids a
-//! `Cargo.toml` edit, so this uses `std::net::UdpSocket`, which cannot set
-//! `SO_REUSEADDR`/`SO_REUSEPORT` before binding: a multicast listener does
-//! not yet share its port with another program bound without reuse. Moving
-//! `socket2` to `[dependencies]` (a CODEOWNERS path) restores the ka9q
-//! pattern (`manta-input/src/ka9q/mod.rs`).
 
 use anyhow::{anyhow, Result};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
 /// Binds `addr` for a WSJT-X relay, nonblocking (tokio adopts it). The
@@ -29,9 +23,11 @@ pub(crate) fn bind_wsjtx_socket(addr: SocketAddr) -> Result<UdpSocket> {
 fn bind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     let socket = match addr {
         SocketAddr::V4(v4) if v4.ip().is_multicast() => {
-            let s = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, v4.port()))?;
+            let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+            s.set_reuse_address(true)?;
+            s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, v4.port()).into())?;
             s.join_multicast_v4(v4.ip(), &Ipv4Addr::UNSPECIFIED)?;
-            s
+            UdpSocket::from(s)
         }
         _ => UdpSocket::bind(addr)?,
     };
@@ -62,6 +58,34 @@ mod tests {
         let local = s.local_addr().unwrap();
         assert_eq!(local.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
         assert_ne!(local.port(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_wsjtx_socket_shares_a_multicast_port_with_a_reuse_enabled_peer() {
+        let peer = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        peer.set_reuse_address(true).unwrap();
+        peer.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+            .unwrap();
+        let peer_addr = peer.local_addr().unwrap().as_socket_ipv4().unwrap();
+
+        let relay = bind_wsjtx_socket(
+            SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), peer_addr.port()).into(),
+        )
+        .unwrap();
+        assert_eq!(relay.local_addr().unwrap(), SocketAddr::V4(peer_addr));
+        // Inspect the flag rather than waiting for an empty multicast receive.
+        assert!(socket2::SockRef::from(&relay).nonblocking().unwrap());
+        // The peer still owns its binding after the relay has joined it.
+        assert_eq!(
+            peer.local_addr().unwrap().as_socket_ipv4().unwrap(),
+            peer_addr
+        );
     }
 
     #[test]
