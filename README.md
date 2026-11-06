@@ -902,12 +902,13 @@ criteria.
   waterfall. manta can feed N1MM+'s Spectrum Display the power spectrum it
   already computes (`[input] spectrum_udp`, MAN-141), but it draws no
   waterfall or band scope itself.
-- Not a general digital-mode skimmer. manta decodes no FT8 or RTTY (FT8 and
-  RTTY decoding are out of scope for 1.0, though the channelizer
-  architecture does not preclude them later). It can forward WSJT-X's
-  FT8/FT4 CQ decodes through its uplink (MAN-320). Decoding RTTY stays a
-  non-goal for now; recognising it so that its tones never become CW tracks
-  is in scope (MAN-314).
+- Not a general digital-mode skimmer. manta decodes FT8 and FT4 when built
+  with `--features ftx` and an input sets
+  [`digital_modes`](docs/CONFIG.md#input) (MAN-323/MAN-485), publishing CQ
+  spots on the JSON stream only; RTTY decoding remains a non-goal, though
+  recognising its tones so they never become CW tracks is in scope
+  (MAN-314). It can also forward WSJT-X's FT8/FT4 CQ decodes through its
+  uplink (MAN-320).
 - Not a cluster network. `manta` relays its own spots, and those of the
   operator's own local skimmers and WSJT-X (MAN-320), to RBN; it takes no
   spots from other stations and serves no relayed spots to clients.

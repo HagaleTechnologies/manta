@@ -125,9 +125,11 @@ their live-state decision has reason `noEvidence` (MAN-106).
 FT8 and FT4 spots (MAN-323) use the same 30 keys in the same order, with
 `mode` `"FT8"` or `"FT4"`. The rows below say where their values differ from
 a CW spot's. They go to this stream only: telnet, the RBN uplink and CLI
-`--json` never carry them. No input produces them yet: the
-`[input].digital_modes` key that turns the decoder on is still to land under
-MAN-323.
+`--json` never carry them. Set `[input].digital_modes = ["FT8", "FT4"]`
+in a build with `--features ftx` and a `[server]` table to decode covered
+windows (MAN-485). The key defaults to `[]`; restart after changing it.
+Only CQ callers become spots, with repeats held for 600 seconds per
+callsign, mode and band.
 
 | Field | JSON type | Null? | Meaning |
 |---|---|---|---|

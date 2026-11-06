@@ -32,6 +32,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod ftx_run;
 mod funnel_cmd;
 mod grade_cmd;
 mod grade_paired;
@@ -2822,6 +2823,31 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
     Ok(mtime)
 }
 
+/// A scheduled replay must use a recorded or explicit epoch, never file mtime.
+fn cw_replay_epoch(
+    path: &Path,
+    explicit: Option<i64>,
+    scheduled: bool,
+    input_name: &str,
+) -> Result<(i64, u32)> {
+    if let Some(epoch) = explicit {
+        return Ok((epoch, 0));
+    }
+    if !scheduled {
+        return Ok((0, 0));
+    }
+    if !manta_input::is_native_recording(path) {
+        bail!(
+            "input {}: scheduled file input requires replay_epoch or a native recording epoch",
+            fmt::quoted(input_name)
+        );
+    }
+    let epoch = epoch_for_replay_path(path)?.duration_since(std::time::UNIX_EPOCH)?;
+    check_replay_epoch("recording epoch", i64::try_from(epoch.as_secs())?)
+        .map(|secs| (secs, epoch.subsec_nanos()))
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// Resolves the wall-clock epoch fed to `SpotBus`: an explicit
 /// `--replay-epoch` wins when given AND this is a replay session (the
 /// escape hatch for a copy/download that didn't preserve the file's
@@ -2843,6 +2869,18 @@ fn resolve_epoch(
         }
         (Some(path), None) => epoch_for_replay_path(path),
         (None, _) => Ok(std::time::SystemTime::now()),
+    }
+}
+
+/// Epoch of sample zero for an individual FTx input, captured when it opens.
+fn resolve_ftx_epoch(
+    spec: &LiveSourceSpec,
+    replay_epoch: Option<i64>,
+    acquired_at: std::time::SystemTime,
+) -> Result<std::time::SystemTime> {
+    match spec {
+        LiveSourceSpec::File { path, .. } => resolve_epoch(Some(path), replay_epoch),
+        _ => Ok(acquired_at),
     }
 }
 
@@ -5366,6 +5404,7 @@ fn start_spot_server(
                         },
                         spot_types: p.spot_types,
                         flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        flush_interval: manta_server::pskreporter::batch::FLUSH_INTERVAL,
                         observation_domain: manta_server::pskreporter::observation_domain(nonce),
                     },
                     socket,
@@ -5804,6 +5843,7 @@ fn conditioned_metric_registration_matches_producible_marks() {
 
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
+    cw_policy: manta_engine::cw_segments::Policy,
     conditioning: manta_dsp::condition::ConditioningConfig,
     spec: LiveSourceSpec,
     replay: ReplayMode,
@@ -5834,8 +5874,10 @@ struct Resolved {
 /// correction, dial and capture rate.
 #[derive(Clone)]
 struct ResolvedInput {
+    cw_policy: manta_engine::cw_segments::Policy,
     conditioning: manta_dsp::condition::ConditioningConfig,
     name: String,
+    digital_modes: Vec<manta_engine::ftx::FtxMode>,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
@@ -5994,6 +6036,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
             let spec = cli.into_spec();
             let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
             return Ok(Resolved {
+                cw_policy: Default::default(),
                 conditioning: Default::default(),
                 spec,
                 replay,
@@ -6037,7 +6080,9 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     bail!("[[input]] {} has no type", fmt::quoted(&n.name));
                 };
                 Ok(ResolvedInput {
+                    cw_policy: n.input.shared.cw_policy.clone(),
                     name: n.name.clone(),
+                    digital_modes: n.input.shared.digital_modes.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
                     conditioning: n.input.shared.conditioning(),
@@ -6077,6 +6122,7 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     };
     let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
+        cw_policy: shared.cw_policy.clone(),
         conditioning: shared.conditioning(),
         spec,
         replay,
@@ -6505,6 +6551,60 @@ fn prepare_config_for(
         decode.engine,
     )?;
     pipeline.conditioning = resolved.conditioning.clone();
+    pipeline.cw_policy = resolved.cw_policy.clone();
+    pipeline.cw_clock = if resolved.spec.is_reconnectable()
+        || !matches!(resolved.spec, LiveSourceSpec::File { .. })
+    {
+        manta_engine::cw_segments::Clock::Live
+    } else {
+        manta_engine::cw_segments::Clock::Samples
+    };
+    if let LiveSourceSpec::File { ref path, .. } = resolved.spec {
+        (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = cw_replay_epoch(
+            path,
+            resolved.replay_epoch,
+            pipeline.cw_policy.scheduled()
+                || resolved.inputs.iter().any(|i| i.cw_policy.scheduled()),
+            loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+        )?;
+    }
+    // Every input's pipeline shares `pipeline`'s epoch (`listen_inputs`
+    // replaces only policy and clock), so scheduled native recordings must
+    // agree on their start; differing ones would run another recording's
+    // schedule against the wrong UTC.
+    let mut shared_epoch = matches!(resolved.spec, LiveSourceSpec::File { .. }).then(|| {
+        (
+            pipeline.cw_epoch,
+            pipeline.cw_epoch_nanoseconds,
+            String::from("[input]"),
+        )
+    });
+    for input in &resolved.inputs {
+        if let LiveSourceSpec::File { ref path, .. } = input.spec {
+            let epoch = cw_replay_epoch(
+                path,
+                resolved.replay_epoch,
+                input.cw_policy.scheduled(),
+                &input.name,
+            )?;
+            if !input.cw_policy.scheduled() || resolved.replay_epoch.is_some() {
+                continue;
+            }
+            match &shared_epoch {
+                None => {
+                    (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = epoch;
+                    shared_epoch = Some((epoch.0, epoch.1, input.name.clone()));
+                }
+                Some((secs, nanos, first)) if (*secs, *nanos) != epoch => bail!(
+                    "inputs {} and {} are recordings with different start times; a scheduled \
+                     replay applies one epoch to every input: set replay_epoch",
+                    fmt::quoted(first),
+                    fmt::quoted(&input.name)
+                ),
+                Some(_) => {}
+            }
+        }
+    }
     pipeline.decode = decode;
     attach_language_prior(&mut pipeline, &resolved.spot, None)?;
     Ok(Prepared {
@@ -7212,6 +7312,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                     path.display()
                 );
             }
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| n.input.shared.cw_policy != loaded.inputs[0].input.shared.cw_policy)
+            {
+                bail!("manta decode cannot choose between inputs with different CW coverage in {}: use a config containing only the recording's input",loaded.origin);
+            }
             // MAN-496: the conditioning keys follow the ppm rule: a
             // recording came from one receiver, so entries that disagree
             // are ambiguous, never silently the first one's.
@@ -7250,8 +7358,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             }
             if several {
                 errln!(
-                    "note: decode applies freq_correction_ppm and dc_block, impulse_suppress and IQ conditioning from the {} [[input]] entries \
-                     in {}",
+                    "note: decode applies freq_correction_ppm and dc_block, impulse_suppress and IQ \
+                     conditioning{} from the {} [[input]] entries in {}",
+                    if shared.cw_policy == Default::default() {
+                        ""
+                    } else {
+                        " and CW coverage"
+                    },
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -7263,7 +7376,13 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.impulse_suppress.is_some()
             {
                 errln!(
-                    "note: decode applies input.freq_correction_ppm and dc_block, impulse_suppress and IQ conditioning from [input] in {}",
+                    "note: decode applies input.freq_correction_ppm and dc_block, impulse_suppress \
+                     and IQ conditioning{} from [input] in {}",
+                    if shared.cw_policy == Default::default() {
+                        ""
+                    } else {
+                        " and CW coverage"
+                    },
                     loaded.origin
                 );
             }
@@ -7295,6 +7414,13 @@ fn run_command() -> Result<std::process::ExitCode> {
             )?;
             note_pinned_lists(&spot, &lists_in_use);
             cfg.conditioning = conditioning;
+            cfg.cw_policy = loaded.input.shared.cw_policy.clone();
+            (cfg.cw_epoch, cfg.cw_epoch_nanoseconds) = cw_replay_epoch(
+                &path,
+                loaded.input.shared.replay_epoch,
+                cfg.cw_policy.scheduled(),
+                loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+            )?;
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an
@@ -7800,7 +7926,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 reload::mask_sighup(libc::SIG_BLOCK)
                     .context("blocking SIGHUP on the decode thread")?;
             }
+            let opening_at = std::time::SystemTime::now();
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
+            let acquired_at = opening_at + first.acquisition_start_offset();
             let iq_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let iq_name = spectrum_input.to_string();
             warn_iq_mismatch(
@@ -7910,6 +8038,36 @@ fn run_command() -> Result<std::process::ExitCode> {
             } else {
                 None
             };
+            // Coverage is reported before the server's listening banner.
+            let digital_modes = if resolved.replaced_file_source.is_none() {
+                loaded.input.shared.digital_modes.as_slice()
+            } else {
+                &[]
+            };
+            let ftx = (!digital_modes.is_empty()).then(|| {
+                std::sync::Arc::new(ftx_run::Session::new(vec![(
+                    source_name.to_string(),
+                    resolved.freq_correction_ppm,
+                )]))
+            });
+            if ftx.is_some() {
+                let (windows, lines) = ftx_run::plan(
+                    source_name,
+                    digital_modes,
+                    first.center_freq_hz(),
+                    first.rf_passband_hz(),
+                    first.trusted_band_hz(),
+                    first.sample_rate(),
+                );
+                for line in lines {
+                    logging::note(&line);
+                }
+                if replay_path.is_none() && !windows.is_empty() {
+                    if let Some(line) = ftx_run::clock_line(clock_check::kernel_synced()) {
+                        logging::note(&line);
+                    }
+                }
+            }
             let (
                 server_runtime,
                 spot_server,
@@ -8299,6 +8457,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
                 None => (src, None),
             };
+            let src = if let Some(ftx) = &ftx {
+                if let Some(server) = &spot_server {
+                    ftx.bind(server.bus.clone(), server.metrics.clone());
+                }
+                ftx.wrap(
+                    0,
+                    src,
+                    resolve_ftx_epoch(spec, replay_epoch, acquired_at)?,
+                    digital_modes,
+                    replay_path.is_none(),
+                )
+            } else {
+                src
+            };
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -8383,6 +8555,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                     static_crashes: Some(static_crashes.clone()),
                     bad_samples: Some(bad_samples.clone()),
                     conditioned: Some(conditioned.clone()),
+                    // MAN-495: the full-report observer is doctor's; the
+                    // daemon's metric reads the counts observer above.
+                    conditioning_report: None,
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -8538,6 +8713,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // reload holds while it applies) and setting `stop` tell the
             // reload thread to ignore SIGHUP instead of flipping `dry_run`
             // mid-drain.
+            if let Some(ftx) = &ftx {
+                ftx.stop();
+            }
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             // MAN-309: the source is gone, so the queue is closed; the
@@ -11400,6 +11578,39 @@ mod tests {
             .to_line();
         std::fs::write(manta_input::metadata_path(&path), meta).unwrap();
         path
+    }
+
+    #[test]
+    fn ftx_epoch_preserves_live_acquisition_before_startup_finishes() {
+        let opened =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_792_407_602);
+        let acquired = opened - std::time::Duration::from_millis(1500);
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), Some(123), acquired).unwrap(),
+            acquired
+        );
+    }
+
+    #[test]
+    fn ftx_epoch_uses_each_native_input_and_keeps_live_time_in_a_mixed_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let acquired = std::time::SystemTime::now();
+        for (name, seconds) in [("a.cf32", 1_792_407_600), ("b.cf32", 1_792_407_615)] {
+            let path = native_pair(dir.path(), name, seconds, 0);
+            let spec = LiveSourceSpec::File {
+                path,
+                source_iq: true,
+                raw: None,
+            };
+            assert_eq!(
+                resolve_ftx_epoch(&spec, None, acquired).unwrap(),
+                std::time::UNIX_EPOCH + std::time::Duration::new(seconds as u64, 500)
+            );
+        }
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), None, acquired).unwrap(),
+            acquired
+        );
     }
 
     #[test]

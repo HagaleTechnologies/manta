@@ -374,7 +374,7 @@ between HANG and CLOSED for a track that has decoded (MAN-108).
 | CANDIDATE → ACTIVE | rise sustained `confirm_hops` (default 19) hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before `confirm_hops` hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
-| HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
+| HANG → ACTIVE | EMA rule `S ≥ F + max(on_snr_db, 12 dB)` again (hang timer reset); window rise does not apply in ACTIVE/HANG (§2.3) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | HANG → DORMANT | hang timer expires on a track that has decoded a character while qualified, with `reacquire_ms > 0` (MAN-108) → decoder flushed exactly as a hang close flushes it, then released; `track_id`, centroid and ownership kept |
 | DORMANT → ACTIVE | rise sustained `confirm_hops` (default 19) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
@@ -1957,6 +1957,13 @@ rules:
    inside the 600 s window) as a duplicate, with no SNR or spot-type
    override; the stored time never moves backwards. See
    docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
+
+8. **FT8/FT4 slots (MAN-323/MAN-485):** slot boundaries come from the
+   session epoch. For file input, FTx spots are a pure function of the file
+   and its epoch. Several replayed inputs publish FTx spots in
+   `(slot start, input index, mode, decode order)` order; their position
+   among CW records on the JSON stream is not fixed. CW output is
+   unaffected.
 
 CI enforces: same binary + same IQ file, 3 runs → identical SHA-256 of the
 JSON spot log; and the §7 vectors on all platforms.

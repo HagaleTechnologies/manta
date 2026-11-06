@@ -148,7 +148,9 @@ confidence weighting. ONNX/candle inference, feature-gated.
 
 ## Post-1.0 candidates (explicitly deferred)
 
-- RTTY/FT4-adjacent modes on the same channelizer.
+- RTTY/FT4-adjacent modes on the same channelizer. FT8/FT4 skimming from
+  IQ streams delivered by MAN-323 (opt-in build feature, reached by
+  MAN-485).
 - ~~Multi-SDR single-daemon orchestration.~~ Pulled forward and delivered by
   MAN-13 (`[[input]]`); several receivers on one HPSDR radio followed in
   MAN-307.

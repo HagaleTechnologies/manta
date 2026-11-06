@@ -421,3 +421,160 @@ fn the_rtty_telnet_port_serves_no_cw_spot() {
         "{body}"
     );
 }
+
+#[test]
+fn cw_segments_cli_replay_uses_epoch_and_enforces_static_and_scheduled_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let (wav, manifest) = v1_fixture(dir.path(), 60.);
+    let config = dir.path().join("segments.toml");
+    let header = format!(
+        "[input]\ntype = 'file'\npath = '{}'\niq = true\n",
+        wav.display()
+    );
+    // Native metadata supplies a stable epoch even when the file mtime changes.
+    let native = dir.path().join("native.cf32");
+    std::fs::write(&native, [0u8; 8]).unwrap();
+    let native_header = manta_input::RecordingHeader {
+        schema: "manta-iq.v1".into(),
+        sample_format: "cf32_le".into(),
+        sample_rate_hz: 48000.,
+        center_freq_hz: 14030000.,
+        start_unix_seconds: 30,
+        start_nanoseconds: 0,
+        rf_passband_hz: [-24000., 24000.],
+        trusted_band_hz: None,
+        analytic_guard_hz: 0.,
+    };
+    use manta_input::recording_format::MetadataRecord;
+    let metadata = MetadataRecord::Header(native_header).to_line()
+        + &MetadataRecord::End {
+            sample_count: 1,
+            reason: manta_input::EndReason::Eof,
+        }
+        .to_line();
+    std::fs::write(manta_input::metadata_path(&native), metadata).unwrap();
+    std::fs::write(&config,format!("[input]\ntype = 'file'\npath = '{}'\n[[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n",native.display())).unwrap();
+    let native_check = manta()
+        .args(["config", "check", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        native_check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native_check.stderr)
+    );
+    // Legacy files never borrow their mtime as a schedule epoch.
+    std::fs::write(
+        &config,
+        format!("{header}[[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n"),
+    )
+    .unwrap();
+    let bad = manta()
+        .args(["config", "check", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad.stderr).contains("scheduled file input requires replay_epoch")
+    );
+    std::fs::write(&config,format!("{header}replay_epoch = 30\n[[input.cw_schedule]]\nat_utc = '00:00'\nsegments_hz = [[13000000,15000000]]\n[[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n")).unwrap();
+    let run = || {
+        manta()
+            .args(["run", "--config"])
+            .arg(&config)
+            .arg("--json")
+            .output()
+            .unwrap()
+    };
+    let a = run();
+    let b = run();
+    assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+    assert_eq!(a.stdout, b.stdout);
+    let spots: Vec<_> = String::from_utf8_lossy(&a.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|v| v.get("spot").cloned())
+        .collect();
+    assert!(!spots.is_empty());
+    assert!(spots
+        .iter()
+        .all(|s| s["sampleTs"].as_u64().unwrap() < (30. * manifest.fs) as u64));
+    std::fs::write(&config, format!("{header}cw_segments_hz = []\n")).unwrap();
+    let empty = run();
+    assert!(
+        empty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&empty.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&empty.stdout).contains("\"spot\""));
+}
+
+/// Codex P1 on #510: every input shares one schedule epoch, so scheduled
+/// native recordings with different start times are refused instead of
+/// running one recording's schedule against another's UTC start.
+#[test]
+fn cw_segments_scheduled_recordings_must_share_one_epoch() {
+    use manta_input::recording_format::MetadataRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let native = |name: &str, start: i64| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let header = manta_input::RecordingHeader {
+            schema: "manta-iq.v1".into(),
+            sample_format: "cf32_le".into(),
+            sample_rate_hz: 48000.,
+            center_freq_hz: 14030000.,
+            start_unix_seconds: start,
+            start_nanoseconds: 0,
+            rf_passband_hz: [-24000., 24000.],
+            trusted_band_hz: None,
+            analytic_guard_hz: 0.,
+        };
+        let metadata = MetadataRecord::Header(header).to_line()
+            + &MetadataRecord::End {
+                sample_count: 1,
+                reason: manta_input::EndReason::Eof,
+            }
+            .to_line();
+        std::fs::write(manta_input::metadata_path(&path), metadata).unwrap();
+        path
+    };
+    let a = native("a.cf32", 30);
+    let b = native("b.cf32", 90);
+    let same = native("c.cf32", 30);
+    let config = dir.path().join("two.toml");
+    let check = |second: &Path| {
+        std::fs::write(
+            &config,
+            format!(
+                "[[input]]\nname = 'a'\ntype = 'file'\npath = '{}'\n\
+                 [[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n\n\
+                 [[input]]\nname = 'b'\ntype = 'file'\npath = '{}'\n\
+                 [[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n",
+                a.display(),
+                second.display()
+            ),
+        )
+        .unwrap();
+        manta()
+            .args(["config", "check", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap()
+    };
+    let differing = check(&b);
+    assert!(!differing.status.success());
+    assert!(
+        String::from_utf8_lossy(&differing.stderr).contains("different start times"),
+        "{}",
+        String::from_utf8_lossy(&differing.stderr)
+    );
+    let agreeing = check(&same);
+    assert!(
+        agreeing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agreeing.stderr)
+    );
+}
