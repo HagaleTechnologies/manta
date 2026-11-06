@@ -10,7 +10,7 @@
 //! cache) and `--cty-sha256`/`cty_sha256` pins.
 //!
 //! Every wait is bounded, every port is ephemeral (the `listening:` banner,
-//! or a retained, non-listening socket for a refused source), and every age and
+//! or a retained, non-listening socket for an unreachable source), and every age and
 //! hash is computed here from `SystemTime::now()`, the bundled bytes and the
 //! bundled retrieval dates (`manta_spot::vintage`; a seeded download always
 //! postdates them), so nothing depends on today's date or on which lists
@@ -96,7 +96,8 @@ fn cty_without_the_united_states() -> Vec<u8> {
 
 /// Reserves an ephemeral source port until the caller drops the socket.
 /// Never listen or enable reuse: connections must fail while other listeners
-/// cannot acquire this address. Keep the returned socket alive through teardown.
+/// cannot acquire this address. macOS times out instead of actively refusing.
+/// Keep the returned socket alive through teardown.
 fn refused_source() -> (socket2::Socket, u16) {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -115,6 +116,13 @@ fn refused_sources_reserve_distinct_ports_without_listening() {
     let (_first_socket, first_port) = refused_source();
     let (_second_socket, second_port) = refused_source();
     assert_ne!(first_port, second_port);
+    // A bound, non-listening TCP socket drops SYNs on macOS; Linux sends a reset.
+    // Check the exact platform error without allowing a successful handshake.
+    let expected_error = if cfg!(target_os = "macos") {
+        std::io::ErrorKind::TimedOut
+    } else {
+        std::io::ErrorKind::ConnectionRefused
+    };
     let addresses =
         [first_port, second_port].map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)));
     for address in addresses {
@@ -122,8 +130,8 @@ fn refused_sources_reserve_distinct_ports_without_listening() {
             TcpStream::connect_timeout(&address, Duration::from_secs(1))
                 .unwrap_err()
                 .kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "source {address} must refuse connections"
+            expected_error,
+            "source {address} must remain unreachable"
         );
         assert_eq!(
             TcpListener::bind(address).unwrap_err().kind(),
@@ -139,8 +147,8 @@ fn refused_sources_reserve_distinct_ports_without_listening() {
             TcpStream::connect_timeout(&address, Duration::from_secs(1))
                 .unwrap_err()
                 .kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "source {address} must refuse connections alongside other listeners"
+            expected_error,
+            "source {address} must remain unreachable alongside other listeners"
         );
     }
 }
