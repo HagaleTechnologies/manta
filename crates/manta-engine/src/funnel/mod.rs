@@ -20,6 +20,9 @@ pub use attribute::{
     Record, RecordSpot, SpotFact, Stage, StageCounts, Summary, Tolerances, TrackFacts, TrackTally,
     TruthLayer, VetoFact, TRACK_TEXT_CHARS,
 };
-pub use bypass::{run_bypass, summarize_bypass, Bypass, BypassRecord, BypassSummary};
+pub use bypass::{
+    run_bypass, run_synthetic_bypass, summarize_bypass, Bypass, BypassRecord, BypassSummary,
+    SyntheticTruth, TruthWord,
+};
 pub use collect::{run_funnel, FunnelReport};
 pub use trace::{FunnelTrace, SpawnVeto, TraceLog, TrackCloseReason, TrackTraceRecord, VetoKey};

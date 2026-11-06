@@ -11,6 +11,7 @@ pub mod crash;
 pub mod crosscheck;
 pub mod fsk;
 pub mod ftx;
+pub mod funnel_truth;
 pub mod keyer;
 pub mod measure;
 pub mod minimize;
