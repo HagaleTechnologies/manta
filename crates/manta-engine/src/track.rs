@@ -821,6 +821,10 @@ pub(crate) struct Track {
     /// MAN-199: where the last lead-in stopped short of the full depth.
     #[cfg_attr(not(test), allow(dead_code))]
     lead_in_cut: LeadInCut,
+    /// MAN-30: the uncalibrated frequency the coverage check admitted this
+    /// track at (its spawn phase position), used until its own phase
+    /// estimate is usable.
+    cw_admitted_hz: Option<f64>,
     /// Set by `process_hops` once `drain_pool` has actually produced a
     /// `DecoderEvent` for this track. Distinct from `decoder.is_some()`:
     /// a track promoted and then merged/evicted within the *same*
@@ -1544,6 +1548,7 @@ impl Track {
             pending: Vec::new(),
             input_gaps: VecDeque::new(),
             lead_in: Vec::new(),
+            cw_admitted_hz: None,
             lead_in_cut: LeadInCut::Full,
             has_emitted: false,
             refiner: None,
@@ -2277,6 +2282,24 @@ impl Track {
         let k0_freq = center_freq_hz
             + wrapped_channel_offset(self.birth_channel, n_channels) * channel_spacing_hz;
         k0_freq + (pos - self.birth_channel as f64) * channel_spacing_hz
+    }
+
+    /// MAN-30: the frequency the CW coverage check judges. `freq_hz` falls
+    /// back to the channel centroid while no phase estimate exists; for an
+    /// isolated birth (left on the integer channel centre) that can sit
+    /// outside coverage the spawn admitted it into, so the admitted
+    /// frequency stands until the track's own estimate is usable.
+    fn cw_coverage_hz(
+        &self,
+        center_freq_hz: f64,
+        channel_spacing_hz: f64,
+        n_channels: usize,
+    ) -> f64 {
+        let z = self.phase_hist.front().copied().unwrap_or(self.phase_z);
+        match self.cw_admitted_hz {
+            Some(hz) if phase_position(z, self.center).is_none() => hz,
+            _ => self.freq_hz(center_freq_hz, channel_spacing_hz, n_channels),
+        }
     }
 }
 
@@ -3309,7 +3332,8 @@ impl TrackManager {
             }
             if self.cw_ranges.as_ref().is_some_and(|r| {
                 !r.contains(
-                    track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n) * self.cw_factor,
+                    track.cw_coverage_hz(self.center_freq_hz, self.channel_spacing_hz, n)
+                        * self.cw_factor,
                 )
             }) {
                 self.close_counts.record(CloseReason::Restricted);
@@ -3469,10 +3493,12 @@ impl TrackManager {
                     // this entry's own `push_hop`, so a `TrackMeta` pairs it
                     // with this hop's `sample_ts`.
                     let freq_hz = track.freq_hz(self.center_freq_hz, self.channel_spacing_hz, n);
+                    let coverage_hz =
+                        track.cw_coverage_hz(self.center_freq_hz, self.channel_spacing_hz, n);
                     if self
                         .cw_ranges
                         .as_ref()
-                        .is_some_and(|r| !r.contains(freq_hz * self.cw_factor))
+                        .is_some_and(|r| !r.contains(coverage_hz * self.cw_factor))
                     {
                         self.close_counts.record(CloseReason::Restricted);
                         close_reasons.insert(id, CloseReason::Restricted);
@@ -4013,12 +4039,12 @@ impl TrackManager {
     /// for spawn admission. An integer-bin seed can lock a straddling birth
     /// onto a neighbor's skirt before the slow centroid EMA settles.
     fn spawn_positioned(&mut self, k: usize, hop: &HopOutput, prev: Option<&HopOutput>) -> u32 {
-        let position = if self.birth_isolated(k) {
-            None
-        } else {
-            self.spawn_phase_position(k, hop, prev)
-        };
+        let phase = self.spawn_phase_position(k, hop, prev);
+        let position = if self.birth_isolated(k) { None } else { phase };
+        // MAN-30: the frequency `cw_spawn_admits` judged this birth at.
+        let admitted_hz = self.cw_ranges.is_some().then(|| self.position_hz(k, phase));
         let id = self.spawn(k);
+        self.tracks.get_mut(&id).unwrap().cw_admitted_hz = admitted_hz;
         if let Some(position) = position {
             self.tracks.get_mut(&id).unwrap().center = position;
             self.recompute_ownership();
@@ -4347,11 +4373,16 @@ impl TrackManager {
         self.cw_ranges = self.cw_policy.active_at(cfg.cw_epoch);
     }
 
-    fn cw_spawn_admits(&self, k: usize, position: Option<f64>) -> bool {
+    /// Uncalibrated frequency of channel position `position` (else `k`).
+    fn position_hz(&self, k: usize, position: Option<f64>) -> f64 {
         let n = self.n_channels() as f64;
         let p = position.unwrap_or(k as f64);
         let offset = (p + n / 2.0).rem_euclid(n) - n / 2.0;
-        let hz = (self.center_freq_hz + offset * self.channel_spacing_hz) * self.cw_factor;
+        self.center_freq_hz + offset * self.channel_spacing_hz
+    }
+
+    fn cw_spawn_admits(&self, k: usize, position: Option<f64>) -> bool {
+        let hz = self.position_hz(k, position) * self.cw_factor;
         self.cw_ranges.as_ref().is_none_or(|r| r.contains(hz))
     }
 
@@ -6598,6 +6629,52 @@ mod tests {
             .unwrap(),
             ..Default::default()
         }
+    }
+
+    /// MAN-30 (Codex P1 on #510): an isolated carrier whose fine phase
+    /// position is inside coverage but whose channel centre is outside it is
+    /// admitted at spawn by its phase position. Until the candidate's own
+    /// phase estimate is usable, its coverage check must keep that admitted
+    /// frequency, not fall back to the channel centroid and restrict (and
+    /// respawn) it every hop.
+    #[test]
+    fn cw_segments_keep_an_admitted_candidate_until_its_estimator_is_usable() {
+        use manta_dsp::channelizer::odd_channel_sign_correction;
+        let n = 512;
+        let (k, p) = (10usize, 10.25f64);
+        // 14 MHz + 10.25 * 93.75 Hz = 14 000 960.9375 Hz; centre 14 000 937.5 Hz.
+        let mut tm = trusted_band_manager(n);
+        feed_warmup(&mut tm, n);
+        tm.set_cw_policy(&cw_test_config(vec![(14_000_950., 14_001_000.)]));
+        let quiet = (1e-9f32).sqrt();
+        let amp = (1e-6f32).sqrt(); // +30 dB over the floor
+        let step = std::f64::consts::TAU * (p - k as f64) / 4.0;
+        let start = 250u64 * 15;
+        for m in start..start + 60 {
+            let x: Vec<num_complex::Complex32> = (0..n)
+                .map(|ch| {
+                    if ch == k {
+                        let ph = (step * m as f64) as f32;
+                        num_complex::Complex32::from_polar(amp, ph)
+                            * odd_channel_sign_correction(m, ch)
+                    } else {
+                        num_complex::Complex32::new(quiet, 0.0)
+                    }
+                })
+                .collect();
+            tm.step_hop(&hop_with_x(m, x), m);
+        }
+        assert_eq!(tm.close_counts.restricted, 0, "{:?}", tm.close_counts);
+        assert!(
+            tm.tracks
+                .values()
+                .any(|t| t.birth_channel == k && t.lifecycle.state != LifecycleState::Candidate),
+            "the admitted carrier should confirm: {:?}",
+            tm.tracks
+                .values()
+                .map(|t| (t.birth_channel, t.lifecycle.state))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
