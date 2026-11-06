@@ -183,7 +183,14 @@ fn iq_datagram(seq: u32, pairs: &[Complex32]) -> Vec<u8> {
 }
 
 /// How the fake streams once manta sends run = 1.
+struct PauseGates {
+    blocks: Vec<usize>,
+    stopped: mpsc::Sender<Instant>,
+    resume: mpsc::Receiver<()>,
+}
+
 struct Stream {
+    gates: Option<PauseGates>,
     samples: Arc<Vec<Complex32>>,
     speed: f64,
     /// `(first, count)`: sequence numbers `first..first + count` and their
@@ -227,7 +234,7 @@ impl FakeP2Radio {
 
     /// As [`Self::start`], bound on `ip`. Hostless discovery includes a
     /// loopback-unicast destination to reach local fakes (MAN-306).
-    fn start_on(ip: [u8; 4], stream: Stream, done: mpsc::Sender<()>) -> Self {
+    fn start_on(ip: [u8; 4], mut stream: Stream, done: mpsc::Sender<()>) -> Self {
         let (base, cmd, iq) = Self::bind(ip);
         let stop = Arc::new(AtomicBool::new(false));
         let peer = Arc::new(Mutex::new(Peer::default()));
@@ -285,6 +292,7 @@ impl FakeP2Radio {
             let per_block = Duration::from_secs_f64(PER_DATAGRAM as f64 / (RATE * stream.speed));
             let (mut streaming_to, mut t0, mut seq) = (None, Instant::now(), 0u32);
             let mut finished: Option<u32> = None;
+            let mut last_send = Instant::now();
             while !s.load(Ordering::SeqCst) {
                 let target = {
                     let p = peer.lock().unwrap();
@@ -307,6 +315,24 @@ impl FakeP2Radio {
                     continue;
                 }
                 let block = seq as usize;
+                if let Some(gates) = stream.gates.as_mut() {
+                    if gates.blocks.first() == Some(&block) {
+                        gates.blocks.remove(0);
+                        let _ = gates.stopped.send(last_send);
+                        loop {
+                            match gates.resume.recv_timeout(Duration::from_millis(20)) {
+                                Ok(()) => break,
+                                Err(mpsc::RecvTimeoutError::Timeout)
+                                    if !s.load(Ordering::SeqCst) =>
+                                {
+                                    continue
+                                }
+                                _ => return,
+                            }
+                        }
+                        t0 = Instant::now() - per_block * seq;
+                    }
+                }
                 let cut = connection == 1 && stream.first_connection_datagrams == Some(seq);
                 if cut || (!stream.looping && block >= blocks) {
                     (finished, streaming_to) = (Some(connection), None);
@@ -322,7 +348,9 @@ impl FakeP2Radio {
                 if !skipped {
                     let start = block * PER_DATAGRAM;
                     let end = (start + PER_DATAGRAM).min(stream.samples.len());
-                    let _ = iq.send_to(&iq_datagram(seq, &stream.samples[start..end]), to);
+                    iq.send_to(&iq_datagram(seq, &stream.samples[start..end]), to)
+                        .unwrap();
+                    last_send = Instant::now();
                 }
                 seq = seq.wrapping_add(1);
             }
@@ -414,7 +442,8 @@ fn explain(stderr: &str, metrics: &str) -> String {
 ///
 /// Real-time pacing leaves CPU-starved runners room to drain the OS-capped
 /// receive buffer (about 425 KB on Linux despite the 4 MiB request).
-/// Faster pacing can lose W1AW in the first pass of `fifty_lost` (MAN-497).
+/// Accelerated finite streams can lose the first-pass W1AW decode under runner
+/// load, triggering a reconnect and a second-pass timestamp shift (MAN-497, MAN-505).
 fn live_run(
     dir: &Path,
     samples: Arc<Vec<Complex32>>,
@@ -426,6 +455,7 @@ fn live_run(
     let go = Arc::new(AtomicBool::new(false));
     let fake = FakeP2Radio::start(
         Stream {
+            gates: None,
             samples,
             speed: 1.0,
             skip,
@@ -723,6 +753,7 @@ fn check_reports_a_protocol2_radio() {
     let (done_tx, _done_rx) = mpsc::channel();
     let fake = FakeP2Radio::start(
         Stream {
+            gates: None,
             samples: Arc::new(samples),
             speed: 1.0,
             skip: None,
@@ -774,6 +805,7 @@ fn check_discovers_a_protocol2_radio_without_an_address() {
     let fake = FakeP2Radio::start_on(
         [127, 0, 0, 1],
         Stream {
+            gates: None,
             samples: Arc::new(samples),
             speed: 1.0,
             skip: None,
@@ -822,6 +854,7 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
         .map(|_| {
             FakeP2Radio::start(
                 Stream {
+                    gates: None,
                     samples: samples.clone(),
                     speed: 1.0,
                     skip: None,
@@ -914,4 +947,122 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
             explain(&stderr, &metrics)
         );
     }
+}
+
+/// MAN-489: no word follows either callsign; the source's soft stall must
+/// settle each tail while the fake refuses to send the next sample.
+#[test]
+fn a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume() {
+    let mut spec = manta_testkit::vectors::v1();
+    spec.fs = RATE;
+    spec.duration_s = 4.0;
+    spec.signals[0].wpm = 40.0;
+    spec.signals[0].loop_text = false;
+    let mut samples = Vec::new();
+    let mut boundaries = Vec::new();
+    for text in ["DE W1AW", "DE K1ABC"] {
+        spec.signals[0].text = text.into();
+        samples.extend(manta_testkit::vectors::render(&spec).unwrap().samples);
+        samples.resize(
+            samples.len().div_ceil(PER_DATAGRAM) * PER_DATAGRAM,
+            Complex32::default(),
+        );
+        boundaries.push(samples.len() / PER_DATAGRAM);
+    }
+    let (stopped, pauses) = mpsc::channel();
+    let (resume, gate) = mpsc::channel();
+    let (done, _) = mpsc::channel();
+    let go = Arc::new(AtomicBool::new(false));
+    let fake = FakeP2Radio::start(
+        Stream {
+            gates: Some(PauseGates {
+                blocks: boundaries.clone(),
+                stopped,
+                resume: gate,
+            }),
+            samples: Arc::new(samples),
+            speed: 1.0,
+            skip: None,
+            looping: false,
+            first_connection_datagrams: None,
+            go: go.clone(),
+        },
+        done,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let [telnet, json, metrics] = free_ports();
+    let cfg = dir.path().join("manta.toml");
+    std::fs::write(&cfg, format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n")).unwrap();
+    let mut child = manta()
+        .args(["run", "--hpsdr-host", "127.0.0.1", "--hpsdr-port"])
+        .arg(fake.base.to_string())
+        .args([
+            "--hpsdr-freq-hz",
+            "14000000",
+            "--hpsdr-rate-hz",
+            "192000",
+            "--json",
+            "--config",
+        ])
+        .arg(cfg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let _child = ChildGuard(child);
+    let (ready_tx, ready) = mpsc::channel();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let err = errors.clone();
+    let stderr_reader = thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains(READY_MARKER) {
+                let _ = ready_tx.send(());
+            }
+            err.lock().unwrap().push(line);
+        }
+    });
+    let (spot_tx, spots) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(s) = v.get("spot") {
+                    let _ = spot_tx.send((spot_of(s), Instant::now()));
+                }
+            }
+        }
+    });
+    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    go.store(true, Ordering::SeqCst);
+    for (episode, call) in ["W1AW", "K1ABC"].into_iter().enumerate() {
+        let last_send = pauses.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert!(spots.try_recv().is_err(), "held tail spotted before stall");
+        let (spot, received) = spots
+            .recv_timeout(Duration::from_secs(5).saturating_sub(last_send.elapsed()))
+            .unwrap_or_else(|e| panic!("{e}: {:?}", errors.lock().unwrap()));
+        assert_eq!(spot.0, call);
+        assert!(received.duration_since(last_send) < Duration::from_secs(5));
+        let start = if episode == 0 {
+            0
+        } else {
+            boundaries[0] * PER_DATAGRAM
+        } as u64;
+        let end = (boundaries[episode] * PER_DATAGRAM) as u64;
+        assert!(
+            spot.2 >= start && spot.2 < end,
+            "held word keeps its sample timestamp: {spot:?}"
+        );
+        assert!(spots.try_recv().is_err());
+        assert!(!errors
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains(" lost: ") || l.contains(" reconnected after ")));
+        resume.send(()).unwrap();
+    }
+    drop(fake);
+    drop(_child);
+    stdout_reader.join().unwrap();
+    stderr_reader.join().unwrap();
 }

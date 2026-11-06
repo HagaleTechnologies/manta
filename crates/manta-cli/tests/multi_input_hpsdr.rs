@@ -860,8 +860,10 @@ fn failed_startup_retires_another_groups_completed_radio() {
     assert!(unknown.sessions.lock().unwrap().is_empty());
     wait_until(
         Duration::from_secs(2),
-        // One retirement sends two stops; double retirement would send four.
-        || opened.generations().iter().any(|s| s.stops == 2),
+        // MAN-474 keeps the immediate pair and adds timed stop retries.
+        // Exact retry counts depend on scheduling; stale retirement is
+        // checked separately by manta-input's replacement-session test.
+        || opened.generations().iter().any(|s| s.stops >= 2),
         || format!("{:?}", opened.generations()),
     );
     assert_eq!(opened.generations().len(), 1);

@@ -35,6 +35,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-494: optional per-input IQ correction uses a controlled-tone calibration
+  to remove receiver images. It defaults to off. Observe and a centre mismatch
+  preserve samples; mirror evidence never enables correction by itself.
+
 - MAN-200: a decode whose samples overlap a decode the repetition gate
   already counted, such as a replay or a second track on the same signal,
   no longer counts as another repetition, even when it arrives a whole
@@ -155,6 +159,37 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-485: `[input].digital_modes = ["FT8", "FT4"]` enables FT8/FT4 CQ
+  skimming from covered IQ windows in builds with `--features ftx`.
+  Spots publish on the JSON stream as `mode` `"FT8"`/`"FT4"`, with
+  `dxGrid` from the CQ and the UTC slot timestamp. Startup lines report
+  attempted and skipped windows; the four `manta_ftx_` metric families
+  appear only for attempted windows. CW decoder output is unchanged.
+
+- MAN-495: `manta doctor` now observes the input-conditioning chain. Every
+  stage not set to `apply` runs as `observe` in doctor's own run (an `off`
+  stage included, so diagnostics exist on a default config; an `apply`
+  stage stays applied), `doctor --json` gains an `inputConditioning`
+  object (always present when a receiver ran, absent in checks-only
+  output) in decode's shape plus the doctor-only
+  `dc.overChannelNoiseDb`, measured against the median channel noise
+  floor over the first second of input, and the text report prints one
+  canonical `input:` line per finding before `verdict:` -- a DC offset
+  from +6 dB over the channel noise upward, a short impulse, or a paused
+  impulse stage. A clean receiver prints no new line. The IQ-imbalance
+  surface (`iq` object, mirror line, `--iq-tone-hz`) lands with MAN-494's
+  IQ stage. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
+- MAN-496: the `[input]` conditioning keys `dc_block` and
+  `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
+  restart-only), turning MAN-203's input-conditioning stages on for
+  `decode`, `run` and `soak`, with per-input settings for multiple receivers.
+  `run` publishes `manta_input_conditioned_samples_total` by source, stage
+  and mark, starting at zero for configured modes and summed across reconnects.
+  `decode --json` gains an `inputConditioning` object (omitted
+  when every stage is `off`) with exact per-stage counts and the bounded
+  span log; `manta config` prints a set stage in the input summary. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
 - MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
   by default) reports validated CQ and beacon spots (`spot_types = "all"`
   for every type) to PSKReporter's public map at
@@ -413,6 +448,18 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
+  audio, SoapySDR; ka9q already did) now reports a stopped stream through
+  `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),
+  before its own loss/reconnect bound, so a held call's spot is emitted
+  without waiting out the stall bound or a reconnect and the same stream
+  keeps reading and spots again after it resumes. A Kiwi peer that keeps
+  pinging while sending no IQ can no longer hide the outage forever, two
+  DDCs on one HPSDR radio each get the report, a grouped member's soft
+  stall no longer retires its whole radio generation, and audio resumes
+  on the same device instead of reopening. Hard failure bounds and
+  reconnect policy are unchanged. See
+  docs/DECISIONS/2026-11-04-man489-live-source-stall-settlement.md.
 - MAN-497: dropping a lone protocol-1 HPSDR receiver sends the stop command
   twice, as protocol 2 does, so one lost UDP datagram no longer leaves the
   radio streaming and refused as in use on rediscovery. Decoder output is

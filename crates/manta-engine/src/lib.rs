@@ -6,8 +6,8 @@ pub mod check;
 pub mod config_file;
 pub mod listen;
 pub use listen::{
-    listen, listen_with_observers, ListenObservers, OperatorLists, OperatorListsUpdate,
-    RttyObserver, SuppressionObserver,
+    listen, listen_with_observers, ConditioningObserver, ListenObservers, OperatorLists,
+    OperatorListsUpdate, RttyObserver, SuppressionObserver,
 };
 pub mod latency;
 pub mod live;
@@ -56,6 +56,8 @@ pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
 /// CLI's wording.
 pub use manta_dsp::sample_guard::MAX_SAMPLE_MAGNITUDE;
 pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
+
+pub mod cw_segments;
 
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
@@ -144,6 +146,14 @@ fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
 /// M0 pipeline tunables. SPEC §5.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
+    /// Per-source CW inclusion policy.
+    pub cw_policy: cw_segments::Policy,
+    /// Schedule time source.
+    pub cw_clock: cw_segments::Clock,
+    /// Replay UTC epoch in seconds.
+    pub cw_epoch: i64,
+    /// Native recording epoch fraction, in nanoseconds.
+    pub cw_epoch_nanoseconds: u32,
     /// Classical decoder tunables. SPEC §5.
     pub decode: DecodeConfig,
     /// Real multi-track detector tunables. SPEC §9 `[detector]` table.
@@ -228,6 +238,10 @@ impl PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            cw_policy: cw_segments::Policy::default(),
+            cw_clock: cw_segments::Clock::Samples,
+            cw_epoch: 0,
+            cw_epoch_nanoseconds: 0,
             decode: DecodeConfig::default(),
             detector: track::DetectorConfig::default(),
             freq_correction_ppm: 0.0,
@@ -275,6 +289,11 @@ pub struct DecodeReport {
     /// `badSamples` in JSON, omitted when 0.
     #[serde(skip_serializing_if = "is_zero")]
     pub bad_samples: u64,
+    /// MAN-496: what the input-conditioning chain did, `inputConditioning`
+    /// in JSON, omitted when every stage is off (the default), so a
+    /// clean run's JSON keeps its pre-MAN-496 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_conditioning: Option<ConditioningReport>,
     /// Input sample rate, for turning `rtty` sample timestamps into
     /// seconds; not serialized.
     #[serde(skip)]
@@ -285,6 +304,141 @@ pub struct DecodeReport {
 /// fields: a clean run's JSON keeps its pre-MAN-234 shape.
 pub(crate) fn is_zero(n: &u64) -> bool {
     *n == 0
+}
+
+/// MAN-496: a conditioning stage mode as it is written in config and JSON.
+fn stage_mode_str(mode: manta_dsp::condition::StageMode) -> String {
+    match mode {
+        manta_dsp::condition::StageMode::Off => "off",
+        manta_dsp::condition::StageMode::Observe => "observe",
+        manta_dsp::condition::StageMode::Apply => "apply",
+    }
+    .to_string()
+}
+
+/// MAN-496: what one conditioning stage did during a decode. The impulse
+/// stage's half of `ConditioningReport`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImpulseConditioning {
+    /// The stage's configured mode: `off`, `observe` or `apply`.
+    pub mode: String,
+    /// Samples judged impulsive and left unchanged (an `observe` stage, a
+    /// run too long to repair, or a run in a paused block).
+    pub flagged_samples: u64,
+    /// Samples replaced by interpolation (`apply` only).
+    pub repaired_samples: u64,
+    /// Flagged runs longer than the repair limit.
+    pub long_runs: u64,
+    /// Samples marked uncertain because the stage held back.
+    pub paused_samples: u64,
+}
+
+/// MAN-496: the DC-removal stage's half of `ConditioningReport`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DcConditioning {
+    /// The stage's configured mode: `off`, `observe` or `apply`.
+    pub mode: String,
+    /// The stage's final DC estimate in dBFS (full scale 1.0), or nothing
+    /// while the stage is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level_dbfs: Option<f64>,
+    /// MAN-495: how far `level_dbfs` sits above the median channel noise
+    /// floor, in dB, from doctor's own bounded floor pre-pass. Doctor-only:
+    /// decode has no floor reference, so it never sets this and its JSON
+    /// keeps #514's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub over_channel_noise_db: Option<f64>,
+    /// Samples the stage changed (`apply` only).
+    pub corrected_samples: u64,
+}
+
+/// MAN-496: one retained span of the conditioning log, as JSON.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditioningSpan {
+    /// The stage that marked the span: `impulse` or `dc`.
+    pub stage: String,
+    /// What it did: `repaired`, `flagged`, `corrected` or `uncertain`.
+    pub mark: String,
+    /// The first marked sample's channelizer-input index.
+    pub start_sample: u64,
+    /// The number of samples in the span.
+    pub samples: u64,
+}
+
+/// MAN-496: what the input-conditioning chain did during one decode, for
+/// `decode --json`'s `inputConditioning` (docs/CLI-JSON.md). Both stage
+/// objects are always present, their `mode` saying `off`; the report exists
+/// at all only when a stage is not off. Counts are exact (never bounded by
+/// the span rings); `spans`/`spansDropped` carry the final segment's rings.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditioningReport {
+    /// The impulse-suppression stage.
+    pub impulse: ImpulseConditioning,
+    /// The DC-removal stage.
+    pub dc: DcConditioning,
+    /// The retained span log, oldest first.
+    pub spans: Vec<ConditioningSpan>,
+    /// Spans dropped from full rings.
+    pub spans_dropped: u64,
+}
+
+impl ConditioningReport {
+    /// A report for a decode whose channelizers ran `cfg`.
+    fn for_config(cfg: &ConditioningConfig) -> Self {
+        ConditioningReport {
+            impulse: ImpulseConditioning {
+                mode: stage_mode_str(cfg.impulse),
+                ..ImpulseConditioning::default()
+            },
+            dc: DcConditioning {
+                mode: stage_mode_str(cfg.dc),
+                ..DcConditioning::default()
+            },
+            spans: Vec::new(),
+            spans_dropped: 0,
+        }
+    }
+
+    /// Fold one segment's log in: counts and long runs sum across segments,
+    /// the DC level is the last one seen, and the bounded span rings carry
+    /// the final segment's.
+    pub(crate) fn add(&mut self, log: &manta_dsp::condition::ConditioningLog) {
+        use manta_dsp::condition::{Mark, Stage};
+        self.impulse.flagged_samples += log.count(Stage::Impulse, Mark::Flagged);
+        self.impulse.repaired_samples += log.count(Stage::Impulse, Mark::Repaired);
+        self.impulse.paused_samples += log.count(Stage::Impulse, Mark::Uncertain);
+        self.impulse.long_runs += log.impulse_long_runs();
+        self.dc.corrected_samples += log.count(Stage::Dc, Mark::Corrected);
+        self.dc.level_dbfs = log.dc_level().and_then(|l| {
+            let mag = (l.re * l.re + l.im * l.im).sqrt();
+            (mag > 0.0).then(|| 20.0 * mag.log10())
+        });
+        self.spans = log
+            .spans()
+            .map(|s| ConditioningSpan {
+                stage: match s.stage {
+                    Stage::Impulse => "impulse",
+                    Stage::Dc => "dc",
+                    Stage::Iq => "iq",
+                }
+                .to_string(),
+                mark: match s.mark {
+                    Mark::Repaired => "repaired",
+                    Mark::Flagged => "flagged",
+                    Mark::Corrected => "corrected",
+                    Mark::Uncertain => "uncertain",
+                }
+                .to_string(),
+                start_sample: s.start_sample,
+                samples: s.len,
+            })
+            .collect();
+        self.spans_dropped = log.spans_dropped();
+    }
 }
 
 /// MAN-234: the suffix `decode_samples` adds to its "no signal found"
@@ -425,6 +579,7 @@ impl IqSource for SliceSource<'_> {
 /// and track manager, as `listen`'s `Segment`, whose sample clock starts at
 /// `base` on the source's timeline.
 struct OfflineSegment {
+    held: listen::HeldLosses,
     ch: manta_dsp::channelizer::Channelizer,
     tm: track::TrackManager,
     hop: u64,
@@ -486,6 +641,7 @@ impl SourceBands {
             cfg.detector,
             cfg.decode.clone(),
         );
+        tm.set_cw_policy(cfg);
         tm.resume_track_ids_from(next_id);
         tm.skip_preroll_hops(pad_hops);
         tm.set_rf_passband_hz(self.rf_passband_hz.0, self.rf_passband_hz.1);
@@ -500,6 +656,7 @@ impl SourceBands {
         // streaming cap on the RTTY log does not apply to a file decode.
         tm.keep_full_rtty_history();
         Ok(OfflineSegment {
+            held: Default::default(),
             ch,
             tm,
             hop,
@@ -599,6 +756,16 @@ pub fn decode_source_observed(
     let mut events = Vec::new();
     let mut rtty: Vec<RttySignalReport> = Vec::new();
     let mut bad_samples = 0u64;
+    // MAN-496: the conditioning report exists only when a stage is on; each
+    // segment's log folds in as it closes, like `bad_samples`.
+    let mut input_conditioning = (cfg.conditioning.impulse != manta_dsp::condition::StageMode::Off
+        || cfg.conditioning.dc != manta_dsp::condition::StageMode::Off)
+        .then(|| ConditioningReport::for_config(&cfg.conditioning));
+    let mut note_conditioning = |seg: &OfflineSegment| {
+        if let (Some(report), Some(log)) = (input_conditioning.as_mut(), seg.ch.conditioning()) {
+            report.add(log);
+        }
+    };
     let mut any_hops = false;
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     // Samples read after a gap, held for the next segment while the
@@ -636,10 +803,19 @@ pub fn decode_source_observed(
             nonzero |= chunk[filled..filled + n]
                 .iter()
                 .any(|s| s.re != 0.0 || s.im != 0.0);
-            // MAN-202: every gap report is taken here. `missing_samples` is
-            // still ignored by file decode, as before (a follow-up: make
-            // `decode_source` honour `take_missing_samples`).
             let cont = ReadContinuity::take(src);
+            // Scheduled source clocks include spliced losses just as the live
+            // front end does. Preserve the legacy unscheduled decode path.
+            if cfg.cw_policy.scheduled() {
+                if let Some(k) = cont.missing_samples {
+                    seg.base = seg
+                        .base
+                        .checked_add(k)
+                        .context("input loss overflows sample clock")?;
+                    seg.held
+                        .record(consumed, k, consumed, seg.ch.filter_len() as u64);
+                }
+            }
             if let Some(missing) = cont.discontinuity {
                 // These samples follow the outage: they open the next
                 // segment, after this one's partial chunk.
@@ -662,7 +838,7 @@ pub fn decode_source_observed(
             let (base, pad_hops, hop) = (seg.base, seg.pad_hops, seg.hop);
             events.extend(
                 seg.tm
-                    .process_hops(&hops, |m| base + m.saturating_sub(pad_hops) * hop),
+                    .process_hops(&hops, |m| seg.held.hop_ts(base, pad_hops, hop, m)),
             );
         }
         let Some(missing) = gap else {
@@ -679,6 +855,7 @@ pub fn decode_source_observed(
         events.extend(seg.tm.finish_for_discontinuity());
         append_rtty(&mut rtty, &seg.tm, calibration_factor, Some(end));
         bad_samples += seg.ch.bad_samples();
+        note_conditioning(&seg);
         let base = end
             .checked_add(missing)
             .context("input discontinuity overflows the sample clock")?;
@@ -694,6 +871,7 @@ pub fn decode_source_observed(
         bail!("input is digital silence");
     }
     bad_samples += seg.ch.bad_samples();
+    note_conditioning(&seg);
     if !any_hops {
         return Err(
             NoSignal::new("input shorter than one filter length or empty", bad_samples).into(),
@@ -794,6 +972,7 @@ pub fn decode_source_observed(
         timing,
         rtty,
         bad_samples,
+        input_conditioning,
         sample_rate_hz: fs,
     };
     Ok((report, observed))
@@ -1128,6 +1307,84 @@ mod tests {
         assert!(s.contains("\"badSamples\":3"), "{s}");
     }
 
+    /// MAN-496: a default decode reports no `inputConditioning`, and a
+    /// report built from the summed logs of two conditioners keeps their
+    /// exact counts and camelCase shape.
+    #[test]
+    fn conditioning_report_sums_two_logs_and_serializes_camel_case() {
+        use manta_dsp::condition::{ConditioningConfig, InputConditioner, StageMode};
+        let (spec, clean) = v1_12s();
+        let default = decode_samples(
+            &clean,
+            spec.fs,
+            spec.center_freq_hz,
+            &PipelineConfig::default(),
+        )
+        .unwrap();
+        assert!(default.input_conditioning.is_none());
+        assert!(serde_json::to_value(&default)
+            .unwrap()
+            .get("inputConditioning")
+            .is_none());
+
+        let cfg = ConditioningConfig {
+            impulse: StageMode::Apply,
+            dc: StageMode::Apply,
+            ..Default::default()
+        };
+        let conditioned = |samples: &[Complex32]| -> InputConditioner {
+            let mut c = InputConditioner::new(96_000.0, &cfg).expect("a stage is on");
+            c.condition(&mut samples.to_vec());
+            c
+        };
+        let logs: Vec<InputConditioner> = vec![
+            conditioned(&clean[..8192.min(clean.len())]),
+            conditioned(&clean[..8192.min(clean.len())]),
+        ];
+        let mut report = ConditioningReport::for_config(&cfg);
+        for log in &logs {
+            report.add(log.log());
+        }
+        use manta_dsp::condition::{Mark, Stage};
+        let flagged: u64 = logs
+            .iter()
+            .map(|c| c.log().count(Stage::Impulse, Mark::Flagged))
+            .sum();
+        let repaired: u64 = logs
+            .iter()
+            .map(|c| c.log().count(Stage::Impulse, Mark::Repaired))
+            .sum();
+        let corrected: u64 = logs
+            .iter()
+            .map(|c| c.log().count(Stage::Dc, Mark::Corrected))
+            .sum();
+        assert_eq!(report.impulse.flagged_samples, flagged);
+        assert_eq!(report.impulse.repaired_samples, repaired);
+        assert_eq!(report.dc.corrected_samples, corrected);
+        assert!(corrected > 0, "the apply DC stage marks its writes");
+        assert_eq!(report.impulse.mode, "apply");
+        assert_eq!(report.dc.mode, "apply");
+        assert!(report.dc.level_dbfs.is_some());
+        // The bounded rings carry the final log's spans.
+        assert_eq!(report.spans.len(), logs[1].log().spans().count());
+        assert_eq!(report.spans_dropped, logs[1].log().spans_dropped());
+        let json = serde_json::to_string(&report).unwrap();
+        for key in [
+            "\"mode\":\"apply\"",
+            "\"flaggedSamples\"",
+            "\"repairedSamples\"",
+            "\"longRuns\"",
+            "\"pausedSamples\"",
+            "\"levelDbfs\"",
+            "\"correctedSamples\"",
+            "\"spans\"",
+            "\"spansDropped\"",
+            "\"startSample\"",
+        ] {
+            assert!(json.contains(key), "{key} missing from {json}");
+        }
+    }
+
     /// MAN-139: `decode --json`'s top-level and `rtty[]` keys are camelCase,
     /// with the stream's `frequency` for the spot frequency.
     #[test]
@@ -1157,6 +1414,7 @@ mod tests {
                 id: 7,
             }],
             bad_samples: 1,
+            input_conditioning: None,
             sample_rate_hz: 96_000.0,
         };
         let s = serde_json::to_string(&report).unwrap();

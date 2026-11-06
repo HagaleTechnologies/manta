@@ -27,6 +27,7 @@ cargo test -p manta-input -p manta-cli --features hpsdr --locked
 cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
 cargo test -p manta-engine --features ftx --locked --lib ftx
 cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
+cargo test -p manta-cli --features ftx --locked --test ftx_acceptance
 ```
 
 ## Status

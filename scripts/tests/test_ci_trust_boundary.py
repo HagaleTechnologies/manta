@@ -23,7 +23,7 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "test-soapy")
+CI_TEST_JOBS = ("test", "ubuntu-support", "ubuntu-shards", "macos-support", "macos-shards", "test-soapy")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 NATIVE_IF = ("github.event_name != 'pull_request' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
@@ -356,7 +356,7 @@ CACHE_MARKERS = ("actions/cache@", "cache-from:", "cache-to:", "sccache")
 class CiFullCacheTests(unittest.TestCase):
     def test_rust_cache_saves_only_on_push_to_main(self):
         found = rust_cache_steps(read("ci-full.yml"))
-        self.assertEqual(len(found), 2, "expected exactly two rust-cache steps in ci-full.yml")
+        self.assertEqual({job for job, _ in found}, set(CI_TEST_JOBS))
         for job, step in found:
             with self.subTest(job=job):
                 with_block = sub(step, "with")
@@ -397,7 +397,7 @@ class CiFullNativePathTests(unittest.TestCase):
         self.text = read("ci-full.yml")
 
     def test_hpsdr_coverage_moves_to_default_ci_and_catalyst_together(self):
-        self.assertEqual(tuple(j for j in job_ids(self.text) if j.startswith("test")), CI_TEST_JOBS)
+        self.assertEqual(tuple(j for j in job_ids(self.text) if j in CI_TEST_JOBS), CI_TEST_JOBS)
         # This suite also runs on macOS; do not require Python 3.11's tomllib.
         with open(os.path.join(ROOT, ".catalyst", "catalyst.toml"), encoding="utf-8") as f:
             config = f.read()
@@ -422,7 +422,7 @@ class CiFullNativePathTests(unittest.TestCase):
 
     def test_trust_boundary_test_runs_in_required_test_job(self):
         wanted = "python3 -m unittest scripts.tests.test_ci_trust_boundary -v"
-        matches = [s for s in steps(job_block(self.text, "test")) if field(s, "run") == wanted]
+        matches = [s for s in steps(job_block(self.text, "ubuntu-support")) if field(s, "run") == wanted]
         self.assertEqual(len(matches), 1, f"job test has no step running {wanted!r}")
         self.assertEqual(field(matches[0], "if"), "runner.os != 'Windows'")
 

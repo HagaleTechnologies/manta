@@ -296,8 +296,39 @@
 
 # The settings below apply to any receiver type, or none.
 
+# CW coverage uses calibrated RF Hz. No default: omission keeps full coverage.
+# An empty list pauses CW decoding. Daily entries and dated overrides replace
+# the base ranges. See docs/CONFIG.md for the complete scheduling example.
+#cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+#cw_schedule = []                   # no default: daily UTC entries that replace the base ranges
+#cw_overrides = []                  # no default: dated entries that replace the base and daily ranges
+
+# IQ correction uses a controlled tone calibration for this receiver. Restart required.
+# Observe only measures mirrors; Apply requires the complete triple below.
+#iq_correction = "off"
+
+# No default: controlled-tone gain ratio, finite and 0.5 through 2.0. Supply all three values together.
+#iq_gain_ratio = 1.05
+
+# No default: controlled-tone phase error, finite and -45 through 45 degrees. Remeasure after a gain change.
+#iq_phase_deg = 2.0
+
+# No default: positive receiver centre, Hz, when measured. Apply needs agreement within 1 Hz; bands refuses calibration.
+#iq_calibrated_center_hz = 14000000.0
+
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
+
+# FT8/FT4 spots on the JSON stream from windows this input covers.
+# Needs a manta built with --features ftx and a [server] table. Restart required.
+#digital_modes = []
+
+# Input-conditioning stages, each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
 
 # Your radio's dial frequency, Hz, for a sound card or WAV recording that
 # carries no frequency of its own. No default: without it, frequencies are
@@ -501,3 +532,11 @@
 #speed_alpha = 0.2                   # how quickly the speed estimate follows the sender
 #seed_units_hops = [9.0, 13.0, 18.0, 26.0, 38.0]  # starting dot lengths tried
 #conf_kappa = 6.0                    # confidence scale
+
+# CW coverage example, under your input table:
+# [input]
+# cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+# [[input.cw_schedule]]
+# at_utc = "18:00"
+# segments_hz = [[14000000, 14030000]]
+# Full UTC daily/dated semantics: docs/CONFIG.md.

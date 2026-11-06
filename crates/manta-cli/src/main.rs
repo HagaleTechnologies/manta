@@ -32,6 +32,7 @@ mod config_edit;
 mod devices;
 mod doctor_checks;
 mod fmt;
+mod ftx_run;
 mod funnel_cmd;
 mod grade_cmd;
 mod grade_paired;
@@ -2822,6 +2823,31 @@ fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime
     Ok(mtime)
 }
 
+/// A scheduled replay must use a recorded or explicit epoch, never file mtime.
+fn cw_replay_epoch(
+    path: &Path,
+    explicit: Option<i64>,
+    scheduled: bool,
+    input_name: &str,
+) -> Result<(i64, u32)> {
+    if let Some(epoch) = explicit {
+        return Ok((epoch, 0));
+    }
+    if !scheduled {
+        return Ok((0, 0));
+    }
+    if !manta_input::is_native_recording(path) {
+        bail!(
+            "input {}: scheduled file input requires replay_epoch or a native recording epoch",
+            fmt::quoted(input_name)
+        );
+    }
+    let epoch = epoch_for_replay_path(path)?.duration_since(std::time::UNIX_EPOCH)?;
+    check_replay_epoch("recording epoch", i64::try_from(epoch.as_secs())?)
+        .map(|secs| (secs, epoch.subsec_nanos()))
+        .map_err(|e| anyhow::anyhow!(e))
+}
+
 /// Resolves the wall-clock epoch fed to `SpotBus`: an explicit
 /// `--replay-epoch` wins when given AND this is a replay session (the
 /// escape hatch for a copy/download that didn't preserve the file's
@@ -2843,6 +2869,18 @@ fn resolve_epoch(
         }
         (Some(path), None) => epoch_for_replay_path(path),
         (None, _) => Ok(std::time::SystemTime::now()),
+    }
+}
+
+/// Epoch of sample zero for an individual FTx input, captured when it opens.
+fn resolve_ftx_epoch(
+    spec: &LiveSourceSpec,
+    replay_epoch: Option<i64>,
+    acquired_at: std::time::SystemTime,
+) -> Result<std::time::SystemTime> {
+    match spec {
+        LiveSourceSpec::File { path, .. } => resolve_epoch(Some(path), replay_epoch),
+        _ => Ok(acquired_at),
     }
 }
 
@@ -3238,7 +3276,10 @@ fn build_pipeline_config(
             // MAN-79's rule for an explicit file; a pin is the operator's
             // exact choice of bytes, so it skips every check (D5).
             if let (list_refresh::Origin::File(path), true) = (&in_use.origin, table.is_empty()) {
-                bail!("cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?", path.display());
+                bail!(
+                    "cty.dat file {} lists no callsign prefixes; is it AD1C's cty.dat (not cty.csv or a saved web page)?",
+                    path.display()
+                );
             }
             cfg.cty = Some(std::sync::Arc::new(table));
             in_use
@@ -4343,6 +4384,33 @@ fn latency_histogram_of(
     }
 }
 
+/// Emit one calibration mismatch warning for the lifetime of an input.
+fn warn_iq_mismatch(
+    cfg: &manta_dsp::condition::ConditioningConfig,
+    center: f64,
+    name: Option<&str>,
+    warned: &std::sync::atomic::AtomicBool,
+) {
+    use manta_dsp::condition::StageMode;
+    let Some(cal) = &cfg.iq_calibration else {
+        return;
+    };
+    if cfg.iq != StageMode::Apply
+        || (center.is_finite() && center > 0.0 && (cal.center_freq_hz - center).abs() <= 1.0)
+    {
+        return;
+    }
+    if warned.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let prefix = name.map_or_else(String::new, |n| format!("input {}: ", fmt::quoted(n)));
+    logging::warning(&format!(
+        "{prefix}IQ correction withheld: calibrated at {:.1} kHz, receiver at {:.1} kHz; measure a new calibration",
+        cal.center_freq_hz / 1000.0,
+        center / 1000.0
+    ));
+}
+
 /// `manta decode`'s decode: a manta IQ recording or headerless IQ through
 /// `decode_source_observed` (MAN-309), a WAV otherwise. MAN-131: says so
 /// before decoding when the reported frequencies will be baseband offsets,
@@ -4378,6 +4446,12 @@ fn decode_for_cli(
                 path.display()
             );
         }
+        warn_iq_mismatch(
+            &cfg.conditioning,
+            src.center_freq_hz(),
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
         // `decode_source` segments the decode at each recorded gap.
         manta_engine::decode_source_observed(src.as_mut(), cfg, policy)
     } else {
@@ -4392,7 +4466,17 @@ fn decode_for_cli(
                 center_freq_hz = Some(0.0);
             }
         }
-        manta_engine::decode_wav_observed(path, center_freq_hz, cfg, policy)
+        let mut src = match center_freq_hz {
+            Some(hz) => manta_input::WavIqSource::open_with_center_freq_hz(path, hz)?,
+            None => manta_input::WavIqSource::open(path)?,
+        };
+        warn_iq_mismatch(
+            &cfg.conditioning,
+            src.center_freq_hz(),
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+        );
+        manta_engine::decode_source_observed(&mut src, cfg, policy)
     }
 }
 
@@ -4870,10 +4954,10 @@ fn start_spot_server(
                     .await
                     .with_context(|| {
                         format!(
-                        "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
-                        fmt::quoted(&cfg.metrics_bind_addr),
-                        cfg.metrics_port
-                    )
+                    "binding the metrics server (metrics_bind_addr = {}, metrics_port = {})",
+                    fmt::quoted(&cfg.metrics_bind_addr),
+                    cfg.metrics_port
+                )
                     })?;
             let metrics_addr = metrics_listener.local_addr()?;
             let json_addr = json_listener.local_addr()?;
@@ -5325,6 +5409,7 @@ fn start_spot_server(
                         },
                         spot_types: p.spot_types,
                         flush_offset: manta_server::pskreporter::flush_offset(nonce),
+                        flush_interval: manta_server::pskreporter::batch::FLUSH_INTERVAL,
                         observation_domain: manta_server::pskreporter::observation_domain(nonce),
                     },
                     socket,
@@ -5677,8 +5762,94 @@ impl ReplayMode {
     }
 }
 
+/// Register configured conditioning series at zero, then publish exact running counts.
+fn publish_conditioned(
+    metrics: &manta_server::metrics::Metrics,
+    source: &str,
+    cfg: &manta_dsp::condition::ConditioningConfig,
+    observer: &manta_engine::ConditioningObserver,
+) {
+    use manta_dsp::condition::{Mark, Stage, StageMode};
+    let counts = observer.snapshot();
+    for (stage, name, mode) in [
+        (Stage::Impulse, "impulse", cfg.impulse),
+        (Stage::Dc, "dc", cfg.dc),
+    ] {
+        for (mark, label) in [
+            (Mark::Repaired, "repaired"),
+            (Mark::Flagged, "flagged"),
+            (Mark::Corrected, "corrected"),
+            (Mark::Uncertain, "uncertain"),
+        ] {
+            let enabled = matches!(
+                (stage, mode, mark),
+                (Stage::Dc, StageMode::Apply, Mark::Corrected)
+                    | (Stage::Impulse, StageMode::Apply, Mark::Repaired)
+                    | (
+                        Stage::Impulse,
+                        StageMode::Observe | StageMode::Apply,
+                        Mark::Flagged | Mark::Uncertain
+                    )
+            );
+            if enabled {
+                metrics.set_input_conditioned_samples(
+                    source,
+                    name,
+                    label,
+                    counts[stage as usize][mark as usize],
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn conditioned_metric_registration_matches_producible_marks() {
+    use manta_dsp::condition::{ConditioningConfig, StageMode};
+    for (mode, impulse_marks, dc_marks) in [
+        (StageMode::Off, 0, 0),
+        (StageMode::Observe, 2, 0),
+        (StageMode::Apply, 3, 1),
+    ] {
+        let metrics = manta_server::metrics::Metrics::new();
+        publish_conditioned(
+            &metrics,
+            "rx",
+            &ConditioningConfig {
+                impulse: mode,
+                dc: mode,
+                ..Default::default()
+            },
+            &manta_engine::ConditioningObserver::default(),
+        );
+        let text = metrics.render_prometheus_text();
+        let samples: Vec<_> = text
+            .lines()
+            .filter(|l| l.starts_with("manta_input_conditioned_samples_total{"))
+            .collect();
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|l| l.contains("stage=\"impulse\""))
+                .count(),
+            impulse_marks
+        );
+        assert_eq!(
+            samples
+                .iter()
+                .filter(|l| l.contains("stage=\"dc\""))
+                .count(),
+            dc_marks
+        );
+        assert!(samples.iter().all(|l| l.ends_with(" 0")));
+    }
+}
+
 /// Everything a live command needs after CLI > env > file > default.
 struct Resolved {
+    cw_policy: manta_engine::cw_segments::Policy,
+    conditioning: manta_dsp::condition::ConditioningConfig,
     spec: LiveSourceSpec,
     replay: ReplayMode,
     freq_correction_ppm: f64,
@@ -5708,7 +5879,10 @@ struct Resolved {
 /// correction, dial and capture rate.
 #[derive(Clone)]
 struct ResolvedInput {
+    cw_policy: manta_engine::cw_segments::Policy,
+    conditioning: manta_dsp::condition::ConditioningConfig,
     name: String,
+    digital_modes: Vec<manta_engine::ftx::FtxMode>,
     spec: LiveSourceSpec,
     freq_correction_ppm: f64,
     dial_freq_hz: Option<f64>,
@@ -5867,6 +6041,8 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
             let spec = cli.into_spec();
             let replay = resolve_replay_mode(cli_realtime, cli_loop, None, &spec)?;
             return Ok(Resolved {
+                cw_policy: Default::default(),
+                conditioning: Default::default(),
                 spec,
                 replay,
                 freq_correction_ppm: freq_correction_ppm.unwrap_or(0.0),
@@ -5909,9 +6085,12 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
                     bail!("[[input]] {} has no type", fmt::quoted(&n.name));
                 };
                 Ok(ResolvedInput {
+                    cw_policy: n.input.shared.cw_policy.clone(),
                     name: n.name.clone(),
+                    digital_modes: n.input.shared.digital_modes.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),
+                    conditioning: n.input.shared.conditioning(),
                     dial_freq_hz: n.input.shared.center_freq_hz,
                     capture_rate_hz: n.input.shared.capture_rate_hz,
                     record_iq: n.input.shared.record_iq.clone(),
@@ -5948,6 +6127,8 @@ fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Resolved> {
     };
     let replay = resolve_replay_mode(cli_realtime, cli_loop, file_replay, &spec)?;
     Ok(Resolved {
+        cw_policy: shared.cw_policy.clone(),
+        conditioning: shared.conditioning(),
         spec,
         replay,
         freq_correction_ppm: freq_correction_ppm
@@ -6374,6 +6555,61 @@ fn prepare_config_for(
         loaded.detector,
         decode.engine,
     )?;
+    pipeline.conditioning = resolved.conditioning.clone();
+    pipeline.cw_policy = resolved.cw_policy.clone();
+    pipeline.cw_clock = if resolved.spec.is_reconnectable()
+        || !matches!(resolved.spec, LiveSourceSpec::File { .. })
+    {
+        manta_engine::cw_segments::Clock::Live
+    } else {
+        manta_engine::cw_segments::Clock::Samples
+    };
+    if let LiveSourceSpec::File { ref path, .. } = resolved.spec {
+        (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = cw_replay_epoch(
+            path,
+            resolved.replay_epoch,
+            pipeline.cw_policy.scheduled()
+                || resolved.inputs.iter().any(|i| i.cw_policy.scheduled()),
+            loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+        )?;
+    }
+    // Every input's pipeline shares `pipeline`'s epoch (`listen_inputs`
+    // replaces only policy and clock), so scheduled native recordings must
+    // agree on their start; differing ones would run another recording's
+    // schedule against the wrong UTC.
+    let mut shared_epoch = matches!(resolved.spec, LiveSourceSpec::File { .. }).then(|| {
+        (
+            pipeline.cw_epoch,
+            pipeline.cw_epoch_nanoseconds,
+            String::from("[input]"),
+        )
+    });
+    for input in &resolved.inputs {
+        if let LiveSourceSpec::File { ref path, .. } = input.spec {
+            let epoch = cw_replay_epoch(
+                path,
+                resolved.replay_epoch,
+                input.cw_policy.scheduled(),
+                &input.name,
+            )?;
+            if !input.cw_policy.scheduled() || resolved.replay_epoch.is_some() {
+                continue;
+            }
+            match &shared_epoch {
+                None => {
+                    (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = epoch;
+                    shared_epoch = Some((epoch.0, epoch.1, input.name.clone()));
+                }
+                Some((secs, nanos, first)) if (*secs, *nanos) != epoch => bail!(
+                    "inputs {} and {} are recordings with different start times; a scheduled \
+                     replay applies one epoch to every input: set replay_epoch",
+                    fmt::quoted(first),
+                    fmt::quoted(&input.name)
+                ),
+                Some(_) => {}
+            }
+        }
+    }
     pipeline.decode = decode;
     attach_language_prior(&mut pipeline, &resolved.spot, None)?;
     Ok(Prepared {
@@ -7081,11 +7317,59 @@ fn run_command() -> Result<std::process::ExitCode> {
                     path.display()
                 );
             }
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| n.input.shared.cw_policy != loaded.inputs[0].input.shared.cw_policy)
+            {
+                bail!("manta decode cannot choose between inputs with different CW coverage in {}: use a config containing only the recording's input",loaded.origin);
+            }
+            // MAN-496: the conditioning keys follow the ppm rule: a
+            // recording came from one receiver, so entries that disagree
+            // are ambiguous, never silently the first one's.
+            let cond_of = |n: &config::NamedInput| {
+                let c = n.input.shared.conditioning();
+                (c.dc, c.impulse)
+            };
+            let conditioning = loaded.inputs[0].input.shared.conditioning();
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| cond_of(n) != cond_of(&loaded.inputs[0]))
+            {
+                let names: Vec<&str> = loaded.inputs.iter().map(|n| n.name.as_str()).collect();
+                bail!(
+                    "manta decode cannot tell which of {}'s {} inputs ({}) recorded {}: set \
+                     dc_block and impulse_suppress alike in every [[input]] entry",
+                    loaded.origin,
+                    names.len(),
+                    names.join(", "),
+                    path.display()
+                );
+            }
             let shared = &loaded.input.shared;
+            if several
+                && loaded
+                    .inputs
+                    .iter()
+                    .any(|n| n.input.shared.conditioning != shared.conditioning)
+            {
+                bail!(
+                    "manta decode cannot tell which input recorded {}: the [[input]] entries have conflicting IQ conditioning; supply a config for the recording's receiver",
+                    path.display()
+                );
+            }
             if several {
                 errln!(
-                    "note: decode applies only freq_correction_ppm from the {} [[input]] entries \
-                     in {}",
+                    "note: decode applies freq_correction_ppm and dc_block, impulse_suppress and IQ \
+                     conditioning{} from the {} [[input]] entries in {}",
+                    if shared.cw_policy == Default::default() {
+                        ""
+                    } else {
+                        " and CW coverage"
+                    },
                     loaded.inputs.len(),
                     loaded.origin
                 );
@@ -7093,9 +7377,17 @@ fn run_command() -> Result<std::process::ExitCode> {
                 || shared.center_freq_hz.is_some()
                 || shared.capture_rate_hz.is_some()
                 || shared.replay_epoch.is_some()
+                || shared.dc_block.is_some()
+                || shared.impulse_suppress.is_some()
             {
                 errln!(
-                    "note: decode applies only input.freq_correction_ppm from [input] in {}",
+                    "note: decode applies input.freq_correction_ppm and dc_block, impulse_suppress \
+                     and IQ conditioning{} from [input] in {}",
+                    if shared.cw_policy == Default::default() {
+                        ""
+                    } else {
+                        " and CW coverage"
+                    },
                     loaded.origin
                 );
             }
@@ -7126,6 +7418,14 @@ fn run_command() -> Result<std::process::ExitCode> {
                 decode_cfg.engine,
             )?;
             note_pinned_lists(&spot, &lists_in_use);
+            cfg.conditioning = conditioning;
+            cfg.cw_policy = loaded.input.shared.cw_policy.clone();
+            (cfg.cw_epoch, cfg.cw_epoch_nanoseconds) = cw_replay_epoch(
+                &path,
+                loaded.input.shared.replay_epoch,
+                cfg.cw_policy.scheduled(),
+                loaded.inputs.first().map_or("file", |i| i.name.as_str()),
+            )?;
             cfg.decode = decode_cfg;
             attach_language_prior(&mut cfg, &spot, None)?;
             // MAN-207: the observation file is created before decoding, so an
@@ -7631,7 +7931,17 @@ fn run_command() -> Result<std::process::ExitCode> {
                 reload::mask_sighup(libc::SIG_BLOCK)
                     .context("blocking SIGHUP on the decode thread")?;
             }
+            let opening_at = std::time::SystemTime::now();
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
+            let acquired_at = opening_at + first.acquisition_start_offset();
+            let iq_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let iq_name = spectrum_input.to_string();
+            warn_iq_mismatch(
+                &cfg.conditioning,
+                first.center_freq_hz(),
+                Some(&iq_name),
+                &iq_warned,
+            );
             let replay_epoch = resolved.replay_epoch;
             // MAN-312 (SPEC §2.7): read here, while `first` is in hand;
             // logged just before decoding starts (below).
@@ -7733,6 +8043,36 @@ fn run_command() -> Result<std::process::ExitCode> {
             } else {
                 None
             };
+            // Coverage is reported before the server's listening banner.
+            let digital_modes = if resolved.replaced_file_source.is_none() {
+                loaded.input.shared.digital_modes.as_slice()
+            } else {
+                &[]
+            };
+            let ftx = (!digital_modes.is_empty()).then(|| {
+                std::sync::Arc::new(ftx_run::Session::new(vec![(
+                    source_name.to_string(),
+                    resolved.freq_correction_ppm,
+                )]))
+            });
+            if ftx.is_some() {
+                let (windows, lines) = ftx_run::plan(
+                    source_name,
+                    digital_modes,
+                    first.center_freq_hz(),
+                    first.rf_passband_hz(),
+                    first.trusted_band_hz(),
+                    first.sample_rate(),
+                );
+                for line in lines {
+                    logging::note(&line);
+                }
+                if replay_path.is_none() && !windows.is_empty() {
+                    if let Some(line) = ftx_run::clock_line(clock_check::kernel_synced()) {
+                        logging::note(&line);
+                    }
+                }
+            }
             let (
                 server_runtime,
                 spot_server,
@@ -7979,10 +8319,15 @@ fn run_command() -> Result<std::process::ExitCode> {
                     active_tracks.clone(),
                 );
                 let reopen_spec = spec.clone();
+                let iq_cfg = cfg.conditioning.clone();
                 let wrapped = ReconnectingSource::new(
                     name,
                     first,
-                    Box::new(move || reopen_spec.open(capture_rate_hz, dial_freq_hz)),
+                    Box::new(move || {
+                        let src = reopen_spec.open(capture_rate_hz, dial_freq_hz)?;
+                        warn_iq_mismatch(&iq_cfg, src.center_freq_hz(), Some(&iq_name), &iq_warned);
+                        Ok(src)
+                    }),
                     stop.clone(),
                     initial_healthy,
                     on_health,
@@ -8117,6 +8462,20 @@ fn run_command() -> Result<std::process::ExitCode> {
                 }
                 None => (src, None),
             };
+            let src = if let Some(ftx) = &ftx {
+                if let Some(server) = &spot_server {
+                    ftx.bind(server.bus.clone(), server.metrics.clone());
+                }
+                ftx.wrap(
+                    0,
+                    src,
+                    resolve_ftx_epoch(spec, replay_epoch, acquired_at)?,
+                    digital_modes,
+                    replay_path.is_none(),
+                )
+            } else {
+                src
+            };
             // Captured before `src` is moved into the pipeline, for the
             // readiness event below.
             let source_sample_rate_hz = src.sample_rate();
@@ -8154,8 +8513,20 @@ fn run_command() -> Result<std::process::ExitCode> {
             // it is published at 0 from startup.
             let bad_samples = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let mut bad_samples_warned: u64 = 0;
+            cfg.conditioning = if resolved.replaced_file_source.is_some() {
+                Default::default()
+            } else {
+                loaded.input.shared.conditioning()
+            };
+            let conditioned = std::sync::Arc::new(manta_engine::ConditioningObserver::default());
             if let Some(server) = &spot_server {
                 server.metrics.set_input_bad_samples(source_name, 0);
+                publish_conditioned(
+                    &server.metrics,
+                    source_name,
+                    &cfg.conditioning,
+                    &conditioned,
+                );
             }
             // MAN-314: the engine's marked RTTY set, logged on change and
             // copied into `manta_rtty_signals` from the per-batch callback.
@@ -8188,6 +8559,10 @@ fn run_command() -> Result<std::process::ExitCode> {
                     callsign_lookup,
                     static_crashes: Some(static_crashes.clone()),
                     bad_samples: Some(bad_samples.clone()),
+                    conditioned: Some(conditioned.clone()),
+                    // MAN-495: the full-report observer is doctor's; the
+                    // daemon's metric reads the counts observer above.
+                    conditioning_report: None,
                     rtty: Some(rtty_observer.clone()),
                     // MAN-324: only with a live-state listener.
                     live_state: spot_server
@@ -8290,6 +8665,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     }
                     if let Some(server) = &spot_server {
                         server.metrics.set_input_bad_samples(source_name, n_bad);
+                        publish_conditioned(
+                            &server.metrics,
+                            source_name,
+                            &cfg.conditioning,
+                            &conditioned,
+                        );
                     }
                     if let Some(marks_hz) = rtty_log.poll(&rtty_observer) {
                         if let Some(server) = &spot_server {
@@ -8337,6 +8718,9 @@ fn run_command() -> Result<std::process::ExitCode> {
             // reload holds while it applies) and setting `stop` tell the
             // reload thread to ignore SIGHUP instead of flipping `dry_run`
             // mid-drain.
+            if let Some(ftx) = &ftx {
+                ftx.stop();
+            }
             drain_gate.close();
             stop_ready.store(true, std::sync::atomic::Ordering::Relaxed);
             // MAN-309: the source is gone, so the queue is closed; the
@@ -8576,6 +8960,12 @@ fn run_command() -> Result<std::process::ExitCode> {
                     name: input.as_deref(),
                 }),
             )?;
+            let mut cfg = cfg;
+            cfg.conditioning = if resolved.replaced_file_source.is_some() {
+                Default::default()
+            } else {
+                loaded.input.shared.conditioning()
+            };
             if loaded.server.is_some() {
                 errln!(
                     "note: soak does not start the spot servers; ignoring [server] from {}",
@@ -8603,6 +8993,17 @@ fn run_command() -> Result<std::process::ExitCode> {
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);
             let src: Box<dyn IqSource> =
                 spec.open(resolved.capture_rate_hz, resolved.dial_freq_hz)?;
+            warn_iq_mismatch(
+                &cfg.conditioning,
+                src.center_freq_hz(),
+                Some(
+                    loaded
+                        .inputs
+                        .first()
+                        .map_or(spec.name(), |input| input.name.as_str()),
+                ),
+                &std::sync::atomic::AtomicBool::new(false),
+            );
             // MAN-196: the same usable-passband line `run` logs, once,
             // before the soak starts; `Some` only with a decimator in the
             // path. Plain stderr: `soak` installs no tracing subscriber.
@@ -9746,7 +10147,9 @@ mod tests {
             &GEOGRAPHY_CTY_FIXTURE.replace("K,W,N;", "K,W,N,QQ9;"),
             GEOGRAPHY_DXCC_FIXTURE,
         ));
-        let loaded = loaded_from("[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let loaded = loaded_from(
+            "[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
+        );
         let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
@@ -9799,7 +10202,9 @@ mod tests {
     #[test]
     fn published_spot_geography_follows_a_swapped_cty_table() {
         let lists = bundled_reference_lists();
-        let loaded = loaded_from("[server]\nstation_callsign = 'QQ9ZZZ'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n");
+        let loaded = loaded_from(
+            "[server]\nstation_callsign = 'QQ9ZZZ'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
+        );
         let (test_runtime, server) = start_spot_server(
             loaded.server.unwrap(),
             vec![],
@@ -11178,6 +11583,39 @@ mod tests {
             .to_line();
         std::fs::write(manta_input::metadata_path(&path), meta).unwrap();
         path
+    }
+
+    #[test]
+    fn ftx_epoch_preserves_live_acquisition_before_startup_finishes() {
+        let opened =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_792_407_602);
+        let acquired = opened - std::time::Duration::from_millis(1500);
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), Some(123), acquired).unwrap(),
+            acquired
+        );
+    }
+
+    #[test]
+    fn ftx_epoch_uses_each_native_input_and_keeps_live_time_in_a_mixed_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let acquired = std::time::SystemTime::now();
+        for (name, seconds) in [("a.cf32", 1_792_407_600), ("b.cf32", 1_792_407_615)] {
+            let path = native_pair(dir.path(), name, seconds, 0);
+            let spec = LiveSourceSpec::File {
+                path,
+                source_iq: true,
+                raw: None,
+            };
+            assert_eq!(
+                resolve_ftx_epoch(&spec, None, acquired).unwrap(),
+                std::time::UNIX_EPOCH + std::time::Duration::new(seconds as u64, 500)
+            );
+        }
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), None, acquired).unwrap(),
+            acquired
+        );
     }
 
     #[test]
@@ -14321,7 +14759,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             (
                 "spot.scp_sha256",
                 "[spot]\nscp_sha256 = '00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0'\n",
-
             ),
             (
                 "spot.pattern_path",

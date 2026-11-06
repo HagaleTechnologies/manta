@@ -17,6 +17,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
+use manta_input::IqSource;
 use manta_server::metrics::Metrics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -454,6 +455,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // thread after each of its batches, as the one-input path reads one
     // counter; `bad_warned` holds what the one-time warning already named.
     let bad: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let conditioned: Vec<_> = (0..n)
+        .map(|_| Arc::new(manta_engine::ConditioningObserver::default()))
+        .collect();
     let bad_warned: Vec<std::cell::Cell<u64>> = (0..n).map(|_| std::cell::Cell::new(0)).collect();
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
@@ -502,6 +506,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 },
             )
         });
+    let ftx = m
+        .inputs
+        .iter()
+        .any(|i| !i.digital_modes.is_empty())
+        .then(|| {
+            Arc::new(crate::ftx_run::Session::new(
+                m.inputs
+                    .iter()
+                    .map(|i| (i.name.clone(), i.freq_correction_ppm))
+                    .collect(),
+            ))
+        });
     let specs = m
         .inputs
         .iter()
@@ -509,6 +525,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .zip(grouped)
         .map(|((index, input), grouped)| {
             let spec = input.spec.clone();
+            let ftx_spec = input.spec.clone();
+            let ftx = ftx.clone();
+            let digital_modes = input.digital_modes.clone();
+            let input_live = input.spec.is_reconnectable();
             let (capture, dial) = (input.capture_rate_hz, input.dial_freq_hz);
             let record_iq = input.record_iq.clone();
             let recordings = recordings.clone();
@@ -526,13 +546,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             };
             let input_counters = input_counters.clone();
             let bad = bad[index].clone();
+            let iq_cfg = input.conditioning.clone();
+            let iq_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
             InputSpec {
+                cw_policy: input.cw_policy.clone(),
+                conditioning: input.conditioning.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
                     bad_samples: Some(bad),
+                    conditioned: Some(conditioned[index].clone()),
                     rtty: Some(rtty_observers[index].clone()),
                     spectrum: spectrum_late[index]
                         .clone()
@@ -541,7 +566,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 },
                 open: Box::new(move || {
                     let record_stop = stop.clone();
-                    let src = (move || -> Result<Box<dyn manta_input::IqSource>> {
+                    let (src, acquired_at) = (move || -> Result<(Box<dyn manta_input::IqSource>, std::time::SystemTime)> {
                         if let Some(member) = grouped {
                             let source = member.open()?;
                             // A member claimed after its siblings has still been
@@ -552,9 +577,24 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = source.input_health();
                             }
-                            return Ok(Box::new(source) as Box<dyn manta_input::IqSource>);
+                            crate::warn_iq_mismatch(
+                                &iq_cfg,
+                                source.center_freq_hz(),
+                                Some(&name),
+                                &iq_warned,
+                            );
+                            let acquired_at = std::time::SystemTime::now() - source.acquired_at().elapsed();
+                            return Ok((Box::new(source) as Box<dyn manta_input::IqSource>, acquired_at));
                         }
+                        let opening_at = std::time::SystemTime::now();
                         let first = spec.open(capture, dial)?;
+                        let acquired_at = opening_at + first.acquisition_start_offset();
+                        crate::warn_iq_mismatch(
+                            &iq_cfg,
+                            first.center_freq_hz(),
+                            Some(&name),
+                            &iq_warned,
+                        );
                         if let Ok(mut at) = opened_at.lock() {
                             at[index] = Some(Instant::now());
                         }
@@ -564,10 +604,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             // is live (Kiwi, ka9q) is healthy once it has.
                             let initial_healthy = first.confirmed_live_handle().is_none();
                             let on_health = input_health_sink(index, name.clone(), health);
+                            let iq_name = name.clone();
                             let wrapped = ReconnectingSource::new(
                                 name,
                                 first,
-                                Box::new(move || reopen.open(capture, dial)),
+                                Box::new(move || {
+                                    let src = reopen.open(capture, dial)?;
+                                    crate::warn_iq_mismatch(
+                                        &iq_cfg,
+                                        src.center_freq_hz(),
+                                        Some(&iq_name),
+                                        &iq_warned,
+                                    );
+                                    Ok(src)
+                                }),
                                 stop,
                                 initial_healthy,
                                 on_health,
@@ -575,7 +625,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = wrapped.input_health();
                             }
-                            Ok(Box::new(wrapped) as Box<dyn manta_input::IqSource>)
+                            Ok((Box::new(wrapped) as Box<dyn manta_input::IqSource>, acquired_at))
                         } else {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = InputHealthTotals::for_source(first.as_ref());
@@ -584,7 +634,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                 LiveSourceSpec::File { path, .. } => path.display().to_string(),
                                 _ => String::new(),
                             };
-                            wrap_file_replay(
+                            let src = wrap_file_replay(
                                 first,
                                 replay,
                                 label,
@@ -593,37 +643,63 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                         as Box<dyn manta_input::IqSource>)
                                 }),
                                 stop,
-                            )
+                            )?;
+                            Ok((src, acquired_at))
                         }
                     })()?;
-                    // MAN-309: this input's recording wraps exactly what it
-                    // hands the engine; a replay starts at its own epoch.
-                    let Some(path) = &record_iq else {
-                        return Ok(src);
+                    // Recordings keep their session epoch. FTx slots use this
+                    // input's own file metadata or live sample-zero instant.
+                    let ftx_epoch = if digital_modes.is_empty() {
+                        None
+                    } else {
+                        Some(crate::resolve_ftx_epoch(&ftx_spec, replay_epoch, acquired_at)?)
                     };
-                    // The session's epoch, as the spot clock uses: the first
-                    // file's (or --replay-epoch) for a replay, now for live.
-                    let start = crate::resolve_epoch(session_file.as_deref(), replay_epoch)?;
-                    // Created under the lock, so a startup that already
-                    // failed (and took the handles) is never recorded to.
-                    let mut slots = recordings.lock().unwrap_or_else(PoisonError::into_inner);
-                    let Some(slots) = slots.as_mut() else {
-                        bail!(
-                            "startup failed elsewhere; not recording to {}",
-                            path.display()
-                        );
+                    let start = if record_iq.is_some() {
+                        Some(crate::resolve_epoch(session_file.as_deref(), replay_epoch)?)
+                    } else {
+                        None
                     };
-                    let (src, handle) =
-                        crate::start_input_recording(src, path, start, record_stop)?;
-                    slots[index] = Some(handle);
-                    Ok(src)
+                    let src = if let Some(path) = &record_iq {
+                        let mut slots = recordings.lock().unwrap_or_else(PoisonError::into_inner);
+                        let Some(slots) = slots.as_mut() else {
+                            bail!(
+                                "startup failed elsewhere; not recording to {}",
+                                path.display()
+                            );
+                        };
+                        let (src, handle) = crate::start_input_recording(
+                            src,
+                            path,
+                            start.expect("recording epoch"),
+                            record_stop,
+                        )?;
+                        slots[index] = Some(handle);
+                        src
+                    } else {
+                        src
+                    };
+                    Ok(if let Some(ftx) = &ftx {
+                        if digital_modes.is_empty() {
+                            src
+                        } else {
+                            ftx.wrap(
+                                index,
+                                src,
+                                ftx_epoch.expect("FTx epoch"),
+                                &digital_modes,
+                                input_live,
+                            )
+                        }
+                    } else {
+                        src
+                    })
                 }),
             }
         })
         .collect();
 
     let opened = manta_engine::open_inputs(specs, stop.clone())?;
-    for (input, resolved) in opened.inputs().iter().zip(m.inputs) {
+    for (index, (input, resolved)) in opened.inputs().iter().zip(m.inputs).enumerate() {
         tracing::info!(
             "{}",
             manta_server::status::format_input_line(
@@ -646,6 +722,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         // own side of the split.
         if let Some(line) = spawn_band_line(input) {
             tracing::info!("{line}");
+        }
+        if let Some(ftx) = &ftx {
+            for line in ftx.lines(index) {
+                logging::note(&line);
+            }
         }
     }
     let clock = if live {
@@ -800,13 +881,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             // Health edges from here on reach `Metrics` directly; each
             // input's state so far is copied in once.
             let _ = metrics_slot.set(server.metrics.clone());
-            for (name, up) in names.iter().zip(healthy.iter()) {
+            for (index, (name, up)) in names.iter().zip(healthy.iter()).enumerate() {
                 server
                     .metrics
                     .set_source_health(name, up.load(Ordering::Relaxed));
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    name,
+                    &m.inputs[index].conditioning,
+                    &conditioned[index],
+                );
             }
             // MAN-14: every input's hearing series, at 0, in config order.
             server.metrics.register_input_hearing(&names);
@@ -914,6 +1001,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             spectrum_threads.push(thread);
         }
     }
+    if let (Some(ftx), Some((_, server))) = (&ftx, &server) {
+        ftx.bind(server.bus.clone(), server.metrics.clone());
+    }
     // Only the engine's observers hold the feeds now, so each sender thread
     // ends when `listen_inputs` drops them.
     drop(spectrum_late);
@@ -996,6 +1086,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_input_bad_samples(&names[input], n_bad);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    &names[input],
+                    &m.inputs[input].conditioning,
+                    &conditioned[input],
+                );
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
@@ -1015,6 +1111,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
         },
         |end| {
+            if let Some(ftx) = &ftx {
+                ftx.input_ended(end.index);
+            }
             if let Some((_, server)) = &server {
                 retire_input_gauges(&server.metrics, end.index, &tracks, &rtty_marks);
                 let stopping = stop_end.load(Ordering::Relaxed);
@@ -1040,6 +1139,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         },
     )?;
     // MAN-78 D7: draining from here on; a later SIGHUP is ignored.
+    if let Some(ftx) = &ftx {
+        ftx.stop();
+    }
     drain_gate.close();
     stop_ready.store(true, Ordering::Relaxed);
     // MAN-309: every input has ended, so every queue is closed; the writers
@@ -1294,7 +1396,10 @@ mod tests {
     #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
+            cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "b".into(),
+            digital_modes: Vec::new(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,
             dial_freq_hz: None,

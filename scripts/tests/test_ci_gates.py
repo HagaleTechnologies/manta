@@ -41,7 +41,7 @@ def steps_running(job_lines, command):
 
 class RustdocGateTests(unittest.TestCase):
     def setUp(self):
-        self.test_job = wf.job_block(wf.read("ci-full.yml"), "test")
+        self.test_job = wf.job_block(wf.read("ci-full.yml"), "ubuntu-support")
 
     def test_test_job_builds_docs_with_warnings_denied(self):
         found = steps_running(self.test_job, "cargo doc --no-deps --workspace --locked")
@@ -54,7 +54,7 @@ class RustdocGateTests(unittest.TestCase):
         doc = next(i for i, s in enumerate(all_steps)
                    if (wf.run_body(s) or "").strip() == "cargo doc --no-deps --workspace --locked")
         tests = next(i for i, s in enumerate(all_steps)
-                     if (wf.run_body(s) or "").strip() == "cargo test --workspace --locked")
+                     if (wf.run_body(s) or "").strip() == "cargo test --workspace --doc --locked")
         self.assertLess(doc, tests)
 
     def test_this_module_runs_in_the_required_test_job(self):
@@ -75,7 +75,7 @@ class FieldNodeTestsGateTests(unittest.TestCase):
     """MAN-445: field-node tests must fail the required Unix test checks."""
 
     def setUp(self):
-        self.test_job = wf.job_block(wf.read("ci-full.yml"), "test")
+        self.test_job = wf.job_block(wf.read("ci-full.yml"), "ubuntu-support")
 
     def test_field_node_tests_run_in_the_required_test_job_on_unix(self):
         found = steps_running(self.test_job, "python3 -m unittest scripts.tests.test_field_node -v")
@@ -99,7 +99,7 @@ class VerifierTestsGateTests(unittest.TestCase):
     Python dependabot-auto-merge.yml runs the verifier with."""
 
     def setUp(self):
-        self.test_job = wf.job_block(wf.read("ci-full.yml"), "test")
+        self.test_job = wf.job_block(wf.read("ci-full.yml"), "ubuntu-support")
         self.verify_job = wf.job_block(wf.read("dependabot-auto-merge.yml"), "verify")
 
     def test_verifier_tests_run_in_the_required_test_job_on_linux(self):
@@ -240,7 +240,7 @@ class WindowsVisibilityTests(unittest.TestCase):
         self.text = wf.read("ci-full.yml")
 
     def test_windows_stays_in_the_test_matrix(self):
-        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]",
+        self.assertIn("os: [windows-latest]",
                       "\n".join(wf.job_block(self.text, "test")))
 
     def test_create_ci_check_mints_the_windows_check_run(self):
@@ -1044,5 +1044,87 @@ class MainAlertWatchTests(unittest.TestCase):
         self.assertEqual([w for w in watched if w not in names], [])
 
 
-if __name__ == "__main__":
+class ShardedRequiredChecksTests(unittest.TestCase):
+    def test_unix_graph_is_complete_and_independent(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            aggregate = wf.job_block(text, f'{platform}-aggregate')
+            self.assertEqual(wf.field(aggregate, 'name'), f'test ({platform}-latest)')
+            self.assertEqual(wf.field(aggregate, 'needs'), f'[{platform}-support, {platform}-shards]')
+            self.assertIn('always() &&', wf.field(aggregate, 'if'))
+            self.assertIn('github.event.pull_request.head.repo.full_name != github.repository', wf.field(aggregate, 'if'))
+            shards = wf.job_block(text, f'{platform}-shards')
+            self.assertIn('shard: [0, 1, 2, 3, 4, 5, 6, 7]', '\n'.join(shards))
+            self.assertIn('fail-fast: false', '\n'.join(shards))
+            self.assertNotIn('max-parallel', '\n'.join(shards))
+            self.assertEqual(wf.field(shards, 'timeout-minutes'), '35')
+            self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '') for s in wf.steps(shards)))
+            upload = next(s for s in wf.steps(shards) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or ''))
+            self.assertEqual(wf.field(upload, 'if'), 'always()')
+            support = wf.job_block(text, f'{platform}-support')
+            self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
+            self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v')), 1)
+        relay = wf.job_block(text, 'relay-check-runs')
+        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, test, ubuntu-aggregate, macos-aggregate]')
+
+    def test_aggregate_verdict_fails_closed(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            aggregate = wf.job_block(text, f'{platform}-aggregate')
+            body = wf.run_body(wf.steps(aggregate)[0])
+            for shard, support, expected in [('success', 'success', 0), ('failure', 'success', 1),
+                                             ('cancelled', 'success', 1), ('skipped', 'success', 1),
+                                             ('success', 'failure', 1), (None, 'success', 1)]:
+                results = {f'{platform}-support': {'result': support}}
+                if shard:
+                    results[f'{platform}-shards'] = {'result': shard}
+                proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
+                self.assertEqual(proc.returncode, expected, proc.stderr)
+
+    def test_relay_uses_independent_actual_job_results(self):
+        relay = wf.job_block(wf.read('ci-full.yml'), 'relay-check-runs')
+        body = wf.run_body(wf.steps(relay)[-1]).replace('${{ github.run_id }}', '123')
+        for mac in ('failure', 'cancelled', 'skipped', None):
+            with tempfile.TemporaryDirectory() as tmp:
+                stub = os.path.join(tmp, 'gh')
+                with open(stub, 'w') as f:
+                    f.write('#!/usr/bin/env python3\nimport os,sys\n'
+                            'if "--paginate" in sys.argv: print(os.environ["JOBS"])\n'
+                            'else:\n with open(os.environ["CALLS"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
+                os.chmod(stub, 0o755)
+                results = [{'name': CHECKS[0], 'conclusion': 'success'},
+                           {'name': CHECKS[2], 'conclusion': 'success'}]
+                if mac is not None:
+                    results.append({'name': CHECKS[1], 'conclusion': mac})
+                calls = os.path.join(tmp, 'calls')
+                env = {**os.environ, 'PATH': tmp+os.pathsep+os.environ['PATH'], 'CALLS': calls,
+                       'JOBS': json.dumps({'jobs': results}), 'REPO': 'o/r', 'APP_TOKEN': 'stub',
+                       'UBUNTU_CHECK_ID': '11', 'MACOS_CHECK_ID': '12', 'WINDOWS_CHECK_ID': '13'}
+                proc = subprocess.run(['bash', '-e', '-c', body], env=env, capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                with open(calls) as f:
+                    written = f.read().splitlines()
+                self.assertIn('conclusion=success', written[0])
+                self.assertIn('check-runs/11', written[0])
+                self.assertIn(f'conclusion={mac or "failure"}', written[1])
+                self.assertIn('check-runs/12', written[1])
+                self.assertIn('conclusion=success', written[2])
+
+    def test_every_unix_command_has_a_required_home(self):
+        text = wf.read('ci-full.yml')
+        # Windows retains the old commands and conditions. Both Unix supports retain the
+        # same steps except the serial suite, replaced by shards plus explicit doctests.
+        reference = wf.job_block(text, 'test')
+        for platform in ('ubuntu', 'macos'):
+            support = wf.job_block(text, f'{platform}-support')
+            for step in wf.steps(reference):
+                command = (wf.run_body(step) or '').strip()
+                if not command or command == 'cargo test --workspace --locked':
+                    continue
+                matches = steps_running(support, command)
+                self.assertEqual(len(matches), 1, command)
+                self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
+
+
+if __name__ == '__main__':
     unittest.main()

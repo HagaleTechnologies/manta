@@ -222,6 +222,12 @@ fn diff_values(
     if is_reloadable(&path) {
         return;
     }
+    // MAN-30: absent coverage is unrestricted, whereas [] pauses CW.
+    // The generic array comparison treats absent and empty as equivalent.
+    if path.ends_with(".cw_segments_hz") && old.is_none() != new.is_none() {
+        out.insert(path);
+        return;
+    }
     let empty_table = toml::Table::new();
     let empty_array: Vec<Value> = Vec::new();
     match (old, new) {
@@ -457,6 +463,22 @@ blocklist_path = \"bl.txt\"
             .iter()
             .map(|u| u.flag.load(Ordering::Relaxed))
             .collect()
+    }
+
+    #[test]
+    fn iq_keys_are_restart_only() {
+        let old: toml::Table = toml::from_str("[input]\niq_correction = \"off\"\n").unwrap();
+        let new: toml::Table = toml::from_str("[input]\niq_correction = \"apply\"\niq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n").unwrap();
+        let keys = restart_only_changes(&old, &new);
+        assert_eq!(
+            keys,
+            vec![
+                "input.iq_calibrated_center_hz",
+                "input.iq_correction",
+                "input.iq_gain_ratio",
+                "input.iq_phase_deg"
+            ]
+        );
     }
 
     #[test]
@@ -889,6 +911,28 @@ blocklist_path = \"bl.txt\"
         assert_eq!(report.restart_needed, vec!["skimmer_relay[0].callsign"]);
     }
 
+    #[test]
+    fn cw_segments_schedule_edits_are_restart_only_and_invalid_reload_keeps_state() {
+        assert_eq!(
+            restart_only_changes(&table(""), &table("[input]\ncw_segments_hz = []\n")),
+            vec!["input.cw_segments_hz"]
+        );
+
+        let original=format!("{BASE}\n[input]\ncw_segments_hz = [[14000000,14030000]]\n[[input.cw_schedule]]\nat_utc = '06:00'\nsegments_hz = []\n");
+        let f = start(&original, CliOverrides::none());
+        let changed = original.replace("06:00", "18:00");
+        write(&f.path("manta.toml"), &changed);
+        let report = applied(&f.ctx);
+        assert!(report
+            .restart_needed
+            .iter()
+            .any(|k| k.contains("cw_schedule")));
+        assert_eq!(f.ctx.startup_raw, table(&original));
+        write(&f.path("manta.toml"), &original.replace("06:00", "25:00"));
+        assert!(reload_once(&f.ctx).is_err());
+        assert_eq!(f.ctx.startup_raw, table(&original));
+    }
+
     /// MAN-310: a band plan decides which streams are open, so it is
     /// restart-only like every other `input.*` key.
     #[test]
@@ -966,7 +1010,9 @@ blocklist_path = \"bl.txt\"
     #[test]
     fn restart_only_changes_reports_cty_and_scp_paths() {
         let old = table("[spot]\ncty_path = \"/a/cty.dat\"\nblocklist_path = \"bl.txt\"\n");
-        let new = table("[spot]\ncty_path = \"/b/cty.dat\"\nscp_path = \"/b/master.scp\"\nblocklist_path = \"other.txt\"\n");
+        let new = table(
+            "[spot]\ncty_path = \"/b/cty.dat\"\nscp_path = \"/b/master.scp\"\nblocklist_path = \"other.txt\"\n",
+        );
         assert_eq!(
             restart_only_changes(&old, &new),
             vec!["spot.cty_path", "spot.scp_path"]
@@ -1007,6 +1053,14 @@ blocklist_path = \"bl.txt\"
             assert!(!is_reloadable(&format!("spot.{key}")), "{key}");
         }
         assert!(is_reloadable("spot.allowlist"));
+    }
+
+    /// MAN-496: the `[input]` conditioning keys are restart-only, like
+    /// every other `[input]` key (only the four D6 leaf paths reload).
+    #[test]
+    fn conditioning_keys_are_restart_only() {
+        assert!(!is_reloadable("input.dc_block"));
+        assert!(!is_reloadable("input.impulse_suppress"));
     }
 
     #[test]

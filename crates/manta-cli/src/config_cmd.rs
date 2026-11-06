@@ -764,6 +764,19 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             "freq_correction_ppm",
             shared.freq_correction_ppm.map(|v| v.to_string()),
         ),
+        // MAN-496: only when set, so every existing summary is unchanged.
+        (
+            "dc_block",
+            shared
+                .dc_block
+                .map(|m| crate::config::stage_mode_str(m).to_string()),
+        ),
+        (
+            "impulse_suppress",
+            shared
+                .impulse_suppress
+                .map(|m| crate::config::stage_mode_str(m).to_string()),
+        ),
         (
             "center_freq_hz",
             shared.center_freq_hz.map(|v| v.to_string()),
@@ -1027,6 +1040,21 @@ mod tests {
     }
 
     // ---- Phase 2: the summary and notes
+
+    /// MAN-496: a set conditioning stage prints in the input summary; an
+    /// all-off config's line is unchanged.
+    #[test]
+    fn conditioning_stages_print_in_the_input_summary_when_set() {
+        let set = lines_of(
+            "[input]\ntype = \"audio\"\ndc_block = \"apply\"\nimpulse_suppress = \"observe\"\n",
+        );
+        assert_eq!(
+            line(&set, "input:"),
+            "input: type=audio device=default dc_block=apply impulse_suppress=observe"
+        );
+        let off = lines_of("[input]\ntype = \"audio\"\n");
+        assert_eq!(line(&off, "input:"), "input: type=audio device=default");
+    }
 
     #[test]
     fn server_listeners_includes_live_only_when_live_port_is_set() {
@@ -1876,7 +1904,10 @@ mod tests {
              scp_url = \"http://mirror.lan:8080/MASTER.SCP\"\n",
         );
         assert!(
-            has(&n, "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"),
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"
+            ),
             "{n:?}"
         );
         let n = notes_of(
@@ -2071,6 +2102,9 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("input", "iq_gain_ratio"),
+        ("input", "iq_phase_deg"),
+        ("input", "iq_calibrated_center_hz"),
         ("server", "live_port"),
         ("server", "rtty_telnet_port"),
         ("server", "station_callsign"),
@@ -2104,6 +2138,7 @@ mod tests {
         ("input", "ssrc"),
         ("input", "interface"),
         ("input", "center_freq_hz"),
+        ("input", "cw_segments_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
@@ -2135,6 +2170,10 @@ mod tests {
         ("server", "json_max_pings_per_ip"),
         ("server", "metrics_max_requests_per_ip"),
         ("input", "freq_correction_ppm"),
+        // MAN-496: a written "off" loads as Some(Off), the builtin default
+        // over an absent key, exactly like freq_correction_ppm's 0.0.
+        ("input", "dc_block"),
+        ("input", "impulse_suppress"),
         ("spot", "cty_url"),
         ("spot", "scp_url"),
     ];
