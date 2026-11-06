@@ -12,16 +12,16 @@
 //! of the channelizer, so an A/B comparison is a re-decode of the same file
 //! with a different config.
 //!
-//! The chain runs short-impulse suppression ([`impulse`]) and then DC
-//! removal ([`dc`]). The IQ-imbalance stage from the MAN-203 plan is a
-//! follow-up; it has no mode here, so nothing can be configured that this
-//! module ignores. An applying impulse stage holds back
+//! The chain runs short-impulse suppression ([`impulse`]), DC removal
+//! ([`dc`]), tone measurement, then calibrated IQ correction ([`iq`]).
+//! An applying impulse stage holds back
 //! [`impulse::IMPULSE_LOOKAHEAD`] samples, so [`InputConditioner::condition`]
 //! returns how many samples are final and the channelizer forms hops only
 //! from those.
 
 pub mod dc;
 pub mod impulse;
+pub mod iq;
 
 use num_complex::{Complex32, Complex64};
 use std::collections::VecDeque;
@@ -40,7 +40,7 @@ pub enum StageMode {
 
 /// Which conditioning stages run, and how. The default turns every stage
 /// off.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConditioningConfig {
     /// Short-impulse suppression: repair isolated runs of up to
     /// [`impulse::IMPULSE_MAX_RUN`] samples; longer bursts are never
@@ -49,13 +49,53 @@ pub struct ConditioningConfig {
     /// DC removal: a 5 Hz first-order high-pass at the centre frequency
     /// ([`dc::DC_CORNER_HZ`]).
     pub dc: StageMode,
+    /// Calibrated IQ correction, or conservative mirror observation.
+    pub iq: StageMode,
+    /// Controlled-tone calibration for this receiver and centre frequency.
+    pub iq_calibration: Option<iq::IqCalibration>,
+    /// Declared calibration-tone offset, measured before correction.
+    pub iq_tone_hz: Option<f64>,
 }
 
 impl ConditioningConfig {
     /// True when every stage is off, so no conditioner is built.
     pub fn is_off(&self) -> bool {
-        self.impulse == StageMode::Off && self.dc == StageMode::Off
+        self.impulse == StageMode::Off && self.dc == StageMode::Off && self.iq == StageMode::Off
     }
+
+    /// The impulse and DC stages with every non-`apply` mode forced to
+    /// [`StageMode::Observe`] (`Off` becomes `Observe`; `Apply` stays
+    /// `Apply`); any other stage this struct gains later keeps its
+    /// configured mode, so that stage's observation surface lands with
+    /// its own ticket. Built by cloning and overwriting the two fields
+    /// (never an exhaustive literal), so a sibling ticket adding a stage
+    /// does not break the build. What a diagnostic command runs so it
+    /// measures while never writing a sample the operator did not ask to
+    /// have corrected (MAN-203: doctor observes the impulse and DC
+    /// stages).
+    pub fn observing(&self) -> Self {
+        let force = |mode: StageMode| match mode {
+            StageMode::Off | StageMode::Observe => StageMode::Observe,
+            StageMode::Apply => StageMode::Apply,
+        };
+        let mut observed = self.clone();
+        observed.impulse = force(self.impulse);
+        observed.dc = force(self.dc);
+        observed
+    }
+}
+
+/// IQ correction authorization, frozen at stream construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IqStatus {
+    /// No IQ work requested.
+    Off,
+    /// Evidence only; samples are unchanged.
+    Observing,
+    /// Valid calibration at a matching receiver centre.
+    Correcting,
+    /// Requested correction withheld, including invalid or absent calibration.
+    CalibrationMismatch,
 }
 
 /// A conditioning stage, for span and counter labels.
@@ -65,11 +105,13 @@ pub enum Stage {
     Impulse,
     /// DC removal ([`dc`]).
     Dc,
+    /// IQ imbalance ([`iq`]).
+    Iq,
 }
 
 impl Stage {
     /// Every stage, in chain order.
-    pub const ALL: [Stage; 2] = [Stage::Impulse, Stage::Dc];
+    pub const ALL: [Stage; 3] = [Stage::Impulse, Stage::Dc, Stage::Iq];
 }
 
 /// What a stage did to a span of samples.
@@ -82,7 +124,7 @@ pub enum Mark {
     /// unchanged: an `Observe` stage, a run too long to repair, or a run in
     /// a paused block.
     Flagged,
-    /// The stage changed these samples (an `Apply` DC stage).
+    /// The stage changed these samples (an `Apply` DC or IQ stage).
     Corrected,
     /// The stage's assumption did not hold here, so it changed nothing:
     /// a block the impulse stage paused itself in.
@@ -135,6 +177,9 @@ pub struct ConditioningLog {
     impulse_long_runs: u64,
     repairs: VecDeque<impulse::Repair>,
     repairs_dropped: u64,
+    iq_status: IqStatus,
+    image_result: Option<iq::ImageResult>,
+    tone_result: Option<iq::ToneResult>,
 }
 
 impl ConditioningLog {
@@ -149,7 +194,23 @@ impl ConditioningLog {
             impulse_long_runs: 0,
             repairs: VecDeque::new(),
             repairs_dropped: 0,
+            iq_status: IqStatus::Off,
+            image_result: None,
+            tone_result: None,
         }
+    }
+
+    /// Whether calibration authorized correction for this stream.
+    pub fn iq_status(&self) -> IqStatus {
+        self.iq_status
+    }
+    /// Latest completed five-second image window.
+    pub fn image_result(&self) -> Option<&iq::ImageResult> {
+        self.image_result.as_ref()
+    }
+    /// Latest controlled-tone measurement, before correction.
+    pub fn tone_result(&self) -> Option<&iq::ToneResult> {
+        self.tone_result.as_ref()
     }
 
     /// The config the conditioner runs.
@@ -249,6 +310,9 @@ pub struct InputConditioner {
     impulse_apply: bool,
     dc: Option<dc::DcBlocker>,
     dc_apply: bool,
+    iq: Option<iq::IqCorrector>,
+    tone: Option<iq::ToneMeter>,
+    image: Option<iq::ImageMonitor>,
     /// Samples an earlier [`InputConditioner::condition`] call held back
     /// (not yet final).
     held: usize,
@@ -261,6 +325,12 @@ impl InputConditioner {
     /// The chain for `cfg` at sample rate `fs`, or `None` when every stage
     /// is off (so an all-off channelizer does no per-sample work).
     pub fn new(fs: f64, cfg: &ConditioningConfig) -> Option<Self> {
+        Self::with_geometry(fs, f64::NAN, (fs / 93.75).round() as usize, cfg)
+    }
+
+    /// Construct with the actual receiver centre and channelizer geometry.
+    /// Unknown centres never authorize correction.
+    pub fn with_geometry(fs: f64, center: f64, n: usize, cfg: &ConditioningConfig) -> Option<Self> {
         if cfg.is_off() {
             return None;
         }
@@ -270,7 +340,33 @@ impl InputConditioner {
         let dc = (cfg.dc != StageMode::Off).then(|| dc::DcBlocker::new(fs));
         let mut log = ConditioningLog::new(cfg.clone());
         log.dc_level = dc.as_ref().map(dc::DcBlocker::level);
+        let iq = if cfg.iq == StageMode::Apply {
+            cfg.iq_calibration
+                .as_ref()
+                .filter(|c| {
+                    c.validate().is_ok()
+                        && center.is_finite()
+                        && center > 0.0
+                        && (c.center_freq_hz - center).abs() <= 1.0
+                })
+                .and_then(|c| iq::IqCorrector::new(c.image_ratio()).ok())
+        } else {
+            None
+        };
+        log.iq_status = match cfg.iq {
+            StageMode::Off => IqStatus::Off,
+            StageMode::Observe => IqStatus::Observing,
+            StageMode::Apply if iq.is_some() => IqStatus::Correcting,
+            StageMode::Apply => IqStatus::CalibrationMismatch,
+        };
         Some(InputConditioner {
+            iq,
+            tone: if cfg.iq != StageMode::Off {
+                cfg.iq_tone_hz.map(|f| iq::ToneMeter::new(fs, f))
+            } else {
+                None
+            },
+            image: (cfg.iq != StageMode::Off).then(|| iq::ImageMonitor::new(fs, n, n / 4)),
             impulse,
             impulse_apply,
             dc,
@@ -334,9 +430,44 @@ impl InputConditioner {
                     .mark(Stage::Dc, Mark::Corrected, start, ready as u64);
             }
         }
+        for sample in &mut tail[..ready] {
+            if let Some(tone) = self.tone.as_mut() {
+                tone.push(*sample);
+            }
+            if let Some(iq) = self.iq.as_ref() {
+                *sample = iq.process_sample(*sample);
+            }
+        }
+        self.log.tone_result = self.tone.as_ref().map(iq::ToneMeter::result);
+        if self.iq.is_some() {
+            self.log
+                .mark(Stage::Iq, Mark::Corrected, start, ready as u64);
+        } else if self.log.iq_status == IqStatus::CalibrationMismatch {
+            self.log
+                .mark(Stage::Iq, Mark::Uncertain, start, ready as u64);
+        }
         self.released += ready as u64;
         self.held = tail.len() - ready;
         ready
+    }
+
+    /// Observe each completed channelizer hop once. Windows cover disjoint
+    /// input intervals, independent of overlapping FFT support.
+    pub fn observe_hop(&mut self, x: &[Complex32], start_sample: u64) {
+        if let Some(result) = self.image.as_mut().and_then(|m| m.observe(x, start_sample)) {
+            if result.suspected
+                && self.iq.is_none()
+                && self.log.iq_status != IqStatus::CalibrationMismatch
+            {
+                self.log.mark(
+                    Stage::Iq,
+                    Mark::Uncertain,
+                    result.start_sample,
+                    result.end_sample - result.start_sample,
+                );
+            }
+            self.log.image_result = Some(result);
+        }
     }
 
     /// What the chain did so far.
@@ -412,7 +543,166 @@ mod tests {
     }
 
     #[test]
+    fn iq_authorization_requires_valid_calibration_and_known_matching_center() {
+        let calibration = iq::IqCalibration {
+            gain_ratio: 1.05,
+            phase_deg: 2.0,
+            center_freq_hz: 14e6,
+        };
+        let cfg = ConditioningConfig {
+            iq: StageMode::Apply,
+            iq_calibration: Some(calibration),
+            ..Default::default()
+        };
+        assert_eq!(
+            InputConditioner::new(48000.0, &cfg)
+                .unwrap()
+                .log()
+                .iq_status(),
+            IqStatus::CalibrationMismatch
+        );
+        for (center, expected) in [
+            (14e6, IqStatus::Correcting),
+            (14e6 + 1.0, IqStatus::Correcting),
+            (14e6 + 1.01, IqStatus::CalibrationMismatch),
+            (f64::NAN, IqStatus::CalibrationMismatch),
+        ] {
+            assert_eq!(
+                InputConditioner::with_geometry(48000.0, center, 512, &cfg)
+                    .unwrap()
+                    .log()
+                    .iq_status(),
+                expected
+            );
+        }
+        let near_zero = ConditioningConfig {
+            iq_calibration: Some(iq::IqCalibration {
+                center_freq_hz: 0.5,
+                ..calibration
+            }),
+            ..cfg.clone()
+        };
+        for unknown in [0.0, -0.1] {
+            let mut c = InputConditioner::with_geometry(48000.0, unknown, 512, &near_zero).unwrap();
+            assert_eq!(c.log().iq_status(), IqStatus::CalibrationMismatch);
+            let original = vec![Complex32::new(0.1, 0.2); 100];
+            let mut samples = original.clone();
+            c.condition(&mut samples);
+            assert_eq!(samples, original);
+        }
+        let invalid = ConditioningConfig {
+            iq_calibration: Some(iq::IqCalibration {
+                gain_ratio: f64::NAN,
+                ..calibration
+            }),
+            ..cfg
+        };
+        assert_eq!(
+            InputConditioner::with_geometry(48000.0, 14e6, 512, &invalid)
+                .unwrap()
+                .log()
+                .iq_status(),
+            IqStatus::CalibrationMismatch
+        );
+    }
+
+    #[test]
+    fn combined_inverse_reverses_iq_then_dc_then_impulse() {
+        let calibration = iq::IqCalibration {
+            gain_ratio: 1.05,
+            phase_deg: 2.0,
+            center_freq_hz: 14e6,
+        };
+        let cfg = ConditioningConfig {
+            impulse: StageMode::Apply,
+            dc: StageMode::Apply,
+            iq: StageMode::Apply,
+            iq_calibration: Some(calibration),
+            ..Default::default()
+        };
+        let original: Vec<_> = (0..30000)
+            .map(|i| {
+                if i == 4000 {
+                    Complex32::new(100.0, 50.0)
+                } else {
+                    Complex32::from_polar(0.1, i as f32 * 0.1) + Complex32::new(0.01, -0.02)
+                }
+            })
+            .collect();
+        let mut corrected = original.clone();
+        let mut c = InputConditioner::with_geometry(48000.0, 14e6, 512, &cfg).unwrap();
+        let ready = c.condition(&mut corrected);
+        corrected.truncate(ready);
+        iq::revert_iq(&mut corrected, calibration.image_ratio()).unwrap();
+        let mut restored = dc::revert_dc(&corrected, 48000.0);
+        impulse::revert_repairs(&mut restored, 0, c.log());
+        assert_eq!(c.log().count(Stage::Impulse, Mark::Repaired), 1);
+        for (a, b) in original.iter().zip(restored) {
+            assert!((*a - b).norm() <= 1e-6 * a.norm() + 1e-7, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn tone_log_measures_samples_before_iq_correction() {
+        let cal = iq::IqCalibration {
+            gain_ratio: 1.05,
+            phase_deg: 2.0,
+            center_freq_hz: 14e6,
+        };
+        let cfg = ConditioningConfig {
+            iq: StageMode::Apply,
+            iq_calibration: Some(cal),
+            iq_tone_hz: Some(700.0),
+            ..Default::default()
+        };
+        let mut samples: Vec<_> = (0..4096 * 5)
+            .map(|i| {
+                let s =
+                    Complex64::from_polar(0.5, std::f64::consts::TAU * 713.7 * i as f64 / 4096.0);
+                let phi = cal.phase_deg.to_radians();
+                Complex32::new(
+                    s.re as f32,
+                    (cal.gain_ratio * (s.im * phi.cos() + s.re * phi.sin())) as f32,
+                )
+            })
+            .collect();
+        let mut c = InputConditioner::with_geometry(4096.0, 14e6, 16, &cfg).unwrap();
+        c.condition(&mut samples);
+        let Some(iq::ToneResult::Accepted { rho, .. }) = c.log().tone_result() else {
+            panic!("tone not accepted")
+        };
+        assert!((*rho - cal.image_ratio()).norm() < 1e-5);
+    }
+
+    #[test]
     fn all_off_builds_no_conditioner() {
         assert!(InputConditioner::new(48_000.0, &ConditioningConfig::default()).is_none());
+    }
+
+    #[test]
+    // The configs under test are built by mutation, like `observing`
+    // itself: an exhaustive literal would break when the struct gains a
+    // stage, which is exactly how this round's CI failure happened.
+    #[allow(clippy::field_reassign_with_default)]
+    fn observing_maps_off_to_observe_and_keeps_apply() {
+        for (impulse, dc) in [
+            (StageMode::Off, StageMode::Off),
+            (StageMode::Observe, StageMode::Off),
+            (StageMode::Off, StageMode::Apply),
+            (StageMode::Apply, StageMode::Observe),
+        ] {
+            let mut cfg = ConditioningConfig::default();
+            cfg.impulse = impulse;
+            cfg.dc = dc;
+            let observed = cfg.observing();
+            let expect = |mode: StageMode| match mode {
+                StageMode::Off | StageMode::Observe => StageMode::Observe,
+                StageMode::Apply => StageMode::Apply,
+            };
+            assert_eq!(observed.impulse, expect(impulse), "{impulse:?}/{dc:?}");
+            assert_eq!(observed.dc, expect(dc), "{impulse:?}/{dc:?}");
+        }
+        // The mapped default is a real run of the chain, not "nothing".
+        assert!(!ConditioningConfig::default().observing().is_off());
     }
 }

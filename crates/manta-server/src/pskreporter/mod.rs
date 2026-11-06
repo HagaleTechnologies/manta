@@ -51,7 +51,7 @@ use crate::bus::{BusSpot, SpotBus};
 use crate::config::UplinkSpotTypes;
 use crate::metrics::PskReporterStats;
 use crate::rbn_compare::Clock;
-use batch::{Batcher, Datagram, Offer, FLUSH_INTERVAL};
+use batch::{Batcher, Datagram, Offer};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +72,10 @@ pub struct PskReporter {
     /// Added to the first flush (D5), so stations started together do not
     /// send together.
     pub flush_offset: Duration,
+    /// How often a flush is due; the page's rule is 300 s
+    /// ([`batch::FLUSH_INTERVAL`]). Tests shorten it: they pace a real
+    /// socket in real time, which a paused clock cannot (MAN-478, MAN-506).
+    pub flush_interval: Duration,
     /// The header's observation domain ID (D7).
     pub observation_domain: u32,
 }
@@ -216,7 +220,7 @@ pub async fn run(
         warned_resolve: false,
         warned_send: false,
     };
-    let mut next_flush = Instant::now() + FLUSH_INTERVAL + cfg.flush_offset;
+    let mut next_flush = Instant::now() + cfg.flush_interval + cfg.flush_offset;
     loop {
         if *shutdown.borrow() {
             break;
@@ -228,7 +232,7 @@ pub async fn run(
                 }
             }
             _ = tokio::time::sleep_until(next_flush) => {
-                next_flush += FLUSH_INTERVAL;
+                next_flush += cfg.flush_interval;
                 while let Some(d) = batcher.flush(Instant::now(), export_time(&clock)) {
                     deliver(&mut batcher, &mut sender, d).await;
                 }
@@ -265,7 +269,15 @@ mod tests {
     const RATE: f64 = 48_000.0;
     const EPOCH: u64 = 1_793_650_000;
     const NOW: i64 = 1_793_650_330;
-    const OFFSET: Duration = Duration::from_secs(7);
+    /// Real time (MAN-506): a paused clock auto-advances past the receive
+    /// window before kqueue reports a loopback datagram (MAN-478's race),
+    /// so these tests pace a real socket in real time, with the flush
+    /// interval shortened to match. The production rules keyed to wall
+    /// time (the 300 s gate, the hourly templates) key on the spots' Unix
+    /// times and `Instant` arithmetic, not on this interval, so a short
+    /// one changes only when datagrams are due.
+    const INTERVAL: Duration = Duration::from_millis(250);
+    const OFFSET: Duration = Duration::from_millis(100);
 
     fn spot(call: &str, at_s: u64, snr_db: f32, spot_type: SpotType) -> Spot {
         Spot {
@@ -336,6 +348,7 @@ mod tests {
                     receiver: receiver(),
                     spot_types: UplinkSpotTypes::CqBeacon,
                     flush_offset: OFFSET,
+                    flush_interval: INTERVAL,
                     observation_domain: 0x1234_ABCD,
                 },
                 socket,
@@ -376,18 +389,17 @@ mod tests {
         assert!(flush_offset(u128::MAX) < Duration::from_secs(30));
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn nothing_is_sent_before_the_first_flush_and_one_datagram_is_sent_at_it() {
         let mut h = Harness::new("127.0.0.1").await;
         let _task = h.start();
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
         assert_eq!(
-            h.recv(FLUSH_INTERVAL + OFFSET - Duration::from_secs(1))
-                .await,
+            h.recv(INTERVAL + OFFSET - Duration::from_millis(50)).await,
             None
         );
         let d = h
-            .recv(Duration::from_secs(5))
+            .recv(Duration::from_secs(10))
             .await
             .expect("the first flush");
         let want = ipfix::datagram(
@@ -408,12 +420,12 @@ mod tests {
         );
         assert_eq!(d, want);
         // Nothing pending: nothing more is sent.
-        assert_eq!(h.recv(FLUSH_INTERVAL * 2).await, None);
+        assert_eq!(h.recv(Duration::from_secs(1)).await, None);
         assert_eq!(h.stats.datagrams(), 1);
         assert_eq!(h.stats.reports(), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_first_three_datagrams_carry_templates_and_the_fourth_does_not() {
         let mut h = Harness::new("127.0.0.1").await;
         let _task = h.start();
@@ -421,9 +433,7 @@ mod tests {
         for i in 0..4u64 {
             h.bus
                 .publish(spot(&format!("K{i}ABC"), 21 + 300 * i, 15.0, SpotType::Cq));
-            let d = h
-                .recv(FLUSH_INTERVAL + OFFSET + Duration::from_secs(5))
-                .await;
+            let d = h.recv(Duration::from_secs(10)).await;
             let d = d.expect("a datagram per flush");
             seen.push((templated(&d), sequence(&d)));
         }
@@ -431,15 +441,15 @@ mod tests {
         assert_eq!(seen, vec![(true, 0), (true, 2), (true, 4), (false, 6)]);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_re_emitted_call_is_reported_once() {
         let mut h = Harness::new("127.0.0.1").await;
         let _task = h.start();
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
-        sleep(Duration::from_secs(60)).await;
+        sleep(Duration::from_millis(25)).await;
         h.bus.publish(spot("W1AW", 81, 27.0, SpotType::Cq));
         let d = h
-            .recv(FLUSH_INTERVAL + OFFSET)
+            .recv(Duration::from_secs(10))
             .await
             .expect("the first flush");
         assert_eq!(h.stats.reports(), 1);
@@ -453,19 +463,19 @@ mod tests {
         assert_eq!(d.len(), one);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn shutdown_sends_what_is_pending() {
         let mut h = Harness::new("127.0.0.1").await;
         let task = h.start();
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_millis(50)).await;
         h.shutdown.send(true).unwrap();
         let d = h
-            .recv(Duration::from_secs(1))
+            .recv(Duration::from_secs(10))
             .await
             .expect("the final flush");
         assert!(templated(&d));
-        timeout(Duration::from_secs(1), task)
+        timeout(Duration::from_secs(10), task)
             .await
             .expect("the worker ends")
             .unwrap();
@@ -473,20 +483,18 @@ mod tests {
         assert_eq!(h.stats.datagrams(), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_spot_published_before_the_task_first_runs_is_reported() {
         let mut h = Harness::new("127.0.0.1").await;
         // The receiver was subscribed in `new`, before the spawn (D3).
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
         let _task = h.start();
-        let d = h
-            .recv(FLUSH_INTERVAL + OFFSET + Duration::from_secs(1))
-            .await;
+        let d = h.recv(Duration::from_secs(10)).await;
         assert!(d.is_some());
         assert_eq!(h.stats.reports(), 1);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn sending_to_a_closed_port_is_not_an_error() {
         let mut h = Harness::new("127.0.0.1").await;
         // Nothing listens on the collector's port any more.
@@ -495,7 +503,7 @@ mod tests {
         drop(closed);
         let task = h.start();
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
-        sleep(FLUSH_INTERVAL + OFFSET + Duration::from_secs(1)).await;
+        sleep(Duration::from_secs(1)).await;
         h.shutdown.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(h.stats.datagrams(), 1);
@@ -503,14 +511,14 @@ mod tests {
         assert_eq!(h.stats.dropped(PskDrop::SendError), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_host_that_does_not_resolve_counts_resolve_error() {
         // RFC 6761: `.invalid` never resolves, so nothing is sent anywhere.
         let mut h = Harness::new("pskreporter.invalid").await;
         let task = h.start();
         h.bus.publish(spot("W1AW", 21, 21.0, SpotType::Cq));
         h.bus.publish(spot("K1ABC", 22, 15.0, SpotType::Cq));
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(50)).await;
         h.shutdown.send(true).unwrap();
         task.await.unwrap();
         assert_eq!(h.stats.dropped(PskDrop::ResolveError), 2);
@@ -518,7 +526,7 @@ mod tests {
         assert_eq!(h.stats.reports(), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn the_counters_match_what_was_sent() {
         let mut h = Harness::new("127.0.0.1").await;
         let task = h.start();
@@ -526,9 +534,7 @@ mod tests {
         h.bus.publish(spot("K5ARH", 22, 14.0, SpotType::De));
         h.bus.publish(spot("W1AW", 81, 27.0, SpotType::Cq));
         h.bus.publish(spot("K1ABC", 90, 9.0, SpotType::Beacon));
-        let d = h
-            .recv(FLUSH_INTERVAL + OFFSET + Duration::from_secs(1))
-            .await;
+        let d = h.recv(Duration::from_secs(10)).await;
         let d = d.expect("the first flush");
         h.shutdown.send(true).unwrap();
         task.await.unwrap();

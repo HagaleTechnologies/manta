@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Decoder output
 
+- MAN-494: optional per-input IQ correction uses a controlled-tone calibration
+  to remove receiver images. It defaults to off. Observe and a centre mismatch
+  preserve samples; mirror evidence never enables correction by itself.
+
 - MAN-200: a decode whose samples overlap a decode the repetition gate
   already counted, such as a replay or a second track on the same signal,
   no longer counts as another repetition, even when it arrives a whole
@@ -144,6 +148,20 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-495: `manta doctor` now observes the input-conditioning chain. Every
+  stage not set to `apply` runs as `observe` in doctor's own run (an `off`
+  stage included, so diagnostics exist on a default config; an `apply`
+  stage stays applied), `doctor --json` gains an `inputConditioning`
+  object (always present when a receiver ran, absent in checks-only
+  output) in decode's shape plus the doctor-only
+  `dc.overChannelNoiseDb`, measured against the median channel noise
+  floor over the first second of input, and the text report prints one
+  canonical `input:` line per finding before `verdict:` -- a DC offset
+  from +6 dB over the channel noise upward, a short impulse, or a paused
+  impulse stage. A clean receiver prints no new line. The IQ-imbalance
+  surface (`iq` object, mirror line, `--iq-tone-hz`) lands with MAN-494's
+  IQ stage. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
 - MAN-496: the `[input]` conditioning keys `dc_block` and
   `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
   restart-only), turning MAN-203's input-conditioning stages on for

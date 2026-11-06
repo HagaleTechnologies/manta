@@ -658,6 +658,7 @@ pub struct CloseTally {
     pub rtty: usize,
     pub not_cw: usize,
     pub unkeyed: usize,
+    pub restricted: usize,
     pub open_at_end: usize,
 }
 
@@ -672,6 +673,7 @@ impl CloseTally {
             TrackCloseReason::Rtty => &mut self.rtty,
             TrackCloseReason::NotCw => &mut self.not_cw,
             TrackCloseReason::Unkeyed => &mut self.unkeyed,
+            TrackCloseReason::Restricted => &mut self.restricted,
         };
         *slot += 1;
     }

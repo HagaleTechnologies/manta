@@ -90,7 +90,7 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    stage runs, so output is bit-identical to an unconditioned
    channelizer), `observe` (measures, never writes a sample) or `apply`
    (corrects, and records each corrected run of samples as a span with a
-   per-stage counter). The stages run in the order impulse, then DC. The
+   per-stage counter). The stages run in the order impulse, DC, then IQ. The
    impulse stage flags a sample whose power exceeds `12² = 144` times the
    reference power of the 33 samples centred on it (fewer at the stream
    start): their mean power once the 8 strongest are left out. A zero
@@ -111,7 +111,12 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    (full scale); exact-zero samples before the first nonzero one (the
    lead-in padding) leave the state untouched, so `n` counts from the
    first real sample. It reads only `y`, so `x[n] = y[n] + dc[n]` inverts
-   it exactly. Every stage is a per-sample state machine with a fixed
+   it exactly. The IQ stage (MAN-494) applies `y = m - rho*conj(m)` only
+   with a validated, fixed controlled-tone calibration whose receiver centre
+   agrees within 1 Hz. A sample-domain tone meter reads after DC and before
+   IQ. A hop-domain mirror monitor reports five-second windows and never
+   changes coefficients. Suspected windows without correction are uncertain.
+   Every correction stage is a per-sample state machine with a fixed
    release delay, so the hops do not depend on how the input is split into
    `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
@@ -369,7 +374,7 @@ between HANG and CLOSED for a track that has decoded (MAN-108).
 | CANDIDATE → ACTIVE | rise sustained `confirm_hops` (default 19) hops → lease decoder from pool; with `non_cw_filter` on, the lease waits for qualification (below, §2.8) |
 | CANDIDATE → IDLE | rise condition lost before `confirm_hops` hops |
 | ACTIVE → HANG | drop condition met (below off threshold) |
-| HANG → ACTIVE | `S ≥ F + on_snr_db` again (hang timer reset) |
+| HANG → ACTIVE | EMA rule `S ≥ F + max(on_snr_db, 12 dB)` again (hang timer reset); window rise does not apply in ACTIVE/HANG (§2.3) |
 | HANG → CLOSED | hang timer (5 000 ms) expires → decoder returned, final spots flushed |
 | HANG → DORMANT | hang timer expires on a track that has decoded a character while qualified, with `reacquire_ms > 0` (MAN-108) → decoder flushed exactly as a hang close flushes it, then released; `track_id`, centroid and ownership kept |
 | DORMANT → ACTIVE | rise sustained `confirm_hops` (default 19) consecutive hops on an owned channel within `reacquire_ms` (10 000 ms) → fresh decoder leased under the same `track_id`; no MAN-313 requalification, no new `TrackPromoted` |
@@ -2301,6 +2306,16 @@ freq_correction_ppm = 0.0
 #dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
 #impulse_suppress = "off"  # short-impulse suppression
 
+# Fixed controlled-tone IQ calibration, per input. Restart required.
+# Off is the default. Observe never writes samples. Apply requires all three
+# calibration values, with actual receiver centre agreement within 1 Hz.
+# All values must be finite; gain 0.5..2, phase -45..45 degrees, centre > 0.
+# Refused with bands. Remeasure after a receiver gain change.
+iq_correction = "off"
+# iq_gain_ratio = 1.05
+# iq_phase_deg = 2.0
+# iq_calibrated_center_hz = 14000000.0
+
 # Target post-decimation capture rate, Hz (issue #169). Omit to use the
 # source's native rate unchanged. Must evenly divide the source's native
 # rate by a power of two, and must itself satisfy fs/93.75 being a power
@@ -2485,7 +2500,7 @@ values of `crates/manta-cli/build.rs`, never read at run time, and
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and
-`input.freq_correction_ppm`, `oracle` applies `[decode]`, and both
+`input.freq_correction_ppm` plus the four IQ keys, `oracle` applies `[decode]`, and both
 validate the whole file.
 
 `SPEC-decode-core-v2.md` §7 adds `[decode]` keys beyond `engine` (`"legacy"`

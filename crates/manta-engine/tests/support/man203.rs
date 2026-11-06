@@ -168,3 +168,70 @@ pub fn found_calls(scene: &Scene, out: &Outcome) -> Vec<String> {
     calls.sort();
     calls
 }
+
+/// Applies a receiver's Q gain and quadrature phase error. The I arm is unchanged.
+pub fn add_iq_imbalance(x: &mut [Complex32], gain_ratio: f64, phase_deg: f64) {
+    let (sin, cos) = phase_deg.to_radians().sin_cos();
+    for s in x {
+        s.im = (gain_ratio * (f64::from(s.im) * cos + f64::from(s.re) * sin)) as f32;
+    }
+}
+
+/// A controlled tone captured separately from a keyed station scene. Its
+/// frequency intentionally misses the declared tone by 13.7 Hz.
+pub fn iq_tone_capture(gain_ratio: f64, phase_deg: f64) -> Vec<Complex32> {
+    let mut samples: Vec<_> = (0..5 * SAMPLE_RATE_HZ as usize)
+        .map(|i| {
+            let phase = std::f64::consts::TAU * 12_013.7 * i as f64 / SAMPLE_RATE_HZ;
+            Complex32::new(phase.cos() as f32, phase.sin() as f32)
+        })
+        .collect();
+    add_iq_imbalance(&mut samples, gain_ratio, phase_deg);
+    samples
+}
+
+/// Spots in an otherwise empty conjugate-image window. A wrong call at
+/// the mirror is still a bogus spot, while a real station there is not.
+pub fn mirror_spots(scene: &Scene, out: &Outcome) -> usize {
+    out.spots
+        .iter()
+        .filter(|(_, freq)| {
+            scene.stations.iter().any(|station| {
+                let mirror = 2.0 * CENTER_FREQ_HZ - station.freq_hz;
+                (*freq - mirror).abs() <= HIT_HZ
+                    && !scene
+                        .stations
+                        .iter()
+                        .any(|real| (real.freq_hz - mirror).abs() <= HIT_HZ)
+            })
+        })
+        .count()
+}
+
+/// The historical IQ-image experiment: one 45 dB station at +12056.25 Hz,
+/// five 8 dB stations elsewhere, and no station at the strong one's mirror.
+pub fn iq_scene(trial: u32) -> Scene {
+    let offsets = [12_056.25, -30_000.0, -20_000.0, -6_000.0, 6_000.0, 30_000.0];
+    let signals: Vec<_> = series_signals(Condition::Awgn, 25.0, trial, SEED)
+        .into_iter()
+        .zip(offsets)
+        .enumerate()
+        .map(|(i, (mut signal, offset))| {
+            signal.offset_hz = offset;
+            signal.snr_2500_db = if i == 0 { 45.0 } else { 8.0 };
+            signal
+        })
+        .collect();
+    let (clean, _) = render_series(&signals, DURATION_S).expect("render IQ experiment stations");
+    let noise = render_noise(DURATION_S, SEED, trial).expect("render IQ experiment noise");
+    let samples = compose(&clean, &noise, 1.0);
+    let stations = series_calls(trial)
+        .into_iter()
+        .zip(offsets)
+        .map(|(call, offset)| Station {
+            call,
+            freq_hz: CENTER_FREQ_HZ + offset,
+        })
+        .collect();
+    Scene { samples, stations }
+}

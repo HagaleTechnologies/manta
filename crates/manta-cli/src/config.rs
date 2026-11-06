@@ -94,6 +94,7 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("callsign_lookup", "qrz_password"),
     ("callsign_lookup", "qrz_url"),
     ("input", "type"),
+    ("input", "iq_correction"),
     ("input", "device"),
     ("input", "path"),
     ("input", "record_iq"),
@@ -487,6 +488,11 @@ impl InputKind {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
+    cw_segments_hz: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    cw_schedule: Vec<CwDaily>,
+    #[serde(default)]
+    cw_overrides: Vec<CwOverride>,
     /// MAN-13: the input's name (required with two or more `[[input]]`).
     name: Option<String>,
     #[serde(rename = "type")]
@@ -523,6 +529,10 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
+    iq_correction: Option<String>,
+    iq_gain_ratio: Option<f64>,
+    iq_phase_deg: Option<f64>,
+    iq_calibrated_center_hz: Option<f64>,
     freq_correction_ppm: Option<f64>,
     /// MAN-496: the DC-removal conditioning stage's mode, written `off`,
     /// `observe` or `apply` (default `off`, restart-only).
@@ -539,6 +549,133 @@ struct InputToml {
     /// `IP:port`, under `spectrum_name` (default `manta <name>`).
     spectrum_udp: Option<String>,
     spectrum_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwDaily {
+    at_utc: String,
+    segments_hz: Vec<Vec<f64>>,
+}
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwOverride {
+    start_utc: toml::value::Datetime,
+    end_utc: toml::value::Datetime,
+    segments_hz: Vec<Vec<f64>>,
+}
+
+fn cw_policy(t: &InputToml) -> std::result::Result<manta_engine::cw_segments::Policy, String> {
+    use manta_engine::cw_segments::{Policy, Ranges};
+    let name = t
+        .name
+        .as_deref()
+        .unwrap_or_else(|| t.kind.as_ref().map_or("audio", |k| k.name()));
+    let prefix = |e: String| format!("input \"{name}\": {e}");
+    let ranges = |v: &[Vec<f64>], field: &str| -> std::result::Result<Ranges, String> {
+        let mut out = Vec::new();
+        for (i, r) in v.iter().enumerate() {
+            if r.len() != 2 || Ranges::new(vec![(r[0], r[1])]).is_err() {
+                return Err(prefix(format!(
+                    "{field}[{i}] must contain two finite positive Hz values with lo < hi"
+                )));
+            }
+            out.push((r[0], r[1]));
+        }
+        Ranges::new(out).map_err(|e| prefix(e.into()))
+    };
+    let base = t
+        .cw_segments_hz
+        .as_ref()
+        .map(|v| ranges(v, "cw_segments_hz"))
+        .transpose()?;
+    let mut daily = Vec::new();
+    for (i, e) in t.cw_schedule.iter().enumerate() {
+        let b = e.at_utc.as_bytes();
+        if b.len() != 5 || b[2] != b':' || ![b[0], b[1], b[3], b[4]].iter().all(u8::is_ascii_digit)
+        {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        let h = (b[0] - b'0') as u16 * 10 + (b[1] - b'0') as u16;
+        let m = (b[3] - b'0') as u16 * 10 + (b[4] - b'0') as u16;
+        if h > 23 || m > 59 {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        daily.push((
+            h * 60 + m,
+            ranges(&e.segments_hz, &format!("cw_schedule[{i}].segments_hz"))?,
+        ));
+    }
+    let mut overrides = Vec::new();
+    for (i, e) in t.cw_overrides.iter().enumerate() {
+        let err = || {
+            prefix(format!(
+                "cw_overrides[{i}] requires UTC start_utc < end_utc"
+            ))
+        };
+        let a = cw_utc(&e.start_utc).ok_or_else(err)?;
+        let b = cw_utc(&e.end_utc).ok_or_else(err)?;
+        if a >= b {
+            return Err(err());
+        }
+        overrides.push((
+            a,
+            b,
+            ranges(&e.segments_hz, &format!("cw_overrides[{i}].segments_hz"))?,
+        ));
+    }
+    Policy::new(base, daily, overrides).map_err(prefix)
+}
+
+// Validate the Gregorian calendar and count days without a timezone dependency.
+fn cw_utc(v: &toml::value::Datetime) -> Option<i64> {
+    if v.offset != Some(toml::value::Offset::Z) {
+        return None;
+    }
+    let d = v.date?;
+    let t = v.time?;
+    if t.nanosecond.unwrap_or(0) != 0
+        || t.hour > 23
+        || t.minute > 59
+        || t.second.unwrap_or(0) > 59
+        || d.year < 1970
+        || d.year > 2100
+    {
+        return None;
+    }
+    let leap = |y: u16| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let months = [
+        31,
+        if leap(d.year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if d.month == 0 || d.month > 12 || d.day == 0 || d.day > months[d.month as usize - 1] {
+        return None;
+    }
+    let mut days = 0i64;
+    for y in 1970..d.year {
+        days += if leap(y) { 366 } else { 365 };
+    }
+    days += months[..d.month as usize - 1]
+        .iter()
+        .map(|&n| i64::from(n))
+        .sum::<i64>()
+        + i64::from(d.day)
+        - 1;
+    let seconds = days * 86400
+        + i64::from(t.hour) * 3600
+        + i64::from(t.minute) * 60
+        + i64::from(t.second.unwrap_or(0));
+    crate::check_replay_epoch("UTC", seconds).ok()
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -598,6 +735,8 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
+    pub cw_policy: manta_engine::cw_segments::Policy,
+    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
     /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
     pub dc_block: Option<manta_dsp::condition::StageMode>,
@@ -620,6 +759,7 @@ impl SharedInput {
         manta_dsp::condition::ConditioningConfig {
             impulse: self.impulse_suppress.unwrap_or_default(),
             dc: self.dc_block.unwrap_or_default(),
+            ..self.conditioning.clone()
         }
     }
 }
@@ -1504,7 +1644,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         if group.members.len() > 1
             && matches!(group.protocol, manta_input::hpsdr::HpsdrProtocol::Two)
         {
-            bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
+            bail!(
+                "{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\""
+            );
         }
         // MAN-308 D1: several receivers on one radio run protocol 1, which
         // has no attenuator manta drives.
@@ -1519,7 +1661,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
                 )
             }) {
                 let name = &inputs[index].name;
-                bail!("{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta");
+                bail!(
+                    "{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta"
+                );
             }
         }
         for &index in group.members.iter().skip(1) {
@@ -1532,19 +1676,30 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             }) = &inputs[index].input.source
             {
                 if receivers.is_some() {
-                    bail!("{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")"
+                    );
                 }
                 if *protocol != group.protocol {
-                    bail!("{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")"
+                    );
                 }
                 if *rate_hz != group.rate {
-                    bail!("{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")", group.rate);
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")",
+                        group.rate
+                    );
                 }
             }
         }
         if let Some(capacity) = group.receivers {
             if group.members.len() > capacity {
-                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured", group.endpoint(), group.members.len());
+                bail!(
+                    "{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured",
+                    group.endpoint(),
+                    group.members.len()
+                );
             }
         }
         manta_input::HpsdrConfig {
@@ -1588,6 +1743,7 @@ fn take_entry(
         };
         return Ok((vec![one], Vec::new()));
     };
+    iq_conditioning(&t)?;
     if t.freq_hz.is_some() {
         return Err(
             "input.bands and input.freq_hz both set the receiver's centre; keep one".to_string(),
@@ -1603,7 +1759,7 @@ fn take_entry(
                     .map(|x| float_hz(*x))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ))
+            ));
         }
     };
     let texts = band_item_texts(&bands)?;
@@ -1892,11 +2048,54 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
+/// IQ correction is always a fixed, receiver-specific calibration.
+fn iq_conditioning(
+    t: &InputToml,
+) -> std::result::Result<manta_dsp::condition::ConditioningConfig, String> {
+    use manta_dsp::condition::{iq::IqCalibration, ConditioningConfig, StageMode};
+    let mode = match t.iq_correction.as_deref().unwrap_or("off") {
+        "off" => StageMode::Off,
+        "observe" => StageMode::Observe,
+        "apply" => StageMode::Apply,
+        value => {
+            return Err(format!(
+                "iq_correction must be \"off\", \"observe\" or \"apply\", not {}",
+                crate::fmt::quoted(value)
+            ));
+        }
+    };
+    let calibration = match (t.iq_gain_ratio, t.iq_phase_deg, t.iq_calibrated_center_hz) {
+        (None, None, None) if mode == StageMode::Apply => return Err("iq_correction = \"apply\" needs iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz".to_string()),
+        (None, None, None) => None,
+        (Some(gain_ratio), Some(phase_deg), Some(center_freq_hz)) => {
+            for (key, value, valid, range) in [
+                ("iq_gain_ratio", gain_ratio, (0.5..=2.0).contains(&gain_ratio), "0.5 through 2.0"),
+                ("iq_phase_deg", phase_deg, (-45.0..=45.0).contains(&phase_deg), "-45 through 45 degrees"),
+                ("iq_calibrated_center_hz", center_freq_hz, center_freq_hz > 0.0, "positive Hz"),
+            ] {
+                if !value.is_finite() || !valid { return Err(format!("{key} must be finite and {range}")); }
+            }
+            if t.bands.is_some() { return Err("IQ calibration cannot be used with bands; each stream needs its own calibration".to_string()); }
+            let calibration = IqCalibration { gain_ratio, phase_deg, center_freq_hz };
+            calibration.validate()?;
+            Some(calibration)
+        }
+        _ => return Err("iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz must be supplied together".to_string()),
+    };
+    Ok(ConditioningConfig {
+        iq: mode,
+        iq_calibration: calibration,
+        ..Default::default()
+    })
+}
+
 fn validate_input(
     t: InputToml,
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
+        cw_policy: cw_policy(&t)?,
+        conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
             .map(crate::check_freq_correction_ppm)
@@ -1973,7 +2172,7 @@ fn validate_input(
             rate_hz: finite_positive("rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
             gain_db: match t.gain_db {
                 Some(g) if !g.is_finite() => {
-                    return Err(format!("input.gain_db must be finite, got {g}"))
+                    return Err(format!("input.gain_db must be finite, got {g}"));
                 }
                 g => g,
             },
@@ -2766,7 +2965,9 @@ mod tests {
     #[test]
     fn hpsdr_hostless_inputs_with_different_selectors_are_separate_radios() {
         let entry = |name: &str, selector: &str| {
-            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}"
+            )
         };
         // Distinct MACs, or a pinned entry beside an unqualified one: two
         // radios offline. The run refuses the pair if both resolve to one
@@ -2892,6 +3093,7 @@ mod tests {
             manta_dsp::condition::ConditioningConfig {
                 impulse: StageMode::Apply,
                 dc: StageMode::Observe,
+                ..Default::default()
             }
         );
     }
@@ -3035,6 +3237,58 @@ mod tests {
     }
 
     #[test]
+    fn cw_segments_policy_parses_for_each_input_kind_and_expanded_streams() {
+        for (kind, keys) in [
+            ("audio", ""),
+            ("file", "path = 'x.wav'"),
+            ("kiwi", "host = 'kiwi.example.org'\nfreq_hz = 14050000"),
+            (
+                "soapy",
+                "driver = 'test'\nfreq_hz = 14050000\nrate_hz = 48000",
+            ),
+            (
+                "hpsdr",
+                "host = '127.0.0.1'\nfreq_hz = 14050000\nrate_hz = 192000",
+            ),
+            ("ka9q", "group = '239.1.2.3'"),
+        ] {
+            let body = format!(
+                "[input]\ntype = '{kind}'\n{keys}\ncw_segments_hz = [[14000000,14060000]]\n"
+            );
+            let loaded = load_file(&body).unwrap();
+            assert!(
+                loaded
+                    .input
+                    .shared
+                    .cw_policy
+                    .active_at(0)
+                    .unwrap()
+                    .contains(14030000.),
+                "{kind}"
+            );
+        }
+        let loaded=load_file("[input]\ntype = 'kiwi'\nhost = 'kiwi.example.org'\nbands = ['20m']\ncw_segments_hz = [[7000000,14060000]]\n").unwrap();
+        assert!(loaded.inputs.len() > 1);
+        assert!(loaded
+            .inputs
+            .iter()
+            .all(|i| i.input.shared.cw_policy == loaded.input.shared.cw_policy));
+        for text in [
+            "2026-02-30T00:00:00Z",
+            "2026-11-28T00:00:00+00:00",
+            "1969-01-01T00:00:00Z",
+            "2101-01-01T00:00:00Z",
+        ] {
+            let parsed = toml::from_str::<CwOverride>(&format!(
+                "start_utc = {text}\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = []"
+            ));
+            if let Ok(parsed) = parsed {
+                assert!(cw_utc(&parsed.start_utc).is_none(), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn replay_epoch_belongs_on_the_first_entry() {
         let first = file_entry("a", "replay_epoch = 1700000000\n");
         assert!(load_file(&format!("{first}{}", file_entry("b", ""))).is_ok());
@@ -3072,7 +3326,9 @@ mod tests {
     }
 
     fn hpsdr_entry(name: &str, host: &str, extra: &str) -> String {
-        format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}")
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}"
+        )
     }
 
     #[test]
@@ -4125,6 +4381,94 @@ mod tests {
         );
     }
 
+    #[test]
+    fn iq_keys_validate_modes_and_complete_calibrations() {
+        load_file("[input]\niq_correction = \"observe\"\n").unwrap();
+        for mode in ["off", "observe", "apply"] {
+            load_file(&format!("[input]\niq_correction = \"{mode}\"\niq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n")).unwrap();
+        }
+        for (body, message) in [
+            ("iq_correction = \"on\"", "iq_correction must be"),
+            ("iq_correction = \"apply\"", "needs iq_gain_ratio"),
+            ("iq_gain_ratio = 1.05", "must be supplied together"),
+        ] {
+            let err = err_of(&format!("[input]\n{body}\n"));
+            assert!(err.contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn iq_calibration_ranges_environment_and_bands() {
+        let triple =
+            "iq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n";
+        for (key, value) in [
+            ("iq_gain_ratio", "0.49"),
+            ("iq_gain_ratio", "2.01"),
+            ("iq_gain_ratio", "nan"),
+            ("iq_phase_deg", "45.1"),
+            ("iq_phase_deg", "inf"),
+            ("iq_calibrated_center_hz", "0.0"),
+            ("iq_calibrated_center_hz", "nan"),
+        ] {
+            let mut doc: toml::Table = toml::from_str(triple).unwrap();
+            doc.insert(
+                key.into(),
+                toml::from_str::<toml::Table>(&format!("v = {value}"))
+                    .unwrap()
+                    .remove("v")
+                    .unwrap(),
+            );
+            let err = err_of(&format!("[input]\n{}", toml::to_string(&doc).unwrap()));
+            assert!(err.contains(key), "{err}");
+        }
+        let err = err_of(&format!(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = \"20m\"\n{triple}"
+        ));
+        assert!(
+            err.contains("IQ calibration cannot be used with bands"),
+            "{err}"
+        );
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_IQ_CORRECTION", "observe"),
+                ("MANTA_INPUT_IQ_GAIN_RATIO", "1.05"),
+                ("MANTA_INPUT_IQ_PHASE_DEG", "2.0"),
+                ("MANTA_INPUT_IQ_CALIBRATED_CENTER_HZ", "14000000.0"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        assert_eq!(
+            loaded
+                .input
+                .shared
+                .conditioning
+                .iq_calibration
+                .unwrap()
+                .gain_ratio,
+            1.05
+        );
+        let loaded = load_file(&format!("[[input]]\nname = \"a\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"apply\"\n{triple}[[input]]\nname = \"b\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"observe\"\n")).unwrap();
+        assert_eq!(
+            loaded.inputs[0].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Apply
+        );
+        assert_eq!(
+            loaded.inputs[1].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        let invalid = "[[input]]\nname = \"ok\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\n[[input]]\nname = \"rx1\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"on\"\n";
+        let err = err_of(invalid);
+        assert!(
+            err.contains("rx1") && err.contains("iq_correction"),
+            "{err}"
+        );
+    }
+
     // ---- Phase 3: [input]
 
     #[test]
@@ -4222,8 +4566,7 @@ mod tests {
         );
     }
 
-    const HPSDR_BODY: &str =
-        "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+    const HPSDR_BODY: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
 
     fn hpsdr_protocol_of(source: &Option<SourceFromFile>) -> manta_input::hpsdr::HpsdrProtocol {
         match source {
