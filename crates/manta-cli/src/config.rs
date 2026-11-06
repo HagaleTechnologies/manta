@@ -488,6 +488,11 @@ impl InputKind {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
+    cw_segments_hz: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    cw_schedule: Vec<CwDaily>,
+    #[serde(default)]
+    cw_overrides: Vec<CwOverride>,
     /// MAN-13: the input's name (required with two or more `[[input]]`).
     name: Option<String>,
     #[serde(rename = "type")]
@@ -524,6 +529,7 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
+    digital_modes: Option<Vec<String>>,
     iq_correction: Option<String>,
     iq_gain_ratio: Option<f64>,
     iq_phase_deg: Option<f64>,
@@ -544,6 +550,133 @@ struct InputToml {
     /// `IP:port`, under `spectrum_name` (default `manta <name>`).
     spectrum_udp: Option<String>,
     spectrum_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwDaily {
+    at_utc: String,
+    segments_hz: Vec<Vec<f64>>,
+}
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwOverride {
+    start_utc: toml::value::Datetime,
+    end_utc: toml::value::Datetime,
+    segments_hz: Vec<Vec<f64>>,
+}
+
+fn cw_policy(t: &InputToml) -> std::result::Result<manta_engine::cw_segments::Policy, String> {
+    use manta_engine::cw_segments::{Policy, Ranges};
+    let name = t
+        .name
+        .as_deref()
+        .unwrap_or_else(|| t.kind.as_ref().map_or("audio", |k| k.name()));
+    let prefix = |e: String| format!("input \"{name}\": {e}");
+    let ranges = |v: &[Vec<f64>], field: &str| -> std::result::Result<Ranges, String> {
+        let mut out = Vec::new();
+        for (i, r) in v.iter().enumerate() {
+            if r.len() != 2 || Ranges::new(vec![(r[0], r[1])]).is_err() {
+                return Err(prefix(format!(
+                    "{field}[{i}] must contain two finite positive Hz values with lo < hi"
+                )));
+            }
+            out.push((r[0], r[1]));
+        }
+        Ranges::new(out).map_err(|e| prefix(e.into()))
+    };
+    let base = t
+        .cw_segments_hz
+        .as_ref()
+        .map(|v| ranges(v, "cw_segments_hz"))
+        .transpose()?;
+    let mut daily = Vec::new();
+    for (i, e) in t.cw_schedule.iter().enumerate() {
+        let b = e.at_utc.as_bytes();
+        if b.len() != 5 || b[2] != b':' || ![b[0], b[1], b[3], b[4]].iter().all(u8::is_ascii_digit)
+        {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        let h = (b[0] - b'0') as u16 * 10 + (b[1] - b'0') as u16;
+        let m = (b[3] - b'0') as u16 * 10 + (b[4] - b'0') as u16;
+        if h > 23 || m > 59 {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        daily.push((
+            h * 60 + m,
+            ranges(&e.segments_hz, &format!("cw_schedule[{i}].segments_hz"))?,
+        ));
+    }
+    let mut overrides = Vec::new();
+    for (i, e) in t.cw_overrides.iter().enumerate() {
+        let err = || {
+            prefix(format!(
+                "cw_overrides[{i}] requires UTC start_utc < end_utc"
+            ))
+        };
+        let a = cw_utc(&e.start_utc).ok_or_else(err)?;
+        let b = cw_utc(&e.end_utc).ok_or_else(err)?;
+        if a >= b {
+            return Err(err());
+        }
+        overrides.push((
+            a,
+            b,
+            ranges(&e.segments_hz, &format!("cw_overrides[{i}].segments_hz"))?,
+        ));
+    }
+    Policy::new(base, daily, overrides).map_err(prefix)
+}
+
+// Validate the Gregorian calendar and count days without a timezone dependency.
+fn cw_utc(v: &toml::value::Datetime) -> Option<i64> {
+    if v.offset != Some(toml::value::Offset::Z) {
+        return None;
+    }
+    let d = v.date?;
+    let t = v.time?;
+    if t.nanosecond.unwrap_or(0) != 0
+        || t.hour > 23
+        || t.minute > 59
+        || t.second.unwrap_or(0) > 59
+        || d.year < 1970
+        || d.year > 2100
+    {
+        return None;
+    }
+    let leap = |y: u16| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let months = [
+        31,
+        if leap(d.year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if d.month == 0 || d.month > 12 || d.day == 0 || d.day > months[d.month as usize - 1] {
+        return None;
+    }
+    let mut days = 0i64;
+    for y in 1970..d.year {
+        days += if leap(y) { 366 } else { 365 };
+    }
+    days += months[..d.month as usize - 1]
+        .iter()
+        .map(|&n| i64::from(n))
+        .sum::<i64>()
+        + i64::from(d.day)
+        - 1;
+    let seconds = days * 86400
+        + i64::from(t.hour) * 3600
+        + i64::from(t.minute) * 60
+        + i64::from(t.second.unwrap_or(0));
+    crate::check_replay_epoch("UTC", seconds).ok()
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -603,6 +736,9 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
+    /// MAN-485: enabled FT8/FT4 modes, in startup-summary order.
+    pub digital_modes: Vec<manta_engine::ftx::FtxMode>,
+    pub cw_policy: manta_engine::cw_segments::Policy,
     pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
     /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
@@ -989,6 +1125,26 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             inputs
         }
     };
+    // MAN-485 D4: every config entry point shares these publication and
+    // build-feature rules, including SIGHUP's restart-only validation.
+    if inputs
+        .iter()
+        .any(|input| !input.input.shared.digital_modes.is_empty())
+    {
+        if server.is_none() {
+            bail!(
+                "{origin}: [input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table{}",
+                overlay.suffix("input")
+            );
+        }
+        if !manta_engine::ftx::decoder_compiled() {
+            bail!(
+                "{origin}: [input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}{}",
+                crate::build_info::FEATURES,
+                overlay.suffix("input")
+            );
+        }
+    }
     let input = inputs[0].input.clone();
 
     let mut env_vars: Vec<String> = overlay.vars_by_table.into_values().flatten().collect();
@@ -1915,6 +2071,32 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
+/// MAN-485 D4: accept exact wire spellings and normalize to the mode order.
+fn digital_modes(
+    texts: Option<&[String]>,
+) -> std::result::Result<Vec<manta_engine::ftx::FtxMode>, String> {
+    use manta_engine::ftx::FtxMode;
+    let mut modes = BTreeSet::new();
+    for text in texts.unwrap_or_default() {
+        let mode = FtxMode::parse(text).ok_or_else(|| {
+            format!(
+                "digital_modes: {} is not a mode manta decodes; use \"FT8\", \"FT4\" or both",
+                crate::fmt::quoted(text),
+            )
+        })?;
+        if !modes.insert(mode) {
+            return Err(format!(
+                "digital_modes: {} is repeated; list each mode once",
+                crate::fmt::quoted(text)
+            ));
+        }
+    }
+    Ok(FtxMode::ALL
+        .into_iter()
+        .filter(|mode| modes.contains(mode))
+        .collect())
+}
+
 /// IQ correction is always a fixed, receiver-specific calibration.
 fn iq_conditioning(
     t: &InputToml,
@@ -1961,6 +2143,8 @@ fn validate_input(
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
+        digital_modes: digital_modes(t.digital_modes.as_deref())?,
+        cw_policy: cw_policy(&t)?,
         conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
@@ -2321,6 +2505,91 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digital_modes_parses_and_bands_streams_inherit_it() {
+        use manta_engine::ftx::FtxMode;
+        // The parser and expansion are feature-independent; load below owns
+        // the build-feature refusal.
+        let t: InputToml = toml::from_str(
+            "type = 'kiwi'\nhost = 'h'\nbands = ['20m']\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        let (inputs, _) = take_entry(t, "kiwi".into(), None, "[input]", &|_, p| p).unwrap();
+        assert_eq!(inputs.len(), 12);
+        for input in inputs {
+            assert_eq!(input.input.shared.digital_modes, FtxMode::ALL);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_repeated_digital_mode_is_refused() {
+        let err = err_of("[input]\ndigital_modes = ['JT65']\n");
+        assert!(err.ends_with("[input]: digital_modes: \"JT65\" is not a mode manta decodes; use \"FT8\", \"FT4\" or both"), "{err}");
+        let err = err_of("[input]\ndigital_modes = ['FT8', 'FT8']\n");
+        assert!(
+            err.ends_with("[input]: digital_modes: \"FT8\" is repeated; list each mode once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn digital_modes_needs_a_server_table() {
+        let err = err_of("[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with("[input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table"), "{err}");
+        assert!(load_file("[input]\ndigital_modes = []\n")
+            .unwrap()
+            .input
+            .shared
+            .digital_modes
+            .is_empty());
+    }
+
+    #[cfg(not(feature = "ftx"))]
+    #[test]
+    fn digital_modes_needs_the_ftx_feature() {
+        let err =
+            err_of("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with(&format!("[input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}", crate::build_info::FEATURES)), "{err}");
+    }
+
+    #[cfg(feature = "ftx")]
+    #[test]
+    fn digital_modes_loads_with_the_ftx_feature() {
+        let loaded = load_file(
+            "[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.digital_modes,
+            manta_engine::ftx::FtxMode::ALL
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_digital_modes() {
+        let result = load_env(
+            Some("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[\"FT8\"]")],
+        );
+        #[cfg(feature = "ftx")]
+        assert_eq!(
+            result.unwrap().input.shared.digital_modes,
+            [manta_engine::ftx::FtxMode::Ft8]
+        );
+        #[cfg(not(feature = "ftx"))]
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("digital_modes needs a manta built with the ftx feature"));
+        // Empty arrays work in every build and override an enabled file key.
+        let disabled = load_env(
+            Some("[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[]")],
+        )
+        .unwrap();
+        assert!(disabled.input.shared.digital_modes.is_empty());
+    }
 
     #[test]
     fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
@@ -3100,6 +3369,58 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn cw_segments_policy_parses_for_each_input_kind_and_expanded_streams() {
+        for (kind, keys) in [
+            ("audio", ""),
+            ("file", "path = 'x.wav'"),
+            ("kiwi", "host = 'kiwi.example.org'\nfreq_hz = 14050000"),
+            (
+                "soapy",
+                "driver = 'test'\nfreq_hz = 14050000\nrate_hz = 48000",
+            ),
+            (
+                "hpsdr",
+                "host = '127.0.0.1'\nfreq_hz = 14050000\nrate_hz = 192000",
+            ),
+            ("ka9q", "group = '239.1.2.3'"),
+        ] {
+            let body = format!(
+                "[input]\ntype = '{kind}'\n{keys}\ncw_segments_hz = [[14000000,14060000]]\n"
+            );
+            let loaded = load_file(&body).unwrap();
+            assert!(
+                loaded
+                    .input
+                    .shared
+                    .cw_policy
+                    .active_at(0)
+                    .unwrap()
+                    .contains(14030000.),
+                "{kind}"
+            );
+        }
+        let loaded=load_file("[input]\ntype = 'kiwi'\nhost = 'kiwi.example.org'\nbands = ['20m']\ncw_segments_hz = [[7000000,14060000]]\n").unwrap();
+        assert!(loaded.inputs.len() > 1);
+        assert!(loaded
+            .inputs
+            .iter()
+            .all(|i| i.input.shared.cw_policy == loaded.input.shared.cw_policy));
+        for text in [
+            "2026-02-30T00:00:00Z",
+            "2026-11-28T00:00:00+00:00",
+            "1969-01-01T00:00:00Z",
+            "2101-01-01T00:00:00Z",
+        ] {
+            let parsed = toml::from_str::<CwOverride>(&format!(
+                "start_utc = {text}\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = []"
+            ));
+            if let Ok(parsed) = parsed {
+                assert!(cw_utc(&parsed.start_utc).is_none(), "{text}");
+            }
+        }
     }
 
     #[test]

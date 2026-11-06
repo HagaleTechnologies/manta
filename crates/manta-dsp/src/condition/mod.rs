@@ -62,6 +62,27 @@ impl ConditioningConfig {
     pub fn is_off(&self) -> bool {
         self.impulse == StageMode::Off && self.dc == StageMode::Off && self.iq == StageMode::Off
     }
+
+    /// The impulse and DC stages with every non-`apply` mode forced to
+    /// [`StageMode::Observe`] (`Off` becomes `Observe`; `Apply` stays
+    /// `Apply`); any other stage this struct gains later keeps its
+    /// configured mode, so that stage's observation surface lands with
+    /// its own ticket. Built by cloning and overwriting the two fields
+    /// (never an exhaustive literal), so a sibling ticket adding a stage
+    /// does not break the build. What a diagnostic command runs so it
+    /// measures while never writing a sample the operator did not ask to
+    /// have corrected (MAN-203: doctor observes the impulse and DC
+    /// stages).
+    pub fn observing(&self) -> Self {
+        let force = |mode: StageMode| match mode {
+            StageMode::Off | StageMode::Observe => StageMode::Observe,
+            StageMode::Apply => StageMode::Apply,
+        };
+        let mut observed = self.clone();
+        observed.impulse = force(self.impulse);
+        observed.dc = force(self.dc);
+        observed
+    }
 }
 
 /// IQ correction authorization, frozen at stream construction.
@@ -656,5 +677,32 @@ mod tests {
     #[test]
     fn all_off_builds_no_conditioner() {
         assert!(InputConditioner::new(48_000.0, &ConditioningConfig::default()).is_none());
+    }
+
+    #[test]
+    // The configs under test are built by mutation, like `observing`
+    // itself: an exhaustive literal would break when the struct gains a
+    // stage, which is exactly how this round's CI failure happened.
+    #[allow(clippy::field_reassign_with_default)]
+    fn observing_maps_off_to_observe_and_keeps_apply() {
+        for (impulse, dc) in [
+            (StageMode::Off, StageMode::Off),
+            (StageMode::Observe, StageMode::Off),
+            (StageMode::Off, StageMode::Apply),
+            (StageMode::Apply, StageMode::Observe),
+        ] {
+            let mut cfg = ConditioningConfig::default();
+            cfg.impulse = impulse;
+            cfg.dc = dc;
+            let observed = cfg.observing();
+            let expect = |mode: StageMode| match mode {
+                StageMode::Off | StageMode::Observe => StageMode::Observe,
+                StageMode::Apply => StageMode::Apply,
+            };
+            assert_eq!(observed.impulse, expect(impulse), "{impulse:?}/{dc:?}");
+            assert_eq!(observed.dc, expect(dc), "{impulse:?}/{dc:?}");
+        }
+        // The mapped default is a real run of the chain, not "nothing".
+        assert!(!ConditioningConfig::default().observing().is_off());
     }
 }

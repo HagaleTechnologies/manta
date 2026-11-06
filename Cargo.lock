@@ -1394,7 +1394,7 @@ dependencies = [
 [[package]]
 name = "pancetta-core"
 version = "0.9.6"
-source = "git+https://github.com/HagaleTechnologies/pancetta.git?rev=390d7860315d5086eb52b834605a0a7ff4b741c5#390d7860315d5086eb52b834605a0a7ff4b741c5"
+source = "git+https://github.com/HagaleTechnologies/pancetta.git?rev=7f8078b19d759e24f50adb1efd0b3fd75371a39d#7f8078b19d759e24f50adb1efd0b3fd75371a39d"
 dependencies = [
  "chrono",
  "serde",
@@ -1405,7 +1405,7 @@ dependencies = [
 [[package]]
 name = "pancetta-ft8"
 version = "0.9.6"
-source = "git+https://github.com/HagaleTechnologies/pancetta.git?rev=390d7860315d5086eb52b834605a0a7ff4b741c5#390d7860315d5086eb52b834605a0a7ff4b741c5"
+source = "git+https://github.com/HagaleTechnologies/pancetta.git?rev=7f8078b19d759e24f50adb1efd0b3fd75371a39d#7f8078b19d759e24f50adb1efd0b3fd75371a39d"
 dependencies = [
  "anyhow",
  "bitvec",

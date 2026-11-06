@@ -2138,6 +2138,7 @@ mod tests {
         ("input", "ssrc"),
         ("input", "interface"),
         ("input", "center_freq_hz"),
+        ("input", "cw_segments_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
