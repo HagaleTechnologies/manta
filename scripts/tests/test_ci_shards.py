@@ -90,7 +90,9 @@ class ShardTests(unittest.TestCase):
             for record in records:
                 for result in record['results']:
                     self.assertGreaterEqual(result['seconds'], 0)
-                    self.assertEqual(result['cwd'], str(p))
+                    # cargo metadata reports resolved paths; macOS tmp dirs are
+                    # /var -> /private/var symlinks, so compare resolved paths.
+                    self.assertEqual(Path(result['cwd']).resolve(), p.resolve())
                     self.assertEqual(len(result['command']), 1)
             doc = subprocess.run(['cargo', 'test', '--doc', '--locked'], cwd=p, check=True, capture_output=True, text=True)
             self.assertIn('1 passed', doc.stdout)
