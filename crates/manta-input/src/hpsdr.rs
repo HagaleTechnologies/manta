@@ -801,12 +801,18 @@ struct Inner {
     /// garbage-only stream a caller still wants (the acceptance fake's
     /// start-up mode) must not hard-fail each bound and reconnect-loop.
     last_datagram: Instant,
+    /// MAN-489 review: receive time spent waiting with no datagram since
+    /// `last_datagram`. Only active waits count -- a consumer parked
+    /// while other inputs open is not radio silence -- and it lives on
+    /// `Inner`, so neither bounded pump windows nor the soft report reset
+    /// it. The hard stall bound is judged on this.
+    silent_waited: Duration,
     /// MAN-489: consecutive malformed datagrams with no valid packet
     /// between, kept on `Inner` (not per pump call) so bounded receive
     /// windows cannot reset the bound `MAX_CONSECUTIVE_MALFORMED` pins.
     consecutive_malformed: u32,
     /// MAN-489: hard stall bound (test knob; `HARD_STALL_AFTER` in
-    /// production) since `last_datagram`.
+    /// production) of actively waited silence (`silent_waited`).
     hard_stall_after: Duration,
     /// The socket read timeout currently installed, so clamping a receive
     /// window only touches the socket when the value actually changes.
@@ -867,9 +873,11 @@ impl Inner {
             // inside one unbounded pump call; the same budget as elapsed
             // silence since the last received datagram of any kind, which
             // a bounded pump call can no longer accumulate -- malformed
-            // arrivals kept the old counter from accumulating too). A
-            // stream that never delivered measures from the open.
-            if self.last_datagram.elapsed() >= self.hard_stall_after {
+            // arrivals kept the old counter from accumulating too). Only
+            // actively waited receive time counts (`silent_waited`), as
+            // the timeout count did: an unread, parked consumer is not
+            // radio silence.
+            if self.silent_waited >= self.hard_stall_after {
                 bail!(
                     "HPSDR device stalled: no data for {} s",
                     self.hard_stall_after.as_secs_f64()
@@ -893,12 +901,14 @@ impl Inner {
                 self.read_timeout = want;
             }
 
+            let waiting = Instant::now();
             match self.socket.recv(&mut self.recv_buf) {
                 Ok(n) if n == METIS_PACKET_LEN => {
                     // MAN-489: any datagram is "data" for the hard stall
                     // bound above, valid or malformed -- the timeout count
                     // it replaced never advanced while packets arrived.
                     self.last_datagram = Instant::now();
+                    self.silent_waited = Duration::ZERO;
                     let mut demuxed = vec![Vec::new(); self.num_receivers];
                     match demux_metis_packet(&self.recv_buf[..n], self.num_receivers, &mut demuxed)
                     {
@@ -957,6 +967,7 @@ impl Inner {
                     // reported as a length mismatch rather than truncated
                     // or WSAEMSGSIZE'd, per RECV_BUF_LEN's doc comment).
                     self.last_datagram = Instant::now();
+                    self.silent_waited = Duration::ZERO;
                     self.gap.record_malformed();
                     self.consecutive_malformed += 1;
                 }
@@ -964,6 +975,7 @@ impl Inner {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    self.silent_waited += waiting.elapsed();
                     continue;
                 }
                 Err(e) => return Err(e).context("HPSDR UDP read"),
@@ -1087,6 +1099,7 @@ impl HpsdrDevice {
             cc_seq: 0,
             last_valid_packet: Instant::now(),
             last_datagram: Instant::now(),
+            silent_waited: Duration::ZERO,
             consecutive_malformed: 0,
             hard_stall_after: HARD_STALL_AFTER,
             read_timeout: READ_TIMEOUT,
@@ -2128,6 +2141,42 @@ mod tests {
         for reader in readers {
             reader.join().expect("reader thread must not panic");
         }
+    }
+
+    /// MAN-489 review (Codex P2 on #511): time nobody spent reading -- a
+    /// consumer parked while other inputs open (`multi::open_inputs`) --
+    /// is not silence. A radio that streamed throughout must still be
+    /// readable after a pause longer than the hard bound, with its queued
+    /// datagrams intact, instead of being retired as stalled.
+    #[test]
+    fn a_parked_consumer_does_not_spend_the_hard_stall_budget() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        let mut src = sources.remove(0);
+        let client_addr = drain_initial_open_packets(&device_socket, 1);
+        let hard = Duration::from_millis(400);
+        src.inner.lock().unwrap().hard_stall_after = hard;
+        let pkt = synth_metis_packet(1, |_| Complex32::new(0.25, 0.0));
+        device_socket.send_to(&pkt, client_addr).unwrap();
+        // Nobody reads for longer than the hard bound.
+        std::thread::sleep(hard * 2);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let n = src
+            .read(&mut buf)
+            .expect("a parked consumer is not a stalled radio");
+        assert!(n > 0);
     }
 
     /// MAN-489 remediation: the hard stall bound is the old "40
