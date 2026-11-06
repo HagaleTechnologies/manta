@@ -119,9 +119,6 @@ enum ReadAttempt {
 struct RetryState {
     timeout_retries: u32,
     overflow_retries: u32,
-    /// When the current no-sample wait began (the receive-timeout cap and
-    /// the soft clock's anchor); cleared by delivery.
-    waiting_since: Option<Instant>,
     /// Time of the last delivered samples.
     last_delivery: Instant,
     /// The one-shot soft-stall episode behind `take_stalled`.
@@ -133,28 +130,37 @@ impl RetryState {
         Self {
             timeout_retries: 0,
             overflow_retries: 0,
-            waiting_since: None,
             last_delivery: Instant::now(),
             stall: StallEpisode::new(SOFT_STALL_AFTER),
         }
-    }
-
-    fn note_wait(&mut self) {
-        self.waiting_since.get_or_insert_with(Instant::now);
     }
 
     /// The next native read timeout: the usual `TIMEOUT_US`, capped by
     /// the remaining soft deadline so a blocking read cannot overshoot
     /// the report bound (the driver's own units are microseconds).
     fn next_timeout_us(&self) -> i64 {
-        let mut us = TIMEOUT_US;
-        if let Some(since) = self.waiting_since {
-            if self.stall.is_delivering() {
-                let remaining = self.stall.soft_after().saturating_sub(since.elapsed());
-                us = us.min(remaining.as_micros() as i64);
-            }
+        let wait = self.stall.clamp_wait(
+            Duration::from_micros(TIMEOUT_US as u64),
+            self.last_delivery,
+            Instant::now(),
+        );
+        wait.as_micros().clamp(1, TIMEOUT_US as u128) as i64
+    }
+
+    /// Count one no-sample attempt -- a native read timeout or a native
+    /// `Ok(0)` -- against the silence budget, erroring at the bound so
+    /// neither can keep the loop alive forever (MAN-489 review).
+    fn spend_silence_budget(&mut self) -> anyhow::Result<()> {
+        self.timeout_retries += 1;
+        if self.timeout_retries >= MAX_TIMEOUT_RETRIES {
+            anyhow::bail!(
+                "SoapySDR read timed out after {} consecutive no-sample attempts (~{}s of \
+                 silence)",
+                MAX_TIMEOUT_RETRIES,
+                (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
+            );
         }
-        us.max(1)
+        Ok(())
     }
 
     /// The production retry loop. `read_once` performs one native (or, in
@@ -172,26 +178,18 @@ impl RetryState {
                 ReadAttempt::Samples(n) if n > 0 => {
                     self.timeout_retries = 0;
                     self.overflow_retries = 0;
-                    self.waiting_since = None;
                     self.last_delivery = Instant::now();
                     self.stall.note_delivery();
                     return Ok(n);
                 }
                 // A native `Ok(0)` means the stream is waiting, not that
                 // it ended: it must not leak as an unflagged EOF while the
-                // live stream may still deliver (MAN-489).
-                ReadAttempt::Samples(_) => self.note_wait(),
-                ReadAttempt::Timeout => {
-                    self.note_wait();
-                    self.timeout_retries += 1;
-                    if self.timeout_retries >= MAX_TIMEOUT_RETRIES {
-                        anyhow::bail!(
-                            "SoapySDR read timed out after {} consecutive attempts (~{}s of silence)",
-                            MAX_TIMEOUT_RETRIES,
-                            (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
-                        );
-                    }
-                }
+                // live stream may still deliver (MAN-489). It is still a
+                // no-sample attempt, so it spends the silence budget a
+                // `Timeout` does -- repeated zeros cannot keep this loop
+                // alive forever (MAN-489 review).
+                ReadAttempt::Samples(_) => self.spend_silence_budget()?,
+                ReadAttempt::Timeout => self.spend_silence_budget()?,
                 ReadAttempt::Overflow => {
                     // Before the retry-bound check so the bound's own
                     // `bail!` overflow is counted too (MAN-233). The
@@ -204,7 +202,6 @@ impl RetryState {
                         Instant::now(),
                         unknown_gap,
                     );
-                    self.note_wait();
                     self.overflow_retries += 1;
                     if self.overflow_retries >= MAX_OVERFLOW_RETRIES {
                         anyhow::bail!(
@@ -478,9 +475,13 @@ mod tests {
     /// plan's "scripted timed reads").
     const SCRIPT_POLL: Duration = Duration::from_millis(20);
 
+    /// The operator-notice parameter's type, kept behind an alias so the
+    /// test helper's return type stays under clippy's complexity bar.
+    type OverflowNotice = Option<Box<dyn Fn() + Send + Sync>>;
+
     fn retry_parts() -> (
         Arc<InputHealthCounters>,
-        Option<Box<dyn Fn() + Send + Sync>>,
+        OverflowNotice,
         Option<Instant>,
         UnknownGapLatch,
     ) {
@@ -632,16 +633,23 @@ mod tests {
             ReadAttempt::Overflow,
             ReadAttempt::Samples(64),
         ]);
-        let n = state
-            .run(
-                &mut |_| ops.pop_front().expect("scripted attempt"),
-                &health,
-                &notice,
-                &mut last_warn,
-                &mut unknown,
-            )
-            .unwrap();
-        assert_eq!(n, 64);
+        let mut next = |_| ops.pop_front().expect("scripted attempt");
+        // `run` returns at the first successful read, so the first call
+        // consumes only the leading samples; the overflow is exercised by
+        // the next call, which returns with the trailing samples.
+        assert_eq!(
+            state
+                .run(&mut next, &health, &notice, &mut last_warn, &mut unknown)
+                .unwrap(),
+            64
+        );
+        assert_eq!(health.gaps_detected(), 0);
+        assert_eq!(
+            state
+                .run(&mut next, &health, &notice, &mut last_warn, &mut unknown)
+                .unwrap(),
+            64
+        );
         assert_eq!(health.gaps_detected(), 1);
         assert!(unknown.take());
 
@@ -658,5 +666,121 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("driver died"), "{err}");
+    }
+
+    /// MAN-489 review: a native driver that only ever returns `Ok(0)` is
+    /// bounded -- a never-delivering source reaches the hard error at the
+    /// retry limit instead of looping forever.
+    #[test]
+    fn startup_native_zeros_error_at_the_retry_bound() {
+        let mut state = RetryState::new();
+        let (health, notice, mut last_warn, mut unknown) = retry_parts();
+        let err = state
+            .run(
+                &mut |_| ReadAttempt::Samples(0),
+                &health,
+                &notice,
+                &mut last_warn,
+                &mut unknown,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out after"), "{err}");
+    }
+
+    /// MAN-489 review: once the soft report disarms the latch, repeated
+    /// native zeros still spend the silence budget and reach the hard
+    /// error -- no read is left with no exit.
+    #[test]
+    fn post_report_native_zeros_still_error_at_the_retry_bound() {
+        let mut state = RetryState::new();
+        state.stall = StallEpisode::new(Duration::from_millis(3 * SCRIPT_POLL.as_millis() as u64));
+        let (health, notice, mut last_warn, mut unknown) = retry_parts();
+        // Delivery, then zeros until the soft report (the sleeps keep the
+        // report ahead of the retry limit).
+        assert_eq!(
+            state
+                .run(
+                    &mut |_| ReadAttempt::Samples(512),
+                    &health,
+                    &notice,
+                    &mut last_warn,
+                    &mut unknown
+                )
+                .unwrap(),
+            512
+        );
+        assert_eq!(
+            state
+                .run(
+                    &mut |_| {
+                        std::thread::sleep(SCRIPT_POLL);
+                        ReadAttempt::Samples(0)
+                    },
+                    &health,
+                    &notice,
+                    &mut last_warn,
+                    &mut unknown
+                )
+                .unwrap(),
+            0
+        );
+        assert!(state.stall.take());
+        // The same outage continues with immediate zeros: bounded error.
+        let err = state
+            .run(
+                &mut |_| ReadAttempt::Samples(0),
+                &health,
+                &notice,
+                &mut last_warn,
+                &mut unknown,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed out after"), "{err}");
+    }
+
+    /// MAN-489 phase 5: at the production 1 s soft deadline (ahead of the
+    /// ~2 s retry limit) the report lands well inside the ticket's 5 s
+    /// bound.
+    #[test]
+    fn timeouts_report_within_the_production_five_second_bound() {
+        let mut state = RetryState::new();
+        let (health, notice, mut last_warn, mut unknown) = retry_parts();
+        assert_eq!(
+            state
+                .run(
+                    &mut |_| ReadAttempt::Samples(512),
+                    &health,
+                    &notice,
+                    &mut last_warn,
+                    &mut unknown,
+                )
+                .unwrap(),
+            512
+        );
+        let started = Instant::now();
+        // Each attempt waits the real TIMEOUT_US (100 ms), so the 1 s
+        // soft deadline is reached after ~10 attempts, inside the 20
+        // retry budget -- the production cadence, not the 20 ms script
+        // poll (which would exhaust the budget first).
+        assert_eq!(
+            state
+                .run(
+                    &mut |_| {
+                        std::thread::sleep(Duration::from_millis(TIMEOUT_US as u64 / 1_000));
+                        ReadAttempt::Timeout
+                    },
+                    &health,
+                    &notice,
+                    &mut last_warn,
+                    &mut unknown,
+                )
+                .unwrap(),
+            0
+        );
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(5), "{reported:?}");
+        assert!(state.stall.take());
     }
 }
