@@ -330,6 +330,12 @@ pub struct DcConditioning {
     /// while the stage is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level_dbfs: Option<f64>,
+    /// MAN-495: how far `level_dbfs` sits above the median channel noise
+    /// floor, in dB, from doctor's own bounded floor pre-pass. Doctor-only:
+    /// decode has no floor reference, so it never sets this and its JSON
+    /// keeps #514's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub over_channel_noise_db: Option<f64>,
     /// Samples the stage changed (`apply` only).
     pub corrected_samples: u64,
 }
@@ -386,7 +392,7 @@ impl ConditioningReport {
     /// Fold one segment's log in: counts and long runs sum across segments,
     /// the DC level is the last one seen, and the bounded span rings carry
     /// the final segment's.
-    fn add(&mut self, log: &manta_dsp::condition::ConditioningLog) {
+    pub(crate) fn add(&mut self, log: &manta_dsp::condition::ConditioningLog) {
         use manta_dsp::condition::{Mark, Stage};
         self.impulse.flagged_samples += log.count(Stage::Impulse, Mark::Flagged);
         self.impulse.repaired_samples += log.count(Stage::Impulse, Mark::Repaired);

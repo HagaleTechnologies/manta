@@ -175,6 +175,7 @@ mod worker {
                 },
                 spot_types: manta_server::config::UplinkSpotTypes::CqBeacon,
                 flush_offset: Duration::from_secs(7),
+                flush_interval: pskreporter::batch::FLUSH_INTERVAL,
                 observation_domain: 0x1234_abcd,
             },
             socket,

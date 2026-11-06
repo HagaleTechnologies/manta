@@ -8,7 +8,7 @@ use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
 use crate::spectrum::{SpectrumAccumulator, SpectrumFeed, SpectrumSink};
 use crate::track::{first_hop_after_gap, CloseCounts};
-use crate::PipelineConfig;
+use crate::{ConditioningReport, PipelineConfig};
 use anyhow::Result;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_input::{IqSource, ReadContinuity};
@@ -123,6 +123,13 @@ pub struct ListenObservers {
     pub bad_samples: Option<Arc<AtomicU64>>,
     /// Exact conditioning counts summed across reconnect segments.
     pub conditioned: Option<Arc<ConditioningObserver>>,
+    /// MAN-495: the full conditioning report -- counts, long runs, the
+    /// last DC level and the final segment's spans -- folded across
+    /// reconnect segments exactly like `conditioned`, for a caller that
+    /// needs the whole report (doctor) rather than the counts alone.
+    /// Published after each processed chunk under a short mutex;
+    /// `None` (the default) skips it, so existing callers pay nothing.
+    pub conditioning_report: Option<Arc<Mutex<ConditioningReport>>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -882,6 +889,24 @@ pub fn listen_with_observers(
     };
     // MAN-234: samples replaced by segments a discontinuity already replaced.
     let mut conditioned_base = [[0; 4]; 2];
+    // MAN-495: the same fold for the full-report observer: the base holds
+    // the closed segments' folded report (modes from `cfg.conditioning`,
+    // zero counts to start), and each publish stores base + the current
+    // segment's cumulative log, so repeated publishes within a segment
+    // never double-count (`add` sums, the slot is overwritten).
+    let mut conditioning_report_base = ConditioningReport::for_config(&cfg.conditioning);
+    let report_conditioning =
+        |ch: &manta_dsp::channelizer::Channelizer,
+         base: &ConditioningReport,
+         slot: &Option<Arc<Mutex<ConditioningReport>>>| {
+            if let Some(slot) = slot {
+                let mut report = base.clone();
+                if let Some(log) = ch.conditioning() {
+                    report.add(log);
+                }
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = report;
+            }
+        };
     let mut bad_base: u64 = 0;
     let report_bad_samples = |n: u64| {
         if let Some(counter) = &observers.bad_samples {
@@ -1014,6 +1039,11 @@ pub fn listen_with_observers(
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
     }
+    report_conditioning(
+        &seg.ch,
+        &conditioning_report_base,
+        &observers.conditioning_report,
+    );
     rtty.update(&seg.tm);
     if let Some(obs) = lifecycle {
         obs.publish_counts(
@@ -1172,6 +1202,9 @@ pub fn listen_with_observers(
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
             conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
+            if let Some(log) = seg.ch.conditioning() {
+                conditioning_report_base.add(log);
+            }
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
@@ -1244,6 +1277,11 @@ pub fn listen_with_observers(
         if let Some(observer) = &observers.conditioned {
             observer.report(conditioning_counts(&seg.ch, conditioned_base));
         }
+        report_conditioning(
+            &seg.ch,
+            &conditioning_report_base,
+            &observers.conditioning_report,
+        );
         rtty.update(&seg.tm);
         if let Some(obs) = lifecycle {
             obs.publish_counts(
@@ -1287,6 +1325,11 @@ pub fn listen_with_observers(
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
     }
+    report_conditioning(
+        &seg.ch,
+        &conditioning_report_base,
+        &observers.conditioning_report,
+    );
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -2967,6 +3010,59 @@ mod tests {
             expected
         );
         assert_eq!(counters[1].snapshot(), [[0; 4]; 2]);
+    }
+
+    /// MAN-495: the full-report observer folds across a reconnect segment
+    /// exactly like the counts observer -- counts sum over both segments,
+    /// the DC level is the last one seen, and the spans are the final
+    /// segment's.
+    #[test]
+    fn conditioning_report_observer_accumulates_across_a_reconnect_segment() {
+        use manta_dsp::condition::{ConditioningConfig, StageMode};
+        let (spec, iq) = v1_6s();
+        let cfg = PipelineConfig {
+            conditioning: ConditioningConfig {
+                dc: StageMode::Apply,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let padding = manta_dsp::channelizer::Channelizer::new(spec.fs, spec.center_freq_hz)
+            .unwrap()
+            .filter_len();
+        let expected = 2 * (iq.len() + padding) as u64;
+        let slot = Arc::new(Mutex::new(ConditioningReport::for_config(
+            &cfg.conditioning,
+        )));
+        listen_with_observers(
+            Box::new(GapSource::new(
+                iq.clone(),
+                spec.fs,
+                spec.center_freq_hz,
+                48_000,
+            )),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                conditioning_report: Some(slot.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let report = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(report.dc.mode, "apply", "{report:?}");
+        assert_eq!(report.impulse.mode, "off", "{report:?}");
+        assert_eq!(report.dc.corrected_samples, expected, "{report:?}");
+        assert!(report.dc.level_dbfs.is_some(), "{report:?}");
+        // The final segment's rings: one coalesced corrected span covering
+        // that segment's whole input (lead-in padding plus the buffer).
+        assert_eq!(report.spans.len(), 1, "{report:?}");
+        assert_eq!(report.spans[0].stage, "dc");
+        assert_eq!(report.spans[0].mark, "corrected");
+        assert_eq!(report.spans[0].samples, (iq.len() + padding) as u64);
     }
 
     /// Runs `listen_with_observers` with a bad-sample observer, returning
