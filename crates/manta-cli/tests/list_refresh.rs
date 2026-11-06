@@ -10,7 +10,7 @@
 //! cache) and `--cty-sha256`/`cty_sha256` pins.
 //!
 //! Every wait is bounded, every port is ephemeral (the `listening:` banner,
-//! or a bind-then-drop for a port nobody listens on), and every age and
+//! or a retained, non-listening socket for a refused source), and every age and
 //! hash is computed here from `SystemTime::now()`, the bundled bytes and the
 //! bundled retrieval dates (`manta_spot::vintage`; a seeded download always
 //! postdates them), so nothing depends on today's date or on which lists
@@ -94,13 +94,55 @@ fn cty_without_the_united_states() -> Vec<u8> {
     out.into_bytes()
 }
 
-/// A port nothing listens on: bound, read, and released.
-fn closed_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Reserves an ephemeral source port until the caller drops the socket.
+/// Never listen or enable reuse: connections must fail while other listeners
+/// cannot acquire this address. Keep the returned socket alive through teardown.
+fn refused_source() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], 0));
+    socket.bind(&address.into()).unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    (socket, port)
+}
+
+#[test]
+fn refused_sources_reserve_distinct_ports_without_listening() {
+    let (_first_socket, first_port) = refused_source();
+    let (_second_socket, second_port) = refused_source();
+    assert_ne!(first_port, second_port);
+    let addresses =
+        [first_port, second_port].map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    for address in addresses {
+        assert_eq!(
+            TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "source {address} must refuse connections"
+        );
+        assert_eq!(
+            TcpListener::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse,
+            "source {address} must stay reserved"
+        );
+    }
+    let _listeners: Vec<_> = (0..8)
+        .map(|_| TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    for address in addresses {
+        assert_eq!(
+            TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "source {address} must refuse connections alongside other listeners"
+        );
+    }
 }
 
 /// The vendored copy's retrieval date (`manta_spot::vintage`) for `list`.
@@ -612,7 +654,7 @@ fn scenario_2_an_unreachable_scp_server_keeps_the_last_good_copy() {
     let scp_sha = sha256_hex(bundled_scp());
     let server = ListServer::start(bundled_cty().to_vec(), bundled_scp().to_vec());
     let cty_url = server.url("/cty.dat");
-    let scp_port = closed_port();
+    let (_scp_socket, scp_port) = refused_source();
     let scp_url = format!("http://127.0.0.1:{scp_port}/MASTER.SCP");
     // Given a cached MASTER.SCP last checked two days ago (due: daily).
     let state_path = seed_cache(
@@ -671,7 +713,8 @@ fn scenario_3a_a_fresh_install_without_network_runs_on_the_bundled_lists() {
     let cache = dir.path().join("cache");
     std::fs::create_dir_all(&cache).unwrap();
     let (cty_sha, scp_sha) = (sha256_hex(bundled_cty()), sha256_hex(bundled_scp()));
-    let (cty_port, scp_port) = (closed_port(), closed_port());
+    let (_cty_socket, cty_port) = refused_source();
+    let (_scp_socket, scp_port) = refused_source();
     let cty_url = format!("http://127.0.0.1:{cty_port}/cty.dat");
     let scp_url = format!("http://127.0.0.1:{scp_port}/MASTER.SCP");
 
