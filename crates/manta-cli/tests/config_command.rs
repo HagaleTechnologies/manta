@@ -1653,3 +1653,61 @@ fn check_rejects_each_relay_error_with_its_message() {
         "{err}"
     );
 }
+
+#[test]
+fn cw_segments_config_and_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid="[input]\ncw_segments_hz = [[14000000,14030000],[14040000,14060000]]\n[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []\n[[input.cw_overrides]]\nstart_utc = 2026-11-28T00:00:00Z\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = [[14000000,14060000]]\n";
+    succeeds(&check_file(&write_cfg(dir.path(), "valid.toml", valid)));
+    for (body,error) in [
+        ("cw_segments_hz = [[2,1]]","cw_segments_hz[0] must contain two finite positive Hz values with lo < hi"),
+        ("cw_segments_hz = [[1]]","cw_segments_hz[0]"),
+        ("cw_segments_hz = [[1,inf]]","cw_segments_hz[0]"),
+        ("[[input.cw_schedule]]\nat_utc = \"6:00\"\nsegments_hz = []","cw_schedule[0].at_utc must be HH:MM UTC"),
+        ("[[input.cw_schedule]]\nat_utc = \"24:00\"\nsegments_hz = []","cw_schedule[0].at_utc"),
+        ("[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []\n[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []","cw_schedule contains duplicate at_utc 06:00"),
+        ("[[input.cw_overrides]]\nstart_utc = 2026-11-28T00:00:00+01:00\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = []","cw_overrides[0] requires UTC start_utc < end_utc"),
+        ("[[input.cw_overrides]]\nstart_utc = 2026-11-30T00:00:00Z\nend_utc = 2026-11-28T00:00:00Z\nsegments_hz = []","cw_overrides[0]"),
+        ("cw_segmnts_hz = []","unknown field"),
+    ] {
+        let path=write_cfg(dir.path(),"invalid.toml",&format!("[input]\n{body}\n"));
+        let err=fails(&check_file(&path));
+        assert!(err.contains(error),"{err}");
+    }
+    let path=write_cfg(dir.path(),"named.toml","[[input]]\nname = \"20m\"\ntype = \"kiwi\"\nhost = \"kiwi.example.org\"\nfreq_hz = 14050000\ncw_segments_hz = [[2,1]]\n");
+    assert!(fails(&check_file(&path)).contains("input \"20m\": cw_segments_hz[0]"));
+}
+
+#[test]
+fn cw_segments_documented_example_parses() {
+    let doc = include_str!("../../../docs/CONFIG.md");
+    let section = doc
+        .split("### CW sub-segments and UTC schedules")
+        .nth(1)
+        .unwrap();
+    let example = section
+        .split("```toml\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    succeeds(&check_file(&write_cfg(
+        dir.path(),
+        "documented.toml",
+        example,
+    )));
+}
+
+#[test]
+fn cw_segments_decode_rejects_ambiguous_input_policies() {
+    let dir = tempfile::tempdir().unwrap();
+    let config=write_cfg(dir.path(),"two.toml","[[input]]\nname = '20m'\ntype = 'file'\npath = '20m.wav'\ncw_segments_hz = [[14000000,14060000]]\n[[input]]\nname = '40m'\ntype = 'file'\npath = '40m.wav'\ncw_segments_hz = [[7000000,7060000]]\n");
+    let out = manta()
+        .args(["decode", "missing.wav", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert!(fails(&out).contains("different CW coverage"));
+}

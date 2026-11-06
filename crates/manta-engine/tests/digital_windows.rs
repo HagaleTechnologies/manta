@@ -177,6 +177,7 @@ fn digital_window_each_service_input_uses_its_own_rf_center() {
             .map(|(index, (center, samples))| {
                 let (center, samples) = (*center, samples.clone());
                 InputSpec {
+                    cw_policy: Default::default(),
                     conditioning: Default::default(),
                     name: format!("receiver-{index}"),
                     open: Box::new(move || {

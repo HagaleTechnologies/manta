@@ -77,6 +77,8 @@ pub enum TrackCloseReason {
     Rtty,
     NotCw,
     Unkeyed,
+    /// MAN-30: the track left the source's CW coverage.
+    Restricted,
 }
 
 impl TrackCloseReason {
@@ -91,6 +93,7 @@ impl TrackCloseReason {
             Self::Rtty => "rtty",
             Self::NotCw => "notCw",
             Self::Unkeyed => "unkeyed",
+            Self::Restricted => "restricted",
         }
     }
 }
@@ -107,6 +110,7 @@ impl From<crate::track::CloseReason> for TrackCloseReason {
             C::Rtty => Self::Rtty,
             C::NotCw => Self::NotCw,
             C::Unkeyed => Self::Unkeyed,
+            C::Restricted => Self::Restricted,
         }
     }
 }

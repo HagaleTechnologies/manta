@@ -71,6 +71,19 @@ fn bench_cpu_budget(c: &mut Criterion) {
             .unwrap()
         })
     });
+    let mut restricted = cfg.clone();
+    restricted.cw_policy = manta_engine::cw_segments::Policy::new(
+        Some(manta_engine::cw_segments::Ranges::new(vec![(13_990_000.0, 14_010_000.0)]).unwrap()),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    group.bench_function("192khz_300tracks_restricted", |b| {
+        b.iter(|| {
+            manta_engine::decode_samples(black_box(&iq), fs, center_freq_hz, black_box(&restricted))
+                .unwrap()
+        })
+    });
     group.finish();
 }
 
