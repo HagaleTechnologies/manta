@@ -303,6 +303,18 @@
 #cw_schedule = []                   # no default: daily UTC entries that replace the base ranges
 #cw_overrides = []                  # no default: dated entries that replace the base and daily ranges
 
+# IQ correction uses a controlled tone calibration for this receiver. Restart required.
+# Observe only measures mirrors; Apply requires the complete triple below.
+#iq_correction = "off"
+
+# No default: controlled-tone gain ratio, finite and 0.5 through 2.0. Supply all three values together.
+#iq_gain_ratio = 1.05
+
+# No default: controlled-tone phase error, finite and -45 through 45 degrees. Remeasure after a gain change.
+#iq_phase_deg = 2.0
+
+# No default: positive receiver centre, Hz, when measured. Apply needs agreement within 1 Hz; bands refuses calibration.
+#iq_calibrated_center_hz = 14000000.0
 
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0

@@ -973,6 +973,7 @@ mod tests {
     fn resolved_with(spec: LiveSourceSpec) -> Resolved {
         Resolved {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             spec,
             freq_correction_ppm: 0.0,
             dial_freq_hz: Some(7_000_000.0),

@@ -191,6 +191,7 @@ fn spec(name: &str, scene: &Scene, ppm: f64, fail_at: usize, fault: Fault) -> In
     let (fs, center) = (scene.fs, scene.center_freq_hz);
     InputSpec {
         cw_policy: Default::default(),
+        conditioning: Default::default(),
         name: name.into(),
         open: Box::new(move || {
             Ok(Box::new(SceneSource {
@@ -203,7 +204,6 @@ fn spec(name: &str, scene: &Scene, ppm: f64, fail_at: usize, fault: Fault) -> In
             }) as Box<dyn manta_input::IqSource>)
         }),
         freq_correction_ppm: ppm,
-        conditioning: Default::default(),
         observers: Default::default(),
         spawn_band_hz: None,
     }
@@ -460,13 +460,13 @@ fn live_merge_does_not_wait_for_a_stalled_input() {
         plain("a", short_scene()),
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "b".into(),
             open: Box::new(move || {
                 Ok(Box::new(StalledSource { stop: stalled_stop })
                     as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -511,10 +511,10 @@ fn open_inputs_fails_fast_naming_the_input() {
         plain("a", short_scene()),
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -537,6 +537,7 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
     let specs = vec![
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "a".into(),
             open: Box::new(move || {
                 // Stands in for an opener blocked in a connect: it returns
@@ -545,16 +546,15 @@ fn open_inputs_does_not_wait_for_a_hung_opener_after_a_failure() {
                 anyhow::bail!("a was never opened")
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "b".into(),
             open: Box::new(|| anyhow::bail!("boom")),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -600,12 +600,12 @@ fn open_inputs_fails_when_a_source_panics_reading_its_metadata() {
         plain("a", short_scene()),
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: "b".into(),
             open: Box::new(|| {
                 Ok(Box::new(PanickingMetadataSource) as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: Default::default(),
             spawn_band_hz: None,
         },
@@ -898,6 +898,7 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
         let (fs, center) = (scene.fs, scene.center_freq_hz);
         InputSpec {
             cw_policy: Default::default(),
+            conditioning: Default::default(),
             name: name.into(),
             open: Box::new(move || {
                 Ok(Box::new(SceneSource {
@@ -910,7 +911,6 @@ fn an_inputs_replaced_samples_reach_only_its_own_counter() {
                 }) as Box<dyn manta_input::IqSource>)
             }),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             observers: manta_engine::InputObservers {
                 bad_samples: Some(counter),
                 ..Default::default()
