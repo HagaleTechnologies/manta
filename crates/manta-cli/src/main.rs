@@ -6552,14 +6552,41 @@ fn prepare_config_for(
             loaded.inputs.first().map_or("file", |i| i.name.as_str()),
         )?;
     }
+    // Every input's pipeline shares `pipeline`'s epoch (`listen_inputs`
+    // replaces only policy and clock), so scheduled native recordings must
+    // agree on their start; differing ones would run another recording's
+    // schedule against the wrong UTC.
+    let mut shared_epoch = matches!(resolved.spec, LiveSourceSpec::File { .. }).then(|| {
+        (
+            pipeline.cw_epoch,
+            pipeline.cw_epoch_nanoseconds,
+            String::from("[input]"),
+        )
+    });
     for input in &resolved.inputs {
         if let LiveSourceSpec::File { ref path, .. } = input.spec {
-            cw_replay_epoch(
+            let epoch = cw_replay_epoch(
                 path,
                 resolved.replay_epoch,
                 input.cw_policy.scheduled(),
                 &input.name,
             )?;
+            if !input.cw_policy.scheduled() || resolved.replay_epoch.is_some() {
+                continue;
+            }
+            match &shared_epoch {
+                None => {
+                    (pipeline.cw_epoch, pipeline.cw_epoch_nanoseconds) = epoch;
+                    shared_epoch = Some((epoch.0, epoch.1, input.name.clone()));
+                }
+                Some((secs, nanos, first)) if (*secs, *nanos) != epoch => bail!(
+                    "inputs {} and {} are recordings with different start times; a scheduled \
+                     replay applies one epoch to every input: set replay_epoch",
+                    fmt::quoted(first),
+                    fmt::quoted(&input.name)
+                ),
+                Some(_) => {}
+            }
         }
     }
     pipeline.decode = decode;

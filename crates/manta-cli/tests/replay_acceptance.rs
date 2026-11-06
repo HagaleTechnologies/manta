@@ -510,3 +510,71 @@ fn cw_segments_cli_replay_uses_epoch_and_enforces_static_and_scheduled_coverage(
     );
     assert!(!String::from_utf8_lossy(&empty.stdout).contains("\"spot\""));
 }
+
+/// Codex P1 on #510: every input shares one schedule epoch, so scheduled
+/// native recordings with different start times are refused instead of
+/// running one recording's schedule against another's UTC start.
+#[test]
+fn cw_segments_scheduled_recordings_must_share_one_epoch() {
+    use manta_input::recording_format::MetadataRecord;
+    let dir = tempfile::tempdir().unwrap();
+    let native = |name: &str, start: i64| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, [0u8; 8]).unwrap();
+        let header = manta_input::RecordingHeader {
+            schema: "manta-iq.v1".into(),
+            sample_format: "cf32_le".into(),
+            sample_rate_hz: 48000.,
+            center_freq_hz: 14030000.,
+            start_unix_seconds: start,
+            start_nanoseconds: 0,
+            rf_passband_hz: [-24000., 24000.],
+            trusted_band_hz: None,
+            analytic_guard_hz: 0.,
+        };
+        let metadata = MetadataRecord::Header(header).to_line()
+            + &MetadataRecord::End {
+                sample_count: 1,
+                reason: manta_input::EndReason::Eof,
+            }
+            .to_line();
+        std::fs::write(manta_input::metadata_path(&path), metadata).unwrap();
+        path
+    };
+    let a = native("a.cf32", 30);
+    let b = native("b.cf32", 90);
+    let same = native("c.cf32", 30);
+    let config = dir.path().join("two.toml");
+    let check = |second: &Path| {
+        std::fs::write(
+            &config,
+            format!(
+                "[[input]]\nname = 'a'\ntype = 'file'\npath = '{}'\n\
+                 [[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n\n\
+                 [[input]]\nname = 'b'\ntype = 'file'\npath = '{}'\n\
+                 [[input.cw_schedule]]\nat_utc = '00:01'\nsegments_hz = []\n",
+                a.display(),
+                second.display()
+            ),
+        )
+        .unwrap();
+        manta()
+            .args(["config", "check", "--config"])
+            .arg(&config)
+            .output()
+            .unwrap()
+    };
+    let differing = check(&b);
+    assert!(!differing.status.success());
+    assert!(
+        String::from_utf8_lossy(&differing.stderr).contains("different start times"),
+        "{}",
+        String::from_utf8_lossy(&differing.stderr)
+    );
+    let agreeing = check(&same);
+    assert!(
+        agreeing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&agreeing.stderr)
+    );
+}
