@@ -148,6 +148,13 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-485: `[input].digital_modes = ["FT8", "FT4"]` enables FT8/FT4 CQ
+  skimming from covered IQ windows in builds with `--features ftx`.
+  Spots publish on the JSON stream as `mode` `"FT8"`/`"FT4"`, with
+  `dxGrid` from the CQ and the UTC slot timestamp. Startup lines report
+  attempted and skipped windows; the four `manta_ftx_` metric families
+  appear only for attempted windows. CW decoder output is unchanged.
+
 - MAN-495: `manta doctor` now observes the input-conditioning chain. Every
   stage not set to `apply` runs as `observe` in doctor's own run (an `off`
   stage included, so diagnostics exist on a default config; an `apply`

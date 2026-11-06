@@ -1958,6 +1958,13 @@ rules:
    override; the stored time never moves backwards. See
    docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md.
 
+8. **FT8/FT4 slots (MAN-323/MAN-485):** slot boundaries come from the
+   session epoch. For file input, FTx spots are a pure function of the file
+   and its epoch. Several replayed inputs publish FTx spots in
+   `(slot start, input index, mode, decode order)` order; their position
+   among CW records on the JSON stream is not fixed. CW output is
+   unaffected.
+
 CI enforces: same binary + same IQ file, 3 runs → identical SHA-256 of the
 JSON spot log; and the §7 vectors on all platforms.
 

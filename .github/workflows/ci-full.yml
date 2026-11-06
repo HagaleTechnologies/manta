@@ -284,6 +284,8 @@ jobs:
         run: cargo test -p manta-engine --features ftx --locked --lib ftx
       - if: runner.os != 'Windows'
         run: cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
+      - if: runner.os != 'Windows'
+        run: cargo test -p manta-cli --features ftx --locked --test ftx_acceptance
       # MAN-65: the release pipeline's tag grammar and :latest recency
       # logic are testable without pushing a tag, and this rides the
       # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
@@ -474,6 +476,8 @@ jobs:
         run: cargo test -p manta-engine --features ftx --locked --lib ftx
       - if: runner.os != 'Windows'
         run: cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
+      - if: runner.os != 'Windows'
+        run: cargo test -p manta-cli --features ftx --locked --test ftx_acceptance
       # MAN-65: the release pipeline's tag grammar and :latest recency
       # logic are testable without pushing a tag, and this rides the
       # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new
@@ -809,6 +813,8 @@ jobs:
         run: cargo test -p manta-engine --features ftx --locked --lib ftx
       - if: runner.os != 'Windows'
         run: cargo test -p manta-engine --features ftx --locked --test ftx_band_stream
+      - if: runner.os != 'Windows'
+        run: cargo test -p manta-cli --features ftx --locked --test ftx_acceptance
       # MAN-65: the release pipeline's tag grammar and :latest recency
       # logic are testable without pushing a tag, and this rides the
       # ALREADY-REQUIRED `test` check (ubuntu + macos) rather than a new

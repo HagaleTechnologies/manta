@@ -319,6 +319,10 @@
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
 
+# FT8/FT4 spots on the JSON stream from windows this input covers.
+# Needs a manta built with --features ftx and a [server] table. Restart required.
+#digital_modes = []
+
 # Input-conditioning stages, each off | observe | apply:
 # "observe" measures and annotates without changing a sample, "apply"
 # corrects. Restart-only. `decode --json` reports what ran as

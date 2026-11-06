@@ -529,6 +529,7 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
+    digital_modes: Option<Vec<String>>,
     iq_correction: Option<String>,
     iq_gain_ratio: Option<f64>,
     iq_phase_deg: Option<f64>,
@@ -735,6 +736,8 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
+    /// MAN-485: enabled FT8/FT4 modes, in startup-summary order.
+    pub digital_modes: Vec<manta_engine::ftx::FtxMode>,
     pub cw_policy: manta_engine::cw_segments::Policy,
     pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
@@ -1122,6 +1125,26 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             inputs
         }
     };
+    // MAN-485 D4: every config entry point shares these publication and
+    // build-feature rules, including SIGHUP's restart-only validation.
+    if inputs
+        .iter()
+        .any(|input| !input.input.shared.digital_modes.is_empty())
+    {
+        if server.is_none() {
+            bail!(
+                "{origin}: [input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table{}",
+                overlay.suffix("input")
+            );
+        }
+        if !manta_engine::ftx::decoder_compiled() {
+            bail!(
+                "{origin}: [input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}{}",
+                crate::build_info::FEATURES,
+                overlay.suffix("input")
+            );
+        }
+    }
     let input = inputs[0].input.clone();
 
     let mut env_vars: Vec<String> = overlay.vars_by_table.into_values().flatten().collect();
@@ -2048,6 +2071,32 @@ fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
 }
 
+/// MAN-485 D4: accept exact wire spellings and normalize to the mode order.
+fn digital_modes(
+    texts: Option<&[String]>,
+) -> std::result::Result<Vec<manta_engine::ftx::FtxMode>, String> {
+    use manta_engine::ftx::FtxMode;
+    let mut modes = BTreeSet::new();
+    for text in texts.unwrap_or_default() {
+        let mode = FtxMode::parse(text).ok_or_else(|| {
+            format!(
+                "digital_modes: {} is not a mode manta decodes; use \"FT8\", \"FT4\" or both",
+                crate::fmt::quoted(text),
+            )
+        })?;
+        if !modes.insert(mode) {
+            return Err(format!(
+                "digital_modes: {} is repeated; list each mode once",
+                crate::fmt::quoted(text)
+            ));
+        }
+    }
+    Ok(FtxMode::ALL
+        .into_iter()
+        .filter(|mode| modes.contains(mode))
+        .collect())
+}
+
 /// IQ correction is always a fixed, receiver-specific calibration.
 fn iq_conditioning(
     t: &InputToml,
@@ -2094,6 +2143,7 @@ fn validate_input(
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
+        digital_modes: digital_modes(t.digital_modes.as_deref())?,
         cw_policy: cw_policy(&t)?,
         conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
@@ -2455,6 +2505,91 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digital_modes_parses_and_bands_streams_inherit_it() {
+        use manta_engine::ftx::FtxMode;
+        // The parser and expansion are feature-independent; load below owns
+        // the build-feature refusal.
+        let t: InputToml = toml::from_str(
+            "type = 'kiwi'\nhost = 'h'\nbands = ['20m']\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        let (inputs, _) = take_entry(t, "kiwi".into(), None, "[input]", &|_, p| p).unwrap();
+        assert_eq!(inputs.len(), 12);
+        for input in inputs {
+            assert_eq!(input.input.shared.digital_modes, FtxMode::ALL);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_repeated_digital_mode_is_refused() {
+        let err = err_of("[input]\ndigital_modes = ['JT65']\n");
+        assert!(err.ends_with("[input]: digital_modes: \"JT65\" is not a mode manta decodes; use \"FT8\", \"FT4\" or both"), "{err}");
+        let err = err_of("[input]\ndigital_modes = ['FT8', 'FT8']\n");
+        assert!(
+            err.ends_with("[input]: digital_modes: \"FT8\" is repeated; list each mode once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn digital_modes_needs_a_server_table() {
+        let err = err_of("[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with("[input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table"), "{err}");
+        assert!(load_file("[input]\ndigital_modes = []\n")
+            .unwrap()
+            .input
+            .shared
+            .digital_modes
+            .is_empty());
+    }
+
+    #[cfg(not(feature = "ftx"))]
+    #[test]
+    fn digital_modes_needs_the_ftx_feature() {
+        let err =
+            err_of("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with(&format!("[input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}", crate::build_info::FEATURES)), "{err}");
+    }
+
+    #[cfg(feature = "ftx")]
+    #[test]
+    fn digital_modes_loads_with_the_ftx_feature() {
+        let loaded = load_file(
+            "[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.digital_modes,
+            manta_engine::ftx::FtxMode::ALL
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_digital_modes() {
+        let result = load_env(
+            Some("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[\"FT8\"]")],
+        );
+        #[cfg(feature = "ftx")]
+        assert_eq!(
+            result.unwrap().input.shared.digital_modes,
+            [manta_engine::ftx::FtxMode::Ft8]
+        );
+        #[cfg(not(feature = "ftx"))]
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("digital_modes needs a manta built with the ftx feature"));
+        // Empty arrays work in every build and override an enabled file key.
+        let disabled = load_env(
+            Some("[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[]")],
+        )
+        .unwrap();
+        assert!(disabled.input.shared.digital_modes.is_empty());
+    }
 
     #[test]
     fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
