@@ -242,3 +242,179 @@ fn impulse_suppression_leaves_clean_scenes_alone() {
         }
     }
 }
+
+#[test]
+fn bypass_iq_imbalance_produces_a_bogus_mirror_spot() {
+    for trial in 1..=2 {
+        let mut scene = iq_scene(trial);
+        add_iq_imbalance(&mut scene.samples, 1.05, 2.0);
+        let out = decode(&scene.samples, &bypass());
+        let mirrors = mirror_spots(&scene, &out);
+        eprintln!(
+            "IQ imbalance trial {trial}: bypass {} clean calls, {mirrors} mirror spots",
+            found(&scene, &out)
+        );
+        assert!(
+            mirrors > 0,
+            "the fixture must produce an actual false mirror spot"
+        );
+    }
+}
+
+fn measured_iq_calibration(
+    gain_ratio: f64,
+    phase_deg: f64,
+) -> manta_dsp::condition::iq::IqCalibration {
+    use manta_dsp::condition::iq::{IqCalibration, ToneMeter, ToneResult};
+    let mut meter = ToneMeter::new(96_000.0, 12_000.0);
+    for sample in iq_tone_capture(gain_ratio, phase_deg) {
+        meter.push(sample);
+    }
+    match meter.result() {
+        ToneResult::Accepted { offset_hz, rho, .. } => {
+            assert!((offset_hz - 12_013.7).abs() < 0.05);
+            IqCalibration::from_image_ratio(rho, 14_000_000.0)
+                .expect("a valid measured calibration")
+        }
+        result => panic!("separate controlled-tone measurement failed: {result:?}"),
+    }
+}
+
+fn iq_apply(calibration: Option<manta_dsp::condition::iq::IqCalibration>) -> PipelineConfig {
+    PipelineConfig {
+        conditioning: ConditioningConfig {
+            iq: StageMode::Apply,
+            iq_calibration: calibration,
+            ..ConditioningConfig::default()
+        },
+        ..PipelineConfig::default()
+    }
+}
+
+#[test]
+fn iq_correction_from_a_measured_tone_removes_the_mirror_spot() {
+    let calibration = measured_iq_calibration(1.05, 2.0);
+    for trial in 1..=2 {
+        let clean = iq_scene(trial);
+        let want = found_calls(&clean, &decode(&clean.samples, &bypass()));
+        assert_eq!(
+            want.len(),
+            6,
+            "the clean positive control must decode every station"
+        );
+        let mut scene = iq_scene(trial);
+        add_iq_imbalance(&mut scene.samples, 1.05, 2.0);
+        let b = decode(&scene.samples, &bypass());
+        assert!(
+            mirror_spots(&scene, &b) > 0,
+            "the bypass control must reproduce the false spot"
+        );
+        let out = decode(&scene.samples, &iq_apply(Some(calibration)));
+        eprintln!(
+            "measured IQ trial {trial}: bypass {} mirrors, corrected {} mirrors and {} calls",
+            mirror_spots(&scene, &b),
+            mirror_spots(&scene, &out),
+            found(&scene, &out)
+        );
+        assert_eq!(mirror_spots(&scene, &out), 0);
+        assert_eq!(found_calls(&scene, &out), want);
+    }
+}
+
+#[test]
+fn iq_correction_on_a_balanced_receiver_changes_no_spot() {
+    let calibration = measured_iq_calibration(1.0, 0.0);
+    for trial in 1..=2 {
+        let scene = series_scene(45.0, trial);
+        let b = decode(&scene.samples, &bypass());
+        assert_eq!(
+            found(&scene, &b),
+            10,
+            "the bypass control must decode the scene"
+        );
+        let out = decode(&scene.samples, &iq_apply(Some(calibration)));
+        assert_eq!(mirror_spots(&scene, &out), 0);
+        assert_eq!(found_calls(&scene, &out), found_calls(&scene, &b));
+    }
+}
+
+#[test]
+fn iq_correction_is_withheld_without_a_matching_calibration() {
+    let mut calibration = measured_iq_calibration(1.05, 2.0);
+    calibration.center_freq_hz += 30_000.0;
+    let mut scene = iq_scene(1);
+    add_iq_imbalance(&mut scene.samples, 1.05, 2.0);
+    let b = decode(&scene.samples, &bypass());
+    assert!(
+        mirror_spots(&scene, &b) > 0,
+        "the bypass control must reproduce the false spot"
+    );
+    for calibration in [None, Some(calibration)] {
+        let cfg = iq_apply(calibration);
+        let out = decode(&scene.samples, &cfg);
+        assert_eq!(
+            out.spots, b.spots,
+            "withheld correction must preserve every bypass spot"
+        );
+        let log = condition_log(&scene.samples, &cfg.conditioning);
+        assert_eq!(
+            log.iq_status(),
+            manta_dsp::condition::IqStatus::CalibrationMismatch
+        );
+        assert_eq!(log.count(Stage::Iq, Mark::Corrected), 0);
+        assert_eq!(
+            log.count(Stage::Iq, Mark::Uncertain),
+            scene.samples.len() as u64
+        );
+    }
+}
+
+/// MAN-496: decode reports the conditioning it ran: `inputConditioning`
+/// exists only when a stage is on, and its counts match the channelizer's
+/// own log over the same scene.
+#[test]
+fn decode_reports_input_conditioning_when_a_stage_is_on() {
+    use manta_engine::decode_samples;
+    use manta_testkit::sensitivity::{CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
+    let scene = near_centre_scene(NEAR_OFFSETS_HZ[0], NEAR_SNR_DB, DC, 1);
+    let on = decode_samples(&scene.samples, SAMPLE_RATE_HZ, CENTER_FREQ_HZ, &dc_apply()).unwrap();
+    let cond = on.input_conditioning.as_ref().unwrap();
+    assert_eq!(cond.dc.mode, "apply");
+    assert_eq!(cond.impulse.mode, "off");
+    let log = condition_log(
+        &scene.samples,
+        &ConditioningConfig {
+            dc: StageMode::Apply,
+            ..ConditioningConfig::default()
+        },
+    );
+    // Decode feeds `filter_len()` zeros of lead-in padding before the
+    // scene (the `condition_log` doc above), and the apply DC stage marks
+    // those corrected too.
+    let pad = manta_dsp::channelizer::Channelizer::with_conditioning(
+        SAMPLE_RATE_HZ,
+        CENTER_FREQ_HZ,
+        &ConditioningConfig::default(),
+    )
+    .unwrap()
+    .filter_len() as u64;
+    assert_eq!(
+        cond.dc.corrected_samples,
+        log.count(Stage::Dc, Mark::Corrected) + pad,
+        "the report sums the channelizer's exact corrected count"
+    );
+    assert!(
+        cond.dc.corrected_samples > 0,
+        "the apply DC stage marks its writes"
+    );
+    assert!(cond.dc.level_dbfs.is_some());
+    assert!(!cond.spans.is_empty());
+    // With every stage off the report is absent, whatever the decode found.
+    match decode_samples(&scene.samples, SAMPLE_RATE_HZ, CENTER_FREQ_HZ, &bypass()) {
+        Ok(off) => assert!(off.input_conditioning.is_none()),
+        Err(e) => assert!(
+            e.to_string().contains("no signal found"),
+            "unexpected bypass error: {e:#}"
+        ),
+    }
+}

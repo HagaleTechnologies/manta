@@ -61,6 +61,7 @@ lowest-numbered track that sent any event besides `TrackPromoted` and
 | `timing` | object or null | until learned | The primary track's last `TimingUpdate`, without `event`, `trackId` and `sampleTs`. See [`timing`](#timing). `null` when the track sent none. |
 | `rtty` | array | never | Every RTTY signal the detector marked (SPEC §2.6); empty when there is none. See [`rtty` entries](#rtty-entries). |
 | `badSamples` | integer | never | Input samples replaced with silence because they were NaN, infinite or too large (SPEC §1.3 step 0). Omitted when 0. |
+| `inputConditioning` | object | when a conditioning stage is on | What the input-conditioning chain did (MAN-496): `impulse` and `dc` stage objects (always both, their `mode` saying `off`), `spans` and `spansDropped` from the bounded span log. Counts are exact. Omitted when every `[input]` stage is `off`, so a clean run's JSON keeps its pre-MAN-496 shape. |
 
 ## `run --json` and `listen --json`
 

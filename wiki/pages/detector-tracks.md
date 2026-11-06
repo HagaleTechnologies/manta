@@ -81,6 +81,10 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   Tests that expect a decoder or `TrackPromoted` at the promotion hop
   need the filter off. `drain_pool` must skip queued tracks that hold no
   decoder, or it panics on the unwrap.
+  MAN-199: tests that count decoder input must expect the lead-in (up
+  to 64 recorded pre-promotion hops, uncounted in `hop_count`) ahead of
+  `pending`; every close goes through `Track::close`. See the MAN-199
+  [decision record](../../docs/DECISIONS/2026-11-02-man199-lead-in-replay-and-one-close-routine.md).
 - MAN-313 flatness: the per-track neighbourhood test must tolerate a
   louder neighbour. Requiring `PdB[k]` to beat its ±2/±3 channels kept
   weak CW 300 Hz from a loud RTTY mark from ever qualifying; only a

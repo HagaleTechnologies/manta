@@ -17,6 +17,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
+use manta_input::IqSource;
 use manta_server::metrics::Metrics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -454,6 +455,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // thread after each of its batches, as the one-input path reads one
     // counter; `bad_warned` holds what the one-time warning already named.
     let bad: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let conditioned: Vec<_> = (0..n)
+        .map(|_| Arc::new(manta_engine::ConditioningObserver::default()))
+        .collect();
     let bad_warned: Vec<std::cell::Cell<u64>> = (0..n).map(|_| std::cell::Cell::new(0)).collect();
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
@@ -526,13 +530,17 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             };
             let input_counters = input_counters.clone();
             let bad = bad[index].clone();
+            let iq_cfg = input.conditioning.clone();
+            let iq_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
             InputSpec {
+                conditioning: input.conditioning.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
                     bad_samples: Some(bad),
+                    conditioned: Some(conditioned[index].clone()),
                     rtty: Some(rtty_observers[index].clone()),
                     spectrum: spectrum_late[index]
                         .clone()
@@ -552,9 +560,21 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = source.input_health();
                             }
+                            crate::warn_iq_mismatch(
+                                &iq_cfg,
+                                source.center_freq_hz(),
+                                Some(&name),
+                                &iq_warned,
+                            );
                             return Ok(Box::new(source) as Box<dyn manta_input::IqSource>);
                         }
                         let first = spec.open(capture, dial)?;
+                        crate::warn_iq_mismatch(
+                            &iq_cfg,
+                            first.center_freq_hz(),
+                            Some(&name),
+                            &iq_warned,
+                        );
                         if let Ok(mut at) = opened_at.lock() {
                             at[index] = Some(Instant::now());
                         }
@@ -564,10 +584,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             // is live (Kiwi, ka9q) is healthy once it has.
                             let initial_healthy = first.confirmed_live_handle().is_none();
                             let on_health = input_health_sink(index, name.clone(), health);
+                            let iq_name = name.clone();
                             let wrapped = ReconnectingSource::new(
                                 name,
                                 first,
-                                Box::new(move || reopen.open(capture, dial)),
+                                Box::new(move || {
+                                    let src = reopen.open(capture, dial)?;
+                                    crate::warn_iq_mismatch(
+                                        &iq_cfg,
+                                        src.center_freq_hz(),
+                                        Some(&iq_name),
+                                        &iq_warned,
+                                    );
+                                    Ok(src)
+                                }),
                                 stop,
                                 initial_healthy,
                                 on_health,
@@ -800,13 +830,19 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             // Health edges from here on reach `Metrics` directly; each
             // input's state so far is copied in once.
             let _ = metrics_slot.set(server.metrics.clone());
-            for (name, up) in names.iter().zip(healthy.iter()) {
+            for (index, (name, up)) in names.iter().zip(healthy.iter()).enumerate() {
                 server
                     .metrics
                     .set_source_health(name, up.load(Ordering::Relaxed));
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    name,
+                    &m.inputs[index].conditioning,
+                    &conditioned[index],
+                );
             }
             // MAN-14: every input's hearing series, at 0, in config order.
             server.metrics.register_input_hearing(&names);
@@ -996,6 +1032,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_input_bad_samples(&names[input], n_bad);
+                crate::publish_conditioned(
+                    &server.metrics,
+                    &names[input],
+                    &m.inputs[input].conditioning,
+                    &conditioned[input],
+                );
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
@@ -1294,6 +1336,7 @@ mod tests {
     #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
+            conditioning: Default::default(),
             name: "b".into(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,

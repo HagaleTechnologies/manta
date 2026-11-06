@@ -90,7 +90,7 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    stage runs, so output is bit-identical to an unconditioned
    channelizer), `observe` (measures, never writes a sample) or `apply`
    (corrects, and records each corrected run of samples as a span with a
-   per-stage counter). The stages run in the order impulse, then DC. The
+   per-stage counter). The stages run in the order impulse, DC, then IQ. The
    impulse stage flags a sample whose power exceeds `12² = 144` times the
    reference power of the 33 samples centred on it (fewer at the stream
    start): their mean power once the 8 strongest are left out. A zero
@@ -111,7 +111,12 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    (full scale); exact-zero samples before the first nonzero one (the
    lead-in padding) leave the state untouched, so `n` counts from the
    first real sample. It reads only `y`, so `x[n] = y[n] + dc[n]` inverts
-   it exactly. Every stage is a per-sample state machine with a fixed
+   it exactly. The IQ stage (MAN-494) applies `y = m - rho*conj(m)` only
+   with a validated, fixed controlled-tone calibration whose receiver centre
+   agrees within 1 Hz. A sample-domain tone meter reads after DC and before
+   IQ. A hop-domain mirror monitor reports five-second windows and never
+   changes coefficients. Suspected windows without correction are uncertain.
+   Every correction stage is a per-sample state machine with a fixed
    release delay, so the hops do not depend on how the input is split into
    `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
@@ -411,6 +416,29 @@ is later (0.5–1.5 s of stream on the golden vectors). A track that never
 qualifies emits nothing, including at end of input. `NotCw`, `Unkeyed` and
 the garbage-collect close each start the MAN-171 respawn cooldown on their
 channels. `non_cw_filter = false` leases at promotion, as before.
+
+**Lead-in (MAN-199).** The detector keeps the power spectrum of the last
+64 hops it stepped (171 ms), indexed by hop and stamped with each hop's
+original `sample_ts`. When a track is promoted, or a DORMANT track wakes,
+it takes a *lead-in*: the recorded hops before that hop, on the owned
+channel the live decoder feed would select (excluding a close
+neighbour's channel, MAN-112) and through the §2.7 crash hold, minus
+every hop a decoder on the same channels already consumed. A lead-in
+never reaches back past the segment's first recorded hop (stream start,
+pre-roll, a discontinuity) or an unknown-length input gap, and it never
+contains a synthetic hop: a hop that was not recorded is absent, with its reason,
+and one that has not arrived is "not yet known". The decoder replays the
+lead-in ahead of its queued input, when it is leased. Lead-in hops do not
+count toward the §5 report cadence or the SNR peak-hold window, and §2.8
+qualification reads only the post-promotion queue. The refiner (v2 §3)
+is not fed from the lead-in: its entries carry the recorded amplitude.
+
+**One close routine (MAN-199).** Every close of a track (end of stream, a
+discontinuity, DORMANT entry, and every close reason) drains the refiner
+backlog, the lead-in and the queued input through the decoder, then
+finishes the decoder: forced for `HangExpired`, DORMANT entry and end of
+stream (an observed RF gap may resolve an open mark), speed-only for
+every other close. The §5 `TrackClosed` gate runs after that flush.
 On a hop where a static crash is suppressed (§2.7, `detector.crash_filter`
 `"full"` or `"starts-only"`), no IDLE → CANDIDATE transition happens, a
 CANDIDATE's lifecycle does not step (its confirm count neither advances
@@ -1232,7 +1260,7 @@ dahs (`TT`) has no element gaps and keeps the dit assumption. See
 docs/DECISIONS/2026-10-25-man402-dah-heavy-bootstrap.md.
 
 **[DEVIATION] (MAN-271)** — at a **genuine end-of-signal** `finish()`
-(stream EOF, or a HangExpired/Silent closure, where a sustained real
+(stream EOF, a HangExpired closure, or DORMANT entry, where a sustained real
 on-air gap has been observed), a tracker that saw **2–4 marks**
 initializes from them with exactly the split rule above, and the runs
 buffered while the quorum was unfilled replay through the ordinary
@@ -1376,6 +1404,10 @@ uses the same unit):
 - `u < 2.0` → **inter-element** (within a character)
 - `2.0 ≤ u < 5.0` → **inter-character**
 - `u ≥ 5.0` → **inter-word**
+
+A space before the decoder's first mark (MAN-199) is a truncation: the
+decoder started inside it, as at the start of a §2.4 lead-in. It is
+neither classified nor learned, like the trailing space at `finish()`.
 
 The implementation matches this nominal `2.0` boundary (`CHAR_GAP_DITS` in
 `crates/manta-decode/src/timing.rs`). It was lowered to `1.6` for a period
@@ -1765,7 +1797,8 @@ TrackClosed    { track_id, closure: SignalEnded
                  (added post-freeze, MAN-19; `closure` PR #154 round 9,
                  MAN-174 — a track has closed and will never emit another
                  event under this track_id. Emitted only for a track that
-                 produced at least one other event first, or that a
+                 produced at least one other event first (on every close
+                 path that includes the close's own flush, MAN-199), or that a
                  merged-away track named as its `survivor_track_id`. The
                  `closure` kind says what a consumer holding deferred
                  per-track evidence, such as manta-spot's pending Beacon
@@ -1904,8 +1937,10 @@ rules:
 6. **Pool scheduling must not affect output:** decoder workers may run in any
    order, but each track's decoder is a pure function of its own input queue;
    emitted events are sequenced by `(sample_ts, track_id)` before the
-   validator sees them. `TrackClosed` events sort after every other event of
-   their batch; a merge loser's `TrackClosed` precedes its survivor's own
+   validator sees them. Within a batch, a track's events sort no earlier
+   than its same-batch `TrackPromoted` (MAN-199: a lead-in's output is
+   stamped before the promotion hop). `TrackClosed` events sort after
+   every other event of their batch; a merge loser's `TrackClosed` precedes its survivor's own
    `TrackClosed` in the same batch; other closures stay in `track_id` order
    (MAN-174).
 7. **Several inputs (MAN-13):** each `[[input]]` runs rules 1–6 on its own
@@ -2264,6 +2299,23 @@ flush_gap_dits = 7.0
 # MANTA_INPUT_FREQ_CORRECTION_PPM override it.
 freq_correction_ppm = 0.0
 
+# Input-conditioning stages (MAN-496), each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
+
+# Fixed controlled-tone IQ calibration, per input. Restart required.
+# Off is the default. Observe never writes samples. Apply requires all three
+# calibration values, with actual receiver centre agreement within 1 Hz.
+# All values must be finite; gain 0.5..2, phase -45..45 degrees, centre > 0.
+# Refused with bands. Remeasure after a receiver gain change.
+iq_correction = "off"
+# iq_gain_ratio = 1.05
+# iq_phase_deg = 2.0
+# iq_calibrated_center_hz = 14000000.0
+
 # Target post-decimation capture rate, Hz (issue #169). Omit to use the
 # source's native rate unchanged. Must evenly divide the source's native
 # rate by a power of two, and must itself satisfy fs/93.75 being a power
@@ -2448,7 +2500,7 @@ values of `crates/manta-cli/build.rs`, never read at run time, and
 read only the file `--config` names and never the environment
 (`MANTA_CONFIG` included), so their output cannot depend on the ambient
 environment; `decode` applies `[detector]`, `[spot]`, `[decode]` and
-`input.freq_correction_ppm`, `oracle` applies `[decode]`, and both
+`input.freq_correction_ppm` plus the four IQ keys, `oracle` applies `[decode]`, and both
 validate the whole file.
 
 `SPEC-decode-core-v2.md` §7 adds `[decode]` keys beyond `engine` (`"legacy"`

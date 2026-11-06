@@ -710,7 +710,8 @@ impl HpsdrSession {
         self.started_at
     }
 
-    /// Stop pumping, discard pending samples and send one best-effort stop.
+    /// Stop pumping, discard pending samples and repeat the best-effort stop.
+    /// Two sends tolerate one lost UDP datagram (MAN-305 D8, MAN-497).
     /// The pump observes retirement between bounded UDP reads.
     pub fn retire(&self) {
         let _authority = self.authority.lock().expect("HPSDR retirement poisoned");
@@ -722,7 +723,9 @@ impl HpsdrSession {
             inner.confirmed_live.store(false, Ordering::Relaxed);
             let mut stop = build_start_command();
             stop[3] = 0;
-            let _ = inner.socket.send(&stop);
+            for _ in 0..proto2::STOP_REPEATS {
+                let _ = inner.socket.send(&stop);
+            }
         }
     }
 }
@@ -1340,9 +1343,11 @@ mod tests {
         first.join().unwrap();
         second.join().unwrap();
         let mut datagram = [0; 65536];
-        let (n, _) = socket.recv_from(&mut datagram).unwrap();
-        assert_eq!(n, 60);
-        assert_eq!(&datagram[..4], &[0xef, 0xfe, 4, 0]);
+        for _ in 0..proto2::STOP_REPEATS {
+            let (n, _) = socket.recv_from(&mut datagram).unwrap();
+            assert_eq!(n, 60);
+            assert_eq!(&datagram[..4], &[0xef, 0xfe, 4, 0]);
+        }
         let mut replacement = HpsdrDevice::open(cfg).unwrap();
         let peer = drain_initial_open_packets(&socket, 1);
         assert!(old[0].read(&mut [Complex32::default(); 1]).is_err());
@@ -2729,6 +2734,7 @@ mod open_receiver_tests {
     struct StatefulP1Radio {
         port: u16,
         streaming: Arc<AtomicBool>,
+        commands: Arc<Mutex<Vec<(bool, SocketAddr)>>>,
         stop: Arc<AtomicBool>,
         handle: Option<thread::JoinHandle<()>>,
     }
@@ -2740,9 +2746,11 @@ mod open_receiver_tests {
                 .unwrap();
             let port = sock.local_addr().unwrap().port();
             let streaming = Arc::new(AtomicBool::new(false));
+            let commands = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let handle = {
-                let (streaming, stop) = (streaming.clone(), stop.clone());
+                let (streaming, commands, stop) =
+                    (streaming.clone(), commands.clone(), stop.clone());
                 thread::spawn(move || {
                     let mut buf = [0u8; 2048];
                     while !stop.load(Ordering::SeqCst) {
@@ -2757,7 +2765,9 @@ mod open_receiver_tests {
                             }
                             let _ = sock.send_to(&reply, from);
                         } else if n >= 4 && d[..3] == [0xEF, 0xFE, 0x04] {
-                            streaming.store(d[3] & 1 == 1, Ordering::SeqCst);
+                            let run = d[3] & 1 == 1;
+                            commands.lock().unwrap().push((run, from));
+                            streaming.store(run, Ordering::SeqCst);
                         }
                     }
                 })
@@ -2765,6 +2775,7 @@ mod open_receiver_tests {
             Self {
                 port,
                 streaming,
+                commands,
                 stop,
                 handle: Some(handle),
             }
@@ -2786,7 +2797,8 @@ mod open_receiver_tests {
             while self.streaming.load(Ordering::SeqCst) != want {
                 assert!(
                     Instant::now() < deadline,
-                    "radio never saw streaming = {want}"
+                    "radio never saw streaming = {want}; commands: {:?}",
+                    self.commands.lock().unwrap()
                 );
                 thread::sleep(Duration::from_millis(5));
             }

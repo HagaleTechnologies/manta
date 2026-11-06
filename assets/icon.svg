@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-label="manta">
+  <title>manta</title>
+  <rect width="16" height="16" rx="3" fill="#1f2937"/>
+  <path fill="#60a5fa" d="M1 13 H15 V14 H1 Z M3 10 H4 V13 H3 Z M5 11 H6 V13 H5 Z M10 12 H11 V13 H10 Z M12 10 H13 V13 H12 Z"/>
+  <path fill="#e5e7eb" d="M6 2 H7 V3 H9 V2 H10 V4 L15 7 V8 L10 9 L9 10 V15 H7 V10 L6 9 L1 8 V7 L6 4 Z"/>
+</svg>
