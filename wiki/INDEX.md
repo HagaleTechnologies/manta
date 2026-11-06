@@ -114,9 +114,6 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 
 - [Why does a close neighbor invalidate the three-bin ownership parabola?](../docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md) MAN-112 uses gated phase positions and frequency-exclusive association.
 - [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
-<<<<<<< HEAD
 - [Can a later repetition rescue an ambiguous decode?](../docs/DECISIONS/2026-11-05-man208-delayed-refinement.md) — Bounded single-input replay revises the same occurrence; the RF timestamp remains distinct from decision availability. Includes fixture and multi-input limits.
-=======
 
 - [How is IQ correction calibrated and withheld?](../docs/DECISIONS/2026-11-05-man494-calibrated-iq-conditioning.md) MAN-494 fixes coefficients per stream and requires receiver-centre agreement.
->>>>>>> 8b24d471cf4426e7a2465273d1a362af69a93c32

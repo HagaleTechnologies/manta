@@ -1085,11 +1085,19 @@ impl RepetitionGate {
     /// signal. A refinement is a re-decode of the SAME samples
     /// (`ObservationLog::revise`'s "a re-decode adds no repetition"
     /// contract): the occurrence's repetition support MOVES to the refined
-    /// call, it is never duplicated, and the losing call loses it. The
-    /// moved touch keeps its own `message_distinct` verdict (frozen once by
-    /// `classify_new_occurrence`, never re-derived -- see `accepted`'s
-    /// doc), and its span moves with it so a later touch of the same
-    /// samples under either call never counts again (the rule at `spans`).
+    /// call, it is never duplicated, and the losing call loses it.
+    ///
+    /// The destination is reconciled first, exactly as `record_span`
+    /// reconciles a fresh decode (Codex review, PR #520): if `to`'s entry
+    /// already holds the same samples (two overlapping tracks decoding one
+    /// RF occurrence as different calls) or another touch of the same
+    /// message (adjacent words of one message that initially read
+    /// differently), the destination already counts that evidence under
+    /// its own verdicts, and the moved occurrence joins as accepted,
+    /// UNCOUNTED evidence of theirs -- never as a second counted touch.
+    /// `message_distinct` verdicts already frozen in the destination are
+    /// never revisited (the rule in `accepted`'s doc); only the moved
+    /// touch is classified, once, against what the destination holds now.
     ///
     /// Returns whether the source touch was still retained; a lost source
     /// touch (expired, swept, or never counted under `from`) is an
@@ -1100,6 +1108,7 @@ impl RepetitionGate {
         to: &str,
         track_id: u32,
         span: (u64, u64),
+        is_track_active: impl Fn(u32) -> bool,
     ) -> bool {
         let span = (span.0.min(span.1), span.1);
         // Find the entry holding this occurrence: a `from` entry whose
@@ -1148,7 +1157,60 @@ impl RepetitionGate {
             .seen
             .entry(dest_key)
             .or_insert_with(|| GateEntry::new(anchor_freq_hz));
-        dest.accepted.push(found);
+        // MAN-200 D2, at the destination: a span overlapping one this
+        // entry already holds is the same samples decoded again -- not
+        // another repetition, and not a new accepted occurrence (the
+        // same treatment `record_span` gives a re-decode).
+        if let Some(overlapped) = dest
+            .spans
+            .iter()
+            .find(|&&(s, e, _)| overlaps((s, e), span))
+            .map(|&(.., anchor)| anchor)
+        {
+            dest.last_seen_by_track
+                .entry(track_id)
+                .and_modify(|existing| {
+                    if found.0 >= existing.0 {
+                        *existing = (found.0, found.1, overlapped);
+                    }
+                })
+                .or_insert((found.0, found.1, overlapped));
+            dest.spans.push((span.0, span.1, overlapped));
+            return true;
+        }
+        // Shared-message reconciliation: `classify_new_occurrence`'s
+        // same-track and cross-track message rules, made symmetric -- a
+        // moved touch is usually EARLIER than the destination's existing
+        // touches (a refinement revisits an older span), and whether two
+        // touches are one message does not depend on arrival order.
+        let shares_a_message = |o: &(u64, u64, u32, bool, u64)| {
+            if o.2 == track_id {
+                found.1.abs_diff(o.1) < MIN_MESSAGE_WORD_GAP
+                    && found.0.abs_diff(o.0) < self.time_gap_samples
+            } else {
+                is_track_active(o.2) && found.0.abs_diff(o.0) < self.time_gap_samples
+            }
+        };
+        let (counted, anchor_ts) = match dest.accepted.iter().find(|o| shares_a_message(o)) {
+            // The destination already counts this message (its
+            // representative may itself be a deferred touch; `o.4`
+            // chains to it): the moved occurrence joins as accepted,
+            // uncounted evidence of the same message.
+            Some(o) => (false, o.4),
+            // Nothing at the destination shares this occurrence's
+            // evidence: the touch's own frozen verdict moves with it.
+            None => (found.3, anchor_ts),
+        };
+        dest.last_seen_by_track
+            .entry(track_id)
+            .and_modify(|existing| {
+                if found.0 >= existing.0 {
+                    *existing = (found.0, found.1, anchor_ts);
+                }
+            })
+            .or_insert((found.0, found.1, anchor_ts));
+        dest.accepted
+            .push((found.0, found.1, track_id, counted, anchor_ts));
         dest.spans.push((span.0, span.1, anchor_ts));
         true
     }
@@ -1221,9 +1283,12 @@ impl RepetitionGate {
 
     /// MAN-208: the total number of message-distinct occurrences held
     /// across every entry -- the conservation quantity a refinement must
-    /// preserve (moves support, never adds it). Entries are pruned lazily,
-    /// so this counts what the entries currently hold, exactly as a fresh
-    /// `record` on each would see.
+    /// preserve (moves support, never adds it). A move onto a
+    /// destination that already counts the same samples or message
+    /// removes that duplicate rather than preserving both (see
+    /// `move_occurrence`). Entries are pruned lazily, so this counts
+    /// what the entries currently hold, exactly as a fresh `record` on
+    /// each would see.
     pub fn counted_total(&self) -> usize {
         self.seen
             .values()
@@ -2584,6 +2649,112 @@ mod tests {
             gate.record(4, 14_000_000.0, "K5ARH", now, 20, |tid| tid != 1),
             3,
             "an out-of-order deferred replay must not make a genuinely live entry look expired and discard its real history"
+        );
+    }
+
+    /// MAN-208 remediation (Codex review, PR #520): two overlapping
+    /// tracks decode the same RF occurrence as different calls, so each
+    /// entry counts its own first occurrence. Moving one reading to the
+    /// other must not leave the destination holding TWO counted touches
+    /// for the same samples -- the entry's own "same samples is never
+    /// another repetition" rule (`record_span`, MAN-200 D2) applies at
+    /// the destination of a move exactly as it does to a fresh decode.
+    #[test]
+    fn moving_occurrence_support_onto_the_same_samples_never_counts_twice() {
+        let mut gate = RepetitionGate::new(FS);
+        // Both spans cover the same keying (a second track on one
+        // signal), so they overlap -- but each reading sits in its own
+        // (bucket, callsign) entry, where overlap is not checked (D3).
+        assert_eq!(
+            gate.record_span(
+                1,
+                7_080_000.0,
+                "K3ABC",
+                (1_000_000, 1_010_000),
+                7,
+                always_active
+            ),
+            1
+        );
+        assert_eq!(
+            gate.record_span(
+                2,
+                7_080_000.0,
+                "K3ABD",
+                (1_000_200, 1_010_200),
+                3,
+                always_active
+            ),
+            1
+        );
+        assert_eq!(gate.counted_total(), 2);
+
+        assert!(gate.move_occurrence("K3ABD", "K3ABC", 2, (1_000_200, 1_010_200), always_active));
+        assert_eq!(
+            gate.counted_total(),
+            1,
+            "one over-the-air occurrence counts once under the refined call"
+        );
+        let snapshot = gate
+            .support_snapshot(7_080_000.0, "K3ABC", 1_010_200)
+            .expect("K3ABC entry");
+        assert_eq!(
+            snapshot.counted.len(),
+            1,
+            "the same samples must not report two repetitions"
+        );
+    }
+
+    /// MAN-208 remediation (Codex review, PR #520): adjacent words of one
+    /// message that initially read as different calls each count their
+    /// own entry's first occurrence. A refinement that unifies the
+    /// readings must reconcile the shared message at the destination:
+    /// one message of support, never two (`classify_new_occurrence`'s
+    /// same-track rule, made symmetric for the earlier-arriving move).
+    #[test]
+    fn moving_occurrence_support_into_a_shared_message_never_counts_twice() {
+        let mut gate = RepetitionGate::new(FS);
+        // One transmission, the callsign keyed twice back-to-back: word 7
+        // mis-read as K3ABC, adjacent word 8 read as K3ABD. Separate
+        // keyings, so the spans do not overlap.
+        assert_eq!(
+            gate.record_span(
+                1,
+                7_080_000.0,
+                "K3ABC",
+                (1_000_000, 1_010_000),
+                7,
+                always_active
+            ),
+            1
+        );
+        assert_eq!(
+            gate.record_span(
+                1,
+                7_080_000.0,
+                "K3ABD",
+                (1_010_200, 1_020_200),
+                8,
+                always_active
+            ),
+            1
+        );
+        assert_eq!(gate.counted_total(), 2);
+
+        assert!(gate.move_occurrence("K3ABC", "K3ABD", 1, (1_000_000, 1_010_000), always_active));
+        assert_eq!(
+            gate.counted_total(),
+            1,
+            "one message of support, not one per reading"
+        );
+        let snapshot = gate
+            .support_snapshot(7_080_000.0, "K3ABD", 1_020_200)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 1);
+        assert_eq!(
+            snapshot.accepted.len(),
+            2,
+            "the moved occurrence stays as accepted evidence of the message"
         );
     }
 }
