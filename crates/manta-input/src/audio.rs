@@ -542,6 +542,22 @@ mod tests {
         assert!(aiq.take_stalled());
     }
 
+    /// MAN-489 phase 5: at production durations (the real
+    /// `SOFT_STALL_AFTER` and `DEVICE_STALL_TIMEOUT`, no shortened knob) a
+    /// delivering device whose ring goes empty reports inside the ticket's
+    /// 5 s bound, before its hard device-loss error.
+    #[test]
+    fn an_emptied_ring_reports_within_the_production_five_second_bound() {
+        let (mut aiq, _feeder) = scripted_ring(&[(256, 0.25)], DEVICE_STALL_TIMEOUT);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
+        assert_eq!(aiq.read(&mut buf).unwrap(), 256);
+        let started = Instant::now();
+        assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(5), "{reported:?}");
+        assert!(aiq.take_stalled());
+    }
+
     /// MAN-489: the hard device-loss bound survives the soft report -- a
     /// stream that never resumes still errors within its stall timeout,
     /// measured from the wait episode the report did not reset.

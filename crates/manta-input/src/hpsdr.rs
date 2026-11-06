@@ -2074,6 +2074,62 @@ mod tests {
         }
     }
 
+    /// MAN-489 phase 5: at production durations (the real
+    /// `SOFT_STALL_AFTER` and hard bound, no shortened knob) both active
+    /// DDC readers of one radio report a stopped stream inside the
+    /// ticket's 5 s bound.
+    #[test]
+    fn both_ddcs_report_a_stopped_stream_within_the_production_five_second_bound() {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 2,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0, 14_030_000.0],
+            auto_attenuation: None,
+        };
+        let sources = HpsdrDevice::open(cfg).unwrap();
+        assert_eq!(sources.len(), 2);
+        let client_addr = drain_initial_open_packets(&device_socket, 2);
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Duration>>();
+        let readers: Vec<_> = sources
+            .into_iter()
+            .map(|mut src| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+                    assert!(src.read(&mut buf).unwrap() > 0);
+                    tx.send(None).unwrap();
+                    let started = Instant::now();
+                    assert_eq!(src.read(&mut buf).unwrap(), 0);
+                    let reported = started.elapsed();
+                    assert!(src.take_stalled());
+                    tx.send(Some(reported)).unwrap();
+                })
+            })
+            .collect();
+        drop(tx);
+        let pkt = synth_metis_packet(2, |rx| Complex32::new(0.1 * (rx as f32 + 1.0), 0.0));
+        device_socket.send_to(&pkt, client_addr).unwrap();
+        let next = || {
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("reader step")
+        };
+        assert_eq!((next(), next()), (None, None));
+        for _ in 0..2 {
+            let reported = next().expect("a report");
+            assert!(reported < Duration::from_secs(5), "{reported:?}");
+        }
+        for reader in readers {
+            reader.join().expect("reader thread must not panic");
+        }
+    }
+
     /// MAN-489 remediation: the hard stall bound is the old "40
     /// consecutive read timeouts" budget, and *any* arriving datagram --
     /// malformed ones included -- kept that counter from accumulating. Its

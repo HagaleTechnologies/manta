@@ -112,13 +112,20 @@ and `..._multi_input` observe the held call spot while the gate is still
 closed and a different call spot after the same-stream resume. Timing note:
 the 5 s promise assumes an actively read source and normal OS scheduling;
 this program is not a hard real-time system. Production-duration reports
-are measured for Kiwi, protocol 2 and SoapySDR
+are measured for every source family: Kiwi, protocol 2 and SoapySDR
 (`a_stopped_stream_reports_within_the_production_five_second_bound`,
 `a_stopped_radio_reports_within_the_production_five_second_bound`,
-`timeouts_report_within_the_production_five_second_bound`).
+`timeouts_report_within_the_production_five_second_bound`), protocol-1
+HPSDR with both DDC readers active
+(`both_ddcs_report_a_stopped_stream_within_the_production_five_second_bound`)
+and the live audio ring
+(`an_emptied_ring_reports_within_the_production_five_second_bound`).
 
-Deferred to a follow-up (declared in the run's deviations): the
-child-process protocol-2/Kiwi acceptance latency measurements, and
-production-duration timing smokes for protocol-1 HPSDR and the live audio
-ring; the shared 5 s bound they would measure is otherwise pinned by the
-unit suites above.
+Child-process acceptance measures the operator-visible latency end to end
+against a real `manta run`: `hpsdr_protocol2_acceptance.rs`
+`a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume`
+and `kiwi_stall_acceptance.rs`
+`a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume`
+(Kiwi keeps pinging through the pause) each require the held call's JSON
+spot within 5 s of the fake's last IQ send, before the fake resumes and
+with no loss or reconnect, then a second call on the same session.
