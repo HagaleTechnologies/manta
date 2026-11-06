@@ -587,6 +587,19 @@ type PendingEntry = (f32, f32, Option<f32>, u64, f32, f64);
 /// MAN-199: one lead-in entry, `(amplitude, raw_power, sample_ts)`.
 type LeadInEntry = (f32, f32, u64);
 
+/// MAN-30: the first sample a lead-in at calibrated `hz` may replay. `None`
+/// when `hz` was already admitted before the last coverage change (or there
+/// was none), so a continuously admitted track keeps its full lead-in.
+fn cw_lead_in_floor(
+    change: &Option<(u64, Option<std::sync::Arc<crate::cw_segments::Ranges>>)>,
+    hz: f64,
+) -> Option<u64> {
+    match change {
+        Some((at, previous)) if previous.as_ref().is_some_and(|r| !r.contains(hz)) => Some(*at),
+        _ => None,
+    }
+}
+
 /// MAN-199: why a requested hop is not in the [`HopHistory`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NotRecorded {
@@ -1878,6 +1891,12 @@ impl Track {
         }
     }
 
+    /// MAN-30: drop lead-in entries from before `floor`, the sample this
+    /// track's frequency was admitted from.
+    fn trim_lead_in_before(&mut self, floor: u64) {
+        self.lead_in.retain(|&(_, _, ts)| ts >= floor);
+    }
+
     /// MAN-312 (SPEC §2.7): queue one decoder input entry onto `pending`,
     /// applying `crash_filter = "full"`'s decoder hold. An entry observed
     /// on a held crash hop (its `crash` flag, captured when the hop was
@@ -2285,6 +2304,10 @@ pub struct TrackManager {
     cw_epoch: i64,
     cw_epoch_nanoseconds: u32,
     cw_ranges: Option<std::sync::Arc<crate::cw_segments::Ranges>>,
+    /// The last coverage change: the first sample it applies to and the
+    /// ranges before it, so a lead-in never replays hops from before a
+    /// frequency was admitted.
+    cw_change: Option<(u64, Option<std::sync::Arc<crate::cw_segments::Ranges>>)>,
     cw_factor: f64,
     cw_fs: f64,
     center_freq_hz: f64,
@@ -2524,6 +2547,7 @@ impl TrackManager {
             cw_epoch: 0,
             cw_epoch_nanoseconds: 0,
             cw_ranges: None,
+            cw_change: None,
             cw_factor: 1.0,
             cw_fs: fs,
             close_counts: CloseCounts::default(),
@@ -3353,6 +3377,10 @@ impl TrackManager {
                         self.lead_in_hops,
                         n,
                     );
+                    if let Some(floor) = cw_lead_in_floor(&self.cw_change, freq_hz * self.cw_factor)
+                    {
+                        track.trim_lead_in_before(floor);
+                    }
                     #[cfg(test)]
                     {
                         self.reacquisitions += 1;
@@ -3475,6 +3503,10 @@ impl TrackManager {
                         self.lead_in_hops,
                         n,
                     );
+                    if let Some(floor) = cw_lead_in_floor(&self.cw_change, freq_hz * self.cw_factor)
+                    {
+                        track.trim_lead_in_before(floor);
+                    }
                     let spectral_ref_power = compute_spectral_ref_power
                         .then(|| Self::spectral_ref_power(&self.floor, track.center))
                         .flatten();
@@ -4372,7 +4404,10 @@ impl TrackManager {
             while end < hops.len() && at(&hops[end]) < next {
                 end += 1;
             }
-            self.cw_ranges = selected;
+            if selected != self.cw_ranges {
+                let previous = std::mem::replace(&mut self.cw_ranges, selected);
+                self.cw_change = Some((hop_to_sample_ts(hops[start].m), previous));
+            }
             out.extend(self.process_hops_inner(&hops[start..end], &hop_to_sample_ts));
             start = end;
         }
@@ -6520,6 +6555,37 @@ mod tests {
             "a strong channel should spawn and promote a track"
         );
         assert_eq!(tm.tracks.len(), 1);
+    }
+
+    /// MAN-30 (Codex P2 on #510): a frequency admitted by a coverage change
+    /// replays no lead-in from before the change; one admitted on both sides
+    /// keeps its full lead-in.
+    #[test]
+    fn cw_lead_in_never_replays_hops_from_before_admission() {
+        use crate::cw_segments::Ranges;
+        let before = Some(std::sync::Arc::new(
+            Ranges::new(vec![(14_000_000., 14_010_000.)]).unwrap(),
+        ));
+        let change = Some((1_000u64, before));
+        assert_eq!(cw_lead_in_floor(&change, 14_020_000.), Some(1_000));
+        assert_eq!(cw_lead_in_floor(&change, 14_005_000.), None);
+        assert_eq!(cw_lead_in_floor(&None, 14_020_000.), None);
+        // Full coverage before the change admitted everything.
+        assert_eq!(cw_lead_in_floor(&Some((1_000, None)), 14_020_000.), None);
+
+        let mut tm = trusted_band_manager(512);
+        feed_warmup(&mut tm, 512);
+        let id = tm.spawn(10);
+        let track = tm.tracks.get_mut(&id).unwrap();
+        track.lead_in = vec![
+            (1.0, 1.0, 900),
+            (1.0, 1.0, 999),
+            (1.0, 1.0, 1_000),
+            (1.0, 1.0, 1_100),
+        ];
+        track.trim_lead_in_before(1_000);
+        let kept: Vec<u64> = track.lead_in.iter().map(|e| e.2).collect();
+        assert_eq!(kept, vec![1_000, 1_100]);
     }
 
     fn cw_test_config(ranges: Vec<(f64, f64)>) -> crate::PipelineConfig {
