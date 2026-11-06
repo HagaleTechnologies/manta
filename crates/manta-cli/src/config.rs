@@ -736,12 +736,9 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
-<<<<<<< HEAD
     /// MAN-485: enabled FT8/FT4 modes, in startup-summary order.
     pub digital_modes: Vec<manta_engine::ftx::FtxMode>,
-=======
     pub cw_policy: manta_engine::cw_segments::Policy,
->>>>>>> 486a86e07e1d579e29fa831bc955a43cebbaf45c
     pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
     /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
@@ -2146,11 +2143,8 @@ fn validate_input(
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
-<<<<<<< HEAD
         digital_modes: digital_modes(t.digital_modes.as_deref())?,
-=======
         cw_policy: cw_policy(&t)?,
->>>>>>> 486a86e07e1d579e29fa831bc955a43cebbaf45c
         conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
