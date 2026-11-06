@@ -450,11 +450,23 @@ fn transcript_evidence(
     // character at the truth speed.
     let char_step_ts = (5.0 * 1200.0 / f64::from(truth.wpm) / 1000.0 * fs).round() as u64;
     let start_ts = truth.words[0].0;
-    let mut events = vec![DecoderEvent::TrackPromoted {
-        track_id: TRACK_ID,
-        sample_ts: start_ts,
-        freq_hz: op.freq_hz,
-    }];
+    // Unlike the decoder-fed bypasses, this stream has no TrackDecoder
+    // to emit metadata. The validator needs it before evaluating words.
+    let mut events = vec![
+        DecoderEvent::TrackPromoted {
+            track_id: TRACK_ID,
+            sample_ts: start_ts,
+            freq_hz: op.freq_hz,
+        },
+        DecoderEvent::TrackMeta {
+            track_id: TRACK_ID,
+            sample_ts: start_ts,
+            freq_hz: op.freq_hz,
+            // A placeholder, as in the other bypasses; no measured SNR.
+            snr_2500_db: 0.0,
+            last_char_ts: start_ts,
+        },
+    ];
     let mut end_ts = start_ts;
     for &(ts, ref word) in &truth.words {
         let mut t = ts;
@@ -618,6 +630,62 @@ mod tests {
             track_text: None,
             decisions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn known_transcript_delivers_repeated_self_id() {
+        let fs = 96_000.0;
+        let geo = Geometry {
+            sample_rate_hz: fs,
+            center_freq_hz: 14_000_000.0,
+            duration_s: 45.0,
+            passband_hz: (13_952_000.0, 14_048_000.0),
+            channel_width_hz: 93.75,
+            freq_correction_ppm: 0.0,
+        };
+        let op = Opportunity {
+            call: "W1AW".into(),
+            freq_hz: 14_012_300.0,
+            first_s: 25.0,
+            last_s: 25.0,
+            rows: 1,
+            snr_db: 20,
+            wpm: Some(20.0),
+        };
+        let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
+        let truth = SyntheticTruth {
+            wpm: 20.0,
+            words: manta_testkit::funnel_truth::transcript_items(
+                "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K",
+                &spec,
+                fs,
+                10.0,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|i| (i.start_ts, i.word))
+            .collect(),
+            ..SyntheticTruth::default()
+        };
+        let tol = Tolerances::default();
+        let production = attribute(&op, &Evidence::default(), &geo, &tol);
+        let (line, summary) = run_synthetic_bypass(
+            Bypass::KnownTranscript,
+            &op,
+            &truth,
+            &PipelineConfig::default(),
+            &[production],
+            &geo,
+            &tol,
+        )
+        .unwrap();
+        assert_eq!(line.lost_at, None, "{line:?}");
+        assert_eq!(summary.delivered, 1);
+        let evidence = transcript_evidence(&truth, &op, &PipelineConfig::default(), &geo).unwrap();
+        assert!(evidence
+            .spots
+            .iter()
+            .any(|s| s.call == op.call && s.freq_hz == op.freq_hz));
     }
 
     /// MAN-493: the four experiments' labels and forced stages.
