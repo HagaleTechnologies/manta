@@ -2847,6 +2847,18 @@ fn resolve_epoch(
     }
 }
 
+/// Epoch of sample zero for an individual FTx input, captured when it opens.
+fn resolve_ftx_epoch(
+    spec: &LiveSourceSpec,
+    replay_epoch: Option<i64>,
+    acquired_at: std::time::SystemTime,
+) -> Result<std::time::SystemTime> {
+    match spec {
+        LiveSourceSpec::File { path, .. } => resolve_epoch(Some(path), replay_epoch),
+        _ => Ok(acquired_at),
+    }
+}
+
 /// Derives a stable, recording-specific session nonce from a WAV file's
 /// CONTENT (not its path): same bytes -> same nonce on every run
 /// (deterministic spot `id`s across reruns) *regardless of where the file
@@ -7804,7 +7816,9 @@ fn run_command() -> Result<std::process::ExitCode> {
                 reload::mask_sighup(libc::SIG_BLOCK)
                     .context("blocking SIGHUP on the decode thread")?;
             }
+            let opening_at = std::time::SystemTime::now();
             let first = spec.open(capture_rate_hz, dial_freq_hz)?;
+            let acquired_at = opening_at + first.acquisition_start_offset();
             let iq_warned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let iq_name = spectrum_input.to_string();
             warn_iq_mismatch(
@@ -8340,7 +8354,7 @@ fn run_command() -> Result<std::process::ExitCode> {
                 ftx.wrap(
                     0,
                     src,
-                    session_epoch.context("FTx needs a session epoch")?,
+                    resolve_ftx_epoch(spec, replay_epoch, acquired_at)?,
                     digital_modes,
                     replay_path.is_none(),
                 )
@@ -11454,6 +11468,39 @@ mod tests {
             .to_line();
         std::fs::write(manta_input::metadata_path(&path), meta).unwrap();
         path
+    }
+
+    #[test]
+    fn ftx_epoch_preserves_live_acquisition_before_startup_finishes() {
+        let opened =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_792_407_602);
+        let acquired = opened - std::time::Duration::from_millis(1500);
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), Some(123), acquired).unwrap(),
+            acquired
+        );
+    }
+
+    #[test]
+    fn ftx_epoch_uses_each_native_input_and_keeps_live_time_in_a_mixed_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let acquired = std::time::SystemTime::now();
+        for (name, seconds) in [("a.cf32", 1_792_407_600), ("b.cf32", 1_792_407_615)] {
+            let path = native_pair(dir.path(), name, seconds, 0);
+            let spec = LiveSourceSpec::File {
+                path,
+                source_iq: true,
+                raw: None,
+            };
+            assert_eq!(
+                resolve_ftx_epoch(&spec, None, acquired).unwrap(),
+                std::time::UNIX_EPOCH + std::time::Duration::new(seconds as u64, 500)
+            );
+        }
+        assert_eq!(
+            resolve_ftx_epoch(&LiveSourceSpec::AudioDevice(None), None, acquired).unwrap(),
+            acquired
+        );
     }
 
     #[test]

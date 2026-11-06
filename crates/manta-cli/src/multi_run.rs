@@ -525,6 +525,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .zip(grouped)
         .map(|((index, input), grouped)| {
             let spec = input.spec.clone();
+            let ftx_spec = input.spec.clone();
             let ftx = ftx.clone();
             let digital_modes = input.digital_modes.clone();
             let input_live = input.spec.is_reconnectable();
@@ -564,7 +565,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 },
                 open: Box::new(move || {
                     let record_stop = stop.clone();
-                    let src = (move || -> Result<Box<dyn manta_input::IqSource>> {
+                    let (src, acquired_at) = (move || -> Result<(Box<dyn manta_input::IqSource>, std::time::SystemTime)> {
                         if let Some(member) = grouped {
                             let source = member.open()?;
                             // A member claimed after its siblings has still been
@@ -581,9 +582,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                 Some(&name),
                                 &iq_warned,
                             );
-                            return Ok(Box::new(source) as Box<dyn manta_input::IqSource>);
+                            let acquired_at = std::time::SystemTime::now() - source.acquired_at().elapsed();
+                            return Ok((Box::new(source) as Box<dyn manta_input::IqSource>, acquired_at));
                         }
+                        let opening_at = std::time::SystemTime::now();
                         let first = spec.open(capture, dial)?;
+                        let acquired_at = opening_at + first.acquisition_start_offset();
                         crate::warn_iq_mismatch(
                             &iq_cfg,
                             first.center_freq_hz(),
@@ -620,7 +624,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = wrapped.input_health();
                             }
-                            Ok(Box::new(wrapped) as Box<dyn manta_input::IqSource>)
+                            Ok((Box::new(wrapped) as Box<dyn manta_input::IqSource>, acquired_at))
                         } else {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = InputHealthTotals::for_source(first.as_ref());
@@ -629,7 +633,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                 LiveSourceSpec::File { path, .. } => path.display().to_string(),
                                 _ => String::new(),
                             };
-                            wrap_file_replay(
+                            let src = wrap_file_replay(
                                 first,
                                 replay,
                                 label,
@@ -638,11 +642,18 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                         as Box<dyn manta_input::IqSource>)
                                 }),
                                 stop,
-                            )
+                            )?;
+                            Ok((src, acquired_at))
                         }
                     })()?;
-                    // Share the recording's epoch with the FTx tap.
-                    let start = if record_iq.is_some() || !digital_modes.is_empty() {
+                    // Recordings keep their session epoch. FTx slots use this
+                    // input's own file metadata or live sample-zero instant.
+                    let ftx_epoch = if digital_modes.is_empty() {
+                        None
+                    } else {
+                        Some(crate::resolve_ftx_epoch(&ftx_spec, replay_epoch, acquired_at)?)
+                    };
+                    let start = if record_iq.is_some() {
                         Some(crate::resolve_epoch(session_file.as_deref(), replay_epoch)?)
                     } else {
                         None
@@ -673,7 +684,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             ftx.wrap(
                                 index,
                                 src,
-                                start.expect("FTx epoch"),
+                                ftx_epoch.expect("FTx epoch"),
                                 &digital_modes,
                                 input_live,
                             )
