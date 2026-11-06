@@ -86,9 +86,18 @@ pub struct SyntheticTruth {
     /// The exact keying envelope at the decoder's hop rate: (input
     /// sample timestamp, amplitude 0..1). `KnownTransitions`.
     pub envelope: Vec<(u64, f32)>,
-    /// The known words with their leading input-sample timestamps.
-    /// `KnownTranscript`.
-    pub words: Vec<(u64, String)>,
+    /// The known words with each character's keyed span. `KnownTranscript`.
+    pub words: Vec<TruthWord>,
+}
+
+/// One known word: its text and each character's keyed span, `(first
+/// element start, last element end)` in input samples. The transcript
+/// bypass emits each character at its real end, so a word's duration (and
+/// the silence after it) is the truth's, not an approximation.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TruthWord {
+    pub word: String,
+    pub chars: Vec<(u64, u64)>,
 }
 
 /// One `lossFunnelBypass` line. Deliberately no `dxCall`, `frequency` or
@@ -405,8 +414,12 @@ fn transitions_evidence(
 ) -> Result<Evidence> {
     const TRACK_ID: u32 = 1;
     let fs = geo.sample_rate_hz;
+    // The validator applies `freq_correction_ppm` to decoder frequencies
+    // itself, so events carry the uncalibrated value (as `channel_evidence`
+    // does); attribution keeps the calibrated opportunity frequency.
+    let raw_freq_hz = uncalibrated(op.freq_hz, cfg)?;
     let mut dec = TrackDecoder::new(TRACK_ID, cfg.decode.clone());
-    dec.set_freq_hz(op.freq_hz);
+    dec.set_freq_hz(raw_freq_hz);
     dec.set_snr_2500_db(0.0);
     if !dec.seed_speed_wpm(truth.wpm) {
         anyhow::bail!("known-transitions needs a seedable engine");
@@ -416,7 +429,7 @@ fn transitions_evidence(
     let mut events = vec![DecoderEvent::TrackPromoted {
         track_id: TRACK_ID,
         sample_ts: start_ts,
-        freq_hz: op.freq_hz,
+        freq_hz: raw_freq_hz,
     }];
     for &(ts, a) in &truth.envelope {
         events.extend(dec.push_envelope(a, ts));
@@ -442,45 +455,45 @@ fn transcript_evidence(
 ) -> Result<Evidence> {
     const TRACK_ID: u32 = 1;
     let fs = geo.sample_rate_hz;
-    if truth.words.is_empty() {
+    let Some(&(start_ts, _)) = truth.words.iter().flat_map(|w| w.chars.first()).next() else {
         anyhow::bail!("known-transcript needs at least one known word");
-    }
-    // Character spacing only orders events; every window the attributor
-    // applies is measured in seconds. Five dits (mark + gaps) per
-    // character at the truth speed.
-    let char_step_ts = (5.0 * 1200.0 / f64::from(truth.wpm) / 1000.0 * fs).round() as u64;
-    let start_ts = truth.words[0].0;
+    };
+    // See `transitions_evidence`: events carry the uncalibrated frequency.
+    let raw_freq_hz = uncalibrated(op.freq_hz, cfg)?;
     // Unlike the decoder-fed bypasses, this stream has no TrackDecoder
     // to emit metadata. The validator needs it before evaluating words.
     let mut events = vec![
         DecoderEvent::TrackPromoted {
             track_id: TRACK_ID,
             sample_ts: start_ts,
-            freq_hz: op.freq_hz,
+            freq_hz: raw_freq_hz,
         },
         DecoderEvent::TrackMeta {
             track_id: TRACK_ID,
             sample_ts: start_ts,
-            freq_hz: op.freq_hz,
+            freq_hz: raw_freq_hz,
             // A placeholder, as in the other bypasses; no measured SNR.
             snr_2500_db: 0.0,
             last_char_ts: start_ts,
         },
     ];
+    // Each character at its real keyed end and each word boundary at the
+    // word's real end: the silence between words is the truth's, so the
+    // validator's turn and frame decisions see the actual timing.
     let mut end_ts = start_ts;
-    for &(ts, ref word) in &truth.words {
-        let mut t = ts;
-        for c in word.chars() {
+    for w in &truth.words {
+        for (c, &(_, char_end)) in w.word.chars().zip(&w.chars) {
             events.push(DecoderEvent::char_decoded(
                 TRACK_ID,
-                t,
+                char_end,
                 Glyph::Char(c.to_ascii_uppercase()),
                 1.0,
             ));
-            t += char_step_ts;
         }
-        events.push(DecoderEvent::word_boundary(TRACK_ID, t));
-        end_ts = end_ts.max(t);
+        if let Some(&(_, word_end)) = w.chars.last() {
+            events.push(DecoderEvent::word_boundary(TRACK_ID, word_end));
+            end_ts = end_ts.max(word_end);
+        }
     }
     events.push(DecoderEvent::SpeedUpdate {
         track_id: TRACK_ID,
@@ -492,6 +505,13 @@ fn transcript_evidence(
     });
     let span = [start_ts as f64 / fs, end_ts as f64 / fs];
     evidence_from_events(events, TRACK_ID, cfg, fs, op.freq_hz, span)
+}
+
+/// `freq_hz` (calibrated) back in the receiver's uncalibrated frame.
+fn uncalibrated(freq_hz: f64, cfg: &PipelineConfig) -> Result<f64> {
+    let factor = manta_spot::calibration_factor_from_ppm(cfg.freq_correction_ppm)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok(freq_hz / factor)
 }
 
 /// The shared tail of every bypass runner: one track's decoder events
@@ -632,6 +652,22 @@ mod tests {
         }
     }
 
+    fn truth_words(
+        text: &str,
+        spec: &manta_testkit::keyer::KeyerSpec,
+        fs: f64,
+        t0_s: f64,
+    ) -> Vec<TruthWord> {
+        manta_testkit::funnel_truth::transcript_items(text, spec, fs, t0_s)
+            .unwrap()
+            .into_iter()
+            .map(|i| TruthWord {
+                word: i.word,
+                chars: i.chars,
+            })
+            .collect()
+    }
+
     #[test]
     fn known_transcript_delivers_repeated_self_id() {
         let fs = 96_000.0;
@@ -655,16 +691,7 @@ mod tests {
         let spec = manta_testkit::keyer::KeyerSpec::new(20.0);
         let truth = SyntheticTruth {
             wpm: 20.0,
-            words: manta_testkit::funnel_truth::transcript_items(
-                "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K",
-                &spec,
-                fs,
-                10.0,
-            )
-            .unwrap()
-            .into_iter()
-            .map(|i| (i.start_ts, i.word))
-            .collect(),
+            words: truth_words("CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K", &spec, fs, 10.0),
             ..SyntheticTruth::default()
         };
         let tol = Tolerances::default();
@@ -686,6 +713,116 @@ mod tests {
             .spots
             .iter()
             .any(|s| s.call == op.call && s.freq_hz == op.freq_hz));
+    }
+
+    fn geo_96k(ppm: f64) -> Geometry {
+        Geometry {
+            sample_rate_hz: 96_000.0,
+            center_freq_hz: 14_000_000.0,
+            duration_s: 60.0,
+            passband_hz: (13_952_000.0, 14_048_000.0),
+            channel_width_hz: 93.75,
+            freq_correction_ppm: ppm,
+        }
+    }
+
+    fn op_at(call: &str, wpm: f32) -> Opportunity {
+        Opportunity {
+            call: call.into(),
+            freq_hz: 14_012_300.0,
+            first_s: 10.0,
+            last_s: 10.0,
+            rows: 1,
+            snr_db: 20,
+            wpm: Some(wpm),
+        }
+    }
+
+    fn truth_at(text: &str, wpm: f32, fs: f64, t0_s: f64) -> SyntheticTruth {
+        let spec = manta_testkit::keyer::KeyerSpec::new(wpm);
+        let segs = manta_testkit::funnel_truth::keying_segments(text, &spec).unwrap();
+        let total_ms: f64 = segs.iter().map(|s| s.1).sum();
+        SyntheticTruth {
+            wpm,
+            envelope: manta_testkit::funnel_truth::envelope_at_hops(
+                &segs,
+                375.0,
+                fs,
+                t0_s,
+                total_ms / 1000.0,
+            ),
+            words: truth_words(text, &spec, fs, t0_s),
+        }
+    }
+
+    /// Codex P1 on #523: the transcript's events carry each word's real
+    /// keyed duration. A fixed five-dit character step ended each
+    /// synthetic word early (a 10 WPM OH2XYZ after 3.6 s instead of its
+    /// keyed length), inventing silence before the next word that the
+    /// validator's turn and frame decisions then read as real. Every
+    /// character now lands at its keyed end, so each word spans exactly
+    /// its truth.
+    #[test]
+    fn known_transcript_words_span_their_keyed_durations() {
+        let geo = geo_96k(0.0);
+        let fs = geo.sample_rate_hz;
+        let op = op_at("OH2XYZ", 10.0);
+        let truth = truth_at("CQ CQ DE OH2XYZ OH2XYZ K", 10.0, fs, 10.0);
+        let evidence = transcript_evidence(&truth, &op, &PipelineConfig::default(), &geo).unwrap();
+        let words = &evidence.tracks[0].words;
+        assert_eq!(words.len(), truth.words.len());
+        for ((_, end_s, word), want) in words.iter().zip(&truth.words) {
+            assert_eq!(word, &want.word);
+            let keyed_end_s = want.chars.last().unwrap().1 as f64 / fs;
+            assert!(
+                (end_s - keyed_end_s).abs() < 1e-6,
+                "{word} ends at {end_s} s, keyed end {keyed_end_s} s"
+            );
+        }
+    }
+
+    /// Codex P1 on #523: the validator applies `freq_correction_ppm`
+    /// itself, so synthetic decoder events carry the uncalibrated
+    /// frequency; the delivered spot lands on the opportunity.
+    #[test]
+    fn synthetic_bypasses_do_not_calibrate_twice() {
+        let geo = geo_96k(50.0);
+        let op = op_at("W1AW", 20.0);
+        let truth = truth_at(
+            "CQ CQ DE W1AW W1AW K CQ CQ DE W1AW W1AW K",
+            20.0,
+            geo.sample_rate_hz,
+            10.0,
+        );
+        let cfg = PipelineConfig {
+            freq_correction_ppm: 50.0,
+            ..PipelineConfig::default()
+        };
+        let evidence = transcript_evidence(&truth, &op, &cfg, &geo).unwrap();
+        let spot = evidence
+            .spots
+            .iter()
+            .find(|s| s.call == op.call)
+            .expect("the transcript spots");
+        assert!(
+            (spot.freq_hz - op.freq_hz).abs() < 1.0,
+            "spot at {} Hz, opportunity at {} Hz",
+            spot.freq_hz,
+            op.freq_hz
+        );
+        let tol = Tolerances::default();
+        let production = attribute(&op, &Evidence::default(), &geo, &tol);
+        let (line, _) = run_synthetic_bypass(
+            Bypass::KnownTranscript,
+            &op,
+            &truth,
+            &cfg,
+            &[production],
+            &geo,
+            &tol,
+        )
+        .unwrap();
+        assert_eq!(line.lost_at, None, "{line:?}");
     }
 
     /// MAN-493: the four experiments' labels and forced stages.
@@ -804,7 +941,12 @@ mod tests {
         cfg.decode.engine = manta_decode::decoder::Engine::Hsmm;
         let truth = SyntheticTruth {
             wpm: 20.0,
-            words: vec![((2025.0 * geo.sample_rate_hz) as u64, "CQ".into())],
+            words: truth_words(
+                "CQ",
+                &manta_testkit::keyer::KeyerSpec::new(20.0),
+                geo.sample_rate_hz,
+                2025.0,
+            ),
             ..SyntheticTruth::default()
         };
         let run = |bypass, records: &[Record]| {

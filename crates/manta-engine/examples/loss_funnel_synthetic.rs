@@ -74,7 +74,10 @@ fn truth_for(text: &str, t0_s: f64, fs: f64) -> SyntheticTruth {
         words: manta_testkit::funnel_truth::transcript_items(text, &spec, fs, t0_s)
             .unwrap()
             .into_iter()
-            .map(|i| (i.start_ts, i.word))
+            .map(|i| manta_engine::funnel::TruthWord {
+                word: i.word,
+                chars: i.chars,
+            })
             .collect(),
     }
 }

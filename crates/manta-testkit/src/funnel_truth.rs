@@ -20,6 +20,10 @@ pub type Segment = (bool, f64);
 pub struct TranscriptItem {
     pub word: String,
     pub start_ts: u64,
+    /// Each character's keyed span, `(first element start, last element
+    /// end)` in input samples, so a consumer can place characters and the
+    /// word end at their real times.
+    pub chars: Vec<(u64, u64)>,
 }
 
 /// `keyer`'s private unit math, mirrored: content unit (dit) and spacing
@@ -145,12 +149,15 @@ pub fn transcript_items(
         if wi > 0 {
             t_ms += word_gap_ms;
         }
-        items.push(TranscriptItem {
+        let ts = |ms: f64| ((t0_s + ms / 1000.0) * fs).round() as u64;
+        let mut item = TranscriptItem {
             word: w.to_string(),
-            start_ts: ((t0_s + t_ms / 1000.0) * fs).round() as u64,
-        });
+            start_ts: ts(t_ms),
+            chars: Vec::new(),
+        };
         let chars: Vec<char> = w.chars().collect();
         for (ci, c) in chars.iter().enumerate() {
+            let char_start_ms = t_ms;
             let Some(pattern) = pattern_for(*c) else {
                 anyhow::bail!("character '{}' has no Morse encoding", c.escape_debug());
             };
@@ -165,10 +172,12 @@ pub fn transcript_items(
                     t_ms += spec.element_gap_units as f64 * unit;
                 }
             }
+            item.chars.push((ts(char_start_ms), ts(t_ms)));
             if ci < chars.len() - 1 {
                 t_ms += char_gap_ms;
             }
         }
+        items.push(item);
     }
     Ok(items)
 }

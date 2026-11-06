@@ -22,7 +22,7 @@ pub use attribute::{
 };
 pub use bypass::{
     run_bypass, run_synthetic_bypass, summarize_bypass, Bypass, BypassRecord, BypassSummary,
-    SyntheticTruth,
+    SyntheticTruth, TruthWord,
 };
 pub use collect::{run_funnel, FunnelReport};
 pub use trace::{FunnelTrace, SpawnVeto, TraceLog, TrackCloseReason, TrackTraceRecord, VetoKey};
