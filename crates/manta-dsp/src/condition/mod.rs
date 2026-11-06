@@ -57,21 +57,25 @@ impl ConditioningConfig {
         self.impulse == StageMode::Off && self.dc == StageMode::Off
     }
 
-    /// The same stages with every non-`apply` stage forced to
+    /// The impulse and DC stages with every non-`apply` mode forced to
     /// [`StageMode::Observe`] (`Off` becomes `Observe`; `Apply` stays
-    /// `Apply`). What a diagnostic command runs so it measures every
-    /// stage while never writing a sample the operator did not ask to
-    /// have corrected (MAN-203: `manta doctor` always observes every
-    /// stage that is not set to `apply`).
+    /// `Apply`); any other stage this struct gains later keeps its
+    /// configured mode, so that stage's observation surface lands with
+    /// its own ticket. Built by cloning and overwriting the two fields
+    /// (never an exhaustive literal), so a sibling ticket adding a stage
+    /// does not break the build. What a diagnostic command runs so it
+    /// measures while never writing a sample the operator did not ask to
+    /// have corrected (MAN-203: doctor observes the impulse and DC
+    /// stages).
     pub fn observing(&self) -> Self {
         let force = |mode: StageMode| match mode {
             StageMode::Off | StageMode::Observe => StageMode::Observe,
             StageMode::Apply => StageMode::Apply,
         };
-        ConditioningConfig {
-            impulse: force(self.impulse),
-            dc: force(self.dc),
-        }
+        let mut observed = self.clone();
+        observed.impulse = force(self.impulse);
+        observed.dc = force(self.dc);
+        observed
     }
 }
 
@@ -434,6 +438,10 @@ mod tests {
     }
 
     #[test]
+    // The configs under test are built by mutation, like `observing`
+    // itself: an exhaustive literal would break when the struct gains a
+    // stage, which is exactly how this round's CI failure happened.
+    #[allow(clippy::field_reassign_with_default)]
     fn observing_maps_off_to_observe_and_keeps_apply() {
         for (impulse, dc) in [
             (StageMode::Off, StageMode::Off),
@@ -441,7 +449,10 @@ mod tests {
             (StageMode::Off, StageMode::Apply),
             (StageMode::Apply, StageMode::Observe),
         ] {
-            let observed = ConditioningConfig { impulse, dc }.observing();
+            let mut cfg = ConditioningConfig::default();
+            cfg.impulse = impulse;
+            cfg.dc = dc;
+            let observed = cfg.observing();
             let expect = |mode: StageMode| match mode {
                 StageMode::Off | StageMode::Observe => StageMode::Observe,
                 StageMode::Apply => StageMode::Apply,
