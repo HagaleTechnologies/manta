@@ -1091,3 +1091,263 @@ fn a_lookup_on_the_shared_validator_holds_every_inputs_spots() {
         "W1AW is heard on both inputs and withheld on both"
     );
 }
+
+// MAN-489: prove a held call spots on the stall itself, before the
+// stream resumes -- the ticket's core scenario. A source whose last word
+// completed but whose turn has not ended holds its callsign for the role
+// decision (MAN-201); only the stall report closes the track and settles
+// it, so the spot must arrive while the stream is still stopped.
+
+/// Blocks a held source's reads until the test opens it.
+#[derive(Clone)]
+struct ResumeGate(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+impl ResumeGate {
+    fn new() -> Self {
+        Self(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )))
+    }
+
+    fn open(&self) {
+        let mut open = self.0 .0.lock().unwrap();
+        *open = true;
+        self.0 .1.notify_all();
+    }
+
+    fn wait_open(&self) {
+        let mut open = self.0 .0.lock().unwrap();
+        while !*open {
+            open = self.0 .1.wait(open).unwrap();
+        }
+    }
+}
+
+/// Where a [`HeldTailSource`] is in its scripted episode.
+enum HeldPhase {
+    /// Delivering the held tail (the transmission that never ends its
+    /// turn).
+    Tail,
+    /// The tail is fully delivered: this read reports the soft stall.
+    Stall,
+    /// The stream has stopped: reads block until the resume gate opens.
+    Hold,
+    /// Delivering the post-resume transmission.
+    Resume,
+    /// Both transmissions delivered: ordinary EOF.
+    Eof,
+}
+
+/// A live input that stops mid-turn: it delivers a complete callsign
+/// with no following word or turn-ending token, reports one soft stall
+/// (`Ok(0)` + `take_stalled`), then holds the stream -- blocking reads,
+/// no EOF, no error -- until the test opens the resume gate, then
+/// delivers a second, different call on the same stream and ends with an
+/// ordinary EOF.
+struct HeldTailSource {
+    first: Arc<Vec<Complex32>>,
+    second: Arc<Vec<Complex32>>,
+    cursor: usize,
+    fs: f64,
+    center_freq_hz: f64,
+    gate: ResumeGate,
+    stalled: bool,
+    phase: HeldPhase,
+}
+
+impl manta_input::IqSource for HeldTailSource {
+    fn sample_rate(&self) -> f64 {
+        self.fs
+    }
+    fn center_freq_hz(&self) -> f64 {
+        self.center_freq_hz
+    }
+    fn read(&mut self, buf: &mut [Complex32]) -> anyhow::Result<usize> {
+        match self.phase {
+            HeldPhase::Tail => {
+                let n = buf.len().min(self.first.len() - self.cursor);
+                buf[..n].copy_from_slice(&self.first[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                if self.cursor == self.first.len() {
+                    self.phase = HeldPhase::Stall;
+                }
+                Ok(n)
+            }
+            HeldPhase::Stall => {
+                self.stalled = true;
+                self.phase = HeldPhase::Hold;
+                Ok(0)
+            }
+            HeldPhase::Hold => {
+                // The stall's `Ok(0)` was consumed; the stream stays
+                // stopped until the test proves the spot arrived without
+                // a resume, then delivers the second call's opening
+                // chunk in this same read (an unflagged `Ok(0)` here
+                // would read as EOF).
+                self.gate.wait_open();
+                self.cursor = buf.len().min(self.second.len());
+                buf[..self.cursor].copy_from_slice(&self.second[..self.cursor]);
+                self.phase = HeldPhase::Resume;
+                Ok(self.cursor)
+            }
+            HeldPhase::Resume => {
+                let n = buf.len().min(self.second.len() - self.cursor);
+                buf[..n].copy_from_slice(&self.second[self.cursor..self.cursor + n]);
+                self.cursor += n;
+                if self.cursor == self.second.len() {
+                    self.phase = HeldPhase::Eof;
+                }
+                Ok(n)
+            }
+            HeldPhase::Eof => Ok(0),
+        }
+    }
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
+    }
+}
+
+/// A held-tail transmission: the callsign completes, then nothing but
+/// the trailing quiet needed to close its word -- less than the 5 s of
+/// decoded silence the character rule needs -- so the call's role is
+/// still pending when the stream stops. Same shape as the proven
+/// `a_read_error_settles_the_last_call` fixture (testkit v1 vector, 40
+/// wpm, `DE <call>` and no turn-ending token).
+fn held_tail_scene(call: &str) -> Scene {
+    let mut spec = manta_testkit::vectors::v1();
+    spec.duration_s = 4.0;
+    spec.signals[0].wpm = 40.0;
+    spec.signals[0].text = format!("DE {call}");
+    spec.signals[0].loop_text = false;
+    let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+    Scene {
+        samples: Arc::new(samples),
+        fs: spec.fs,
+        center_freq_hz: spec.center_freq_hz,
+    }
+}
+
+fn held_tail_cfg() -> PipelineConfig {
+    PipelineConfig {
+        allowlist: vec!["W1AW".into(), "K1AW".into()],
+        ..Default::default()
+    }
+}
+
+/// MAN-489: single input. The held call spots while the resume gate is
+/// still closed -- the stall settled it, not a resume or a replay -- and
+/// a different call spots after the same-stream resume.
+#[test]
+fn a_held_call_spots_on_the_stall_before_resume_single_input() {
+    let held = held_tail_scene("W1AW");
+    let resume = held_tail_scene("K1AW");
+    let gate = ResumeGate::new();
+    let src_gate = gate.clone();
+    let (spot_tx, spot_rx) = std::sync::mpsc::channel::<String>();
+    let run = std::thread::spawn(move || {
+        let src = HeldTailSource {
+            first: held.samples,
+            second: resume.samples,
+            cursor: 0,
+            fs: held.fs,
+            center_freq_hz: held.center_freq_hz,
+            gate: src_gate,
+            stalled: false,
+            phase: HeldPhase::Tail,
+        };
+        listen_with_observers(
+            Box::new(src),
+            &held_tail_cfg(),
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers::default(),
+            |_| {},
+            |s| spot_tx.send(s.callsign.clone()).unwrap(),
+            |_| {},
+        )
+        .unwrap();
+    });
+    // The held call must spot with the stream still stopped: the source
+    // cannot deliver anything until the gate opens below.
+    let first = spot_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("held call spots on the stall");
+    assert_eq!(first, "W1AW");
+    gate.open();
+    let second = spot_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("new call spots after resume");
+    assert_eq!(second, "K1AW");
+    run.join().unwrap();
+    // Exactly one spot for the held call across the whole session.
+    assert!(spot_rx.try_recv().is_err(), "no further spots expected");
+}
+
+/// MAN-489: `listen_inputs`. A held input spots its held call on the
+/// stall while a healthy sibling keeps delivering, then spots a new call
+/// after the same-stream resume.
+#[test]
+fn a_held_call_spots_on_the_stall_before_resume_multi_input() {
+    let held = held_tail_scene("W1AW");
+    let resume = held_tail_scene("K1AW");
+    let gate = ResumeGate::new();
+    let src_gate = gate.clone();
+    let held_spec = {
+        let first = held.samples.clone();
+        let second = resume.samples.clone();
+        let (fs, center) = (held.fs, held.center_freq_hz);
+        InputSpec {
+            cw_policy: Default::default(),
+            name: "held".into(),
+            open: Box::new(move || {
+                Ok(Box::new(HeldTailSource {
+                    first: first.clone(),
+                    second: second.clone(),
+                    cursor: 0,
+                    fs,
+                    center_freq_hz: center,
+                    gate: src_gate.clone(),
+                    stalled: false,
+                    phase: HeldPhase::Tail,
+                }) as Box<dyn manta_input::IqSource>)
+            }),
+            freq_correction_ppm: 0.0,
+            conditioning: Default::default(),
+            observers: Default::default(),
+            spawn_band_hz: None,
+        }
+    };
+    let (spot_tx, spot_rx) = std::sync::mpsc::channel::<String>();
+    let run = std::thread::spawn(move || {
+        listen_inputs(
+            open_inputs(
+                vec![held_spec, plain("other", short_scene())],
+                Arc::new(AtomicBool::new(false)),
+            )
+            .unwrap(),
+            &held_tail_cfg(),
+            SessionClock::Replay,
+            SharedObservers::default(),
+            |_| {},
+            |s| spot_tx.send(s.callsign.clone()).unwrap(),
+            |_input, _n| {},
+            |_end| {},
+        )
+        .unwrap();
+    });
+    let first = spot_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("held call spots on the stall");
+    assert_eq!(first, "W1AW");
+    gate.open();
+    let mut seen = vec![first];
+    // The sibling keeps spotting through the hold and the resume; the
+    // held input's new call must appear without a reconnect. The loop
+    // ends when the run drops the sender (or the 60 s timeout fires).
+    while let Ok(call) = spot_rx.recv_timeout(Duration::from_secs(60)) {
+        seen.push(call);
+    }
+    run.join().unwrap();
+    assert!(seen.contains(&"K1AW".to_string()), "{seen:?}");
+    assert_eq!(seen.iter().filter(|c| *c == "W1AW").count(), 1, "{seen:?}");
+}
