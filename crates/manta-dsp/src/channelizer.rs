@@ -178,7 +178,7 @@ impl Channelizer {
             fs,
             center_freq_hz,
             bad_samples: 0,
-            conditioner: InputConditioner::new(fs, cfg),
+            conditioner: InputConditioner::with_geometry(fs, center_freq_hz, n, cfg),
             ready: 0,
         })
     }
@@ -271,6 +271,9 @@ impl Channelizer {
             // Step 3: FFT. Step 4: power.
             let x = self.fft.forward(&v_rot);
             let power: Vec<f32> = x.iter().map(|c| c.norm_sqr()).collect();
+            if let Some(c) = self.conditioner.as_mut() {
+                c.observe_hop(&x, self.m * self.hop as u64);
+            }
             outputs.push(HopOutput {
                 m: self.m,
                 x,
@@ -549,6 +552,7 @@ mod tests {
         let cfg = ConditioningConfig {
             impulse: StageMode::Apply,
             dc: StageMode::Apply,
+            ..Default::default()
         };
         let mut whole = Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap();
         let hops_whole = whole.process(&iq);
@@ -601,6 +605,103 @@ mod tests {
         let log = obs.conditioning().unwrap();
         assert_eq!(log.count(Stage::Impulse, Mark::Flagged), 3);
         assert_eq!(log.count(Stage::Impulse, Mark::Repaired), 0);
+    }
+
+    #[test]
+    fn iq_observe_and_withheld_apply_preserve_bypass() {
+        use crate::condition::{iq::IqCalibration, IqStatus, Mark, Stage, StageMode};
+        let mut input = tone(6_000.0, (FS * 5.2) as usize, 0.1, FS);
+        for s in &mut input {
+            s.im *= 1.1;
+        }
+        let baseline = Channelizer::new(FS, 14e6).unwrap().process(&input);
+        for (mode, calibration) in [
+            (StageMode::Observe, None),
+            (StageMode::Apply, None),
+            (
+                StageMode::Apply,
+                Some(IqCalibration {
+                    gain_ratio: 1.1,
+                    phase_deg: 0.0,
+                    center_freq_hz: 14.03e6,
+                }),
+            ),
+        ] {
+            let cfg = ConditioningConfig {
+                iq: mode,
+                iq_calibration: calibration,
+                ..Default::default()
+            };
+            let mut ch = Channelizer::with_conditioning(FS, 14e6, &cfg).unwrap();
+            assert_hops_bitwise_equal(&baseline, &ch.process(&input));
+            let log = ch.conditioning().unwrap();
+            assert_eq!(
+                log.count(Stage::Iq, Mark::Uncertain),
+                if mode == StageMode::Apply {
+                    input.len() as u64
+                } else {
+                    (FS * 5.0) as u64
+                }
+            );
+            if mode == StageMode::Observe {
+                let mut split = Channelizer::with_conditioning(FS, 14e6, &cfg).unwrap();
+                let mut actual = Vec::new();
+                for chunk in input.chunks(255) {
+                    actual.extend(split.process(chunk));
+                }
+                assert_hops_bitwise_equal(&baseline, &actual);
+                assert_eq!(ch.conditioning(), split.conditioning());
+            }
+            assert_eq!(log.count(Stage::Iq, Mark::Corrected), 0);
+            if mode == StageMode::Apply {
+                assert_eq!(log.iq_status(), IqStatus::CalibrationMismatch);
+            }
+        }
+    }
+
+    #[test]
+    fn iq_and_combined_chains_are_chunk_invariant() {
+        use crate::condition::{iq::IqCalibration, Mark, Stage, StageMode};
+        let input = tone_with_impulses((FS * 5.2) as usize);
+        for combined in [false, true] {
+            let cfg = ConditioningConfig {
+                iq: StageMode::Apply,
+                iq_calibration: Some(IqCalibration {
+                    gain_ratio: 1.05,
+                    phase_deg: 2.0,
+                    center_freq_hz: 14e6,
+                }),
+                iq_tone_hz: Some(6000.0),
+                dc: if combined {
+                    StageMode::Apply
+                } else {
+                    StageMode::Off
+                },
+                impulse: if combined {
+                    StageMode::Apply
+                } else {
+                    StageMode::Off
+                },
+            };
+            let mut whole = Channelizer::with_conditioning(FS, 14e6, &cfg).unwrap();
+            let expected = whole.process(&input);
+            assert_eq!(
+                whole
+                    .conditioning()
+                    .unwrap()
+                    .count(Stage::Iq, Mark::Corrected),
+                input.len() as u64 - if combined { 21 } else { 0 }
+            );
+            for size in [1, 7, 255, 4096] {
+                let mut split = Channelizer::with_conditioning(FS, 14e6, &cfg).unwrap();
+                let mut actual = Vec::new();
+                for chunk in input.chunks(size) {
+                    actual.extend(split.process(chunk));
+                }
+                assert_hops_bitwise_equal(&expected, &actual);
+                assert_eq!(whole.conditioning(), split.conditioning());
+            }
+        }
     }
 
     fn assert_hops_bitwise_equal(a: &[HopOutput], b: &[HopOutput]) {

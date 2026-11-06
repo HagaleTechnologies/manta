@@ -17,6 +17,7 @@ use crate::{
 };
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
+use manta_input::IqSource;
 use manta_server::metrics::Metrics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -544,10 +545,12 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             };
             let input_counters = input_counters.clone();
             let bad = bad[index].clone();
+            let iq_cfg = input.conditioning.clone();
+            let iq_warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
             InputSpec {
+                conditioning: input.conditioning.clone(),
                 name: input.name.clone(),
                 freq_correction_ppm: input.freq_correction_ppm,
-                conditioning: input.conditioning.clone(),
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
@@ -572,9 +575,21 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = source.input_health();
                             }
+                            crate::warn_iq_mismatch(
+                                &iq_cfg,
+                                source.center_freq_hz(),
+                                Some(&name),
+                                &iq_warned,
+                            );
                             return Ok(Box::new(source) as Box<dyn manta_input::IqSource>);
                         }
                         let first = spec.open(capture, dial)?;
+                        crate::warn_iq_mismatch(
+                            &iq_cfg,
+                            first.center_freq_hz(),
+                            Some(&name),
+                            &iq_warned,
+                        );
                         if let Ok(mut at) = opened_at.lock() {
                             at[index] = Some(Instant::now());
                         }
@@ -584,10 +599,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                             // is live (Kiwi, ka9q) is healthy once it has.
                             let initial_healthy = first.confirmed_live_handle().is_none();
                             let on_health = input_health_sink(index, name.clone(), health);
+                            let iq_name = name.clone();
                             let wrapped = ReconnectingSource::new(
                                 name,
                                 first,
-                                Box::new(move || reopen.open(capture, dial)),
+                                Box::new(move || {
+                                    let src = reopen.open(capture, dial)?;
+                                    crate::warn_iq_mismatch(
+                                        &iq_cfg,
+                                        src.center_freq_hz(),
+                                        Some(&iq_name),
+                                        &iq_warned,
+                                    );
+                                    Ok(src)
+                                }),
                                 stop,
                                 initial_healthy,
                                 on_health,
@@ -1359,11 +1384,11 @@ mod tests {
     #[test]
     fn an_input_without_a_frequency_is_refused_naming_it() {
         let inputs = [ResolvedInput {
+            conditioning: Default::default(),
             name: "b".into(),
             digital_modes: Vec::new(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,
-            conditioning: Default::default(),
             dial_freq_hz: None,
             capture_rate_hz: None,
             record_iq: None,
