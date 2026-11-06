@@ -146,6 +146,11 @@ pub(crate) const RECV_BUF_LEN: usize = 65536;
 /// needs no additional undocumented command type.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// MAN-474 / MAN-497: space stop retries beyond a single UDP loss burst.
+const STOP_RESEND_INTERVAL: Duration = Duration::from_millis(50);
+/// MAN-474 / MAN-497: bound the stop retry window during session retirement.
+const STOP_RESEND_WINDOW: Duration = Duration::from_millis(250);
+
 /// How many times `HpsdrDevice::open` repeats the full initial C&C
 /// rotation before sending the start command (PR #79 review, round 4,
 /// P2): UDP is lossy, and a single dropped datagram in a one-shot initial
@@ -711,9 +716,11 @@ impl HpsdrSession {
     }
 
     /// Stop pumping, discard pending samples and repeat the best-effort stop.
-    /// Two sends tolerate one lost UDP datagram (MAN-305 D8, MAN-497).
+    /// Keep the immediate pair (MAN-305 D8, MAN-497), then retry over a
+    /// bounded window to tolerate a burst of lost stops (MAN-474).
     /// The pump observes retirement between bounded UDP reads.
     pub fn retire(&self) {
+        let entered = Instant::now();
         let _authority = self.authority.lock().expect("HPSDR retirement poisoned");
         if !self.retired.swap(true, Ordering::SeqCst) {
             let mut inner = self.inner.lock().expect("HPSDR pump lock poisoned");
@@ -724,6 +731,10 @@ impl HpsdrSession {
             let mut stop = build_start_command();
             stop[3] = 0;
             for _ in 0..proto2::STOP_REPEATS {
+                let _ = inner.socket.send(&stop);
+            }
+            while let Some(remaining) = STOP_RESEND_WINDOW.checked_sub(entered.elapsed()) {
+                std::thread::sleep(STOP_RESEND_INTERVAL.min(remaining));
                 let _ = inner.socket.send(&stop);
             }
         }
@@ -1348,6 +1359,31 @@ mod tests {
             assert_eq!(n, 60);
             assert_eq!(&datagram[..4], &[0xef, 0xfe, 4, 0]);
         }
+        // Drain the timed retries before opening a replacement. Every packet
+        // must still be a stop, and 300 ms of silence bounds the old generation.
+        socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        loop {
+            match socket.recv_from(&mut datagram) {
+                Ok((n, _)) => {
+                    assert_eq!(n, 60);
+                    assert_eq!(&datagram[..4], &[0xef, 0xfe, 4, 0]);
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(e) => panic!("draining retirement stops: {e}"),
+            }
+        }
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut replacement = HpsdrDevice::open(cfg).unwrap();
         let peer = drain_initial_open_packets(&socket, 1);
         assert!(old[0].read(&mut [Complex32::default(); 1]).is_err());
@@ -2793,7 +2829,8 @@ mod open_receiver_tests {
         }
 
         fn wait_streaming(&self, want: bool) {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            // Harness budget matches MAX_CONSECUTIVE_TIMEOUTS x READ_TIMEOUT, 10 s.
+            let deadline = Instant::now() + Duration::from_secs(10);
             while self.streaming.load(Ordering::SeqCst) != want {
                 assert!(
                     Instant::now() < deadline,
