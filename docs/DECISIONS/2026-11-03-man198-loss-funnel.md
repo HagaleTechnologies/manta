@@ -56,12 +56,17 @@ births apart in `births`, as the ticket asks, and counts closes by reason plus
 
 ## Oracle-bypass experiments
 
-`--funnel-bypass known-frequency` (requires `--funnel`) adds the one bypass
-built so far. For each opportunity with audio it leases a fresh decoder on
+`--funnel-bypass` (requires `--funnel`) names the two RBN-fed bypasses:
+`known-frequency` and, since MAN-493, `known-timing`. Each bypass, for
+every opportunity with audio, leases a fresh decoder on
 the truth frequency over the acoustic window clipped to the recording, fed
 the channel with the highest mean power of the three around it (the rule
 `manta oracle` uses, applied over the episode's whole window), and passes
-its events through a fresh production validator. Call-keyed evidence is
+its events through a fresh production validator. `known-timing` seeds that
+decoder at the truth speed first (`TrackDecoder::seed_speed_wpm`), forcing
+`usableTiming` as well, and reports `noRbnWpm` or `hsmmEngine` when the
+truth carries no speed or the engine's speed never passes through the
+seedable tracker. Call-keyed evidence is
 still judged over the wider spot window, which the bypass does not decode,
 so a bypass line can lose where production passed; `upperBound` counts
 production's deliveries too.
@@ -80,8 +85,18 @@ is a recall score, no exit code reads them, and no bypass line has a
 `dxCall`, `frequency` or `spots` key. Apart from the header's `bypasses`,
 the production lines are the same bytes with or without bypasses
 (`oracle_funnel.rs`
-`funnel_bypass_known_frequency_appends_after_summary`). Unknown names,
-including the three unbuilt ones below, exit 2.
+`funnel_bypass_known_frequency_appends_after_summary`,
+`funnel_bypass_known_timing_appends_after_summary`). Unknown names,
+including the two synthetic-only ones below, exit 2.
+
+MAN-493 added the two keying-truth experiments as engine API only:
+`run_synthetic_bypass` takes `known-transitions` (the exact on/off keying
+timeline fed hop by hop to a fresh seeded decoder) and `known-transcript`
+(decoder events synthesized from the known words), built as plain data by
+`manta-testkit::funnel_truth` and run by
+`cargo run -p manta-engine --example loss_funnel_synthetic`. They force
+detection, admission and timing by construction; the text and every
+validator gate stay honest. Their names are not CLI flag values.
 
 ## Decisions
 
@@ -146,10 +161,12 @@ including the three unbuilt ones below, exit 2.
 ## Follow-ups
 
 - The validator role log (`role:<addressee|...>` details at `selfIdRecognized`).
-- The other three oracle-bypass experiments: known timing (needs a
-  `SpeedTracker` seed in `manta-decode`), and known key transitions and
-  known transcript (need synthetic keying truth). Each would be one more
-  `Bypass` variant through `run_bypass`, segregated the same way.
+- Done by MAN-493: the other three oracle-bypass experiments -- known
+  timing (the `SpeedTracker` seed in `manta-decode`,
+  `SpeedTracker::seed_wpm`/`TrackDecoder::seed_speed_wpm`) and known key
+  transitions and known transcript (synthetic keying truth,
+  `manta-testkit::funnel_truth` + `run_synthetic_bypass`) -- all built and
+  segregated the same way.
 - Running the funnel with the config's `[spot]` and `freq_correction_ppm`, as
   `manta decode` does; the nine-row stage-scene golden test.
 - The plain oracle's out-of-range rows (outside the recording or passband are

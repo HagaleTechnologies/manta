@@ -239,9 +239,9 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         funnel: Option<PathBuf>,
         /// Add oracle-bypass experiments to the funnel file, comma-separated:
-        /// known-frequency. Each forces stages with truth and reports an
-        /// upper bound after the production summary; never a score.
-        /// Requires --funnel
+        /// known-frequency, known-timing. Each forces stages with truth and
+        /// reports an upper bound after the production summary; never a
+        /// score. Requires --funnel
         #[arg(
             long,
             value_name = "BYPASS",
@@ -3013,12 +3013,17 @@ fn parse_window_s(s: &str) -> std::result::Result<f64, String> {
     Ok(window_s)
 }
 
-/// MAN-198: `--funnel-bypass` names. Only the bypasses RBN truth can feed
-/// are offered; known-frequency is the one built.
+/// MAN-198/MAN-493: `--funnel-bypass` names. Only the bypasses RBN truth
+/// can feed are offered; known-frequency and known-timing are built. The
+/// two keying-truth experiments (known-transitions, known-transcript)
+/// are engine-API/example-only and keep exiting 2 here.
 fn parse_funnel_bypass(s: &str) -> std::result::Result<manta_engine::funnel::Bypass, String> {
     match s {
         "known-frequency" => Ok(manta_engine::funnel::Bypass::KnownFrequency),
-        _ => Err(format!("unknown bypass `{s}`: expected known-frequency")),
+        "known-timing" => Ok(manta_engine::funnel::Bypass::KnownTiming),
+        _ => Err(format!(
+            "unknown bypass `{s}`: expected known-frequency or known-timing"
+        )),
     }
 }
 
