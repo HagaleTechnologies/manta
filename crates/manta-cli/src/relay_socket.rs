@@ -1,9 +1,16 @@
 //! MAN-320 (D11): the UDP socket a `[[wsjtx_relay]]` listens on, bound in
 //! `manta-cli` and handed to `manta_server::relay::wsjtx::run`, so
-//! `manta-server` gains no dependency edge. An IPv4 multicast group binds
-//! `0.0.0.0:port` and joins the group; a unicast address is a plain bind,
-//! so a taken port is a clear startup error rather than a silently shared
-//! one.
+//! `manta-server` gains no dependency edge. An IPv4 multicast group sets
+//! `SO_REUSEADDR`, binds and joins the group, so it shares the port with
+//! other reuse-enabled consumers; a unicast address is a plain bind, so a
+//! taken port is a clear startup error rather than a silently shared one.
+//!
+//! MAN-471: on macOS the multicast listener binds the group address itself
+//! (`group:port`), not `0.0.0.0:port`. BSD sockets refuse a second wildcard
+//! bind to a port a peer holds unless both set `SO_REUSEPORT`; a bind to
+//! the group address is a distinct local address, which `SO_REUSEADDR`
+//! alone permits, and still receives the group's datagrams. Elsewhere the
+//! wildcard bind with `SO_REUSEADDR` already shares the port.
 
 use anyhow::{anyhow, Result};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -25,7 +32,7 @@ fn bind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
         SocketAddr::V4(v4) if v4.ip().is_multicast() => {
             let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
             s.set_reuse_address(true)?;
-            s.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, v4.port()).into())?;
+            s.bind(&SocketAddrV4::new(multicast_bind_ip(*v4.ip()), v4.port()).into())?;
             s.join_multicast_v4(v4.ip(), &Ipv4Addr::UNSPECIFIED)?;
             UdpSocket::from(s)
         }
@@ -33,6 +40,16 @@ fn bind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     };
     socket.set_nonblocking(true)?;
     Ok(socket)
+}
+
+/// The local address a multicast listener binds: the group itself on
+/// macOS (see the module doc), the wildcard elsewhere.
+fn multicast_bind_ip(group: Ipv4Addr) -> Ipv4Addr {
+    if cfg!(target_os = "macos") {
+        group
+    } else {
+        Ipv4Addr::UNSPECIFIED
+    }
 }
 
 #[cfg(test)]
@@ -56,7 +73,10 @@ mod tests {
     fn bind_wsjtx_socket_joins_an_ipv4_multicast_group() {
         let s = bind_wsjtx_socket("224.0.0.1:0".parse().unwrap()).unwrap();
         let local = s.local_addr().unwrap();
-        assert_eq!(local.ip(), std::net::IpAddr::from([0, 0, 0, 0]));
+        assert_eq!(
+            local.ip(),
+            std::net::IpAddr::from(multicast_bind_ip(Ipv4Addr::new(224, 0, 0, 1)))
+        );
         assert_ne!(local.port(), 0);
     }
 
@@ -78,7 +98,14 @@ mod tests {
             SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 1), peer_addr.port()).into(),
         )
         .unwrap();
-        assert_eq!(relay.local_addr().unwrap(), SocketAddr::V4(peer_addr));
+        let group = Ipv4Addr::new(224, 0, 0, 1);
+        assert_eq!(
+            relay.local_addr().unwrap(),
+            SocketAddr::V4(SocketAddrV4::new(
+                multicast_bind_ip(group),
+                peer_addr.port()
+            ))
+        );
         // Inspect the flag rather than waiting for an empty multicast receive.
         assert!(socket2::SockRef::from(&relay).nonblocking().unwrap());
         // The peer still owns its binding after the relay has joined it.

@@ -25,3 +25,16 @@ three existing socket tests passed. After the fix, all four socket tests
 and all three `relay_acceptance` tests passed. The test checks binding only, not
 multicast packet delivery. macOS and Windows behavior require their CI
 results; the new regression is Unix-only and does not prove Windows sharing.
+
+## macOS: bind the group address (MAN-513, answer A)
+
+macOS refused the shared wildcard bind (`Address already in use`) in CI:
+BSD sockets allow a second `0.0.0.0:port` bind only when both sockets set
+`SO_REUSEPORT`, and the ticket's peer sets only `SO_REUSEADDR`. Tony chose
+(MAN-513, A) to bind the multicast group address itself on macOS rather
+than require peers to set `SO_REUSEPORT`. `group:port` is a distinct local
+address, so `SO_REUSEADDR` alone lets it coexist with a wildcard peer, and a
+socket bound to the group address still receives the group's datagrams.
+Linux and Windows keep the wildcard bind. The regression asserts the bound
+local address per platform; on macOS it failed before this change with
+`Address already in use (os error 48)` and passes after.
