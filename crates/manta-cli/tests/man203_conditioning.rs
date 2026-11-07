@@ -223,6 +223,105 @@ fn metric_value(body: &str, metric_with_labels: &str) -> Option<f64> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+// ---- MAN-495: doctor observes and reports input conditioning ----
+
+/// `manta doctor` against a fixture WAV, hermetically (no config file, no
+/// network): the same invocation output_style.rs uses.
+fn doctor_run(wav: &Path, duration_s: u32, json: bool) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    cmd.args(["doctor", "--source-iq", "--source"])
+        .arg(wav)
+        .args(["--duration", &duration_s.to_string()]);
+    if json {
+        cmd.arg("--json");
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn doctor_names_a_dc_offset_on_a_dc_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (wav, _, _) = fixtures(tmp.path());
+    let out = doctor_run(&wav, 5, false);
+    assert!(out.status.success(), "stderr:\n{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains("input: DC offset at the centre frequency, ")
+            && stdout.contains(
+                " dB above the channel noise. It can hide stations within about \
+                               200 Hz of the centre; [input] dc_block = \"apply\" removes it"
+            ),
+        "no DC line in the doctor report:\n{stdout}"
+    );
+
+    let out = doctor_run(&wav, 5, true);
+    assert!(out.status.success(), "stderr:\n{}", text(&out.stderr));
+    let report: serde_json::Value =
+        serde_json::from_str(text(&out.stdout).trim()).expect("doctor --json is one object");
+    let cond = &report["inputConditioning"];
+    assert!(cond.is_object(), "no inputConditioning: {report}");
+    assert_eq!(cond["impulse"]["mode"], "observe");
+    assert_eq!(cond["dc"]["mode"], "observe");
+    let over = cond["dc"]["overChannelNoiseDb"].as_f64();
+    assert!(
+        over.is_some_and(|over| over >= 12.0),
+        "overChannelNoiseDb {over:?} under 12 dB: {cond}"
+    );
+}
+
+#[test]
+fn doctor_prints_no_conditioning_line_on_a_clean_fixture() {
+    let tmp = tempfile::tempdir().unwrap();
+    // Digital silence: no DC level, no impulses, so nothing to name.
+    let clean = manta_testkit::wav::write_fixture(
+        tmp.path(),
+        "clean_silence",
+        &vec![num_complex::Complex32::new(0.0, 0.0); 5 * SAMPLE_RATE_HZ as usize],
+        SAMPLE_RATE_HZ,
+        CENTER_FREQ_HZ,
+    )
+    .unwrap();
+    let out = doctor_run(&clean, 5, false);
+    assert!(out.status.success(), "stderr:\n{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        !stdout.contains("input:"),
+        "a clean receiver must print no conditioning line:\n{stdout}"
+    );
+    assert!(stdout.contains("verdict: "), "{stdout}");
+
+    // The JSON still carries the observed-but-clean report, always present
+    // once a receiver ran.
+    let out = doctor_run(&clean, 5, true);
+    assert!(out.status.success(), "stderr:\n{}", text(&out.stderr));
+    let report: serde_json::Value =
+        serde_json::from_str(text(&out.stdout).trim()).expect("doctor --json is one object");
+    let cond = &report["inputConditioning"];
+    assert!(cond.is_object(), "no inputConditioning: {report}");
+    assert_eq!(cond["impulse"]["flaggedSamples"], 0, "{cond}");
+    assert_eq!(cond["impulse"]["repairedSamples"], 0, "{cond}");
+    assert_eq!(cond["dc"]["correctedSamples"], 0, "{cond}");
+    assert_eq!(cond["spans"].as_array().map(Vec::len), Some(0), "{cond}");
+}
+
+/// MAN-495 guard: decode's JSON keeps #514's shape -- `inputConditioning`
+/// appears only when a stage is on, and doctor's change adds no decode key.
+#[test]
+fn decode_json_keys_are_unchanged_on_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (wav, off, _) = fixtures(tmp.path());
+    match decode_json(&off, &wav) {
+        Ok(report) => assert!(
+            report.get("inputConditioning").is_none(),
+            "an all-off decode must keep the pre-MAN-496 JSON shape: {report}"
+        ),
+        Err(stderr) => assert!(
+            stderr.contains("no signal found"),
+            "unexpected decode failure: {stderr}"
+        ),
+    }
+}
+
 #[test]
 fn run_daemon_publishes_the_conditioned_samples_metric_from_startup() {
     let tmp = tempfile::tempdir().unwrap();

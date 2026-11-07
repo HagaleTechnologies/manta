@@ -528,7 +528,16 @@ transcript) is an upper bound for one intervention, never a score; its
 lines carry `oracleAssisted: true` and follow the production summary, so
 the production lines stay a byte-identical prefix (the header's `bypasses`
 names what ran) and no gate reads them.
-Built so far: known frequency (`--funnel-bypass known-frequency`).
+Built: all four experiments. `known-frequency` and `known-timing`
+(`--funnel-bypass known-frequency`, `--funnel-bypass known-timing`) are
+RBN-fed and run per production record; `known-timing` also seeds the
+decoder at the truth speed (`TrackDecoder::seed_speed_wpm`), forcing
+`usableTiming`, and is unavailable (`noRbnWpm`, `hsmmEngine`) when the
+truth carries no speed or the engine is hsmm. `known-transitions` and
+`known-transcript` take synthetic keying truth as plain data through the
+engine API (`run_synthetic_bypass`, built by `manta-testkit::funnel_truth`)
+and are example/test-only: their names still exit 2 at the CLI
+(`manta-engine --example loss_funnel_synthetic`).
 
 ### 8.4 Gates (design §6)
 

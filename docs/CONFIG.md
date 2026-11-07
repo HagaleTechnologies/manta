@@ -478,8 +478,12 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `iq_phase_deg` | none; example `2.0` | per input; restart required | Finite phase error, -45 through 45 degrees, from a controlled tone. Remeasure after a receiver gain change. |
 | `iq_calibrated_center_hz` | none; example `14000000.0` | per input; restart required | Finite positive receiver centre in Hz when measured. Apply requires actual source centre agreement within 1 Hz. A mismatch leaves samples unchanged and warns once per input, including reconnects. Calibration is refused with `bands`. |
 | `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
+| `digital_modes` | `[]` | `run` only; any type; restart required | Decode `"FT8"`, `"FT4"` or both from windows fully inside this input's usable passband. Needs a build with `--features ftx` and a `[server]` table; unknown or repeated modes are refused. `MANTA_INPUT_DIGITAL_MODES='["FT8"]'` overrides the file. Startup lines say which windows are decoded or skipped. Spots go only to the [JSON stream](SPOT-SCHEMA.md). Keep the system clock synchronised to network time; the first FT8 spot can take up to 30 s because the partial startup slot is skipped. One FT8 window cost about 4% of one core at 96 kS/s in the MAN-323 prototype; FT4 doubles the decode rate on 7.5 s slots. |
 | `dc_block` | `"off"` | live: `decode`, `run`, `soak`; restart required | The DC-removal input-conditioning stage's mode: `off`, `observe` (measure and annotate, never write a sample) or `apply` (correct the samples and annotate them). MAN-496; `decode --json` reports what ran as `inputConditioning`. See [docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md](DECISIONS/2026-11-03-man203-reversible-input-conditioning.md). |
 | `impulse_suppress` | `"off"` | live: `decode`, `run`, `soak`; restart required | The short-impulse-suppression conditioning stage's mode: `off`, `observe` or `apply` (repair isolated runs of a few samples, keeping the originals in the log). MAN-496. |
+| `cw_segments_hz` | none; example `[[14000000, 14030000], [14040000, 14060000]]`; unset keeps full CW coverage | live: `run`, `decode`; restart required | Inclusive calibrated RF ranges, Hz, in which manta decodes CW; an empty list pauses CW decoding. MAN-30; see [CW sub-segments and UTC schedules](#cw-sub-segments-and-utc-schedules) below. |
+| `cw_schedule` | none; example `[]` | live: `run`, `decode`; restart required | Daily `[[input.cw_schedule]]` entries (`at_utc`, `segments_hz`) that replace the base ranges from that UTC time. MAN-30. |
+| `cw_overrides` | none; example `[]` | live: `run`, `decode`; restart required | Dated `[[input.cw_overrides]]` entries that replace the base and daily ranges during an absolute UTC interval. MAN-30. |
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
@@ -873,3 +877,70 @@ The loader also rejects `[detector] guard_hz`, which SPEC §9 does not list:
 it is the internal DC/Nyquist spawn guard, set from the input source
 (600 Hz for live audio, 0 otherwise; see
 [MAN-273](DECISIONS/2026-10-16-man273-hilbert-image-guard.md)).
+
+### CW sub-segments and UTC schedules
+
+Each `[input]` or `[[input]]` can restrict CW decoder coverage. These fields
+never retune a receiver. They reduce per-track work, not the full-passband FFT
+cost. Capture and tuning coverage do not promise active CW coverage.
+
+```toml
+[[input]]
+name = "20m"
+type = "kiwi"
+host = "kiwi.example.org"
+port = 8073
+freq_hz = 14050000
+cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "06:00"
+segments_hz = [[14000000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "18:00"
+segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_overrides]]
+start_utc = 2026-11-28T00:00:00Z
+end_utc = 2026-11-30T00:00:00Z
+segments_hz = [[14000000, 14060000]]
+```
+
+`cw_segments_hz` lists inclusive absolute RF ranges in Hz. Omit it for current
+coverage; an empty list disables CW decoding for this input. Every range needs
+two finite, positive endpoints with lower < upper. Overlapping or touching
+ranges are combined. Ranges outside the captured passband contribute no coverage;
+a band-plan entry can span several streams.
+
+`cw_schedule` selects the most recent daily `at_utc`, including yesterday's last
+entry before today's first switch. Use exactly `HH:MM`, `00:00` through `23:59`,
+without duplicate times. UTC has no daylight-saving adjustment. Each entry
+replaces the base ranges rather than adding to them.
+
+`cw_overrides` replaces daily or base coverage during an absolute interval,
+including its start and excluding its end. Use UTC TOML datetimes with `Z`, whole
+seconds, from 1970 through 2100-01-01. Intervals must not overlap; adjacent
+intervals are valid. At an interval's end, the current daily or base coverage
+resumes. Empty `segments_hz` pauses CW decoding.
+
+Membership uses the calibrated RF estimate, with the estimator's existing
+boundary uncertainty. Trusted-band, analytic-image and digital-window vetoes
+still apply. Decoding inside a default digital exclusion also needs the existing
+`digital_window_filter` setting to permit it. Newly admitted signals acquire
+normally. Excluded tracks release their decoders without flushing a final word.
+Retained tracks keep their state. Acquisition, spectrum and other modes continue.
+
+Live inputs switch before the first processing batch after the UTC boundary.
+A blocked read postpones processing; resumed processing selects current coverage.
+File inputs use replay epoch plus sample time, even with realtime playback.
+Scheduled legacy files require `replay_epoch`; native recordings can use their
+recorded epoch. Looped files use the advancing session sample clock. Replay
+boundaries split decoder batches so excluded input never reaches a decoder.
+
+Policy edits require restart. Loaded schedules switch automatically without
+signals on all supported operating systems. SIGHUP reports edits as restart-only.
+Use `manta config check --config <file>` to validate. No new RBN registration
+exchange is provided. Local timezones, recurring weekday rules and sunrise/sunset
+scheduling are deferred. Removing the keys and restarting restores old coverage;
+remove them before downgrading to a version that does not recognize them.

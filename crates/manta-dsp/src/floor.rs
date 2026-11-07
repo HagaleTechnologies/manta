@@ -442,7 +442,10 @@ impl Gate {
     }
 
     /// One hop's rise/drop booleans per channel, against `floor`'s current
-    /// effective floor. Rise requires two full disjoint windows; drop uses the EMA.
+    /// effective floor. Rise is the EMA rule when `with_ema_rise` is set, or
+    /// two full disjoint windows clearing the on threshold. The window path
+    /// is withheld when the channel's wrapping ±2 neighbourhood holds a
+    /// stronger recent window (`beside_stronger`). Drop uses the EMA.
     pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
         assert_eq!(
             power_db.len(),

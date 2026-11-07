@@ -58,6 +58,8 @@ pub use manta_dsp::crash::CRASH_MIN_LIVE_CHANNELS;
 pub use manta_dsp::sample_guard::MAX_SAMPLE_MAGNITUDE;
 pub use track::{crash_live_channels, ChannelLevel, CrashFilter, DetectorConfig};
 
+pub mod cw_segments;
+
 use anyhow::{bail, Context, Result};
 use manta_decode::decoder::{events_to_text, DecodeConfig};
 use manta_decode::events::DecoderEvent;
@@ -145,6 +147,14 @@ fn primary_track_id(events: &[DecoderEvent]) -> Option<u32> {
 /// M0 pipeline tunables. SPEC §5.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
+    /// Per-source CW inclusion policy.
+    pub cw_policy: cw_segments::Policy,
+    /// Schedule time source.
+    pub cw_clock: cw_segments::Clock,
+    /// Replay UTC epoch in seconds.
+    pub cw_epoch: i64,
+    /// Native recording epoch fraction, in nanoseconds.
+    pub cw_epoch_nanoseconds: u32,
     /// Classical decoder tunables. SPEC §5.
     pub decode: DecodeConfig,
     /// Real multi-track detector tunables. SPEC §9 `[detector]` table.
@@ -229,6 +239,10 @@ impl PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            cw_policy: cw_segments::Policy::default(),
+            cw_clock: cw_segments::Clock::Samples,
+            cw_epoch: 0,
+            cw_epoch_nanoseconds: 0,
             decode: DecodeConfig::default(),
             detector: track::DetectorConfig::default(),
             freq_correction_ppm: 0.0,
@@ -331,6 +345,12 @@ pub struct DcConditioning {
     /// while the stage is off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level_dbfs: Option<f64>,
+    /// MAN-495: how far `level_dbfs` sits above the median channel noise
+    /// floor, in dB, from doctor's own bounded floor pre-pass. Doctor-only:
+    /// decode has no floor reference, so it never sets this and its JSON
+    /// keeps #514's shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub over_channel_noise_db: Option<f64>,
     /// Samples the stage changed (`apply` only).
     pub corrected_samples: u64,
 }
@@ -387,7 +407,7 @@ impl ConditioningReport {
     /// Fold one segment's log in: counts and long runs sum across segments,
     /// the DC level is the last one seen, and the bounded span rings carry
     /// the final segment's.
-    fn add(&mut self, log: &manta_dsp::condition::ConditioningLog) {
+    pub(crate) fn add(&mut self, log: &manta_dsp::condition::ConditioningLog) {
         use manta_dsp::condition::{Mark, Stage};
         self.impulse.flagged_samples += log.count(Stage::Impulse, Mark::Flagged);
         self.impulse.repaired_samples += log.count(Stage::Impulse, Mark::Repaired);
@@ -560,6 +580,7 @@ impl IqSource for SliceSource<'_> {
 /// and track manager, as `listen`'s `Segment`, whose sample clock starts at
 /// `base` on the source's timeline.
 struct OfflineSegment {
+    held: listen::HeldLosses,
     ch: manta_dsp::channelizer::Channelizer,
     tm: track::TrackManager,
     hop: u64,
@@ -621,6 +642,7 @@ impl SourceBands {
             cfg.detector,
             cfg.decode.clone(),
         );
+        tm.set_cw_policy(cfg);
         tm.resume_track_ids_from(next_id);
         tm.skip_preroll_hops(pad_hops);
         tm.set_rf_passband_hz(self.rf_passband_hz.0, self.rf_passband_hz.1);
@@ -635,6 +657,7 @@ impl SourceBands {
         // streaming cap on the RTTY log does not apply to a file decode.
         tm.keep_full_rtty_history();
         Ok(OfflineSegment {
+            held: Default::default(),
             ch,
             tm,
             hop,
@@ -781,10 +804,19 @@ pub fn decode_source_observed(
             nonzero |= chunk[filled..filled + n]
                 .iter()
                 .any(|s| s.re != 0.0 || s.im != 0.0);
-            // MAN-202: every gap report is taken here. `missing_samples` is
-            // still ignored by file decode, as before (a follow-up: make
-            // `decode_source` honour `take_missing_samples`).
             let cont = ReadContinuity::take(src);
+            // Scheduled source clocks include spliced losses just as the live
+            // front end does. Preserve the legacy unscheduled decode path.
+            if cfg.cw_policy.scheduled() {
+                if let Some(k) = cont.missing_samples {
+                    seg.base = seg
+                        .base
+                        .checked_add(k)
+                        .context("input loss overflows sample clock")?;
+                    seg.held
+                        .record(consumed, k, consumed, seg.ch.filter_len() as u64);
+                }
+            }
             if let Some(missing) = cont.discontinuity {
                 // These samples follow the outage: they open the next
                 // segment, after this one's partial chunk.
@@ -807,7 +839,7 @@ pub fn decode_source_observed(
             let (base, pad_hops, hop) = (seg.base, seg.pad_hops, seg.hop);
             events.extend(
                 seg.tm
-                    .process_hops(&hops, |m| base + m.saturating_sub(pad_hops) * hop),
+                    .process_hops(&hops, |m| seg.held.hop_ts(base, pad_hops, hop, m)),
             );
         }
         let Some(missing) = gap else {

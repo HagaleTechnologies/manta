@@ -3572,6 +3572,7 @@ fn cli_json_doc_lists_every_field_both_ways() {
         distinct_chars: 9,
         spots_confirmed: 0,
         bad_samples: 1,
+        input_conditioning: Some(manta_engine::ConditioningReport::default()),
     };
 
     let md = doc(CLI_JSON_REF);

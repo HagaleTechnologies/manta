@@ -301,6 +301,13 @@ station_callsign = "N0CALL"
 
 # The settings below apply to any receiver type, or none.
 
+# CW coverage uses calibrated RF Hz. No default: omission keeps full coverage.
+# An empty list pauses CW decoding. Daily entries and dated overrides replace
+# the base ranges. See docs/CONFIG.md for the complete scheduling example.
+#cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+#cw_schedule = []                   # no default: daily UTC entries that replace the base ranges
+#cw_overrides = []                  # no default: dated entries that replace the base and daily ranges
+
 # IQ correction uses a controlled tone calibration for this receiver. Restart required.
 # Observe only measures mirrors; Apply requires the complete triple below.
 #iq_correction = "off"
@@ -316,6 +323,10 @@ station_callsign = "N0CALL"
 
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
+
+# FT8/FT4 spots on the JSON stream from windows this input covers.
+# Needs a manta built with --features ftx and a [server] table. Restart required.
+#digital_modes = []
 
 # Input-conditioning stages, each off | observe | apply:
 # "observe" measures and annotates without changing a sample, "apply"
@@ -538,3 +549,11 @@ station_callsign = "N0CALL"
 #    replay_hops_per_batch = 1500     # re-decode work per input batch, in hops
 #    backlog = 16                     # queued episodes, 1 through 256
 #refine = { enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }
+
+# CW coverage example, under your input table:
+# [input]
+# cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+# [[input.cw_schedule]]
+# at_utc = "18:00"
+# segments_hz = [[14000000, 14030000]]
+# Full UTC daily/dated semantics: docs/CONFIG.md.

@@ -393,6 +393,24 @@ impl TrackDecoder {
         self.snr_2500_db = Some(snr_2500_db);
     }
 
+    /// MAN-493: seed this track's speed tracker with a truth WPM, the
+    /// `known-timing` oracle-bypass experiment's entry point. No
+    /// production caller. Refused (`false`, no state change) under
+    /// `Engine::Hsmm`, whose speed comes from `HsmmDecoder::best_u`
+    /// (`feed_hsmm_hop`) and never through `SpeedTracker`. Otherwise the
+    /// tracker is seeded and the demod's dit-dependent thresholds see the
+    /// seed immediately -- the same push `on_run`'s warmup completion
+    /// makes -- so the decoder never buffers runs against a truth it
+    /// already knows.
+    pub fn seed_speed_wpm(&mut self, wpm: f32) -> bool {
+        if matches!(self.cfg.engine, Engine::Hsmm) {
+            return false;
+        }
+        self.tracker.seed_wpm(wpm);
+        self.demod.set_dit_ms(self.tracker.mu_dit_ms());
+        true
+    }
+
     /// Hops fed to this decoder so far. `manta-engine`'s peak-hold reset
     /// checks `hop_count() % META_INTERVAL_HOPS == 0` to detect the SPEC §5
     /// reporting boundary independent of whether it actually produced a
@@ -407,11 +425,15 @@ impl TrackDecoder {
     /// MAN-208: seeds the speed tracker with an explicit WPM estimate
     /// before the first hop, so a refinement replay under a
     /// timing-hypothesis configuration starts from the seeded scale
-    /// instead of the bootstrap (see `SpeedTracker::seed_wpm`). A no-op
-    /// once marks have made the tracker ready: the sender's own marks
-    /// always outrank the seed.
+    /// instead of the bootstrap. Reuses MAN-493's seed
+    /// (`seed_speed_wpm`: the seed stays uncorroborated, so contradicting
+    /// marks can still re-anchor it). A no-op once marks have made the
+    /// tracker ready -- the sender's own marks always outrank the seed --
+    /// and under `Engine::Hsmm`, which never reads `SpeedTracker`.
     pub fn set_initial_wpm(&mut self, wpm: f32) {
-        self.tracker.seed_wpm(wpm);
+        if !self.tracker.ready() {
+            let _ = self.seed_speed_wpm(wpm);
+        }
     }
 
     /// MAN-202: how many unknown input gaps `note_input_gap` has applied to
@@ -1622,6 +1644,46 @@ fn completed_gaps_ms(runs: &[Run]) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::tree::pattern_for;
+
+    /// MAN-493: `seed_speed_wpm` is refused (no state change) by the hsmm
+    /// engine, whose speed never passes through `SpeedTracker`, and
+    /// accepted by the two legacy engines.
+    #[test]
+    fn seed_speed_wpm_is_refused_by_hsmm() {
+        for engine in [Engine::Legacy, Engine::EdgeLegacy, Engine::Hsmm] {
+            let cfg = DecodeConfig {
+                engine,
+                ..DecodeConfig::default()
+            };
+            let mut dec = TrackDecoder::new(1, cfg);
+            let ok = dec.seed_speed_wpm(20.0);
+            assert_eq!(ok, engine != Engine::Hsmm, "{engine:?}");
+        }
+        // The refused call leaves the decoder unseeded: no final speed.
+        let mut hsmm = TrackDecoder::new(
+            1,
+            DecodeConfig {
+                engine: Engine::Hsmm,
+                ..DecodeConfig::default()
+            },
+        );
+        assert!(!hsmm.seed_speed_wpm(20.0));
+        assert!(!hsmm
+            .finish()
+            .iter()
+            .any(|e| matches!(e, DecoderEvent::SpeedUpdate { .. })));
+        // The accepted call leaves the tracker ready at the seed: the
+        // finish-time final report carries the truth speed.
+        let mut legacy = TrackDecoder::new(1, DecodeConfig::default());
+        assert!(legacy.seed_speed_wpm(20.0));
+        let mut saw_wpm = None;
+        for e in legacy.finish() {
+            if let DecoderEvent::SpeedUpdate { wpm, .. } = e {
+                saw_wpm = Some(wpm);
+            }
+        }
+        assert_eq!(saw_wpm, Some(20.0));
+    }
 
     /// Render text as an ideal rectangular envelope at 375 Hz.
     /// 25 WPM => dit = 48 ms = 18 hops exactly (no rounding error).

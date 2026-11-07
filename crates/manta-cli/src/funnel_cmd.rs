@@ -1,7 +1,10 @@
-//! MAN-198: `manta oracle --funnel PATH` -- the stage-attributed loss
-//! funnel, written as JSON Lines: a header, one `lossFunnel` record per RBN
-//! episode, then a `lossFunnelSummary`. Diagnostic only: the oracle's
-//! stdout and `--jsonl` are unchanged, and no exit code reads it. See
+//! MAN-198/MAN-493: `manta oracle --funnel PATH` -- the stage-attributed
+//! loss funnel, written as JSON Lines: a header, one `lossFunnel` record
+//! per RBN episode, then a `lossFunnelSummary`, then one block per
+//! requested oracle-bypass experiment (known-frequency and known-timing
+//! are CLI names; known-transitions and known-transcript are
+//! engine-API/example-only). Diagnostic only: the oracle's stdout and
+//! `--jsonl` are unchanged, and no exit code reads it. See
 //! docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 
 use anyhow::{Context, Result};

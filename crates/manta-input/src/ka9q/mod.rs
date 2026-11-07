@@ -35,8 +35,11 @@ const READ_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// MAN-201: how long a delivering stream may stop before `read` reports
 /// `take_stalled`: the validator's 5 s silence turn end, which a stream
-/// delivering no hops cannot reach on its own.
-const SETTLE_AFTER: Duration = Duration::from_secs(5);
+/// delivering no hops cannot reach on its own. MAN-489 aligned this with
+/// the crate-wide 4.5 s default (`stall::SOFT_STALL_AFTER`) the other
+/// live sources report at, so every source leaves the same polling margin
+/// under the 5 s bound; its own one-shot latch logic stays local.
+const SETTLE_AFTER: Duration = Duration::from_millis(4_500);
 
 /// The status socket's receive timeout while `open` waits for status. The
 /// data socket is drained (one `DRAIN_BATCH` per pass) between status

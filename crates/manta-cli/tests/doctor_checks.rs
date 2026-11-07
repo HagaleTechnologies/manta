@@ -526,13 +526,15 @@ fn the_example_callsign_fails_the_config_check() {
 }
 
 /// The keys `manta doctor --json` printed before MAN-126, plus MAN-313's
-/// `detectorConfirmations`, under MAN-139's camelCase names, sorted.
+/// `detectorConfirmations` and MAN-495's `inputConditioning`, under
+/// MAN-139's camelCase names, sorted.
 const REPORT_KEYS: &[&str] = &[
     "centerFreqHz",
     "charsDecoded",
     "detectorConfirmations",
     "distinctChars",
     "durationS",
+    "inputConditioning",
     "sampleRateHz",
     "snrMax",
     "snrMedian",
@@ -566,6 +568,9 @@ fn json_adds_checks_and_keeps_every_existing_key() {
     for key in REPORT_KEYS {
         assert!(map.contains_key(*key), "no {key} in {stdout}");
     }
+    // MAN-495: a receiver ran, so the report carries `inputConditioning`
+    // on top of the pre-MAN-495 keys; `verdict` is in REPORT_KEYS, so the
+    // only additions beyond it remain `checks` and `checksStatus`.
     assert_eq!(map.len(), REPORT_KEYS.len() + 2, "{stdout}");
     let checks = map["checks"].as_array().unwrap();
     assert!(!checks.is_empty());
