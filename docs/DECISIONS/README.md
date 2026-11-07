@@ -27,6 +27,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 | 2026-11-03 | MAN-205 | [MAN-205: legacy and HSMM rarely recover a call the other misses; fusion is not worth building on the bench](2026-11-03-man205-legacy-hsmm-engine-overlap.md) |
 | 2026-11-03 | MAN-204 | [MAN-204: guarded two-stage cancellation recovers a weak CW station beside a strong one (offline experiment)](2026-11-03-man204-guarded-two-stage-cancellation.md) |
 | 2026-11-03 | MAN-200 | [MAN-200: damaged repetitions of one self-ID can confirm the call](2026-11-03-man200-repetition-evidence-fusion.md) |
+| 2026-11-03 | MAN-186 | [MAN-186: the decimator's CPU cost, measured on a host (no Pi4 claim)](2026-11-03-man186-decimator-cost.md) |
 | 2026-11-03 | MAN-180 | [MAN-180: `--soapy-gain` help warns that an SDRplay reads it as attenuation](2026-11-03-man180-soapy-gain-help-warning.md) |
 | 2026-11-02 | MAN-459 | [MAN-459: the protocol-2 acceptance fake follows manta across a reconnect, and every live-run failure explains itself](2026-11-02-man459-protocol2-fake-follows-reconnects.md) |
 | 2026-11-02 | MAN-201 | [MAN-201: who sent a callsign, not only which callsign](2026-11-02-man201-callsign-roles.md) |
