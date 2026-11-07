@@ -50,7 +50,7 @@
 //! not.
 
 use crate::beam::BeamConfig;
-use crate::decoder::{DecodeConfig, Engine};
+use crate::decoder::{DecodeConfig, Engine, RefineConfig};
 use crate::envelope::DemodConfig;
 use crate::evidence::EvidenceConfig;
 use crate::hsmm::HsmmConfig;
@@ -212,6 +212,10 @@ pub struct DecodeConfigToml {
     pub tau_hi_bounds_ms: [f64; 2],
     #[serde(default = "default_flush_gap_dits")]
     pub flush_gap_dits: f32,
+    /// MAN-208: the `[decode.refine]` sub-table (delayed refinement of
+    /// ambiguous decodes). Absent means the documented defaults.
+    #[serde(default)]
+    pub refine: RefineConfigToml,
     // NOT exposed here despite being in SPEC v1 §9's table --
     // `char_gap_dits`, `word_gap_dits`, `mu_ratio_bounds`, `cluster_alpha`
     // are hardcoded constants in `crates/manta-decode/src/timing.rs`
@@ -272,6 +276,7 @@ impl Default for DecodeConfigToml {
             tau_lo_ms: default_tau_lo_ms(),
             tau_hi_bounds_ms: default_tau_hi_bounds_ms(),
             flush_gap_dits: default_flush_gap_dits(),
+            refine: RefineConfigToml::default(),
         }
     }
 }
@@ -330,6 +335,70 @@ impl DecodeConfigToml {
             },
             refine_bw_hz: self.refine_bw_hz,
             steered_frontend: false,
+            refine: self.refine.into_refine_config(),
+        }
+    }
+}
+
+/// MAN-208: the `[decode.refine]` sub-table (SPEC-style additive sub-table
+/// of `[decode]`; every key defaults to its runtime `RefineConfig`'s
+/// value, so an absent sub-table is indistinguishable from an explicitly
+/// default one). Range validation lives on the runtime
+/// `manta_decode::decoder::RefineConfig::validate`, which the CLI runs at
+/// the one place a `[decode]` table from disk enters the process.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefineConfigToml {
+    #[serde(default = "default_refine_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_refine_lookback_secs")]
+    pub lookback_secs: f64,
+    #[serde(default = "default_refine_max_refinements")]
+    pub max_refinements_per_episode: u32,
+    #[serde(default = "default_refine_replay_hops")]
+    pub replay_hops_per_batch: u32,
+    #[serde(default = "default_refine_backlog")]
+    pub backlog: usize,
+}
+
+fn default_refine_enabled() -> bool {
+    RefineConfig::default().enabled
+}
+fn default_refine_lookback_secs() -> f64 {
+    RefineConfig::default().lookback_secs
+}
+fn default_refine_max_refinements() -> u32 {
+    RefineConfig::default().max_refinements_per_episode
+}
+fn default_refine_replay_hops() -> u32 {
+    RefineConfig::default().replay_hops_per_batch
+}
+fn default_refine_backlog() -> usize {
+    RefineConfig::default().backlog
+}
+
+impl Default for RefineConfigToml {
+    fn default() -> Self {
+        RefineConfigToml {
+            enabled: default_refine_enabled(),
+            lookback_secs: default_refine_lookback_secs(),
+            max_refinements_per_episode: default_refine_max_refinements(),
+            replay_hops_per_batch: default_refine_replay_hops(),
+            backlog: default_refine_backlog(),
+        }
+    }
+}
+
+impl RefineConfigToml {
+    /// The runtime form. Values pass through unclamped; the CLI's
+    /// `validate_decode_config` rejects out-of-range ones at load.
+    pub fn into_refine_config(self) -> RefineConfig {
+        RefineConfig {
+            enabled: self.enabled,
+            lookback_secs: self.lookback_secs,
+            max_refinements_per_episode: self.max_refinements_per_episode,
+            replay_hops_per_batch: self.replay_hops_per_batch,
+            backlog: self.backlog,
         }
     }
 }
@@ -525,5 +594,82 @@ mod tests {
         // but weren't overridden in this instance -- still equal defaults.
         assert_eq!(cfg.flush_gap_dits, default.flush_gap_dits);
         assert_eq!(cfg.beam.width, default.beam.width);
+    }
+
+    // ---- MAN-208: the [decode.refine] sub-table ----
+
+    #[test]
+    fn refine_defaults_round_trip() {
+        // An absent sub-table is indistinguishable from the documented
+        // defaults, on both the TOML and the runtime side.
+        let absent: DecodeConfigFile = toml::from_str("").unwrap();
+        assert_eq!(absent.decode.refine, RefineConfigToml::default());
+        assert_eq!(
+            absent.decode.into_decode_config().refine,
+            RefineConfig::default()
+        );
+        let explicit: DecodeConfigFile = toml::from_str(
+            "[decode.refine]\nenabled = true\nlookback_secs = 10.0\n\
+             max_refinements_per_episode = 2\nreplay_hops_per_batch = 1500\nbacklog = 16\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.decode.refine, RefineConfigToml::default());
+        // `enabled = false` parses and flows through: the causal baseline.
+        let off: DecodeConfigFile = toml::from_str("[decode.refine]\nenabled = false\n").unwrap();
+        assert!(!off.decode.into_decode_config().refine.enabled);
+    }
+
+    #[test]
+    fn refine_section_parses_and_rejects_out_of_range() {
+        let cfg: DecodeConfigFile = toml::from_str(
+            "[decode.refine]\nenabled = true\nlookback_secs = 8.0\n\
+             max_refinements_per_episode = 2\nreplay_hops_per_batch = 750\nbacklog = 8\n",
+        )
+        .unwrap();
+        let refine = cfg.decode.into_decode_config().refine;
+        assert_eq!(
+            refine,
+            RefineConfig {
+                enabled: true,
+                lookback_secs: 8.0,
+                max_refinements_per_episode: 2,
+                replay_hops_per_batch: 750,
+                backlog: 8,
+            }
+        );
+        assert_eq!(refine.validate(), Ok(()));
+        // The plan's documented out-of-range shape and note.
+        let bad = RefineConfig {
+            lookback_secs: 0.5,
+            ..RefineConfig::default()
+        };
+        assert_eq!(
+            bad.validate().unwrap_err(),
+            "invalid value: decode.refine.lookback_secs = 0.5\n  note: must be 0 (off) or 4.0..=10.0 seconds"
+        );
+        assert!(RefineConfig {
+            lookback_secs: 0.0,
+            ..RefineConfig::default()
+        }
+        .validate()
+        .is_ok());
+        for bad in [
+            RefineConfig {
+                max_refinements_per_episode: 5,
+                ..RefineConfig::default()
+            },
+            RefineConfig {
+                replay_hops_per_batch: 0,
+                ..RefineConfig::default()
+            },
+            RefineConfig {
+                backlog: 0,
+                ..RefineConfig::default()
+            },
+        ] {
+            assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+        }
+        // An unknown key in the sub-table fails as every unknown key does.
+        assert!(toml::from_str::<DecodeConfigFile>("[decode.refine]\nnope = 1\n").is_err());
     }
 }

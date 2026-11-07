@@ -28,6 +28,7 @@ pub const RAIL_RATIO_BUCKETS: [f64; 10] = [2.0, 2.5, 3.0, 4.0, 6.0, 10.0, 16.0, 
 /// non-cumulative, with a final `+Inf` overflow slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeQualitySnapshot {
+    pub refine: [u64; 5],
     pub chars_total: u64,
     pub garbles_total: u64,
     /// Length `RAIL_RATIO_BUCKETS.len() + 1`.
@@ -46,6 +47,7 @@ pub struct DecodeQualitySnapshot {
 }
 
 pub struct DecodeQualityObserver {
+    refine: [AtomicU64; 5],
     chars: AtomicU64,
     garbles: AtomicU64,
     rail_buckets: [AtomicU64; RAIL_RATIO_BUCKETS.len() + 1],
@@ -69,6 +71,7 @@ impl Default for DecodeQualityObserver {
 impl DecodeQualityObserver {
     pub fn new() -> Self {
         Self {
+            refine: std::array::from_fn(|_| AtomicU64::new(0)),
             chars: AtomicU64::new(0),
             garbles: AtomicU64::new(0),
             rail_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -134,9 +137,18 @@ impl DecodeQualityObserver {
         }
     }
 
+    /// Adds scheduler deltas, so reconnects and independent inputs cannot
+    /// reset another segment's cumulative metrics.
+    pub fn add_refinements(&self, counts: [u64; 5]) {
+        for (slot, n) in self.refine.iter().zip(counts) {
+            slot.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> DecodeQualitySnapshot {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         DecodeQualitySnapshot {
+            refine: std::array::from_fn(|i| load(&self.refine[i])),
             chars_total: load(&self.chars),
             garbles_total: load(&self.garbles),
             rail_ratio_bucket_counts: self.rail_buckets.iter().map(load).collect(),

@@ -2449,6 +2449,14 @@ pub struct TrackManager {
     /// MAN-199: per channel, the last hop at which a track centred there
     /// queued decoder input. A lead-in starts after it.
     last_fed_hop: Vec<Option<u64>>,
+    /// MAN-208: per-track retained decoder inputs for refinement replay.
+    refine_buf: crate::refine::RefineBuffers,
+    refine_now_ts: u64,
+    /// MAN-208: the deterministic, budget-bounded refinement scheduler.
+    refine: crate::refine::RefineScheduler,
+    /// MAN-208, multi-input front ends: `Some` routes what this manager
+    /// would retain to the shared back end instead (`take_refine_feed`).
+    refine_export: Option<Vec<crate::refine::RefineFeed>>,
 }
 
 /// MAN-312 (SPEC §2.7): the channels inside `rf_passband_hz` with one
@@ -2535,6 +2543,12 @@ fn channels_within(channel_spacing_hz: f64, lo: f64, hi: f64, n: usize) -> Vec<b
         .collect()
 }
 
+impl crate::refine::RefinePass for TrackManager {
+    fn refine_pass(&mut self, validator: &mut manta_spot::Validator) -> Vec<manta_spot::Spot> {
+        self.refine_step(validator)
+    }
+}
+
 impl TrackManager {
     /// A fresh manager over `n_channels` channels, configured per
     /// `DetectorConfig`, with a decoder pool configured per `DecodeConfig`.
@@ -2546,6 +2560,8 @@ impl TrackManager {
         detector_cfg: DetectorConfig,
         decode_cfg: DecodeConfig,
     ) -> Self {
+        let refine_buf = crate::refine::RefineBuffers::new(&decode_cfg.refine);
+        let refine = crate::refine::RefineScheduler::new(&decode_cfg, fs);
         TrackManager {
             floor: FloorBank::new(n_channels),
             gate: Gate::new(
@@ -2620,6 +2636,10 @@ impl TrackManager {
                 .then(|| CoModDetector::new(n_channels)),
             comod_snr_buf: Vec::with_capacity(n_channels),
             confirmations: 0,
+            refine_buf,
+            refine_now_ts: 0,
+            refine,
+            refine_export: None,
         }
     }
 
@@ -3102,6 +3122,7 @@ impl TrackManager {
         Vec<DecoderEvent>,
         Vec<DecoderEvent>,
     ) {
+        self.refine_now_ts = self.refine_now_ts.max(sample_ts);
         let mut promoted_events: Vec<DecoderEvent> = Vec::new();
         if self.funnel.is_some() {
             self.funnel_ts = sample_ts;
@@ -4193,6 +4214,8 @@ impl TrackManager {
         let Some(mut track) = self.tracks.remove(&id) else {
             return (None, Vec::new());
         };
+        // MAN-208: the track's retained replay inputs leave with it.
+        self.refine_buf.drop_track(id);
         // MAN-171: a track that ran the full GC window with zero decoded
         // characters is very likely a stationary artifact (birdie/spur),
         // not real CW -- bar its channels from immediately re-spawning a
@@ -4622,6 +4645,67 @@ impl TrackManager {
             }
         }
         self.input_gap_hops.push_back(first_hop);
+        // MAN-208: no hop recorded before an unknown-length loss is
+        // contiguous with what follows, for any track's refinement replay.
+        match self.refine_export.as_mut() {
+            Some(feed) => feed.push(crate::refine::RefineFeed::InputGap),
+            None => self.refine_buf.break_at_input_gap(),
+        }
+    }
+
+    /// MAN-208, multi-input sessions: this manager's front end hands its
+    /// retention to the shared back end, where the validator and the
+    /// scheduler live (`crate::refine::SharedRefine`), instead of retaining
+    /// locally. `take_refine_feed` drains it with each batch.
+    pub(crate) fn export_refine_feed(&mut self) {
+        self.refine_export = Some(Vec::new());
+    }
+
+    /// The retention feed since the last call (empty unless exporting),
+    /// `sample_ts` still on this input's local clock.
+    pub(crate) fn take_refine_feed(&mut self) -> Vec<crate::refine::RefineFeed> {
+        self.refine_export
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// MAN-208 tests: places this manager's stream position (the newest
+    /// hop stepped) without stepping hops.
+    #[cfg(test)]
+    pub(crate) fn set_refine_stream_position(&mut self, sample_ts: u64) {
+        self.refine_now_ts = sample_ts;
+    }
+
+    /// MAN-208: the scheduler's cumulative counters.
+    #[cfg(test)]
+    pub(crate) fn refine_counters(&self) -> crate::refine::RefineCounters {
+        *self.refine.counters()
+    }
+
+    /// MAN-208: one refinement scheduler pass after a batch's decoder
+    /// events reached the validator. Returns any spots the pass rescued.
+    /// The pass's availability time is this manager's own stream position
+    /// (the newest hop it has stepped), never a timestamp read off the
+    /// batch's events: `TrackClosed` sorts at `u64::MAX`, and taking it as
+    /// the clock expired every retained episode and the cap bookkeeping
+    /// whenever any unrelated track closed (validate round 2, PR #520). A
+    /// no-op returning nothing while `[decode.refine] enabled = false`.
+    pub fn refine_step(&mut self, validator: &mut manta_spot::Validator) -> Vec<manta_spot::Spot> {
+        let decode_cfg = self.decode_cfg.clone();
+        let before = *self.refine.counters();
+        let spots = self.refine.step(
+            &mut self.refine_buf,
+            validator,
+            &decode_cfg,
+            self.refine_now_ts,
+        );
+        crate::refine::publish_refine_deltas(
+            self.quality.as_deref(),
+            &before,
+            self.refine.counters(),
+        );
+        spots
     }
 
     /// MAN-199: replay `depth` recorded hops at each lease instead of
@@ -4750,6 +4834,36 @@ impl TrackManager {
     fn drain_pool(&mut self) -> Vec<DecoderEvent> {
         use rayon::prelude::*;
         let quality = self.quality.as_deref();
+        // MAN-208: the entries about to reach a decoder are exactly the
+        // observations a refinement replay needs -- record them (by
+        // track_id; `values_mut` below loses the key) before the parallel
+        // pass consumes them. Retention is off at `lookback_secs == 0`.
+        if self.decode_cfg.refine.enabled && self.decode_cfg.refine.lookback_secs > 0.0 {
+            let feed: Vec<(u32, crate::refine::ReplayEntry)> = self
+                .tracks
+                .iter()
+                .filter(|(_, t)| t.decoder.is_some())
+                .flat_map(|(id, t)| {
+                    t.pending.iter().map(move |e| {
+                        (
+                            *id,
+                            crate::refine::replay_entry((e.0, e.1, e.2, e.3, e.4, e.5, false)),
+                        )
+                    })
+                })
+                .collect();
+            match self.refine_export.as_mut() {
+                Some(out) => out.extend(
+                    feed.into_iter()
+                        .map(|(id, e)| crate::refine::RefineFeed::Entry(id, e)),
+                ),
+                None => {
+                    for (id, entry) in feed {
+                        self.refine_buf.record(id, entry);
+                    }
+                }
+            }
+        }
         let mut events: Vec<DecoderEvent> = self
             .tracks
             .values_mut()
@@ -4899,9 +5013,10 @@ pub(crate) fn first_hop_after_gap(data_pos: u64, hop: u64) -> u64 {
 /// every `TrackMeta` ahead of its *entire* emitting batch, including
 /// earlier-hop `CharDecoded`/`WordBoundary` events from the same batch, so
 /// a just-reset/just-reported SNR value could retroactively attach to
-/// characters decoded before it -- with the magnitude depending on the
-/// caller's chunk size (`decode_samples` vs. `listen`/`soak_metrics`)).
-fn event_sample_ts(e: &DecoderEvent) -> u64 {
+/// characters decoded before it -- with the magnitude of the error
+/// depending on the caller's chunk size (`decode_samples` vs.
+/// `listen`/`soak_metrics`)).
+pub(crate) fn event_sample_ts(e: &DecoderEvent) -> u64 {
     match e {
         DecoderEvent::CharDecoded { sample_ts, .. }
         | DecoderEvent::WordBoundary { sample_ts, .. }

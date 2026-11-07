@@ -1314,3 +1314,28 @@ consecutive overflows surfaces, as a lost connection
 warning). Until the trigger fires the synchronous loop stays: it is
 deterministic by construction and has no thread boundary between pipeline
 stages to get wrong.
+
+### Delayed refinement (MAN-208)
+
+Every decode path feeds a batch's decoder events to the validator, then runs
+one refinement pass over retained ambiguous words. On a single input
+(`listen`, and the offline `decode_source_observed` loop, which validates each
+batch as it is produced) the pass is `TrackManager::refine_step`; the manager
+records decoder inputs in per-track FIFOs before draining its decoder pool. In
+a multi-input session each front end exports those inputs on the common clock
+with its batch (`Batch::refine_feed`), and the shared back end retains them
+beside the one validator (`SharedRefine`). The pass's clock is its owner's
+stream position, never a batch event's timestamp. Input gaps clear retention
+(only the gapped input's tracks on the multi-input path); closed tracks lose
+their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
+
+`validator → refinement candidates → retained hops → scratch TrackDecoder →
+Validator::apply_refinement → spot sink` is a feedback path over preserved
+observations. Revisions keep the original occurrence and span. Moving support
+between callsigns never creates a repetition. The RF timestamp is the newest
+supporting occurrence's timestamp; the observation's decision timestamp is when
+the replay completes. The scheduler pauses its scratch decoder at the batch hop
+budget and resumes it next batch. It expires episode bookkeeping with the
+validator window. Metrics travel through the atomic decode-quality observer.
+See the [decision record](docs/DECISIONS/2026-11-05-man208-delayed-refinement.md)
+for the current scope and measurement limits.

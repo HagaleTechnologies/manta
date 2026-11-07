@@ -650,6 +650,7 @@ fn settle_lookups(
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
+    refine: Option<&mut dyn crate::refine::RefinePass>,
     ctx: &mut EmitCtx<'_>,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
@@ -699,6 +700,19 @@ fn emit(
     // with their decisions, after the batch's own.
     for spot in validator.poll_lookups() {
         on_spot(&spot);
+    }
+    // MAN-208: the deterministic, budget-bounded refinement pass for this
+    // batch: re-run preserved observations of admitted ambiguous episodes
+    // under an alternate configuration and route any rescue through the
+    // same spot sink. Same single-ownership point as the `ingest` loop
+    // above, on both paths: a single input's `TrackManager`, or a
+    // multi-input session's shared retention (`SharedRefine`). Its clock
+    // is the owner's stream position. A no-op while `[decode.refine]
+    // enabled = false`.
+    if let Some(refine) = refine {
+        for spot in refine.refine_pass(validator) {
+            on_spot(&spot);
+        }
     }
     if let Some(tap) = ctx.live.as_mut() {
         tap.decisions(validator.take_decisions());
@@ -1028,6 +1042,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1063,6 +1078,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1121,6 +1137,7 @@ pub fn listen_with_observers(
                 emit(
                     events,
                     &mut validator,
+                    Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
@@ -1150,6 +1167,7 @@ pub fn listen_with_observers(
                 emit(
                     finish_events,
                     &mut validator,
+                    Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
@@ -1190,6 +1208,7 @@ pub fn listen_with_observers(
             emit(
                 finish_events,
                 &mut validator,
+                Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1239,6 +1258,7 @@ pub fn listen_with_observers(
             emit(
                 events,
                 &mut validator,
+                Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1266,6 +1286,7 @@ pub fn listen_with_observers(
         emit(
             events,
             &mut validator,
+            Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
             &mut ctx,
             &mut on_event,
             &mut on_spot,
@@ -1316,6 +1337,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1368,6 +1390,10 @@ pub(crate) struct Batch {
     /// The input's band sample when this batch crossed one of its stream
     /// seconds, on the common clock; only with a live-state sink.
     pub(crate) band: Option<crate::live::BandSample>,
+    /// MAN-208: the decoder inputs the input's `TrackManager` would have
+    /// retained for refinement replay, on the common clock, for the back
+    /// end's shared retention (`SharedRefine`).
+    pub(crate) refine_feed: Vec<crate::refine::RefineFeed>,
 }
 
 /// MAN-13 (D1): the shared back end of a multi-input session: the one
@@ -1385,6 +1411,9 @@ pub(crate) struct Back<'a> {
     /// MAN-14: where the validator's per-input cross-input dedupe counts
     /// go after each batch; `None` skips the copy.
     suppressions: Option<Arc<SuppressionObserver>>,
+    /// MAN-208: every input's retained observations and the one
+    /// refinement scheduler, beside the one validator.
+    refine: crate::refine::SharedRefine,
 }
 
 impl<'a> Back<'a> {
@@ -1394,6 +1423,7 @@ impl<'a> Back<'a> {
         shared: &'a crate::multi::SharedObservers,
         mut validator: Validator,
         rate_hz: f64,
+        decode_cfg: &manta_decode::decoder::DecodeConfig,
     ) -> Self {
         let references = shared
             .reference_lists
@@ -1418,7 +1448,18 @@ impl<'a> Back<'a> {
             open: BTreeSet::new(),
             input_end_ts: Vec::new(),
             suppressions: shared.suppressions.clone(),
+            refine: crate::refine::SharedRefine::new(
+                decode_cfg,
+                rate_hz,
+                shared.decode_quality.clone(),
+            ),
         }
+    }
+
+    /// MAN-208: the shared refinement scheduler's counters.
+    #[cfg(test)]
+    pub(crate) fn refine_counters(&self) -> crate::refine::RefineCounters {
+        *self.refine.counters()
     }
 
     /// MAN-14: publishes the validator's per-input cross-input dedupe
@@ -1473,9 +1514,15 @@ impl<'a> Back<'a> {
                 }
             }
         }
+        let validator = &self.validator;
+        self.refine
+            .ingest(batch.refine_feed, &batch.events, batch.end_ts, |id| {
+                validator.input_of(id) as usize == input
+            });
         emit(
             batch.events,
             &mut self.validator,
+            Some(&mut self.refine as &mut dyn crate::refine::RefinePass),
             &mut self.ctx,
             on_event,
             on_spot,
@@ -1535,11 +1582,15 @@ impl<'a> Back<'a> {
             emit(
                 events,
                 &mut self.validator,
+                None,
                 &mut self.ctx,
                 on_event,
                 on_spot,
             );
         }
+        let validator = &self.validator;
+        self.refine
+            .drop_input(|id| validator.input_of(id) as usize == input);
         if let Some(tap) = self.ctx.live.as_mut() {
             tap.retain_input_tracks(input, n_inputs, &[]);
         }
@@ -1597,6 +1648,23 @@ fn to_common(
                 DecoderEvent::SpeedUpdate { .. } | DecoderEvent::TrackClosed { .. } => {}
             }
             ev
+        })
+        .collect()
+}
+
+/// MAN-208: maps a front end's retention feed onto the session clock, as
+/// `to_common` maps its events.
+fn refine_feed_to_common(
+    feed: Vec<crate::refine::RefineFeed>,
+    clock: crate::multi::SourceClock,
+) -> Vec<crate::refine::RefineFeed> {
+    feed.into_iter()
+        .map(|step| match step {
+            crate::refine::RefineFeed::Entry(id, mut e) => {
+                e.3 = clock.to_common(e.3);
+                crate::refine::RefineFeed::Entry(id, e)
+            }
+            gap => gap,
         })
         .collect()
 }
@@ -1668,16 +1736,19 @@ pub(crate) fn run_input_front(
         observers.live_ids,
         spectrum.as_ref(),
     )?;
+    // MAN-208: the back end owns refinement; this input exports.
+    seg.tm.export_refine_feed();
     let mut seg_base: u64 = 0;
     let mut seg_consumed: u64 = 0;
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
     let batch =
-        |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| Batch {
+        |events: Vec<DecoderEvent>, end_local: u64, tm: &mut crate::track::TrackManager| Batch {
             events: to_common(events, clock, calibration_factor),
             end_ts: clock.to_common(end_local),
             n_tracks: tm.decoding_track_count(),
             live_ids: observers.live_ids.then(|| tm.track_ids()),
             band: None,
+            refine_feed: refine_feed_to_common(tm.take_refine_feed(), clock),
         };
     let mut band_ticker = observers
         .live_ids
@@ -1754,7 +1825,7 @@ pub(crate) fn run_input_front(
     let events = seg.tm.process_hops(&hops, |m| {
         seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
     });
-    let b = batch(events, fill_end, &seg.tm);
+    let b = batch(events, fill_end, &mut seg.tm);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
@@ -1766,7 +1837,7 @@ pub(crate) fn run_input_front(
         return Ok(());
     }
     let events = seg.process_fill(&calib[..filled], seg_base);
-    let mut b = batch(events, fill_end, &seg.tm);
+    let mut b = batch(events, fill_end, &mut seg.tm);
     tick(&mut b, &mut seg.tm, fill_end);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
@@ -1798,7 +1869,7 @@ pub(crate) fn run_input_front(
             // MAN-201, as `listen_with_observers`.
             if src.take_stalled() {
                 let finish_events = seg.tm.finish_for_discontinuity();
-                if !send(batch(finish_events, seg_base + seg_consumed, &seg.tm)) {
+                if !send(batch(finish_events, seg_base + seg_consumed, &mut seg.tm)) {
                     return Ok(());
                 }
                 stalled = true;
@@ -1824,7 +1895,7 @@ pub(crate) fn run_input_front(
         if let Some(gap) = cont.discontinuity {
             // MAN-423: held losses are already in `seg_base`.
             let finish_events = seg.tm.finish_for_discontinuity();
-            pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
+            pending.push(batch(finish_events, seg_base + seg_consumed, &mut seg.tm));
             let next_id = seg.tm.next_track_id();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
@@ -1846,11 +1917,12 @@ pub(crate) fn run_input_front(
                 observers.live_ids,
                 spectrum.as_ref(),
             )?;
+            seg.tm.export_refine_feed();
             let hops = seg.channelize(&padding);
             let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
             });
-            pending.push(batch(events, seg_base, &seg.tm));
+            pending.push(batch(events, seg_base, &mut seg.tm));
         } else if cont.unknown_gap {
             // MAN-202, as `listen_with_observers`.
             seg.tm
@@ -1865,7 +1937,7 @@ pub(crate) fn run_input_front(
             seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
         });
         seg_consumed += n as u64;
-        let mut b = batch(events, seg_base + seg_consumed, &seg.tm);
+        let mut b = batch(events, seg_base + seg_consumed, &mut seg.tm);
         tick(&mut b, &mut seg.tm, seg_base + seg_consumed);
         pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
@@ -1897,7 +1969,7 @@ pub(crate) fn run_input_front(
         } else {
             seg.tm.finish()
         };
-    let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
+    let mut last = batch(events, seg_base + seg_consumed, &mut seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
@@ -1976,6 +2048,139 @@ mod tests {
         events
     }
 
+    /// MAN-208: `transmission`, with the call's last character left
+    /// ambiguous (an unresolved decoder alternative) -- the scheduler's
+    /// ambiguity trigger.
+    fn ambiguous_transmission(track_id: u32, start_ts: u64) -> Vec<DecoderEvent> {
+        transmission(track_id, start_ts)
+            .into_iter()
+            .map(|ev| match ev {
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph: manta_decode::tree::Glyph::Char('W'),
+                    confidence,
+                    ..
+                } if sample_ts == start_ts + 600 => DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph: manta_decode::tree::Glyph::Char('W'),
+                    confidence,
+                    alternatives: vec![(manta_decode::tree::Glyph::Char('M'), 0.4)],
+                },
+                other => other,
+            })
+            .collect()
+    }
+
+    /// Validate round 2 (MAN-208, PR #520): the refinement pass's clock is
+    /// its owner's stream position, never the batch's event timestamps. A
+    /// batch whose only event closes an UNRELATED track (`TrackClosed`
+    /// sorts at `u64::MAX`) used to expire every retained candidate and
+    /// prune the per-episode cap bookkeeping.
+    #[test]
+    fn an_unrelated_track_closure_does_not_expire_retained_refinement_work() {
+        let fs = 96_000.0;
+        let cfg = PipelineConfig::default();
+        let mut validator = cfg.validator(fs).unwrap();
+        for ev in ambiguous_transmission(1, 1_000_000) {
+            validator.ingest(&ev);
+        }
+        assert!(
+            !validator
+                .refine_candidates(1_100_000, 10 * fs as u64)
+                .is_empty(),
+            "fixture: the once-heard W1AW is a refinement candidate"
+        );
+        let mut tm =
+            crate::track::TrackManager::new(64, fs, 14_000_000.0, cfg.detector, cfg.decode.clone());
+        tm.set_refine_stream_position(1_100_000);
+        let mut ctx = EmitCtx {
+            lists: None,
+            quality: None,
+            calibration_factor: 1.0,
+            live: None,
+            references: None,
+        };
+        emit(
+            vec![DecoderEvent::TrackClosed {
+                track_id: 7,
+                closure: ClosureKind::SignalEnded,
+            }],
+            &mut validator,
+            Some(&mut tm as &mut dyn crate::refine::RefinePass),
+            &mut ctx,
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(
+            tm.refine_counters().admitted_total,
+            1,
+            "the candidate on track 1 must survive track 7's closure"
+        );
+    }
+
+    /// MAN-208 validate round 2: one input's batches through the shared back
+    /// end (`Back`) carry their retention feed, and the scheduler there
+    /// admits and replays the once-heard candidate, as a single-input
+    /// `TrackManager` does. Before, the multi-input `emit` passed no
+    /// refinement owner at all.
+    #[test]
+    fn the_multi_input_back_end_runs_the_refinement_scheduler() {
+        let fs = 96_000.0;
+        let cfg = PipelineConfig::default();
+        let none = crate::multi::SharedObservers::default();
+        let mut back = Back::new(&none, cfg.shared_validator(fs, 2).unwrap(), fs, &cfg.decode);
+        // Input 0 owns odd track ids (TrackIdSpace): track 1. Its call
+        // word spans 1_000_300..=1_000_700; retain ~2 s of hops from 1 s
+        // before it.
+        let feed: Vec<crate::refine::RefineFeed> = (0..750u64)
+            .map(|i| {
+                crate::refine::RefineFeed::Entry(
+                    1,
+                    (0.0, 0.0, None, 1_000_000 - 96_000 + i * 256, 0.0, 0.0),
+                )
+            })
+            .collect();
+        back.ingest(
+            0,
+            2,
+            Batch {
+                events: ambiguous_transmission(1, 1_000_000),
+                end_ts: 1_100_000,
+                n_tracks: 1,
+                live_ids: None,
+                band: None,
+                refine_feed: feed,
+            },
+            &mut |_| {},
+            &mut |_| {},
+        );
+        let c = back.refine_counters();
+        assert_eq!(c.admitted_total, 1, "{c:?}");
+        assert!(c.replayed_hops_total > 0, "{c:?}");
+        // An input gap on the OTHER input leaves input 0's retention alone;
+        // its own gap breaks it.
+        let mut shared = crate::refine::SharedRefine::new(&cfg.decode, fs, None);
+        shared.ingest(
+            vec![crate::refine::RefineFeed::Entry(
+                1,
+                (0.0, 0.0, None, 10, 0.0, 0.0),
+            )],
+            &[],
+            10,
+            |id| id % 2 == 1,
+        );
+        shared.ingest(vec![crate::refine::RefineFeed::InputGap], &[], 11, |id| {
+            id % 2 == 0
+        });
+        assert_eq!(shared.retained_entries(), 1);
+        shared.ingest(vec![crate::refine::RefineFeed::InputGap], &[], 12, |id| {
+            id % 2 == 1
+        });
+        assert_eq!(shared.retained_entries(), 0);
+    }
+
     #[test]
     fn back_publishes_cross_input_dedupe_counts_per_withheld_input() {
         let observer = Arc::new(SuppressionObserver::new(2));
@@ -1988,6 +2193,7 @@ mod tests {
             &shared,
             cfg.shared_validator(48_000.0, 2).unwrap(),
             48_000.0,
+            &cfg.decode,
         );
         let batch = |end_ts, events| Batch {
             events,
@@ -1995,6 +2201,7 @@ mod tests {
             n_tracks: 1,
             live_ids: None,
             band: None,
+            refine_feed: Vec::new(),
         };
         let mut spots = Vec::new();
         // Input 0 (track 1) spots W1AW first; input 1 (track 2) hears the
@@ -2025,7 +2232,12 @@ mod tests {
         assert_eq!(observer.per_input(), counts);
         // No observer registered: the same batches run without one.
         let none = crate::multi::SharedObservers::default();
-        let mut quiet = Back::new(&none, cfg.shared_validator(48_000.0, 2).unwrap(), 48_000.0);
+        let mut quiet = Back::new(
+            &none,
+            cfg.shared_validator(48_000.0, 2).unwrap(),
+            48_000.0,
+            &cfg.decode,
+        );
         quiet.ingest(
             0,
             2,
@@ -2049,6 +2261,7 @@ mod tests {
                 &shared,
                 cfg.shared_validator(48_000.0, 2).unwrap(),
                 48_000.0,
+                &cfg.decode,
             );
             let batch = |end_ts, events| Batch {
                 events,
@@ -2056,6 +2269,7 @@ mod tests {
                 n_tracks: 1,
                 live_ids: None,
                 band: None,
+                refine_feed: Vec::new(),
             };
             let meta = |track_id, sample_ts| DecoderEvent::TrackMeta {
                 track_id,
@@ -2839,6 +3053,81 @@ mod tests {
             self.cursor += n;
             Ok(n)
         }
+    }
+
+    /// MAN-208 validate round 2: both live paths -- one input
+    /// (`listen_with_observers`) and a multi-input session
+    /// (`listen_inputs`, front ends feeding the shared back end) -- run the
+    /// refinement scheduler over real decoder inputs: the rival-withheld
+    /// `K3ABC` is admitted and replayed, visible in the `/metrics`
+    /// counters. Before, the multi-input path never refined.
+    #[test]
+    fn both_live_paths_run_the_refinement_scheduler() {
+        use crate::quality::DecodeQualityObserver;
+        let (spec, samples) = crate::tests::man208_rival_scene();
+        let cfg = crate::tests::man208_hsmm_config(true);
+        let source = || FixedFreqSource {
+            samples: samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        };
+
+        let single = Arc::new(DecodeQualityObserver::new());
+        listen_with_observers(
+            Box::new(source()),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_quality: Some(single.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+
+        let mut src = Some(source());
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let multi = Arc::new(DecodeQualityObserver::new());
+        crate::multi::listen_inputs(
+            opened,
+            &cfg,
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers {
+                decode_quality: Some(multi.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+
+        for (path, obs) in [("single", &single), ("multi", &multi)] {
+            let [admitted, replayed_hops, ..] = obs.snapshot().refine;
+            assert!(admitted >= 1, "{path}: nothing admitted");
+            assert!(replayed_hops > 0, "{path}: nothing replayed");
+        }
+        assert_eq!(
+            single.snapshot().refine,
+            multi.snapshot().refine,
+            "one input decodes the same through either path"
+        );
     }
 
     /// MAN-312: a source whose RF passband is narrower than its stream,

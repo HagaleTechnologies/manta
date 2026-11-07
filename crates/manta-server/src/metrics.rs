@@ -391,6 +391,8 @@ pub struct ValueHistogram {
 /// opposed to whether the daemon is running at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeQuality {
+    /// MAN-208: admitted, replayed hops, rescues, budget exhaustion, orphans.
+    pub refine: [u64; 5],
     pub chars_total: u64,
     pub garbles_total: u64,
     pub rail_ratio: ValueHistogram,
@@ -3162,6 +3164,15 @@ impl Metrics {
         );
         out.push_str("# TYPE manta_candidate_decisions_total counter\n");
         if let Some(q) = &quality {
+            for (header, n) in [
+                ("# TYPE manta_refine_admitted_total counter\nmanta_refine_admitted_total ", q.refine[0]),
+                ("# TYPE manta_refine_replayed_hops_total counter\nmanta_refine_replayed_hops_total ", q.refine[1]),
+                ("# TYPE manta_refine_rescues_total counter\nmanta_refine_rescues_total ", q.refine[2]),
+                ("# TYPE manta_refine_budget_exhausted_total counter\nmanta_refine_budget_exhausted_total ", q.refine[3]),
+                ("# TYPE manta_refine_orphaned_revisions_total counter\nmanta_refine_orphaned_revisions_total ", q.refine[4]),
+            ] {
+                out.push_str(&format!("{header}{n}\n"));
+            }
             for (decision, reason, n) in &q.decisions {
                 out.push_str(&format!(
                     "manta_candidate_decisions_total{{decision=\"{decision}\",reason=\"{reason}\"}} {n}\n"
@@ -4404,6 +4415,7 @@ mod tests {
 
     fn sample_decode_quality() -> DecodeQuality {
         DecodeQuality {
+            refine: [0; 5],
             chars_total: 9690,
             garbles_total: 3,
             rail_ratio: ValueHistogram {
@@ -4427,6 +4439,29 @@ mod tests {
                 ("self_id", 3),
                 ("uncertain", 7),
             ],
+        }
+    }
+
+    #[test]
+    fn refine_metrics_render() {
+        let m = Metrics::new();
+        let mut q = sample_decode_quality();
+        q.refine = [2, 1500, 1, 3, 0];
+        m.set_decode_quality(q);
+        let text = m.render_prometheus_text();
+        for (name, count) in [
+            "admitted",
+            "replayed_hops",
+            "rescues",
+            "budget_exhausted",
+            "orphaned_revisions",
+        ]
+        .iter()
+        .zip([2, 1500, 1, 3, 0])
+        {
+            assert!(text.contains(&format!(
+                "# TYPE manta_refine_{name}_total counter\nmanta_refine_{name}_total {count}\n"
+            )));
         }
     }
 

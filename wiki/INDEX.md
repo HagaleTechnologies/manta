@@ -116,6 +116,7 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 
 - [Why does a close neighbor invalidate the three-bin ownership parabola?](../docs/DECISIONS/2026-11-01-man112-close-pair-resolution.md) MAN-112 uses gated phase positions and frequency-exclusive association.
 - [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
+- [Can a later repetition rescue an ambiguous decode?](../docs/DECISIONS/2026-11-05-man208-delayed-refinement.md) — Bounded replay (live single- and multi-input, offline decode) revises the same occurrence; the RF timestamp remains distinct from decision availability. Includes the fixture's measurement limits.
 - [How are required Unix CI tests sharded without dropping coverage?](../docs/DECISIONS/2026-11-05-man498-required-ci-runtime.md) MAN-498 keeps whole test binaries and explicit doctests behind independent OS aggregates.
 
 - CW sub-segments and automatic daily/dated UTC coverage: [config reference](../docs/CONFIG.md#cw-sub-segments-and-utc-schedules) and [MAN-30 decision](../docs/DECISIONS/2026-11-04-man30-cw-segments.md).

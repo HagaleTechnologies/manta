@@ -3441,6 +3441,11 @@ fn validate_decode_config(
     cfg: manta_decode::decoder::DecodeConfig,
     origin: &str,
 ) -> Result<manta_decode::decoder::DecodeConfig> {
+    // MAN-208: the `[decode.refine]` sub-table's ranges, in the same
+    // single-choke-point style as every check below.
+    if let Err(note) = cfg.refine.validate() {
+        bail!("[decode.refine] {note} in {origin}");
+    }
     if !cfg.prior_weight.is_finite() || cfg.prior_weight < 0.0 {
         bail!("[decode] prior_weight must be finite and >= 0 in {origin}");
     }
@@ -4503,6 +4508,7 @@ fn decode_quality_of(
     s: &manta_engine::DecodeQualitySnapshot,
 ) -> manta_server::metrics::DecodeQuality {
     manta_server::metrics::DecodeQuality {
+        refine: s.refine,
         chars_total: s.chars_total,
         garbles_total: s.garbles_total,
         rail_ratio: manta_server::metrics::ValueHistogram {

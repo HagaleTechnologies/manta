@@ -577,3 +577,28 @@ evaluations on V3/V8 and −36 % gap-phase evaluations on the synthetic
 long-gap scene, while all 25 golden vectors decode byte-identically to
 evaluating every origin at every step; the `hsmm/300_tracks_10s_gappy`
 scene covers the long-silence path.
+
+## Delayed refinement (MAN-208)
+
+`[decode.refine]` defaults to enabled, ten seconds of retention, two attempts per
+episode, 1500 replay hops per batch and sixteen queued episodes. Zero lookback
+or `enabled = false` disables retention. Lookback accepts zero or 4–10 seconds;
+attempts accept 1–4, hop budgets 1–15000, and backlog 1–256.
+
+Admission follows track id and word sequence. Unresolved alternatives or a rival
+admit an initial attempt. A stable changed speed -- at least 3 WPM, held across
+two words since the track's last speed update -- or a neighbour moving
+from within 93.75 Hz to outside that distance can trigger another attempt. A later
+word also permits a second attempt. Attempts remain capped. Replay first flips
+legacy/HSMM and then seeds the causal engine with the current speed estimate.
+The causal engine default remains legacy.
+
+Retained decoder inputs are bounded per track at 375 hops per retained second
+and globally at 8 MiB of estimated entries. Gaps clear retention; missing spans
+are dropped. Replay pauses at its per-batch budget. Backlog overflow drops the
+oldest queued admission. No clock or thread race selects hypotheses.
+
+A refined word revises the original observation id and span. Its support moves
+between callsigns without increasing the total repetition count. Spots use the
+newest supporting occurrence's observed RF time. `decided_sample_ts` records the
+later processing availability time. Public spot fields do not change.
