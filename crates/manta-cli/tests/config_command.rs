@@ -1680,7 +1680,9 @@ fn cw_segments_config_and_diagnostics() {
 
 #[test]
 fn cw_segments_documented_example_parses() {
-    let doc = include_str!("../../../docs/CONFIG.md");
+    // A Windows checkout (core.autocrlf) gives CONFIG.md CRLF line endings;
+    // normalize so the "```toml\n" fence split finds the example.
+    let doc = include_str!("../../../docs/CONFIG.md").replace("\r\n", "\n");
     let section = doc
         .split("### CW sub-segments and UTC schedules")
         .nth(1)
