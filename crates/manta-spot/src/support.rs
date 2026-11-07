@@ -102,23 +102,21 @@ impl SupportLedger {
     }
 
     /// MAN-208: re-reads one already-observed occurrence (`word_seq` on
-    /// `track_id`, spanning `span`) as `new_text`: the occurrence's
-    /// observation leaves `old_text`'s entry and, when `new_text` is
-    /// itself spottable-shaped (`plausible`, the same gate `observe_span`'s
-    /// callers apply), joins `new_text`'s entry under the same span rules
-    /// -- an overlap with a held observation adds nothing. A move, never
-    /// an addition: the arbitration evidence follows the refined reading
-    /// exactly as the repetition gate's support does
-    /// (`RepetitionGate::move_occurrence`).
+    /// `track_id`, spanning `span`): its observation leaves `old_text`'s
+    /// entry and, when the refined reading `new` -- `(text, geo_conf)` --
+    /// is given (the caller passes it only for a spottable-shaped text,
+    /// the same gate `observe_span`'s callers apply), joins that text's
+    /// entry under the same span rules: an overlap with a held observation
+    /// adds nothing. A move, never an addition: the arbitration evidence
+    /// follows the refined reading exactly as the repetition gate's
+    /// support does (`RepetitionGate::move_occurrence`).
     pub fn revise_occurrence(
         &mut self,
         track_id: u32,
         word_seq: u64,
         old_text: &str,
-        new_text: &str,
         span: (u64, u64),
-        geo_conf: f32,
-        plausible: bool,
+        new: Option<(&str, f32)>,
     ) {
         let key = (track_id, old_text.to_string());
         if let Some(entry) = self.seen.get_mut(&key) {
@@ -127,8 +125,8 @@ impl SupportLedger {
                 self.seen.remove(&key);
             }
         }
-        if plausible {
-            self.observe_span(track_id, new_text, word_seq, span, geo_conf);
+        if let Some((text, geo_conf)) = new {
+            self.observe_span(track_id, text, word_seq, span, geo_conf);
         }
     }
 

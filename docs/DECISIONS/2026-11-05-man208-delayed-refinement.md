@@ -1,7 +1,8 @@
 # MAN-208: bounded delayed refinement
 
-The causal decoder remains the default first pass. On the single-input listen
-path, a scheduler replays preserved decoder inputs for ambiguous words under an
+The causal decoder remains the default first pass. On every decode path --
+single-input and multi-input `listen`, and offline `manta decode` -- a scheduler
+replays preserved decoder inputs for ambiguous words under an
 alternate engine, then a seeded timing hypothesis when new context arrives.
 `[decode.refine] enabled = false` opts out. Defaults are ten seconds of retained
 hops, two attempts, 1500 hops per batch and sixteen waiting episodes. Retention
@@ -39,17 +40,30 @@ not establish true rescue rate per replayed hop on noisy RF, delayed false rescu
 rate, or production CPU cost. Those measurements need a frozen RF corpus with
 coppa pinned to f8a4d16d and an enabled/disabled comparison that discloses latency.
 
+## Wiring (validate round 2)
+
+The offline loop now validates each batch as it is produced and runs
+`TrackManager::refine_step` after it, so `manta decode --observations` writes
+`cause: "refined"` revisions (`offline_decode_runs_refinement_and_records_the_revision`).
+Multi-input front ends export their retained decoder inputs on the common clock
+with each batch; the shared back end keeps them beside the validator and runs
+the same scheduler (`SharedRefine`). One input gives identical scheduler counters
+through either live path (`both_live_paths_run_the_refinement_scheduler`).
+
+The pass's clock is its owner's stream position. An earlier version took the
+maximum event timestamp of the batch, and `TrackClosed` sorts at `u64::MAX`, so
+any unrelated closure expired every retained episode and its cap bookkeeping.
+A call-changing refinement now revises the rival ledger occurrence as well as
+the repetition gate's, so the rival check no longer weighs the superseded
+reading. The speed trigger requires a stable estimate: two words decoded since
+the track's last `SpeedUpdate` (which fires only on a 1 WPM change).
+
 ## Current limits
 
-Offline `manta decode` does not yet run this scheduler. Its separate
-`decode_source_observed` loop validates events after the input and track
-managers have finished. The plan's CLI observations example therefore needs
-additional offline-loop wiring; the live boundary fixture does not prove it.
-
-Multi-input batch decoding does not yet run this scheduler. Its shared validator
-uses a common clock while each input owns a local-clock track manager; directly
-passing the manager into that shared boundary would mismatch retained spans.
-The candidate prefix in `apply_refinement` still mirrors the causal checks
-rather than sharing one helper. Speed triggers use the current tracker estimate;
-there is no separate stability confidence contract. These limits are declared
-in the implementation run's deviations for validation.
+On the rendered rival scene (`man208_rival_scene`: the V1 signal at 20 dB SNR, seed 1)
+the engine-flip hypothesis read no word over the occurrence's span in either
+direction; only the seeded-timing replay of an HSMM base produced a reading. The
+alternate-engine hypothesis therefore needs RF tuning (preroll length, the
+fields each engine reads) before any recall claim. The candidate prefix in
+`apply_refinement` still mirrors the causal checks rather than sharing one
+helper.

@@ -586,7 +586,8 @@ or `enabled = false` disables retention. Lookback accepts zero or 4–10 seconds
 attempts accept 1–4, hop budgets 1–15000, and backlog 1–256.
 
 Admission follows track id and word sequence. Unresolved alternatives or a rival
-admit an initial attempt. A changed speed of at least 3 WPM or a neighbour moving
+admit an initial attempt. A stable changed speed -- at least 3 WPM, held across
+two words since the track's last speed update -- or a neighbour moving
 from within 93.75 Hz to outside that distance can trigger another attempt. A later
 word also permits a second attempt. Attempts remain capped. Replay first flips
 legacy/HSMM and then seeds the causal engine with the current speed estimate.

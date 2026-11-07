@@ -48,6 +48,131 @@ pub(crate) fn replay_entry(e: (f32, f32, Option<f32>, u64, f32, f64, bool)) -> R
     (e.0, e.1, e.2, e.3, e.4, e.5)
 }
 
+/// One step of a multi-input front end's retention feed (MAN-13 sessions):
+/// the decoder inputs its `TrackManager` would have retained, in order,
+/// for the shared back end's [`SharedRefine`] to retain instead -- the
+/// validator, and so the scheduler, lives there.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RefineFeed {
+    /// One decoder input for a track, `sample_ts` on the session clock
+    /// once the front end has mapped it.
+    Entry(u32, ReplayEntry),
+    /// An unknown-length gap on this input: nothing of its tracks
+    /// recorded before it is contiguous with what follows.
+    InputGap,
+}
+
+/// One refinement pass after a batch's decoder events reached the
+/// validator, by whoever owns the retained observations: a single-input
+/// `TrackManager`, or a multi-input session's [`SharedRefine`]. The pass
+/// takes its availability time from its owner's own stream position, never
+/// from the batch's events (a `TrackClosed` sorts at `u64::MAX`).
+pub(crate) trait RefinePass {
+    fn refine_pass(&mut self, validator: &mut Validator) -> Vec<Spot>;
+}
+
+/// Publishes one pass's counter deltas to the `/metrics` observer: deltas,
+/// so independent owners (inputs, reconnect segments) never reset each
+/// other's cumulative totals.
+pub(crate) fn publish_refine_deltas(
+    observer: Option<&crate::quality::DecodeQualityObserver>,
+    before: &RefineCounters,
+    after: &RefineCounters,
+) {
+    if let Some(observer) = observer {
+        observer.add_refinements([
+            after.admitted_total - before.admitted_total,
+            after.replayed_hops_total - before.replayed_hops_total,
+            after.rescues_total - before.rescues_total,
+            after.budget_exhausted_total - before.budget_exhausted_total,
+            after.orphaned_revisions_total - before.orphaned_revisions_total,
+        ]);
+    }
+}
+
+/// MAN-208 on the multi-input path: the retention and scheduler a
+/// single-input `TrackManager` owns, held instead by the shared back end
+/// beside the one `Validator`, fed by every input's [`RefineFeed`] on the
+/// session clock. A track's retention leaves with its `TrackClosed`; an
+/// input's gap breaks only that input's tracks.
+pub(crate) struct SharedRefine {
+    buffers: RefineBuffers,
+    scheduler: RefineScheduler,
+    decode_cfg: DecodeConfig,
+    /// The newest batch end seen from any input, on the session clock:
+    /// the pass's availability time, so nothing is backdated.
+    now_ts: u64,
+    quality: Option<std::sync::Arc<crate::quality::DecodeQualityObserver>>,
+}
+
+impl SharedRefine {
+    pub(crate) fn new(
+        decode_cfg: &DecodeConfig,
+        fs: f64,
+        quality: Option<std::sync::Arc<crate::quality::DecodeQualityObserver>>,
+    ) -> Self {
+        SharedRefine {
+            buffers: RefineBuffers::new(&decode_cfg.refine),
+            scheduler: RefineScheduler::new(decode_cfg, fs),
+            decode_cfg: decode_cfg.clone(),
+            now_ts: 0,
+            quality,
+        }
+    }
+
+    /// Applies one input's batch: its retention feed in order, then the
+    /// batch's track closures, and advances the session position to the
+    /// batch's end. `owns` says whether a track id belongs to this input.
+    pub(crate) fn ingest(
+        &mut self,
+        feed: Vec<RefineFeed>,
+        events: &[DecoderEvent],
+        end_ts: u64,
+        owns: impl Fn(u32) -> bool,
+    ) {
+        for step in feed {
+            match step {
+                RefineFeed::Entry(id, entry) => self.buffers.record(id, entry),
+                RefineFeed::InputGap => self.buffers.break_tracks_where(&owns),
+            }
+        }
+        for ev in events {
+            if let DecoderEvent::TrackClosed { track_id, .. } = ev {
+                self.buffers.drop_track(*track_id);
+            }
+        }
+        self.now_ts = self.now_ts.max(end_ts);
+    }
+
+    /// An input has ended: every one of its tracks' retention leaves.
+    pub(crate) fn drop_input(&mut self, owns: impl Fn(u32) -> bool) {
+        self.buffers.drop_tracks_where(owns);
+    }
+
+    /// The scheduler's counters.
+    #[cfg(test)]
+    pub(crate) fn counters(&self) -> &RefineCounters {
+        self.scheduler.counters()
+    }
+
+    /// Retained entries across every input's tracks.
+    #[cfg(test)]
+    pub(crate) fn retained_entries(&self) -> usize {
+        self.buffers.len()
+    }
+}
+
+impl RefinePass for SharedRefine {
+    fn refine_pass(&mut self, validator: &mut Validator) -> Vec<Spot> {
+        let before = *self.scheduler.counters();
+        let spots =
+            self.scheduler
+                .step(&mut self.buffers, validator, &self.decode_cfg, self.now_ts);
+        publish_refine_deltas(self.quality.as_deref(), &before, self.scheduler.counters());
+        spots
+    }
+}
+
 /// Per-track rolling retention of decoder inputs, deep enough for the
 /// configured lookback window (the 4-10 s experiment range; 8 s at 375
 /// hops/s is ~3000 hops -- far deeper than `HopHistory`'s 171 ms lead-in).
@@ -122,6 +247,21 @@ impl RefineBuffers {
     /// Drops a closed/evicted track's retention.
     pub fn drop_track(&mut self, track_id: u32) {
         self.per_track.remove(&track_id);
+    }
+
+    /// An unknown-length gap on one input of a multi-input session: only
+    /// the tracks `owns` selects lose their contiguity.
+    pub(crate) fn break_tracks_where(&mut self, owns: impl Fn(u32) -> bool) {
+        for (id, ring) in self.per_track.iter_mut() {
+            if owns(*id) {
+                ring.clear();
+            }
+        }
+    }
+
+    /// Drops every track `owns` selects (an ended input's).
+    pub(crate) fn drop_tracks_where(&mut self, owns: impl Fn(u32) -> bool) {
+        self.per_track.retain(|id, _| !owns(*id));
     }
 
     /// The preserved inputs covering `span` -- the span's own entries plus

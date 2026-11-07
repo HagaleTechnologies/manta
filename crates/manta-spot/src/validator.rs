@@ -1197,10 +1197,13 @@ impl Validator {
                 track_id,
                 word_seq,
                 &old_call,
-                &refined.call,
                 span,
-                confidence::geo_mean(&refined.confidences),
-                plausible,
+                plausible.then(|| {
+                    (
+                        refined.call.as_str(),
+                        confidence::geo_mean(&refined.confidences),
+                    )
+                }),
             );
         }
         // The word now carries the refined reading: its text, confidences

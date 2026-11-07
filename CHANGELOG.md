@@ -36,10 +36,12 @@ the git history and `docs/DECISIONS/`.
 ### Decoder output
 
 - MAN-208: bounded replay revisits ambiguous observations on the single-input
-  listen path. Support moves between callsigns without adding repetitions, and
-  spots retain the later supporting RF timestamp. `[decode.refine]` controls the
-  budget; five `manta_refine_*` counters report activity. RF recall and
-  multi-input refinement remain unmeasured.
+  and multi-input listen paths and in offline `manta decode`. Support moves
+  between callsigns (in the repetition gate and the rival ledger) without adding
+  repetitions, and spots retain the later supporting RF timestamp. A speed
+  change triggers a replay only once it has held across two words.
+  `[decode.refine]` controls the budget; five `manta_refine_*` counters report
+  activity. RF recall remains unmeasured.
 - MAN-494: optional per-input IQ correction uses a controlled-tone calibration
   to remove receiver images. It defaults to off. Observe and a centre mismatch
   preserve samples; mirror evidence never enables correction by itself.

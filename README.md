@@ -28,8 +28,8 @@ ingest it without changes.
 
 No GUI. CLI, a TOML config file, and Prometheus metrics.
 
-The single-input listen path can replay ambiguous observations under bounded
-budgets. `[decode.refine] enabled = false` opts out. See the
+Live listening (one input or several) and offline `manta decode` can replay
+ambiguous observations under bounded budgets. `[decode.refine] enabled = false` opts out. See the
 [configuration reference](docs/CONFIG.md) and
 [measurement limits](docs/DECISIONS/2026-11-05-man208-delayed-refinement.md).
 

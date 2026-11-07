@@ -731,8 +731,29 @@ pub fn decode_source_observed(
     let fs = bands.fs;
     let center_freq_hz = bands.center_freq_hz;
     let mut seg = bands.segment(cfg, 0, 1)?;
-    // MAN-207: the event index each later segment's events start at.
-    let mut segment_starts: Vec<usize> = Vec::new();
+    // MAN-208: the validator consumes each batch as it is produced, as
+    // `listen`'s `emit` does, so the refinement scheduler can run after
+    // every batch while the batch's tracks still hold their retained
+    // decoder inputs. The validator sees the same events in the same
+    // order as a whole-file pass would; with `[decode.refine] enabled =
+    // false` the output is unchanged.
+    let mut validator = cfg.validator(fs)?.with_observations(policy);
+    let mut spots = Vec::new();
+    let mut records = Vec::new();
+    let mut validate = |batch: &[DecoderEvent],
+                        tm: &mut track::TrackManager,
+                        validator: &mut manta_spot::Validator| {
+        for ev in batch {
+            spots.extend(validator.ingest(ev));
+            if validator.observations().keeps_records() {
+                records.extend(validator.observations_mut().take_appended());
+            }
+        }
+        spots.extend(tm.refine_step(validator));
+        if validator.observations().keeps_records() {
+            records.extend(validator.observations_mut().take_appended());
+        }
+    };
     // Feed the channelizer/track-manager in bounded chunks rather than one
     // `ch.process(&whole_input)` + one `tm.process_hops(...)` call over the
     // whole file. `Channelizer::process` is chunk-size-invariant (proved by
@@ -837,10 +858,11 @@ pub fn decode_source_observed(
             let hops = seg.ch.process(&chunk[..filled]);
             any_hops |= !hops.is_empty();
             let (base, pad_hops, hop) = (seg.base, seg.pad_hops, seg.hop);
-            events.extend(
-                seg.tm
-                    .process_hops(&hops, |m| seg.held.hop_ts(base, pad_hops, hop, m)),
-            );
+            let batch = seg
+                .tm
+                .process_hops(&hops, |m| seg.held.hop_ts(base, pad_hops, hop, m));
+            validate(&batch, &mut seg.tm, &mut validator);
+            events.extend(batch);
         }
         let Some(missing) = gap else {
             if eof || filled == 0 {
@@ -853,7 +875,9 @@ pub fn decode_source_observed(
             .base
             .checked_add(consumed)
             .context("input discontinuity overflows the sample clock")?;
-        events.extend(seg.tm.finish_for_discontinuity());
+        let batch = seg.tm.finish_for_discontinuity();
+        validate(&batch, &mut seg.tm, &mut validator);
+        events.extend(batch);
         append_rtty(&mut rtty, &seg.tm, calibration_factor, Some(end));
         bad_samples += seg.ch.bad_samples();
         note_conditioning(&seg);
@@ -861,7 +885,8 @@ pub fn decode_source_observed(
             .checked_add(missing)
             .context("input discontinuity overflows the sample clock")?;
         seg = bands.segment(cfg, base, seg.tm.next_track_id())?;
-        segment_starts.push(events.len());
+        // MAN-207: each later segment starts a new observation epoch.
+        validator.observations_mut().note_discontinuity();
         pad_left = seg.pad_samples;
         consumed = 0;
     }
@@ -882,11 +907,13 @@ pub fn decode_source_observed(
         .base
         .checked_add(consumed)
         .context("input sample clock overflows")?;
-    events.extend(if terminal_gap {
+    let batch = if terminal_gap {
         seg.tm.finish_for_discontinuity()
     } else {
         seg.tm.finish()
-    });
+    };
+    validate(&batch, &mut seg.tm, &mut validator);
+    events.extend(batch);
     append_rtty(
         &mut rtty,
         &seg.tm,
@@ -930,19 +957,6 @@ pub fn decode_source_observed(
     });
     let text = events_to_text(&this_track);
     let timing = last_timing(&this_track);
-    let mut validator = cfg.validator(fs)?.with_observations(policy);
-    let mut spots = Vec::new();
-    let mut records = Vec::new();
-    let mut starts = segment_starts.iter().peekable();
-    for (i, ev) in events.iter().enumerate() {
-        while starts.next_if(|&&start| start == i).is_some() {
-            validator.observations_mut().note_discontinuity();
-        }
-        spots.extend(validator.ingest(ev));
-        if validator.observations().keeps_records() {
-            records.extend(validator.observations_mut().take_appended());
-        }
-    }
     let observed = ObservedRun {
         records,
         counts: validator.observation_counts(),
@@ -1057,7 +1071,7 @@ mod tests {
     /// unallocated-prefix call.
     fn qq9zzz_spec() -> manta_testkit::vectors::VectorSpec {
         let mut spec = manta_testkit::vectors::v1();
-        spec.duration_s = 30.0;
+        spec.duration_s = 50.0;
         spec.signals[0].text = "CQ CQ DE QQ9ZZZ QQ9ZZZ K".into();
         spec
     }
@@ -1512,6 +1526,83 @@ mod tests {
             report.spots.is_empty(),
             "signal inside a notched range must never be spotted, got {:?}",
             report.spots
+        );
+    }
+
+    /// MAN-208 validate round 2: a fixed scene whose last call is withheld
+    /// against a better-supported rival -- three message-distinct `K3ABD`s,
+    /// then two `K3ABC`s, the second withheld as a `Variant` of `K3ABD` --
+    /// so the refinement scheduler admits it (ambiguity trigger: a rival).
+    /// HSMM base engine: its seeded-timing hypothesis re-reads the word.
+    pub(crate) fn man208_rival_scene() -> (manta_testkit::vectors::VectorSpec, Vec<Complex32>) {
+        let mut spec = manta_testkit::vectors::v1();
+        spec.duration_s = 50.0;
+        spec.noise_seed = 1;
+        spec.signals[0].loop_text = false;
+        spec.signals[0].text =
+            "DE K3ABD K TU DE K3ABD K TU DE K3ABD K TU DE K3ABC K TU DE K3ABC K".into();
+        let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
+        (spec, samples)
+    }
+
+    pub(crate) fn man208_hsmm_config(refine: bool) -> PipelineConfig {
+        let mut cfg = PipelineConfig::default();
+        cfg.decode.engine = manta_decode::decoder::Engine::Hsmm;
+        cfg.decode.refine.enabled = refine;
+        cfg
+    }
+
+    /// Validate round 2 (MAN-208, PR #520): the offline decode
+    /// (`manta decode`, `decode_source_observed`) runs the refinement
+    /// scheduler after every batch, so a refinement shows up in the
+    /// observation record as a `Refined` revision of the SAME occurrence
+    /// -- before, the offline loop never ran the scheduler at all.
+    /// Disabled, the run is the causal baseline: no refined record, and
+    /// the same events.
+    #[test]
+    fn offline_decode_runs_refinement_and_records_the_revision() {
+        use manta_spot::observation::Cause;
+        let (spec, samples) = man208_rival_scene();
+        let run = |refine: bool| {
+            decode_source_observed(
+                &mut SliceSource {
+                    iq: &samples,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                },
+                &man208_hsmm_config(refine),
+                ObservationPolicy::records(),
+            )
+            .unwrap()
+        };
+        let (on, on_obs) = run(true);
+        let (off, off_obs) = run(false);
+        let refined: Vec<_> = on_obs
+            .records
+            .iter()
+            .filter(|o| o.draft.cause == Cause::Refined)
+            .collect();
+        assert!(!refined.is_empty(), "no refined record offline");
+        for r in &refined {
+            let original = on_obs
+                .records
+                .iter()
+                .find(|o| Some(o.seq) == r.supersedes)
+                .expect("a refined record supersedes an earlier one");
+            assert_eq!(
+                original.draft.id, r.draft.id,
+                "a refinement revises the same occurrence, never a new one"
+            );
+        }
+        assert!(off_obs
+            .records
+            .iter()
+            .all(|o| o.draft.cause != Cause::Refined));
+        assert_eq!(on.events, off.events, "refinement never alters events");
+        assert_eq!(
+            on.spots.iter().map(|s| &s.callsign).collect::<Vec<_>>(),
+            off.spots.iter().map(|s| &s.callsign).collect::<Vec<_>>(),
+            "the rival-withheld K3ABC stays withheld; nothing is fabricated"
         );
     }
 }

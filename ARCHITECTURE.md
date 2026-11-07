@@ -1317,11 +1317,17 @@ stages to get wrong.
 
 ### Delayed refinement (MAN-208)
 
-The single-input listen loop feeds decoder events to the validator, then asks
-`TrackManager::refine_step` to revisit retained ambiguous words. The manager
-records decoder inputs in per-track FIFOs before draining its decoder pool.
-Input gaps clear retention; closed tracks lose their FIFO. An 8 MiB estimated
-entry ceiling bounds all tracks together.
+Every decode path feeds a batch's decoder events to the validator, then runs
+one refinement pass over retained ambiguous words. On a single input
+(`listen`, and the offline `decode_source_observed` loop, which validates each
+batch as it is produced) the pass is `TrackManager::refine_step`; the manager
+records decoder inputs in per-track FIFOs before draining its decoder pool. In
+a multi-input session each front end exports those inputs on the common clock
+with its batch (`Batch::refine_feed`), and the shared back end retains them
+beside the one validator (`SharedRefine`). The pass's clock is its owner's
+stream position, never a batch event's timestamp. Input gaps clear retention
+(only the gapped input's tracks on the multi-input path); closed tracks lose
+their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
 
 `validator → refinement candidates → retained hops → scratch TrackDecoder →
 Validator::apply_refinement → spot sink` is a feedback path over preserved

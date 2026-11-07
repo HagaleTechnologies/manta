@@ -87,7 +87,7 @@ is one observation record, in `seq` order. Each line has a `kind`
 - `settled`: a pending beacon or callsign lookup decided later, or a pending
   beacon overflowed or discarded. A beacon migrated to a merge survivor
   keeps its origin track's `observation`.
-- `refined`: a re-decode of the same evidence. Nothing produces it yet; a
+- `refined`: a re-decode of the same evidence (MAN-208, below); a
   refinement never adds a repetition.
 
 `role` values (MAN-201, `docs/DECISIONS/2026-11-02-man201-callsign-roles.md`):
@@ -144,7 +144,8 @@ to the latest earlier record's `seq`. Read an occurrence's history with
 
 ### Live delayed revisions
 
-MAN-208 can produce `cause: "refined"` from the single-input listen loop. These
+MAN-208 can produce `cause: "refined"` from `listen` (one input or several)
+and from `manta decode --observations`. These
 records use the existing `manta-observations.v1` schema. `supersedes` names the
 prior record for the same observation id; start and end samples keep the original
 span. `decided_sample_ts` records replay completion, so readers can distinguish

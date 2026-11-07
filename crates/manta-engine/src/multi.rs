@@ -482,7 +482,7 @@ pub fn listen_inputs(
         .map(|&ppm| manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| anyhow!(e)))
         .collect::<Result<Vec<f64>>>()?;
     let validator = cfg.shared_validator(rate, n as u32)?;
-    let mut back = crate::listen::Back::new(&shared, validator, rate);
+    let mut back = crate::listen::Back::new(&shared, validator, rate, &cfg.decode);
 
     let live = matches!(clock, SessionClock::Live { .. });
     let (live_tx, live_rx) = mpsc::sync_channel::<(usize, Msg)>(LIVE_QUEUE_BATCHES);

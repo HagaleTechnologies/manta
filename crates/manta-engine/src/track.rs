@@ -2454,6 +2454,9 @@ pub struct TrackManager {
     refine_now_ts: u64,
     /// MAN-208: the deterministic, budget-bounded refinement scheduler.
     refine: crate::refine::RefineScheduler,
+    /// MAN-208, multi-input front ends: `Some` routes what this manager
+    /// would retain to the shared back end instead (`take_refine_feed`).
+    refine_export: Option<Vec<crate::refine::RefineFeed>>,
 }
 
 /// MAN-312 (SPEC §2.7): the channels inside `rf_passband_hz` with one
@@ -2538,6 +2541,12 @@ fn channels_within(channel_spacing_hz: f64, lo: f64, hi: f64, n: usize) -> Vec<b
             f >= lo && f <= hi
         })
         .collect()
+}
+
+impl crate::refine::RefinePass for TrackManager {
+    fn refine_pass(&mut self, validator: &mut manta_spot::Validator) -> Vec<manta_spot::Spot> {
+        self.refine_step(validator)
+    }
 }
 
 impl TrackManager {
@@ -2630,6 +2639,7 @@ impl TrackManager {
             refine_buf,
             refine_now_ts: 0,
             refine,
+            refine_export: None,
         }
     }
 
@@ -4637,35 +4647,64 @@ impl TrackManager {
         self.input_gap_hops.push_back(first_hop);
         // MAN-208: no hop recorded before an unknown-length loss is
         // contiguous with what follows, for any track's refinement replay.
-        self.refine_buf.break_at_input_gap();
+        match self.refine_export.as_mut() {
+            Some(feed) => feed.push(crate::refine::RefineFeed::InputGap),
+            None => self.refine_buf.break_at_input_gap(),
+        }
+    }
+
+    /// MAN-208, multi-input sessions: this manager's front end hands its
+    /// retention to the shared back end, where the validator and the
+    /// scheduler live (`crate::refine::SharedRefine`), instead of retaining
+    /// locally. `take_refine_feed` drains it with each batch.
+    pub(crate) fn export_refine_feed(&mut self) {
+        self.refine_export = Some(Vec::new());
+    }
+
+    /// The retention feed since the last call (empty unless exporting),
+    /// `sample_ts` still on this input's local clock.
+    pub(crate) fn take_refine_feed(&mut self) -> Vec<crate::refine::RefineFeed> {
+        self.refine_export
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+
+    /// MAN-208 tests: places this manager's stream position (the newest
+    /// hop stepped) without stepping hops.
+    #[cfg(test)]
+    pub(crate) fn set_refine_stream_position(&mut self, sample_ts: u64) {
+        self.refine_now_ts = sample_ts;
+    }
+
+    /// MAN-208: the scheduler's cumulative counters.
+    #[cfg(test)]
+    pub(crate) fn refine_counters(&self) -> crate::refine::RefineCounters {
+        *self.refine.counters()
     }
 
     /// MAN-208: one refinement scheduler pass after a batch's decoder
-    /// events reached the validator. Returns any spots the pass rescued;
-    /// `now_ts` is the stream sample position at the pass (the rescued
-    /// decisions' availability time). A no-op returning nothing while
-    /// `[decode.refine] enabled = false`.
-    pub fn refine_step(
-        &mut self,
-        validator: &mut manta_spot::Validator,
-        now_ts: u64,
-    ) -> Vec<manta_spot::Spot> {
+    /// events reached the validator. Returns any spots the pass rescued.
+    /// The pass's availability time is this manager's own stream position
+    /// (the newest hop it has stepped), never a timestamp read off the
+    /// batch's events: `TrackClosed` sorts at `u64::MAX`, and taking it as
+    /// the clock expired every retained episode and the cap bookkeeping
+    /// whenever any unrelated track closed (validate round 2, PR #520). A
+    /// no-op returning nothing while `[decode.refine] enabled = false`.
+    pub fn refine_step(&mut self, validator: &mut manta_spot::Validator) -> Vec<manta_spot::Spot> {
         let decode_cfg = self.decode_cfg.clone();
-        let now_ts = now_ts.max(self.refine_now_ts);
         let before = *self.refine.counters();
-        let spots = self
-            .refine
-            .step(&mut self.refine_buf, validator, &decode_cfg, now_ts);
-        if let Some(observer) = &self.quality {
-            let after = self.refine.counters();
-            observer.add_refinements([
-                after.admitted_total - before.admitted_total,
-                after.replayed_hops_total - before.replayed_hops_total,
-                after.rescues_total - before.rescues_total,
-                after.budget_exhausted_total - before.budget_exhausted_total,
-                after.orphaned_revisions_total - before.orphaned_revisions_total,
-            ]);
-        }
+        let spots = self.refine.step(
+            &mut self.refine_buf,
+            validator,
+            &decode_cfg,
+            self.refine_now_ts,
+        );
+        crate::refine::publish_refine_deltas(
+            self.quality.as_deref(),
+            &before,
+            self.refine.counters(),
+        );
         spots
     }
 
@@ -4813,8 +4852,16 @@ impl TrackManager {
                     })
                 })
                 .collect();
-            for (id, entry) in feed {
-                self.refine_buf.record(id, entry);
+            match self.refine_export.as_mut() {
+                Some(out) => out.extend(
+                    feed.into_iter()
+                        .map(|(id, e)| crate::refine::RefineFeed::Entry(id, e)),
+                ),
+                None => {
+                    for (id, entry) in feed {
+                        self.refine_buf.record(id, entry);
+                    }
+                }
             }
         }
         let mut events: Vec<DecoderEvent> = self
