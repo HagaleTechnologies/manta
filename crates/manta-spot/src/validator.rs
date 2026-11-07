@@ -374,6 +374,10 @@ struct TrackState {
     /// have been at the 60 WPM noise ceiling (Codex review on PR #154,
     /// round 10).
     wpm_confirmed: bool,
+    /// MAN-208: `next_word_seq` when the latest `SpeedUpdate` arrived --
+    /// how many words the current speed has held across
+    /// (`RefineCandidate::wpm_stable`).
+    wpm_since_word_seq: u64,
     /// Set once a real `TrackMeta` event has been received. `freq_hz`/
     /// `snr_db` hold bogus `0.0` defaults until then (decoder.rs emits
     /// `TrackMeta` only every 375 hops -- a fast decode can complete
@@ -752,7 +756,18 @@ pub struct RefineCandidate {
     pub rival: Option<String>,
     /// How many of its characters carried unresolved decoder alternatives.
     pub alternatives: usize,
+    /// Whether `wpm` is a reliable estimate: the track has decoded at
+    /// least [`STABLE_SPEED_WORDS`] words since its last `SpeedUpdate`, so
+    /// the speed held rather than just jumped. The speed trigger requires
+    /// it.
+    pub wpm_stable: bool,
 }
+
+/// MAN-208: words a track must decode after its latest `SpeedUpdate`
+/// before that speed counts as a stable new estimate for the refinement
+/// speed trigger. `SpeedUpdate` fires only on a >= 1 WPM change (SPEC
+/// §5), so "no update across two whole words" means the estimate held.
+pub const STABLE_SPEED_WORDS: u64 = 2;
 
 impl Validator {
     /// Parses the supplied country and known-callsign tables.
@@ -1100,6 +1115,8 @@ impl Validator {
                     wpm: track.wpm,
                     rival: word.rival.clone(),
                     alternatives,
+                    wpm_stable: track.wpm_confirmed
+                        && track.next_word_seq - track.wpm_since_word_seq >= STABLE_SPEED_WORDS,
                 });
             }
         }
@@ -1170,6 +1187,21 @@ impl Validator {
                 self.gate
                     .move_occurrence(&old_call, &refined.call, track_id, span, is_active);
             }
+            // The variant-arbitration ledger holds the same occurrence:
+            // revise it there too, or the rival check below compares the
+            // refined call against the reading it just superseded
+            // (validate round 2, PR #520). Moved, never added.
+            let plausible =
+                grammar::is_plausible(&refined.call) && self.cty.is_allocated(&refined.call);
+            self.ledger.revise_occurrence(
+                track_id,
+                word_seq,
+                &old_call,
+                &refined.call,
+                span,
+                confidence::geo_mean(&refined.confidences),
+                plausible,
+            );
         }
         // The word now carries the refined reading: its text, confidences
         // and ambiguity signals are the re-decode's, so the window's later
@@ -1741,6 +1773,7 @@ impl Validator {
                 let track = self.tracks.entry(*track_id).or_default();
                 track.wpm = *wpm;
                 track.wpm_confirmed = true;
+                track.wpm_since_word_seq = track.next_word_seq;
                 // No retry here, and no Beacon-WPM decision here either
                 // (round 7 redesign) -- a non-allowlisted Beacon
                 // candidate is only ever judged once, at `TrackClosed`,
@@ -6145,6 +6178,84 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             spots[0].sample_ts, 1_768_800,
             "the spot carries the later repetition's RF time, not the first decode's"
         );
+    }
+
+    /// Validate round 2 (MAN-208): a call-changing refinement must revise
+    /// the SAME occurrence in the variant-arbitration ledger too, not only
+    /// in the repetition gate. Before the fix the ledger kept the stale
+    /// `K3ABC` (0.95) reading next to the clean `K3ABD` (0.90) repetition:
+    /// one rep each, the stale reading winning the confidence tie-break,
+    /// so the rescue was withheld as a Variant by the very evidence it
+    /// had just superseded.
+    #[test]
+    fn a_call_changing_refinement_revises_the_rival_ledger_occurrence() {
+        let mut v = recording(CTY_FIXTURE);
+        let word_at = |text: &str, conf: f32, start: u64| -> Vec<DecoderEvent> {
+            let mut events = Vec::new();
+            let mut ts = start;
+            for w in ["DE", text, "K"] {
+                let c = if w == text { conf } else { 0.95 };
+                for ch in w.chars() {
+                    events.push(DecoderEvent::char_decoded(1, ts, Glyph::Char(ch), c));
+                    ts += 100;
+                }
+                events.push(DecoderEvent::word_boundary(1, ts));
+                ts += 100;
+            }
+            events
+        };
+        assert!(run(&word_at("K3ABC", 0.95, 1_000_000), &mut v).is_empty());
+        assert!(run(&word_at("K3ABD", 0.90, 1_768_000), &mut v).is_empty());
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let mut fix = refined("K3ABD", span, "engine:hsmm");
+        fix.confidences = vec![0.90; 5];
+        fix.word_confidence = 0.90;
+        let spots = v.apply_refinement(1, seq, fix, 1_800_000);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|s| s.callsign.as_str())
+                .collect::<Vec<_>>(),
+            ["K3ABD"],
+            "the stale K3ABC reading must not veto its own correction"
+        );
+        assert_eq!(
+            v.ledger.support(1, "K3ABC", v.now_ts).reps,
+            0,
+            "the occurrence's K3ABC reading left the ledger"
+        );
+        assert_eq!(
+            v.ledger.support(1, "K3ABD", v.now_ts).reps,
+            2,
+            "moved, not added: the occurrence plus its repetition"
+        );
+    }
+
+    /// Validate round 2 (MAN-208): a candidate's speed is reported stable
+    /// only once the track has decoded `STABLE_SPEED_WORDS` words since
+    /// its last `SpeedUpdate` -- the estimate held, it did not just jump.
+    #[test]
+    fn refine_candidates_report_speed_stability_by_words_held() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let stable = |v: &Validator| {
+            v.refine_candidates(v.now_ts, 10 * FS as u64)
+                .iter()
+                .find(|c| c.call == "K3ABC")
+                .expect("candidate")
+                .wpm_stable
+        };
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 28.0,
+        });
+        assert!(!stable(&v), "a speed that just changed is not stable");
+        let (one, next) = word_events(1, "DE", 1_900_000);
+        run(&one, &mut v);
+        assert!(!stable(&v), "one word is not yet a held estimate");
+        let (two, _) = word_events(1, "K", next);
+        run(&two, &mut v);
+        assert!(stable(&v), "held across two words");
     }
 
     #[test]

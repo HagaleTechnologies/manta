@@ -349,6 +349,18 @@ fn per_episode_cap_of_two_refinements_is_enforced() {
                 track_id: 1,
                 wpm: 29.0,
             });
+            // The new speed must be a stable estimate (held across
+            // `STABLE_SPEED_WORDS` words) before it re-admits the episode.
+            let mut ts = s.span.1 + 40_000;
+            for word in ["TU", "EE"] {
+                for c in word.chars() {
+                    s.validator
+                        .ingest(&DecoderEvent::char_decoded(1, ts, Glyph::Char(c), 0.95));
+                    ts += 100;
+                }
+                s.validator.ingest(&DecoderEvent::word_boundary(1, ts));
+                ts += 100;
+            }
         }
         let now = s.span.1 + 50_000 + i * 32_000;
         s.scheduler

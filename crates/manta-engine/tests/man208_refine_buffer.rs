@@ -133,6 +133,7 @@ fn candidate(rival: Option<&str>, alternatives: usize) -> RefineCandidate {
         wpm: 20.0,
         rival: rival.map(String::from),
         alternatives,
+        wpm_stable: true,
     }
 }
 
@@ -157,9 +158,32 @@ fn ambiguity_trigger_ignores_decided_episodes() {
 
 #[test]
 fn speed_trigger_fires_only_on_a_material_change() {
-    assert!(!speed_trigger(22.0, 20.0), "under the 3 WPM bar");
-    assert!(speed_trigger(25.0, 20.0));
-    assert!(speed_trigger(15.0, 20.0));
+    let at = |wpm: f32| RefineCandidate {
+        wpm,
+        ..candidate(None, 0)
+    };
+    assert!(!speed_trigger(&at(22.0), 20.0), "under the 3 WPM bar");
+    assert!(speed_trigger(&at(25.0), 20.0));
+    assert!(speed_trigger(&at(15.0), 20.0));
+}
+
+/// Validate round 2 (MAN-208): the plan's speed trigger is a material
+/// change "and stable" -- a new RELIABLE estimate. A large jump the
+/// decoder has not yet held across later words is a transient, not a
+/// reason to spend replay budget.
+#[test]
+fn speed_trigger_requires_a_stable_new_estimate() {
+    let transient = RefineCandidate {
+        wpm: 28.0,
+        wpm_stable: false,
+        ..candidate(None, 0)
+    };
+    assert!(!speed_trigger(&transient, 20.0), "unstable jump admitted");
+    let held = RefineCandidate {
+        wpm_stable: true,
+        ..transient
+    };
+    assert!(speed_trigger(&held, 20.0));
 }
 
 #[test]

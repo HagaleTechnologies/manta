@@ -179,10 +179,12 @@ pub fn ambiguity_trigger(c: &RefineCandidate) -> bool {
     c.rival.is_some() || c.alternatives > 0
 }
 
-/// Speed: a new reliable estimate at least 3 WPM from the speed the
-/// episode was decoded at (the decision record's materiality bar).
-pub fn speed_trigger(new_wpm: f32, episode_wpm: f32) -> bool {
-    (new_wpm - episode_wpm).abs() >= 3.0
+/// Speed: a new RELIABLE estimate -- stable (the track held it across
+/// `manta_spot::STABLE_SPEED_WORDS` words, `RefineCandidate::wpm_stable`)
+/// and at least 3 WPM from `reference_wpm`, the speed the episode was
+/// decoded (or last refined) at (the decision record's materiality bar).
+pub fn speed_trigger(c: &RefineCandidate, reference_wpm: f32) -> bool {
+    c.wpm_stable && (c.wpm - reference_wpm).abs() >= 3.0
 }
 
 /// Separability: a close pair on the channel separated -- the gap moved
@@ -306,10 +308,8 @@ impl RefineScheduler {
             // configuration.
             let already_refined = self.per_episode_counts.contains_key(&key);
             let previous = self.last_context.get(&key);
-            let speed_changed = speed_trigger(
-                candidate.wpm,
-                previous.map_or(candidate.episode_wpm, |c| c.1),
-            );
+            let speed_changed =
+                speed_trigger(&candidate, previous.map_or(candidate.episode_wpm, |c| c.1));
             let separated =
                 previous.is_some_and(|c| separability_trigger(c.2, candidate.neighbor_gap_hz));
             let later_word = previous.is_some_and(|c| candidate.latest_word_seq > c.0);

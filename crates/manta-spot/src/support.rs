@@ -101,6 +101,37 @@ impl SupportLedger {
         self.observe_inner(track_id, text, word_seq, span, true, geo_conf);
     }
 
+    /// MAN-208: re-reads one already-observed occurrence (`word_seq` on
+    /// `track_id`, spanning `span`) as `new_text`: the occurrence's
+    /// observation leaves `old_text`'s entry and, when `new_text` is
+    /// itself spottable-shaped (`plausible`, the same gate `observe_span`'s
+    /// callers apply), joins `new_text`'s entry under the same span rules
+    /// -- an overlap with a held observation adds nothing. A move, never
+    /// an addition: the arbitration evidence follows the refined reading
+    /// exactly as the repetition gate's support does
+    /// (`RepetitionGate::move_occurrence`).
+    pub fn revise_occurrence(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        old_text: &str,
+        new_text: &str,
+        span: (u64, u64),
+        geo_conf: f32,
+        plausible: bool,
+    ) {
+        let key = (track_id, old_text.to_string());
+        if let Some(entry) = self.seen.get_mut(&key) {
+            entry.retain(|o| o.word_seq != word_seq);
+            if entry.is_empty() {
+                self.seen.remove(&key);
+            }
+        }
+        if plausible {
+            self.observe_span(track_id, new_text, word_seq, span, geo_conf);
+        }
+    }
+
     fn observe_inner(
         &mut self,
         track_id: u32,
@@ -117,12 +148,19 @@ impl SupportLedger {
                 .iter()
                 .any(|o| crate::gate::overlaps((o.start_ts, o.sample_ts), (start_ts, sample_ts)));
         if !replay {
-            entry.push(Obs {
-                word_seq,
-                start_ts,
-                sample_ts,
-                geo_conf,
-            });
+            // Chronological order, which the shared greedy message-gap
+            // helper assumes. Live decodes arrive in order (this is a
+            // push); a MAN-208 revision re-inserts an older occurrence.
+            let at = entry.partition_point(|o| o.sample_ts <= sample_ts);
+            entry.insert(
+                at,
+                Obs {
+                    word_seq,
+                    start_ts,
+                    sample_ts,
+                    geo_conf,
+                },
+            );
         }
         let cutoff = sample_ts.saturating_sub(self.window_samples);
         entry.retain(|o| o.sample_ts >= cutoff);
