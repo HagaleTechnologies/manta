@@ -2,23 +2,13 @@
 //! the real binary: exit codes, stdout vs stderr, and the guarantee that
 //! check opens no source and binds no port.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // `config check` reads `MANTA_CONFIG` and `MANTA_<TABLE>_<KEY>` and
-    // rejects unknown `MANTA_*` names, so a variable in the test runner's
-    // own environment must never leak into the child. Tests that exercise
-    // the env tier set theirs explicitly.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+use std::process::Output;
 
 /// Writes `body` to `dir/name` and returns that path.
 fn write_cfg(dir: &Path, name: &str, body: &str) -> PathBuf {

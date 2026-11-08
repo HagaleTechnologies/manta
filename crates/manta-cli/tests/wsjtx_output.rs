@@ -223,7 +223,6 @@ mod worker {
 mod manta_run {
     use super::*;
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     /// A 30 s V1 IQ WAV at 48 kS/s, centred on 14 MHz: W1AW's CQ spot is
     /// decoded about 21 s in.
@@ -253,12 +252,7 @@ mod manta_run {
         );
         let path = dir.path().join("manta.toml");
         std::fs::write(&path, config).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-        for (key, _) in std::env::vars() {
-            if key.starts_with("MANTA_") {
-                cmd.env_remove(key);
-            }
-        }
+        let mut cmd = super::common::manta();
         let out = cmd.args(["run", "--config"]).arg(&path).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stderr}");
@@ -331,12 +325,7 @@ mod manta_run {
         );
         let path = dir.path().join("manta.toml");
         std::fs::write(&path, config).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-        for (key, _) in std::env::vars() {
-            if key.starts_with("MANTA_") {
-                cmd.env_remove(key);
-            }
-        }
+        let mut cmd = super::common::manta();
         let out = cmd.args(["run", "--config"]).arg(&path).output().unwrap();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stderr}");

@@ -1,10 +1,14 @@
 //! MAN-148: operator examples must load in the shipped CLI and match the service kit.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const GUIDES: &[&str] = &[
     "docs/GUIDES/rbn-node.md",
@@ -78,16 +82,6 @@ fn toml_blocks(md: &str) -> Vec<String> {
     }
     assert!(language.is_none(), "unclosed code fence");
     blocks
-}
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
 }
 
 fn check_config(config: &toml::Table) -> Output {

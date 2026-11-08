@@ -1,19 +1,13 @@
 //! MAN-125: source diagnostics through the real CLI, without receiver hardware.
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use serde_json::{json, Value};
-
-fn manta() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            command.env_remove(key);
-        }
-    }
-    command
-}
 
 fn wav(dir: &Path, name: &str, rate: u32, channels: u16, frames: usize, value: f32) -> PathBuf {
     let path = dir.join(name);

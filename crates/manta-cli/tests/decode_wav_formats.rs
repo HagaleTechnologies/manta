@@ -3,23 +3,12 @@
 //! fails naming the file, unsupported sample formats name the accepted ones,
 //! and the decode streams instead of holding the recording in memory.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-/// The binary with every `MANTA_*` variable removed, as in `cli.rs`.
-fn manta() -> Command {
-    without_manta_env(Command::new(env!("CARGO_BIN_EXE_manta")))
-}
-
-/// `cmd` with every `MANTA_*` variable removed from its environment.
-fn without_manta_env(mut cmd: Command) -> Command {
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 /// V1 shortened to 30 s, written into `dir` as Float32 with its sidecar;
 /// returns the WAV path. The same fixture as `cli.rs`'s `short_v1`: a 15 s
@@ -196,7 +185,7 @@ fn decode_runs_in_bounded_memory() {
     // same binary completes in <96 MiB on an idle machine (uncapped VSZ:
     // ~420 MiB, almost all lazy arena/stack reservations). With one arena
     // the cap measures manta's own streaming footprint deterministically.
-    let out = without_manta_env(Command::new("sh"))
+    let out = launch::without_manta_env(Command::new("sh"))
         .args(["-c", "ulimit -v 98304 && exec \"$0\" \"$@\""])
         .arg(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", wav.to_str().unwrap(), "--json"])

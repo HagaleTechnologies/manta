@@ -5,7 +5,7 @@ mod common;
 use common::{fake_server, http_reply};
 use manta_server::status_doc::{render_human, StatusDoc};
 use serde_json::{json, Value};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Duration;
 
 fn status_body(health: &str) -> Value {
@@ -36,13 +36,7 @@ fn status_body(health: &str) -> Value {
 
 fn status(body: &Value, json: bool) -> Output {
     let (addr, requests) = fake_server(http_reply("200 OK", &body.to_string()), 1);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // Keep the test runner's config and overrides out of the child.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = common::manta();
     cmd.args(["status", "--addr", &addr.to_string()]);
     if json {
         cmd.arg("--json");

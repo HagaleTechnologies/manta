@@ -12,6 +12,10 @@
 //! and `macos-latest` images ship all three, so a skip there is a bug.
 #![cfg(unix)]
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -30,17 +34,6 @@ fn repo_root() -> PathBuf {
 
 fn script(name: &str) -> PathBuf {
     repo_root().join("scripts").join(name)
-}
-
-/// The binary with every `MANTA_*` variable removed, as in `cli.rs`.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
 }
 
 fn assert_success(what: &str, out: &Output) {

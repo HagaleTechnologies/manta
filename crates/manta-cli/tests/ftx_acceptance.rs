@@ -1,15 +1,7 @@
 //! MAN-485: real daemon coverage of the opt-in FT8/FT4 IQ-to-JSON path.
-use std::process::Command;
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
 
 #[cfg(not(feature = "ftx"))]
 #[test]

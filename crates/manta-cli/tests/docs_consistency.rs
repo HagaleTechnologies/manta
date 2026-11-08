@@ -5,6 +5,10 @@
 //! counts and a two-milestone-stale description of the output layer. Each
 //! test below pins one claim a first-time visitor reads.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use manta_dsp::channelizer::Channelizer;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1057,10 +1061,6 @@ fn spot_output_contract_names_the_rbn_feed_manta_reads() {
 }
 
 // ---- MAN-261: SPEC §9 is the loadable key table; README's node is one file ----
-
-fn manta() -> std::process::Command {
-    std::process::Command::new(env!("CARGO_BIN_EXE_manta"))
-}
 
 /// A 15 s V1 render (fast, still one W1AW CQ), written into `dir`; returns
 /// the WAV path. Same shortened spec `tests/cli.rs` uses.
@@ -3911,12 +3911,7 @@ fn shared_hpsdr_docs_describe_capacity_and_queue_loss_and_example_checks_offline
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("four-bands.toml");
     std::fs::write(&path, example).unwrap();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = manta();
     let output = cmd
         .args(["config", "check", "--config"])
         .arg(path)

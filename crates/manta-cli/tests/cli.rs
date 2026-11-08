@@ -1,19 +1,9 @@
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // MAN-261: `run`/`soak`/`doctor` read `MANTA_CONFIG` and
-    // `MANTA_<TABLE>_<KEY>` and reject unknown `MANTA_*` names, so a
-    // variable in the test runner's own environment must never leak into
-    // the child. Tests that exercise the env tier set theirs explicitly.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 /// MAN-261: a minimal valid `[server]` table -- loopback only, every port 0
 /// (multi-agent hygiene: never bind a fixed port).

@@ -1,13 +1,11 @@
 //! Operator output contracts. Machine values are intentionally not rounded.
+#[path = "common/launch.rs"]
+mod launch;
+
 use std::process::{Command, Output};
 
 fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = launch::manta();
     cmd.env_remove("RUST_LOG");
     cmd
 }

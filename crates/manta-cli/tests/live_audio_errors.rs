@@ -8,18 +8,9 @@
 //! and a name that matches nothing never opens a stream. The one test that
 //! opens a stream is Linux-only and uses ALSA's software null device.
 
-use std::process::Command;
-
-/// The binary with every `MANTA_*` variable removed, as in `cli.rs`.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
 
 #[test]
 fn a_missing_audio_input_names_itself_the_rate_and_manta_devices_in_every_command() {

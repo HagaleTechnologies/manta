@@ -5,10 +5,14 @@
 //! LaunchDaemon run that config and give the SIGTERM drain time to finish.
 //! See docs/DECISIONS/2026-10-10-man268-unattended-packaging.md.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 const EXAMPLE: &str = "manta.example.toml";
 const SYSTEMD_UNIT: &str = "packaging/systemd/manta.service";
@@ -76,20 +80,6 @@ fn doc(rel: &str) -> String {
     std::fs::read_to_string(&p)
         .unwrap_or_else(|e| panic!("reading {}: {e}", p.display()))
         .replace("\r\n", "\n")
-}
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // `run` and `config check` read `MANTA_CONFIG` and `MANTA_<TABLE>_<KEY>`
-    // and reject unknown `MANTA_*` names, so the test runner's own
-    // environment must never leak into the child. Tests that exercise the
-    // env tier set theirs explicitly.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
 }
 
 fn stdout(o: &Output) -> String {

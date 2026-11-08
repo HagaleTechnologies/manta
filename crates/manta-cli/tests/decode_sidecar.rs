@@ -3,19 +3,12 @@
 //! frequencies are baseband offsets, and `--center-freq-hz` supplies (or
 //! overrides) the centre frequency. `decode`'s stdout is unchanged.
 
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
 
-/// The binary with every `MANTA_*` variable removed, as in `cli.rs`.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+use std::path::{Path, PathBuf};
+use std::process::Output;
 
 /// `dir/v1.wav` plus its `v1.json` sidecar (`center_freq_hz` 14 000 000):
 /// V1 shortened to 30 s, the same fixture as `cli.rs`'s `short_v1`, long

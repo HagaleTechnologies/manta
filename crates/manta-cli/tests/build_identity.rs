@@ -4,22 +4,14 @@
 //!   Scenario: --version identifies the exact build
 //!   Scenario: Every emitted spot carries a real decoder version
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
-
-/// The child must not inherit `MANTA_*` from the test runner (MAN-261's
-/// loader rejects unknown names), same as tests/cli.rs's `manta()`.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 /// Verify CLI propagation against build metadata; the child-process feature
 /// matrix independently checks how that metadata is generated.

@@ -1,4 +1,8 @@
 //! MAN-306 acceptance through the real daemon and a broadcast-aware Metis fake.
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Child, Command, Stdio};
@@ -91,16 +95,6 @@ impl Drop for ChildGuard {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn manta() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            command.env_remove(key);
-        }
-    }
-    command
 }
 
 fn configured_command(

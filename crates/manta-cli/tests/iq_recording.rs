@@ -4,23 +4,13 @@
 //! V1 fixtures, no hardware.
 
 mod common;
+use common::{free_ports, manta};
 
 use manta_input::recording_format::MetadataRecord;
 use manta_input::{metadata_path, EndReason, RecordingHeader};
 use num_complex::Complex32;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-
-/// `manta` with no `MANTA_*` variable from the test runner's environment.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 fn run_ok(args: &[&std::ffi::OsStr]) -> Output {
     let out = manta().args(args).output().unwrap();
@@ -265,14 +255,6 @@ fn a_recording_replays_to_the_same_spots_on_every_run() {
         "{stderr}"
     );
     assert_eq!(std::fs::read(&rec).unwrap(), before);
-}
-
-/// `N` distinct loopback ports nothing listens on right now, all held until
-/// every one is read.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [std::net::TcpListener; N] =
-        std::array::from_fn(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// `record_iq` follows `run`'s precedence, `--record-iq` over

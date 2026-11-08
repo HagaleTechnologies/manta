@@ -4,7 +4,7 @@
 //! JSON keep binding `bind_addr` (`0.0.0.0` by default, D14).
 //!
 //! Helpers are copied from `startup_banner.rs` and
-//! `node_health_acceptance.rs`; the repo's test files are self-contained.
+//! `node_health_acceptance.rs`.
 
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};

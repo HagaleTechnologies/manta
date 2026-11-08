@@ -6,10 +6,14 @@
 //! measured in the test. Deadlines are generous and exist only so a broken
 //! build fails cleanly instead of hanging.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::io::{BufRead, BufReader, ErrorKind, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
@@ -27,17 +31,6 @@ impl KillOnDrop {
     fn still_running(&mut self) -> bool {
         self.0.try_wait().unwrap().is_none()
     }
-}
-
-/// `manta` with no `MANTA_*` variable from the test runner's environment.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
 }
 
 /// Starts `manta <args>` and forwards each stderr line, ANSI colour codes

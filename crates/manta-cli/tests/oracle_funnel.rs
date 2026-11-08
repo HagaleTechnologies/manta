@@ -3,20 +3,13 @@
 //! oracle's own stdout and `--jsonl` byte-identical. Real binary, a short
 //! `manta gen`-shaped V1 fixture, no hardware.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
+
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::{Command, Output};
-
-/// `manta` with no `MANTA_*` variable from the test runner's environment.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
+use std::process::Output;
 
 /// Four K5TR rows against V1 (W1AW at 14012.34 kHz, 96 kS/s around
 /// 14.000 MHz): W1AW itself, an empty in-band frequency, one beyond the
