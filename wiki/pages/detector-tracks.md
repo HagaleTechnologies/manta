@@ -115,3 +115,9 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   cross these windows need an explicit opt-out. See the
   [decision record](../../docs/DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
   and [config table](../../docs/CONFIG.md#digital-mode-windows).
+- MAN-526: `FloorBank::update` and `Gate::update` take the same hop in
+  dB and linear units (`&hop.power`); the linear EMA and the gate windows
+  never undo `power_db`. `F_rise` and the gate's linear threshold are
+  cached at the decimated push, so any new write to floor state outside
+  the decimated branch must refresh `rise_floor_db`. See the
+  [decision record](../../docs/DECISIONS/2026-11-08-man526-linear-channel-power.md).
