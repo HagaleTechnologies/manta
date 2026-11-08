@@ -1149,7 +1149,8 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                               ('relay-windows-check-run', {CHECKS[2]})):
             block = wf.job_block(text, job)
             body = wf.run_body(wf.steps(block)[-1])
-            named = set(re.findall(r'^\s*relay "(test \([a-z]+-latest\))" "\$[A-Z_]+"$', body, re.M))
+            # Any mention of a test job, not just one call form, counts as a lookup.
+            named = set(re.findall(r'test \([a-z]+-latest\)', body))
             self.assertEqual(named, expected, job)
             needs = {n.strip() for n in wf.field(block, 'needs').strip('[]').split(',')}
             self.assertTrue({owner[n] for n in named} <= needs, job)

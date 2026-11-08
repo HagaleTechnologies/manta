@@ -37,15 +37,21 @@ job. So every PR got its two required Unix results only when Windows ended
 
 Windows is not a required check (MAN-371 O1 was never applied), so a PR is
 merge-ready once its Unix check-runs, Supply Chain and Codex are green, while
-its dispatched Windows job may still be running. A Windows-only regression
-that merges this way is still caught by the merge-group run's native
-`test (windows-latest)` job, by main's push run that `main-alert.yml`
-watches, and by `release-publish.yml`, which refuses a commit whose push run
-failed Windows. The dispatched Windows job keeps running after the merge; that
-is the same runner time it used before, not new time.
+its dispatched Windows job may still be running. Before this change a red
+Windows result did not block a merge either, but it was on the PR before the
+Unix results, so it could be seen first; that visibility is what this trade
+gives up. A Windows-only regression that merges this way is still reported,
+not blocked: the merge-group run's native `test (windows-latest)` job fails,
+main's push run fails and `main-alert.yml` alerts on it, and
+`release-publish.yml` refuses a commit whose push run failed Windows. The
+dispatched Windows job keeps running after the merge; that is the same runner
+time it used before, not new time. If O1 is applied later, the ruleset makes a
+PR wait for Windows again; the split relay stays correct then.
 
-`gh run rerun --failed` after a failed Windows leg re-runs the Windows job and
-`relay-windows-check-run` only; the Unix relay already succeeded.
+When only the Windows leg failed, `gh run rerun --failed` re-runs `test` and
+its dependent `relay-windows-check-run`; the Unix relay succeeded and is not
+re-run. A run that also had a failed or cancelled Unix job re-runs that job's
+relay too.
 
 ## Not verified here
 
@@ -55,10 +61,12 @@ main-only (Q-0068). The stub-`gh` tests in `scripts/tests/test_ci_gates.py`
 run both real step bodies. On the first trusted PR dispatched after merge,
 with `RUN` its `ci-full` run id and `SHA` its head:
 
-    gh api "repos/HagaleTechnologies/manta/actions/runs/$RUN/jobs?per_page=50" \
-      --jq '.jobs[] | select(.name|test("^test \\(|^Relay")) | "\(.name)\t\(.completed_at)"'
-    gh api "repos/HagaleTechnologies/manta/commits/$SHA/check-runs?per_page=100" \
-      --jq '.check_runs[] | select(.name|startswith("test (")) | "\(.name)\t\(.app.slug)\t\(.conclusion)\t\(.completed_at)"'
+```sh
+gh api "repos/HagaleTechnologies/manta/actions/runs/$RUN/jobs?per_page=50" \
+  --jq '.jobs[] | select(.name|test("^test \\(|^Relay")) | "\(.name)\t\(.completed_at)"'
+gh api "repos/HagaleTechnologies/manta/commits/$SHA/check-runs?per_page=100" \
+  --jq '.check_runs[] | select(.name|startswith("test (")) | "\(.name)\t\(.app.slug)\t\(.conclusion)\t\(.completed_at)"'
+```
 
 Expect hagale-agent's two Unix check-runs within two minutes of the later
 aggregate and before Windows, the Windows check-run within two minutes of its
