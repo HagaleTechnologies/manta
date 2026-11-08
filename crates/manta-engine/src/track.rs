@@ -2350,6 +2350,46 @@ impl Track {
     }
 }
 
+/// MAN-524: what one hop's per-track channel selection
+/// (`TrackManager::select_channels`) reads besides the track itself: the
+/// pre-loop centre snapshot, this hop and its lag partner, the floor and
+/// the respawn cooldowns.
+struct HopSelection<'a> {
+    centers: &'a CenterIndex,
+    hop: &'a HopOutput,
+    prev_hop: Option<&'a HopOutput>,
+    power_db: &'a [f64],
+    floor: &'a FloorBank,
+    cooldown: &'a [u64],
+    now: u64,
+    n: usize,
+}
+
+impl HopSelection<'_> {
+    /// Before the neighbor has its own track, its stronger channel
+    /// must not train this track: `k` feeds tracking (envelope, rise,
+    /// SNR, phase) as well as decoder input. Reject measured carriers
+    /// outside this identity's centroid gate, just as centroid
+    /// updates do.
+    fn phase_matches(&self, track: &Track, ch: usize) -> bool {
+        if channel_distance(ch as f64, track.center, self.n) <= 1.0 {
+            return true;
+        }
+        let floor = self.floor.effective_floor_db(ch);
+        if self.power_db[ch] - floor < FINE_FREQ_MIN_SNR_DB
+            || self
+                .prev_hop
+                .is_none_or(|prev| power_db(prev.power[ch]) - floor < FINE_FREQ_MIN_SNR_DB)
+        {
+            return true;
+        }
+        self.prev_hop
+            .and_then(|prev| phase_lag_product(prev, self.hop, ch))
+            .and_then(|z| phase_position(z, track.center))
+            .is_none_or(|pos| (pos - track.center).abs() <= CENTROID_OUTLIER_CH)
+    }
+}
+
 /// Orchestrates SPEC §2's real detector across all channels: per-channel
 /// floor + gate (`manta-dsp::floor`), per-channel lifecycle state
 /// machines (`Lifecycle`), and §2.5 adjacent-channel ownership, driving a
@@ -3296,75 +3336,17 @@ impl TrackManager {
         for id in ids {
             let n = self.n_channels();
             let track = self.tracks.get_mut(&id).unwrap();
-            // MAN-197: selection skips channels still serving a post-Silent
-            // cooldown, so a track whose window drifted onto a silenced
-            // birdie cannot keep decoding it inside the cooldown window.
-            let k = track.select_exclusive(
-                &centers,
-                &hop.power,
-                &self.channel_cooldown_until,
-                self.hop_counter,
+            let sel = HopSelection {
+                centers: &centers,
+                hop,
+                prev_hop: prev_hop.as_ref(),
+                power_db: &power_db_vals,
+                floor: &self.floor,
+                cooldown: &self.channel_cooldown_until,
+                now: self.hop_counter,
                 n,
-            );
-            // Before the neighbor has its own track, its stronger channel
-            // must not train this track: `k` feeds tracking (envelope, rise,
-            // SNR, phase) as well as decoder input. Reject measured carriers
-            // outside this identity's centroid gate, just as centroid
-            // updates do.
-            let phase_matches = |ch: usize| {
-                if channel_distance(ch as f64, track.center, n) <= 1.0 {
-                    return true;
-                }
-                let floor = self.floor.effective_floor_db(ch);
-                if power_db_vals[ch] - floor < FINE_FREQ_MIN_SNR_DB
-                    || prev_hop
-                        .as_ref()
-                        .is_none_or(|prev| power_db(prev.power[ch]) - floor < FINE_FREQ_MIN_SNR_DB)
-                {
-                    return true;
-                }
-                prev_hop
-                    .as_ref()
-                    .and_then(|prev| phase_lag_product(prev, hop, ch))
-                    .and_then(|z| phase_position(z, track.center))
-                    .is_none_or(|pos| (pos - track.center).abs() <= CENTROID_OUTLIER_CH)
             };
-            let k = if phase_matches(k) {
-                k
-            } else {
-                track
-                    .owned(n)
-                    .into_iter()
-                    .filter(|&ch| {
-                        self.channel_cooldown_until[ch] <= self.hop_counter
-                            && track.channel_exclusive(ch, &centers, n)
-                            && phase_matches(ch)
-                    })
-                    .max_by(|&a, &b| hop.power[a].total_cmp(&hop.power[b]))
-                    .unwrap_or(k)
-            };
-            // A stronger neighbor can contaminate one side of a straddle.
-            let k = track.select_straddle_channel(
-                k,
-                &centers,
-                &self.channel_cooldown_until,
-                self.hop_counter,
-                n,
-            );
-            let k_dec = track.decoder_channel(
-                k,
-                &centers,
-                &self.channel_cooldown_until,
-                self.hop_counter,
-                n,
-            );
-            let k_dec = track.select_straddle_channel(
-                k_dec,
-                &centers,
-                &self.channel_cooldown_until,
-                self.hop_counter,
-                n,
-            );
+            let (k, k_dec) = Self::select_channels(track, &sel);
             let prev_state = track.lifecycle.state();
             // MAN-312: a crash's energy would drag the centroid toward
             // wherever the smear happens to peak this hop. MAN-108: a
@@ -3890,7 +3872,82 @@ impl TrackManager {
             closed_with_kind.extend(kind);
         }
         self.recompute_ownership();
+        self.spawn_pass(
+            &rise,
+            hop,
+            prev_hop.as_ref(),
+            past_warmup,
+            suppress,
+            sample_ts,
+        );
+        self.recompute_ownership();
+        // MAN-199: `close_track` maps each reason to its `ClosureKind`
+        // (round 10: only HangExpired is `SignalEnded`).
+        let (merged_ids, merged_flush) = self.merge_converged();
+        closed_with_kind.extend(merged_ids);
+        closure_flush_events.extend(merged_flush);
+        let (evicted_ids, evicted_flush) = self.evict_over_cap();
+        closed_with_kind.extend(evicted_ids);
+        closure_flush_events.extend(evicted_flush);
+        // MAN-114: this hop is the next hop's lag partner; reuse the
+        // previous hop's buffers rather than allocating a fresh copy.
+        let mut slot = prev_hop.unwrap_or_else(|| HopOutput {
+            m: 0,
+            x: Vec::new(),
+            power: Vec::new(),
+        });
+        slot.m = hop.m;
+        slot.x.clone_from(&hop.x);
+        slot.power.clone_from(&hop.power);
+        self.prev_hop = Some(slot);
+        // MAN-199: recorded after this hop's promotions, so a lead-in built
+        // at hop `m` holds only hops before it.
+        self.history.record(hop.m, sample_ts, &hop.power, hold);
+        (closed_with_kind, promoted_events, closure_flush_events)
+    }
 
+    /// One track's tracking channel `k` and decoder channel `k_dec` for
+    /// this hop, read against the pre-loop centre snapshot `sel.centers`.
+    /// MAN-524: moved out of `step_hop`.
+    fn select_channels(track: &Track, sel: &HopSelection<'_>) -> (usize, usize) {
+        let n = sel.n;
+        // MAN-197: selection skips channels still serving a post-Silent
+        // cooldown, so a track whose window drifted onto a silenced
+        // birdie cannot keep decoding it inside the cooldown window.
+        let k = track.select_exclusive(sel.centers, &sel.hop.power, sel.cooldown, sel.now, n);
+        let k = if sel.phase_matches(track, k) {
+            k
+        } else {
+            track
+                .owned(n)
+                .into_iter()
+                .filter(|&ch| {
+                    sel.cooldown[ch] <= sel.now
+                        && track.channel_exclusive(ch, sel.centers, n)
+                        && sel.phase_matches(track, ch)
+                })
+                .max_by(|&a, &b| sel.hop.power[a].total_cmp(&sel.hop.power[b]))
+                .unwrap_or(k)
+        };
+        // A stronger neighbor can contaminate one side of a straddle.
+        let k = track.select_straddle_channel(k, sel.centers, sel.cooldown, sel.now, n);
+        let k_dec = track.decoder_channel(k, sel.centers, sel.cooldown, sel.now, n);
+        let k_dec = track.select_straddle_channel(k_dec, sel.centers, sel.cooldown, sel.now, n);
+        (k, k_dec)
+    }
+
+    /// The hop's spawn scan, run after its closes' `recompute_ownership`;
+    /// the caller recomputes ownership again afterwards. MAN-524: moved out
+    /// of `step_hop`.
+    fn spawn_pass(
+        &mut self,
+        rise: &[bool],
+        hop: &HopOutput,
+        prev_hop: Option<&HopOutput>,
+        past_warmup: bool,
+        suppress: bool,
+        sample_ts: u64,
+    ) {
         // SPEC §2.5 / MAN-172: scan rising, unowned local maxima of the
         // gate's smoothed power. Falling leakage skirts cannot start a
         // spawn decision. Preserve the same-hop adjacent-rise arbitration.
@@ -3916,7 +3973,7 @@ impl TrackManager {
                         let veto = if rise[k] {
                             self.admission_veto(
                                 k,
-                                self.spawn_phase_position(k, hop, prev_hop.as_ref()),
+                                self.spawn_phase_position(k, hop, prev_hop),
                                 &near,
                             )
                         } else {
@@ -3932,7 +3989,7 @@ impl TrackManager {
             while k < n {
                 // MAN-524: the phase position is pure; evaluate it once.
                 let pos_k = if rise[k] {
-                    self.spawn_phase_position(k, hop, prev_hop.as_ref())
+                    self.spawn_phase_position(k, hop, prev_hop)
                 } else {
                     None
                 };
@@ -3950,7 +4007,7 @@ impl TrackManager {
                 {
                     let mut winner = k;
                     let pos_k1 = if k + 1 < n && rise[k + 1] {
-                        self.spawn_phase_position(k + 1, hop, prev_hop.as_ref())
+                        self.spawn_phase_position(k + 1, hop, prev_hop)
                     } else {
                         None
                     };
@@ -3985,32 +4042,8 @@ impl TrackManager {
             }
         }
         if let Some(before) = before {
-            self.trace_spawn_vetoes(&rise, &before, past_warmup, suppress, &hop.power, sample_ts);
+            self.trace_spawn_vetoes(rise, &before, past_warmup, suppress, &hop.power, sample_ts);
         }
-        self.recompute_ownership();
-        // MAN-199: `close_track` maps each reason to its `ClosureKind`
-        // (round 10: only HangExpired is `SignalEnded`).
-        let (merged_ids, merged_flush) = self.merge_converged();
-        closed_with_kind.extend(merged_ids);
-        closure_flush_events.extend(merged_flush);
-        let (evicted_ids, evicted_flush) = self.evict_over_cap();
-        closed_with_kind.extend(evicted_ids);
-        closure_flush_events.extend(evicted_flush);
-        // MAN-114: this hop is the next hop's lag partner; reuse the
-        // previous hop's buffers rather than allocating a fresh copy.
-        let mut slot = prev_hop.unwrap_or_else(|| HopOutput {
-            m: 0,
-            x: Vec::new(),
-            power: Vec::new(),
-        });
-        slot.m = hop.m;
-        slot.x.clone_from(&hop.x);
-        slot.power.clone_from(&hop.power);
-        self.prev_hop = Some(slot);
-        // MAN-199: recorded after this hop's promotions, so a lead-in built
-        // at hop `m` holds only hops before it.
-        self.history.record(hop.m, sample_ts, &hop.power, hold);
-        (closed_with_kind, promoted_events, closure_flush_events)
     }
 
     /// MAN-172 / SPEC §2.5: a rising channel must be a local maximum of
