@@ -1334,7 +1334,8 @@ whose dit cluster is one mark, a tracker from the other marks); later, from
 3:1 alternative when they duplicate the primary). A candidate within 0.25 of
 a live hypothesis on both `ln μ_dit` and `ln μ_dah` is not spawned. Every
 hypothesis scores each mark against its two centroids (log-normal, σ 0.25)
-and each classified gap against 1, 3 and 7 of its own §4.1a units
+and each closed gap (classified, or a word gap the §4.2 flush resolved, at
+its closed length) against 1, 3 and 7 of its own §4.1a units
 (σ 0.35), max component, equal class weights, floored at −3 nats, decayed
 ×0.9 per observation; a gap of 12 units of the slowest hypothesis is scored
 by none. A challenger switches in when it leads by 4 nats on 2 consecutive

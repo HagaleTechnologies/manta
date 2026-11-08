@@ -1228,8 +1228,11 @@ impl TrackDecoder {
             // run: the demod folded a remainder shorter than its debounce
             // window into this mark, so the length at the flush is the
             // closed length, short by less than that window (MAN-315 D2).
+            // The bank scores it here too: a flushed gap never reaches the
+            // `classify` call below (MAN-544).
             if let Some(flushed_ms) = self.flushed_gap_ms.take() {
                 self.observe_gap(GapClass::InterWord, flushed_ms);
+                self.bank.on_gap(&self.tracker, flushed_ms);
             }
             if live {
                 self.tracker.on_mark(dur_ms);
@@ -1267,9 +1270,11 @@ impl TrackDecoder {
         } else {
             if self.word_flushed {
                 // This gap was already handled by the 7-dit flush. Its
-                // closed length is the sender's word gap (MAN-315 D2).
+                // closed length is the sender's word gap (MAN-315 D2), and
+                // the bank scores it at that length (MAN-544).
                 if let Some(flushed_ms) = self.flushed_gap_ms.take() {
                     self.observe_gap(GapClass::InterWord, flushed_ms + dur_ms);
+                    self.bank.on_gap(&self.tracker, flushed_ms + dur_ms);
                 }
                 if let Some(flushed_ms) = self.single_flush_ms.take() {
                     self.observe_single_flush(flushed_ms + dur_ms);
@@ -1845,6 +1850,26 @@ mod tests {
                 assert!(log.iter().all(|r| !r.applied), "{log:?}");
             }
         }
+    }
+
+    /// MAN-544 (Codex review, PR #544): the bank scores every closed gap
+    /// once, the word gaps `check_flush` resolves included. Ten
+    /// `CQ TEST W1AW` at 18 hops per dit have 270 marks, so 269 gaps between
+    /// them and a trailing space; a bank fed only classified gaps scored 250
+    /// of those 270, the rest being word gaps the flush resolved.
+    #[test]
+    fn bank_scores_flushed_word_gaps_once() {
+        let observe = crate::timing::SpeedBankConfig {
+            width: 3,
+            switching: false,
+        };
+        let cq10 = ["CQ TEST W1AW"; 10].join(" ");
+        let (_, dec) = decode_with_bank(&rect_envelope(&cq10, 18), 0, observe);
+        let bank = dec.speed_bank();
+        assert_eq!(bank.marks_seen(), 270, "27 marks per CQ TEST W1AW");
+        // 269 gaps between marks, and the trailing 8-dit space the flush
+        // resolved before `finish`.
+        assert_eq!(bank.gaps_seen(), 270);
     }
 
     #[test]

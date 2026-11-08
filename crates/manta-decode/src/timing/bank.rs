@@ -149,6 +149,7 @@ pub struct TimingBank {
     /// The latest scored gap, consumed by the next mark's streak step.
     last_gap: Option<f32>,
     marks_seen: u64,
+    gaps_seen: u64,
     /// Index of a challenger that qualified on the latest mark.
     pending: Option<usize>,
     log: VecDeque<SwitchRecord>,
@@ -253,6 +254,7 @@ impl TimingBank {
             streak_side: None,
             last_gap: None,
             marks_seen: 0,
+            gaps_seen: 0,
             pending: None,
             log: VecDeque::new(),
         }
@@ -271,6 +273,11 @@ impl TimingBank {
     /// clock).
     pub fn marks_seen(&self) -> u64 {
         self.marks_seen
+    }
+
+    /// Gaps scored since the bank was built, pauses excluded.
+    pub fn gaps_seen(&self) -> u64 {
+        self.gaps_seen
     }
 
     /// The challengers alive, in spawn order.
@@ -332,9 +339,10 @@ impl TimingBank {
         }
     }
 
-    /// Score one gap that reached classification, against every hypothesis.
-    /// A pause (at least `PAUSE_DITS` units of the slowest hypothesis) is
-    /// scored by none.
+    /// Score one closed gap against every hypothesis: a gap that reached
+    /// classification, or a word gap the decoder's flush resolved, at its
+    /// closed length. A pause (at least `PAUSE_DITS` units of the slowest
+    /// hypothesis) is scored by none.
     pub fn on_gap(&mut self, primary: &SpeedTracker, dur_ms: f32) {
         if self.off() || !primary.ready() || !dur_ms.is_finite() || dur_ms <= 0.0 {
             return;
@@ -348,6 +356,7 @@ impl TimingBank {
             self.last_gap = None;
             return;
         }
+        self.gaps_seen += 1;
         let x = dur_ms.ln();
         let l = gap_ll(x, primary.dit_estimate_ms());
         self.primary_score = DECAY * self.primary_score + l;

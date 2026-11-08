@@ -46,7 +46,9 @@ What the bank does when enabled:
   3:1 alternative when it duplicates the primary). A candidate within
   `DUP_LOG_RATIO` of a live hypothesis on both centroids is not spawned.
 - **Scoring.** Every hypothesis scores every mark against its two
-  centroids and every classified gap against 1, 3 and 7 of its own units, a
+  centroids and every closed gap against 1, 3 and 7 of its own units (a
+  classified gap, or a word gap the flush resolved, at its closed length:
+  Codex review on PR #544), a
   max-component log-normal fit with equal class weights and a per-observation
   floor, decayed by `DECAY` per observation. A gap of `PAUSE_DITS` units of
   the slowest hypothesis is scored by none.
@@ -108,9 +110,12 @@ three-mark streak included the last pre-step dah and proposed a 72.75 ms dit
 for a 60 ms sender. The kept setting passes every bank unit test.
 
 Good would-switches (wrong primary, right target) appear on the fragment-lock
-texts the MAN-398 grid flagged (kept setting): `HH` 20, `SS` 31, `5NN` 22,
-`599 001` 24, `EE` 32, `IS` 53, `E 0000` 33 across their 84 steady streams
-each, so the spawning and scoring find the right hypothesis. Both remaining
+texts the MAN-398 grid flagged (kept setting): `HH` 21, `SS` 34, `5NN` 22,
+`599 001` 24, `EE` 35, `IS` 57, `E 0000` 33 across their 84 steady streams
+each, so the spawning and scoring find the right hypothesis. Scoring the
+word gaps the flush resolves (Codex review on PR #544) raised `HH`, `SS`,
+`EE` and `IS` from 20, 31, 32 and 53 and left the false proposals and the
+step timings above unchanged. Both remaining
 false proposals are `T0M` at 12 WPM under noise, from 100.6 ms to a 144 ms
 dit; the likely cause (not traced) is a noise-split 300 ms dah, whose halves
 score better under the slower challenger.
@@ -138,8 +143,9 @@ on a shared 32-core container, criterion median of 10 samples, 300 tracks ×
 `default` and `width1` are the same configuration, so their spread (up to
 22 % on `noisy`) is this machine's noise; the observe-only bank, which pays
 the full three-hypothesis scoring cost, sits inside it and under the
-ticket's 25 % bound on every scene. A quiet-machine run against a
-`--save-baseline main` is still owed.
+ticket's 25 % bound on every scene. These runs predate scoring the
+flushed word gaps, which adds one gap score per word to the observe-only
+bank. A quiet-machine run against a `--save-baseline main` is still owed.
 
 Not measured in this round: the D12 step sweep (`speed_step_sweep`),
 `manta bench sensitivity` with `engine-overlap.py`, and every
