@@ -1328,6 +1328,9 @@ beside the one validator (`SharedRefine`). The pass's clock is its owner's
 stream position, never a batch event's timestamp. Input gaps clear retention
 (only the gapped input's tracks on the multi-input path); closed tracks lose
 their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
+The ceiling evicts the oldest ring front from an ordered index and keeps a
+running count, so recording costs O(log tracks), not a scan of every ring
+([MAN-525](docs/DECISIONS/2026-11-08-man525-refine-bookkeeping-cost.md)).
 
 `validator → refinement candidates → retained hops → scratch TrackDecoder →
 Validator::apply_refinement → spot sink` is a feedback path over preserved
