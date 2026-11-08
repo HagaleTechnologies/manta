@@ -119,11 +119,8 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
 - [Can a later repetition rescue an ambiguous decode?](../docs/DECISIONS/2026-11-05-man208-delayed-refinement.md) — Bounded replay (live single- and multi-input, offline decode) revises the same occurrence; the RF timestamp remains distinct from decision availability. Includes the fixture's measurement limits.
 - [How are required Unix CI tests sharded without dropping coverage?](../docs/DECISIONS/2026-11-05-man498-required-ci-runtime.md) MAN-498 keeps whole test binaries and explicit doctests behind independent OS aggregates.
-<<<<<<< HEAD
 - [How do the Unix test shards run without compiling?](../docs/DECISIONS/2026-11-08-man518-build-test-executables-once-per-os.md) MAN-518 builds once per OS and ships each shard its slice.
-=======
 - [Why do a PR's Linux and macOS test check-runs land before Windows?](../docs/DECISIONS/2026-11-08-man516-relay-unix-check-runs-before-windows.md) MAN-516: two relays; a PR can merge before its non-required Windows result.
->>>>>>> acaa9f74ffd9ef0a672eb12fae79326ec4ac217d
 
 - CW sub-segments and automatic daily/dated UTC coverage: [config reference](../docs/CONFIG.md#cw-sub-segments-and-utc-schedules) and [MAN-30 decision](../docs/DECISIONS/2026-11-04-man30-cw-segments.md).
 - [How is IQ correction calibrated and withheld?](../docs/DECISIONS/2026-11-05-man494-calibrated-iq-conditioning.md) MAN-494 fixes coefficients per stream and requires receiver-centre agreement.
