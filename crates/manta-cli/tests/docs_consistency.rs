@@ -252,6 +252,11 @@ fn readme_installation_offers_every_release_archive() {
         uploads.contains(&"manta-linux-x86_64-soapy"),
         "release-publish.yml no longer uploads `manta-linux-x86_64-soapy` by name"
     );
+    // MAN-539: `build-soapy-arm64`'s literal upload name.
+    assert!(
+        uploads.contains(&"manta-linux-arm64-soapy"),
+        "release-publish.yml no longer uploads `manta-linux-arm64-soapy` by name"
+    );
     artifacts.extend(uploads);
     for artifact in artifacts {
         let ext = if artifact.contains("windows") {
@@ -324,6 +329,79 @@ fn readme_installation_documents_the_soapy_archive() {
         notes.contains("bundles neither the vendor api nor driver modules"),
         "README must say the Soapy archive bundles no SDRplay API or device modules"
     );
+}
+
+/// MAN-539: a Raspberry Pi operator can pick the arm64 SoapySDR archive from
+/// Installation and install what it needs on Pi OS bookworm, without a Rust
+/// toolchain. The arm64 section points at the x86_64 section's module table
+/// and error messages instead of repeating them.
+#[test]
+fn readme_installation_documents_the_arm64_soapy_archive() {
+    let readme = doc("README.md");
+    let install = squash_whitespace(section(&readme, "Installation"));
+    for needle in [
+        "| Linux arm64 with SoapySDR, 64-bit Raspberry Pi OS bookworm | `manta-linux-arm64-soapy.tar.gz` |",
+        "### SoapySDR on Raspberry Pi OS (arm64)",
+        "releases/latest/download/manta-linux-arm64-soapy.tar.gz",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation never says `{needle}`"
+        );
+    }
+    let arm64 = squash_whitespace(subsection(&readme, "SoapySDR on Raspberry Pi OS (arm64)"));
+    for needle in [
+        "libsoapysdr0.8",
+        "soapysdr0.8-module-rtlsdr",
+        "bookworm",
+        "features: soapy",
+        "(#soapysdr-on-linux-x86_64)",
+        "`manta-linux-arm64.tar.gz`",
+    ] {
+        assert!(
+            arm64.contains(needle),
+            "README's arm64 SoapySDR section never says `{needle}`"
+        );
+    }
+}
+
+/// MAN-539: the maintainer and operator docs that name the x86_64 SoapySDR
+/// archive also name the arm64 one, and the MAN-82 record points at the
+/// MAN-539 record that extends it.
+#[test]
+fn soapy_archive_docs_name_both_architectures() {
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
+    for needle in [
+        "manta-linux-arm64-soapy.tar.gz",
+        "build-soapy-arm64",
+        "debian:bookworm",
+    ] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/release.md never says `{needle}`"
+        );
+    }
+    assert!(
+        doc("docs/GUIDES/rbn-node.md").contains("manta-linux-arm64-soapy.tar.gz"),
+        "docs/GUIDES/rbn-node.md never names manta-linux-arm64-soapy.tar.gz"
+    );
+    let man82 = "docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md";
+    let record = doc(man82);
+    let targets: Vec<&str> = record
+        .split("](")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next())
+        .map(|t| t.split('#').next().unwrap_or(t))
+        .filter(|t| t.contains("man539"))
+        .collect();
+    assert!(!targets.is_empty(), "{man82} never links a man539 record");
+    for target in targets {
+        let path = repo_root().join("docs/DECISIONS").join(target);
+        assert!(
+            path.is_file(),
+            "{man82} links {target}, which does not exist"
+        );
+    }
 }
 
 /// MAN-82: `soapysdr0.8-module-airspy` drives the Airspy R2/Mini only. The
@@ -2650,6 +2728,33 @@ fn docker_docs_describe_the_bare_run_and_the_health_check() {
     );
 }
 
+/// MAN-539: the image carries SoapySDR, and the Docker docs say how to give
+/// it a USB receiver: the device passthrough, the `plugdev` group, and the
+/// host udev rule that grants that group access.
+#[test]
+fn docker_docs_explain_usb_receivers() {
+    let guide = doc("packaging/README.md");
+    let docker = squash_whitespace(section(&guide, "Docker Compose"));
+    for needle in [
+        "--device /dev/bus/usb",
+        "--group-add plugdev",
+        "plugdev",
+        "librtlsdr0",
+        "udev",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let readme = doc("README.md");
+    let readme_docker = squash_whitespace(subsection(&readme, "Docker")).to_lowercase();
+    assert!(
+        readme_docker.contains("soapysdr"),
+        "README's Docker section never says the image includes SoapySDR"
+    );
+}
+
 /// MAN-81: no command line in packaging/README.md's ```sh blocks ends in a
 /// `\` continuation. scripts/tests/test_packaging.py's `sh_blocks` runs
 /// `shlex.split` on each of those lines on its own, which fails on an
@@ -4032,4 +4137,94 @@ fn docs_consistency_lists_refine_options() {
     }
     assert!(doc("ARCHITECTURE.md").contains("TrackManager::refine_step"));
     assert!(doc("README.md").contains("[decode.refine]"));
+}
+
+/// MAN-547: CLAUDE.md (which AGENTS.md symlinks to) is a standing brief of at
+/// most 100 lines; a ticket's outcome goes in its decision record (MAN-238).
+#[test]
+fn claude_md_stays_a_short_standing_brief() {
+    let lines = doc("CLAUDE.md").lines().count();
+    assert!(
+        lines <= 100,
+        "CLAUDE.md is {lines} lines; the standing brief stays at 100 or fewer \
+         (MAN-238, MAN-547): move ticket outcomes to their decision record"
+    );
+}
+
+/// The fenced block under CLAUDE.md's `## Build and test`, with `\`
+/// continuations joined and `#` comments dropped.
+fn claude_md_pre_push_commands() -> Vec<String> {
+    let claude = doc("CLAUDE.md");
+    let build = section(&claude, "Build and test");
+    let fence = build
+        .split_once("```sh\n")
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(body, _)| body)
+        .expect("CLAUDE.md's Build and test has a ```sh block");
+    fence
+        .replace("\\\n", "")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// MAN-547: every command CLAUDE.md tells a contributor to run before pushing
+/// is one a `ci-full.yml` job runs. A `test-hpsdr` leg outlived the job
+/// MAN-239 deleted, because `--features hpsdr` is an empty compatibility
+/// feature and the command still passed.
+#[test]
+fn claude_md_pre_push_commands_are_ci_full_commands() {
+    let ci = doc(".github/workflows/ci-full.yml");
+    let strip = |c: &str| c.trim().trim_start_matches("bash ").to_owned();
+    let ci_runs: std::collections::BTreeSet<String> = ci
+        .lines()
+        .filter_map(|l| {
+            l.trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("run: ")
+        })
+        .map(strip)
+        .collect();
+    let env = regex::Regex::new(r#"^[A-Z_]+="[^"]*" "#).unwrap();
+    for line in claude_md_pre_push_commands() {
+        if line.starts_with("python3 -m unittest -v scripts.tests.test_{") {
+            continue; // the brace list: see claude_md_lists_every_ci_script_suite
+        }
+        for cmd in line.split(" && ") {
+            let cmd = strip(&env.replace(cmd, ""));
+            assert!(
+                ci_runs.contains(&cmd),
+                "CLAUDE.md's Build and test runs `{cmd}`, which no ci-full.yml job runs"
+            );
+        }
+    }
+}
+
+/// MAN-547: CLAUDE.md's unittest brace list names exactly the
+/// `scripts/tests` suites that `ci-full.yml` runs, no more and no fewer. Any
+/// `scripts.tests.test_<name>` in the workflow counts, whatever flags or
+/// sibling modules share its `unittest` line.
+#[test]
+fn claude_md_lists_every_ci_script_suite() {
+    let suite = regex::Regex::new(r"\bscripts\.tests\.test_(\w+)").unwrap();
+    let ci: std::collections::BTreeSet<String> = suite
+        .captures_iter(&doc(".github/workflows/ci-full.yml"))
+        .map(|c| c[1].to_owned())
+        .collect();
+    let brace =
+        regex::Regex::new(r"python3 -m unittest -v scripts\.tests\.test_\{([^}]*)\}").unwrap();
+    let claude = doc("CLAUDE.md");
+    let listed: std::collections::BTreeSet<String> = brace
+        .captures(&claude)
+        .expect("CLAUDE.md names a `scripts.tests.test_{...}` brace list")[1]
+        .split([',', '\\', '\n', ' '])
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        listed, ci,
+        "CLAUDE.md's unittest brace list vs ci-full.yml's suites"
+    );
 }

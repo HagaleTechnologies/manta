@@ -1,5 +1,7 @@
 # MAN-498: shard required Unix workspace tests by executable
 
+> **Superseded in part (MAN-518, 2026-11-08).** Shards no longer compile; one build job per OS does, and each shard runs a prebuilt slice. See [MAN-518](2026-11-08-man518-build-test-executables-once-per-os.md).
+
 Required Ubuntu and macOS CI now use eight whole-binary shards and a concurrent
 support job per OS. The OS aggregate retains `test (ubuntu-latest)` or
 `test (macos-latest)` and requires both dependencies to succeed. Windows keeps
@@ -8,6 +10,11 @@ for both Unix aggregates and Windows, then relays each exact job's conclusion.
 A failed, cancelled, skipped or missing dependency cannot pass the aggregate.
 Native jobs retain the trusted-author routing, reviewed checkout, inline merge
 with main, suppressed checkout credentials and main-push-only cache writes.
+
+**Superseded in part by MAN-516 (2026-11-08):** "The dispatch relay waits for
+both Unix aggregates and Windows" no longer holds. The relay is two jobs, so
+the Unix check-runs land when their aggregates finish; see
+[its record](2026-11-08-man516-relay-unix-check-runs-before-windows.md).
 
 This implements scheduling, not a measured 20-minute hosted outcome. The merge
 queue timeout remains 90 minutes until the rollout below passes. No decoder

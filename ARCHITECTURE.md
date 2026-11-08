@@ -87,8 +87,8 @@ manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp, copp
         │            │        ├──▶ manta-decode
         │            │        └──▶ manta-spot ──────▶ manta-decode
         ├──────────────────▶ manta-server ──▶ manta-spot
-        └──────────────────▶ manta-decode, manta-input, manta-spot,
-                             manta-testkit, coppa-audio
+        └──────────────────▶ manta-decode, manta-dsp, manta-input,
+                             manta-spot, manta-testkit, coppa-audio
 manta-testkit ──▶ manta-dsp, manta-decode, manta-input, coppa-channel
 manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
@@ -99,7 +99,7 @@ and `manta-testkit → coppa-channel` (Watterson fading, see the M1
 pinned-decisions doc).
 
 The graph shows `[dependencies]` only; dev-only edges (for example
-`manta-cli → manta-dsp` and `manta-engine → manta-testkit`) are test
+`manta-cli → coppa-channel` and `manta-engine → manta-testkit`) are test
 fixtures and left out.
 
 ### Reused from coppa vs. new

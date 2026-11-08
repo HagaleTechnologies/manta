@@ -357,6 +357,15 @@ SOAPY_ENTRY = {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04",
                "artifact": "manta-linux-x86_64-soapy"}
 SOAPY_MAN_DIR = "man-pages-soapy"
 SOAPY_BINARY = "target/x86_64-unknown-linux-gnu/release/manta"
+# MAN-539: build-soapy-arm64's one archive, for 64-bit Raspberry Pi OS, built inside Debian bookworm.
+SOAPY_ARM64_JOB = "build-soapy-arm64"
+SOAPY_ARM64_ENTRY = {"target": "aarch64-unknown-linux-gnu", "os": "ubuntu-24.04-arm",
+                     "artifact": "manta-linux-arm64-soapy"}
+SOAPY_ARM64_BINARY = "target/aarch64-unknown-linux-gnu/release/manta"
+SOAPY_ARM64_IMAGE = "rust:1-slim-bookworm"
+# (job, entry, binary) of every job that packages one Soapy archive under literal names.
+SOAPY_PRODUCERS = ((SOAPY_JOB, SOAPY_ENTRY, SOAPY_BINARY),
+                   (SOAPY_ARM64_JOB, SOAPY_ARM64_ENTRY, SOAPY_ARM64_BINARY))
 DEFAULT_ARTIFACTS = {"manta-macos-x86_64", "manta-macos-arm64", "manta-windows-x86_64",
                      "manta-linux-x86_64", "manta-linux-arm64"}
 
@@ -366,8 +375,9 @@ class WorkflowPackageStepTests(ArchiveAssertions):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
                 found = package_steps(name)
-                self.assertEqual(sorted(job for job, _ in found), ["build", SOAPY_JOB],
-                                 f"{name}: expected one Package step in build and one in {SOAPY_JOB}")
+                self.assertEqual(sorted(job for job, _ in found), ["build", SOAPY_JOB, SOAPY_ARM64_JOB],
+                                 f"{name}: expected one Package step in build, {SOAPY_JOB} and "
+                                 f"{SOAPY_ARM64_JOB}")
                 step = producer_package_step(name, "build")
                 self.assertEqual(wf.field(step, "shell"), "bash")
                 self.assertIsNone(wf.field(step, "if"), "the Package step must run on every OS")
@@ -376,15 +386,20 @@ class WorkflowPackageStepTests(ArchiveAssertions):
                             "--man-dir man-pages", "--out-dir "):
                     self.assertIn(arg, body)
                 self.assertIn("matrix.target", body)
-                step = producer_package_step(name, SOAPY_JOB)
-                self.assertEqual(wf.field(step, "shell"), "bash")
-                self.assertIsNone(wf.field(step, "if"))
-                body = executable(wf.run_body(step))
-                for arg in (f'--binary "{SOAPY_BINARY.replace("/manta", "/${BIN_NAME}")}"',
-                            f"--artifact {SOAPY_ENTRY['artifact']}", "--format tar.gz",
-                            f"--man-dir {SOAPY_MAN_DIR}", "--out-dir ."):
-                    self.assertIn(arg, body)
-                self.assertNotIn("matrix.", body)
+                for job, entry, binary in SOAPY_PRODUCERS:
+                    with self.subTest(job=job):
+                        self.assert_soapy_package_step(producer_package_step(name, job), entry, binary)
+
+    def assert_soapy_package_step(self, step, entry, binary):
+        """A Soapy job's Package step: literal names, its own man pages, no matrix."""
+        self.assertEqual(wf.field(step, "shell"), "bash")
+        self.assertIsNone(wf.field(step, "if"))
+        body = executable(wf.run_body(step))
+        for arg in (f'--binary "{binary.replace("/manta", "/${BIN_NAME}")}"',
+                    f"--artifact {entry['artifact']}", "--format tar.gz",
+                    f"--man-dir {SOAPY_MAN_DIR}", "--out-dir ."):
+            self.assertIn(arg, body)
+        self.assertNotIn("matrix.", body)
 
     def test_old_inline_packaging_is_gone(self):
         for name in RELEASE_WORKFLOWS:
@@ -412,23 +427,33 @@ class WorkflowPackageStepTests(ArchiveAssertions):
     def test_soapy_package_step_precedes_its_upload(self):
         for name in RELEASE_WORKFLOWS:
             with self.subTest(workflow=name):
-                steps = wf.steps(wf.job_block(wf.read(name), SOAPY_JOB))
-                pkg = [i for i, s in enumerate(steps)
-                       if "scripts/package-release.py" in executable(wf.run_body(s))]
-                upload = [i for i, s in enumerate(steps)
-                          if (wf.field(s, "uses") or "").startswith("actions/upload-artifact@")]
-                self.assertEqual(len(pkg), 1)
-                self.assertEqual(len(upload), 1)
-                self.assertLess(pkg[0], upload[0])
-                with_block = wf.sub(steps[upload[0]], "with")
-                self.assertEqual(wf.field(with_block, "name"), SOAPY_ENTRY["artifact"])
-                self.assertEqual(wf.field(with_block, "path"), SOAPY_ENTRY["artifact"] + ".tar.gz")
-                self.assertEqual(wf.field(with_block, "if-no-files-found"), "error")
-                build_upload = [s for s in wf.steps(wf.job_block(wf.read(name), "build"))
-                                if (wf.field(s, "uses") or "").startswith("actions/upload-artifact@")]
-                self.assertEqual(wf.field(with_block, "retention-days"),
-                                 wf.field(wf.sub(build_upload[0], "with"), "retention-days"))
-                self.assertEqual(wf.field(steps[upload[0]], "uses"), wf.field(build_upload[0], "uses"))
+                self.assert_package_precedes_upload(name, SOAPY_JOB, SOAPY_ENTRY)
+
+    def test_soapy_arm64_package_step_precedes_its_upload(self):
+        # MAN-539: the arm64 Soapy archive's upload mirrors build-soapy's.
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                self.assert_package_precedes_upload(name, SOAPY_ARM64_JOB, SOAPY_ARM64_ENTRY)
+
+    def assert_package_precedes_upload(self, name, job, entry):
+        """The job's one Package step precedes its one upload, which keeps build's settings."""
+        steps = wf.steps(wf.job_block(wf.read(name), job))
+        pkg = [i for i, s in enumerate(steps)
+               if "scripts/package-release.py" in executable(wf.run_body(s))]
+        upload = [i for i, s in enumerate(steps)
+                  if (wf.field(s, "uses") or "").startswith("actions/upload-artifact@")]
+        self.assertEqual(len(pkg), 1)
+        self.assertEqual(len(upload), 1)
+        self.assertLess(pkg[0], upload[0])
+        with_block = wf.sub(steps[upload[0]], "with")
+        self.assertEqual(wf.field(with_block, "name"), entry["artifact"])
+        self.assertEqual(wf.field(with_block, "path"), entry["artifact"] + ".tar.gz")
+        self.assertEqual(wf.field(with_block, "if-no-files-found"), "error")
+        build_upload = [s for s in wf.steps(wf.job_block(wf.read(name), "build"))
+                        if (wf.field(s, "uses") or "").startswith("actions/upload-artifact@")]
+        self.assertEqual(wf.field(with_block, "retention-days"),
+                         wf.field(wf.sub(build_upload[0], "with"), "retention-days"))
+        self.assertEqual(wf.field(steps[upload[0]], "uses"), wf.field(build_upload[0], "uses"))
 
     @unittest.skipIf(shutil.which("bash") is None, "bash is not installed")
     def test_package_step_builds_every_matrix_archive(self):
@@ -446,13 +471,16 @@ class WorkflowPackageStepTests(ArchiveAssertions):
             for entry in entries:
                 with self.subTest(workflow=name, target=entry["target"]):
                     built.add(self._run_step(bash, body, bin_name, entry))
-            # MAN-82: build-soapy's own step, against only its own man pages.
-            with self.subTest(workflow=name, job=SOAPY_JOB):
-                built.add(self._run_step(bash, wf.run_body(producer_package_step(name, SOAPY_JOB)),
-                                         bin_name, SOAPY_ENTRY, man_dir=SOAPY_MAN_DIR))
+            # MAN-82, MAN-539: each Soapy job's own step, against only its own man pages.
+            for job, entry, _ in SOAPY_PRODUCERS:
+                with self.subTest(workflow=name, job=job):
+                    built.add(self._run_step(bash, wf.run_body(producer_package_step(name, job)),
+                                             bin_name, entry, man_dir=SOAPY_MAN_DIR))
+            soapy = {entry["artifact"] for _, entry, _ in SOAPY_PRODUCERS}
             self.assertEqual(built, {a + (".zip" if "windows" in a else ".tar.gz")
-                                     for a in DEFAULT_ARTIFACTS | {SOAPY_ENTRY["artifact"]}},
-                             f"{name}: six archives across the build matrix and {SOAPY_JOB}")
+                                     for a in DEFAULT_ARTIFACTS | soapy},
+                             f"{name}: seven archives across the build matrix, {SOAPY_JOB} and "
+                             f"{SOAPY_ARM64_JOB}")
 
     def _run_step(self, bash, body, bin_name, entry, man_dir="man-pages"):
         runner_os = RUNNER_OS[entry["os"].split("-")[0]]
@@ -672,6 +700,93 @@ class BuildSoapyJobTests(unittest.TestCase):
                 for step in wf.steps(wf.job_block(text, "build")):
                     if wf.field(step, "name") in ("Build (native)", "Build (cross)"):
                         self.assertNotIn("--features", executable(wf.run_body(step)))
+
+
+class BuildSoapyArm64JobTests(unittest.TestCase):
+    """MAN-539: the arm64 Soapy archive for 64-bit Raspberry Pi OS, built and tested inside Debian
+    bookworm on a native arm64 runner, beside -- not inside -- build and build-soapy."""
+
+    def job(self, name):
+        block = wf.job_block(wf.read(name), SOAPY_ARM64_JOB)
+        self.assertTrue(block, f"{name} has no {SOAPY_ARM64_JOB} job")
+        return block
+
+    def bodies(self, name):
+        return [executable(wf.run_body(s)).strip() for s in wf.steps(self.job(name))]
+
+    def build_body(self, name):
+        builds = [b for b in self.bodies(name) if "cargo build" in b]
+        self.assertEqual(len(builds), 1, "expected exactly one step that runs cargo build")
+        return builds[0]
+
+    def test_job_needs_validate_tag_on_a_native_arm64_runner(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                job = self.job(name)
+                self.assertEqual(wf.field(job, "needs"), "validate-tag")
+                self.assertEqual(wf.field(job, "runs-on"), SOAPY_ARM64_ENTRY["os"])
+                for key in ("if", "environment", "permissions", "continue-on-error", "strategy"):
+                    self.assertIsNone(wf.field(job, key), f"{SOAPY_ARM64_JOB} must not set {key}:")
+
+    def test_job_builds_and_tests_inside_debian_bookworm(self):
+        target = SOAPY_ARM64_ENTRY["target"]
+        ordered = ("apt-get install",
+                   f"cargo build --release --locked -p manta-cli --features soapy --target {target}",
+                   "cargo test --release --locked -p manta-input --features soapy --lib soapy::tests",
+                   f"{SOAPY_ARM64_BINARY} man-pages --out {SOAPY_MAN_DIR}")
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                body = self.build_body(name)
+                self.assertRegex(body, r"(?m)^docker run ")
+                self.assertRegex(body, rf"(?m)^\s*{re.escape(SOAPY_ARM64_IMAGE)} bash ")
+                at = [body.find(needle) for needle in ordered]
+                for needle, pos in zip(ordered, at):
+                    self.assertNotEqual(pos, -1, f"the build container does not run {needle!r}")
+                self.assertEqual(at, sorted(at), "install, build, test, then man pages")
+                install = next(line for line in body.splitlines() if "apt-get install" in line)
+                self.assertIn("--no-install-recommends", install)
+                for package in ("pkg-config", "libasound2-dev", "libsoapysdr-dev", "git"):
+                    self.assertRegex(install, rf"(?<![\w-]){re.escape(package)}(?![\w-])")
+                self.assertNotIn("soapysdr0.8-module", body, "device modules are runtime choices")
+                self.assertIn('-e MANTA_GIT_SHA="$GITHUB_SHA"', body)
+                self.assertIn('"$PWD:/src"', body)
+                self.assertIn("-w /src", body)
+
+    def test_job_renders_its_own_man_pages_before_packaging(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                bodies = self.bodies(name)
+                man = [i for i, b in enumerate(bodies)
+                       if f"{SOAPY_ARM64_BINARY} man-pages --out {SOAPY_MAN_DIR}" in b]
+                pkg = [i for i, b in enumerate(bodies) if "scripts/package-release.py" in b]
+                self.assertEqual((len(man), len(pkg)), (1, 1))
+                self.assertLess(man[0], pkg[0])
+                steps = wf.steps(self.job(name))
+                downloads = [s for s in steps
+                             if (wf.field(s, "uses") or "").startswith("actions/download-artifact@")]
+                self.assertEqual(downloads, [], f"{SOAPY_ARM64_JOB} must not consume the default man pages")
+                for step in steps:
+                    self.assertNotIn("rust-cache", wf.field(step, "uses") or "", "MAN-243: no build cache")
+
+    def test_job_reuses_build_s_pinned_actions(self):
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                pinned = {(wf.field(s, "uses") or "").split("@")[0]: wf.field(s, "uses")
+                          for s in wf.steps(wf.job_block(wf.read(name), "build")) if wf.field(s, "uses")}
+                uses = [wf.field(s, "uses") for s in wf.steps(self.job(name)) if wf.field(s, "uses")]
+                self.assertTrue(uses)
+                for action in uses:
+                    self.assertEqual(action, pinned.get(action.split("@")[0]), f"{action} differs from build's")
+
+    def test_job_uses_neither_cross_nor_the_runner_toolchain(self):
+        # Cross.toml's 0.2.5 aarch64 image is Ubuntu 16.04 with no SoapySDR package, and the
+        # runner's Ubuntu 24.04 glibc is newer than Pi OS bookworm's.
+        for name in RELEASE_WORKFLOWS:
+            with self.subTest(workflow=name):
+                for body in self.bodies(name):
+                    self.assertNotIn("cross ", body)
+                for step in wf.steps(self.job(name)):
+                    self.assertNotIn("dtolnay/rust-toolchain", wf.field(step, "uses") or "")
 
 
 class CiFullTests(unittest.TestCase):

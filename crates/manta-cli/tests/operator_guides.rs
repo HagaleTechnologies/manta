@@ -1,14 +1,10 @@
 //! MAN-148: operator examples must load in the shipped CLI and match the service kit.
 
-#[path = "common/launch.rs"]
-mod launch;
-use launch::manta;
-
 use regex::Regex;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 
 const GUIDES: &[&str] = &[
     "docs/GUIDES/rbn-node.md",
@@ -84,6 +80,31 @@ fn toml_blocks(md: &str) -> Vec<String> {
     blocks
 }
 
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
+
+/// MAN-539: whether the binary under test was built with `--features soapy`,
+/// read from its `--version` line (`…; features: soapy)`).
+fn built_with_soapy() -> bool {
+    let out = manta()
+        .arg("--version")
+        .output()
+        .expect("run manta --version");
+    let version = String::from_utf8_lossy(&out.stdout);
+    let features = version
+        .rsplit_once("features: ")
+        .map(|(_, list)| list.trim().trim_end_matches(')'))
+        .unwrap_or_else(|| panic!("no feature list in {version:?}"));
+    features.split(',').any(|f| f.trim() == "soapy")
+}
+
 fn check_config(config: &toml::Table) -> Output {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("manta.toml");
@@ -149,6 +170,7 @@ fn node_guide_walks_the_ticket_steps_in_order() {
 
 #[test]
 fn guide_configs_load() {
+    let soapy_build = built_with_soapy();
     let mut checked = 0;
     for guide in GUIDES {
         let blocks: Vec<toml::Table> = toml_blocks(&doc(guide))
@@ -181,7 +203,24 @@ fn guide_configs_load() {
             let out = check_config(&config);
             let stdout = String::from_utf8_lossy(&out.stdout);
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(out.status.code(), Some(0), "{guide}: {stdout}\n{stderr}");
+            let soapy_input = config
+                .get("input")
+                .and_then(|input| input.get("type"))
+                .and_then(toml::Value::as_str)
+                == Some("soapy");
+            if soapy_input && !soapy_build {
+                // MAN-539: a USB-receiver example is checked against the build's
+                // own features; a default build must refuse it for that reason only.
+                assert_eq!(out.status.code(), Some(1), "{guide}: {stdout}\n{stderr}");
+                assert!(
+                    stderr.contains(
+                        "input.type = \"soapy\" needs a manta built with --features soapy"
+                    ),
+                    "{guide}: soapy example refused for another reason: {stderr}"
+                );
+            } else {
+                assert_eq!(out.status.code(), Some(0), "{guide}: {stdout}\n{stderr}");
+            }
             checked += 1;
         }
     }
@@ -435,4 +474,29 @@ fn raspberry_pi_guide_explains_hpsdr_discovery_and_mac_pinning() {
         assert!(guide.contains(needle), "missing {needle}");
     }
     assert!(!guide.contains("host = \"<your-hpsdr-host>\""));
+}
+
+/// MAN-539: a Pi operator installs from the arm64 release archives, and the
+/// USB-SDR route uses the SoapySDR archive, not a source build.
+#[test]
+fn raspberry_pi_guide_installs_from_the_release_archives() {
+    let guide = doc(GUIDES[2]);
+    for needle in [
+        "manta-linux-arm64.tar.gz",
+        "manta-linux-arm64-soapy.tar.gz",
+        "sha256sum -c --ignore-missing SHA256SUMS",
+        "libsoapysdr0.8",
+        "soapysdr0.8-module-rtlsdr",
+        "manta devices",
+        "--soapy-driver",
+        "type = \"soapy\"",
+    ] {
+        assert!(guide.contains(needle), "Pi guide omits {needle:?}");
+    }
+    for stale in [
+        "Today, build from source",
+        "A USB SDR needs a build with `soapy`",
+    ] {
+        assert!(!guide.contains(stale), "Pi guide still says {stale:?}");
+    }
 }
