@@ -115,3 +115,11 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   cross these windows need an explicit opt-out. See the
   [decision record](../../docs/DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
   and [config table](../../docs/CONFIG.md#digital-mode-windows).
+
+- MAN-524: ownership, spawn admission and merge read track centres through
+  a per-pass `CenterIndex` (`track/neighbours.rs`), never cached. A test
+  that moves `tm.tracks[..].center` must build `tm.center_index()` after
+  the move. A check written against it must keep the old predicate under an
+  exact negation (`short_of(d, r)`, which is `!(d >= r)`, not `d < r`),
+  or NaN centres decide differently. See the
+  [decision record](../../docs/DECISIONS/2026-11-08-man524-linear-track-neighbour-queries.md).
