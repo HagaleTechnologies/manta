@@ -26,8 +26,8 @@ had to be applied N times, and a new test copied whichever variant it found.
   `#[cfg(unix)]`, while its launcher and port helper run on every OS. Its
   `mod common;` is now unconditional: a second `#[path]` include of the leaf
   beside it fails clippy's `duplicate_mod` on Unix.
-- `manta()` always scrubs (MAN-261). `docs_consistency`, `man203_conditioning`
-  and `man234_bad_samples`, whose launchers did not, now do.
+- `manta()` always scrubs (MAN-261), including in `docs_consistency`,
+  `man203_conditioning` and `man234_bad_samples`, whose launchers did not.
 - `bench_sensitivity`, `calibrate`, `man203_conditioning`,
   `man234_bad_samples` and `output_style` keep a thin local `fn manta` that
   adds one step (args in and `Output` out, stdin null, `RUST_LOG` removed)
@@ -54,19 +54,17 @@ had to be applied N times, and a new test copied whichever variant it found.
 ## Behaviour notes
 
 In a clean environment no test changes behaviour. With a `MANTA_*` variable
-set in the runner's environment, the tests in `docs_consistency`,
-`man203_conditioning` and `man234_bad_samples` that go through `manta()` no
+set in the runner's environment, the `docs_consistency`,
+`man203_conditioning` and `man234_bad_samples` tests that use `manta()` no
 longer inherit it. The four inline scrubs that used `std::env::vars()` now
-use `vars_os()`, which removes a panic on a non-Unicode variable and nothing
-else.
+use `vars_os()`, which only removes a panic on a non-Unicode variable.
 
 ## Not done
 
-- The inline `Command::new(env!("CARGO_BIN_EXE_manta"))` spawns that never
-  scrubbed stay as they are: routing them through `manta()` would change
-  what they send the child, beyond this refactor.
-- `free_port` (singular), `free_udp_port` and `list_refresh.rs`'s
-  `refused_source` (MAN-508) are untouched.
-- No `manta-engine` test helper moves: no two bodies of `decode(`,
-  `scene(` or `spec(` under `crates/manta-engine/tests` are identical.
-- No production code, `Cargo.toml` or CI workflow changes.
+Spawns that never scrubbed keep their inline `Command::new(env!("CARGO_BIN_EXE_manta"))`:
+routing them through `manta()` would change what they send the child.
+`free_port` (singular), `free_udp_port` and `list_refresh.rs`'s
+`refused_source` (MAN-508) are untouched. No `manta-engine` test helper
+moves, because no two bodies of `decode(`, `scene(` or `spec(` under
+`crates/manta-engine/tests` are identical. No production code, `Cargo.toml`
+or CI workflow changes.
