@@ -152,15 +152,17 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      standard build leg, after the tag checks and before the matrix starts) → `build` (builds and packages all five
      targets — macOS x86_64/arm64, Windows x86_64, Linux x86_64/arm64 —
      and needs only `validate-tag`) and, beside it, `build-soapy` (the
-     sixth archive, `manta-linux-x86_64-soapy.tar.gz`, MAN-82, see "The
-     SoapySDR archive" below; also needing only `validate-tag`; it
-     renders its own man pages from the binary it packages) → two jobs
+     sixth archive, `manta-linux-x86_64-soapy.tar.gz`, MAN-82) and
+     `build-soapy-arm64` (the seventh, `manta-linux-arm64-soapy.tar.gz`,
+     MAN-539; see "The SoapySDR archives" below; both also need only
+     `validate-tag`, and each renders its own man pages from the binary it
+     packages) → two jobs
      side by side, both in the `ghcr-publish` environment:
      `docker-publish-release` (pushes the multi-arch image to GHCR as
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
-     after it; see below) and `release` (needs both `build` and
-     `build-soapy`, so a failed or skipped Soapy build publishes no
-     Release; writes `SHA256SUMS` over the six archives, attests their
+     after it; see below) and `release` (needs `build`, `build-soapy`
+     and `build-soapy-arm64`, so a failed or skipped Soapy build publishes
+     no Release; writes `SHA256SUMS` over the seven archives, attests their
      build provenance, then creates the
      GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
      "Verifying a downloaded release" below). The Release notes open with
@@ -168,7 +170,7 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      requests. `release` does not wait for the image; see "If the image
      publish fails" below.
 
-   The release workflow builds all five targets and the Soapy archive cold: no build cache is restored
+   The release workflow builds all five targets and both Soapy archives cold: no build cache is restored
    (MAN-243, `docs/DECISIONS/2026-10-10-man243-ci-trust-boundary.md`).
    Platform builds therefore take longer than a warm CI run. On 2026-10-05 a
    cold dispatch took 1m47s–6m11s per target, while the Docker job took
@@ -202,7 +204,7 @@ The GitHub Release does not wait for the Docker image (MAN-298). Once the
 owner approves `ghcr-publish`, `docker-publish-release` and `release` run
 side by side, so a failed image push leaves the Release in place. The run
 then shows `docker-publish-release` failed, `publish-latest` skipped and
-`release` succeeded: the Release has its six archives and `SHA256SUMS`,
+`release` succeeded: the Release has its seven archives and `SHA256SUMS`,
 and GHCR has no `:X.Y.Z` image.
 
 Do not delete or re-push the tag. The binaries are published and attested,
@@ -444,14 +446,21 @@ docker buildx imagetools inspect ghcr.io/hagaletechnologies/manta:X.Y.Z
 
 Both should report the same digest.
 
-## The SoapySDR archive
+## The SoapySDR archives
+
+Two release archives carry SoapySDR input: `manta-linux-x86_64-soapy.tar.gz`
+for Ubuntu 24.04 x86_64 (`build-soapy`, MAN-82) and
+`manta-linux-arm64-soapy.tar.gz` for 64-bit Raspberry Pi OS bookworm and later
+(`build-soapy-arm64`, MAN-539). Both run the same verifier.
+
+### x86_64: `build-soapy`
 
 `build-soapy` (MAN-82, in the release workflow) builds
 `manta-linux-x86_64-soapy.tar.gz` natively on `ubuntu-24.04` with
 `--features soapy`, against the distro's `libsoapysdr-dev`. Before
 uploading the archive it:
 
-1. runs the three real-library Soapy input tests (`cargo test --release
+1. runs the ten real-library Soapy input tests (`cargo test --release
    --locked -p manta-input --features soapy --lib soapy::tests`);
 2. renders the man pages from the binary it packages, then packages it
    with `scripts/package-release.py`;
@@ -473,7 +482,35 @@ uploading the archive it:
 A failure in any of these stops the upload, and `release` publishes
 nothing. Fix the cause and re-run the failed jobs; keep the tag.
 
-To run the verifier on a local build (Linux, with `libsoapysdr-dev`
+### arm64: `build-soapy-arm64`
+
+`build-soapy-arm64` (MAN-539) runs on the native arm64 runner
+`ubuntu-24.04-arm` and builds inside a `rust:1-slim-bookworm` container (the
+Dockerfile's builder base; the checkout's `rust-toolchain.toml` pins the
+compiler there too). Building in Debian bookworm, the base of Raspberry Pi OS
+bookworm, keeps the binary's glibc floor at what Pi OS ships: a build on the
+runner's own Ubuntu 24.04 can link glibc 2.39 symbols bookworm lacks. It is not
+built with `cross`, whose 0.2.5 aarch64 image is Ubuntu 16.04 with no SoapySDR
+package. Inside the container, after installing `pkg-config`, `libasound2-dev`,
+`libsoapysdr-dev` and `git`, it builds `--features soapy` for
+`aarch64-unknown-linux-gnu`, runs the same ten `soapy::tests` against
+bookworm's library and renders the man pages. On the runner it packages the
+archive. It then verifies it in a clean `debian:bookworm` container with the
+same two-stage check as step 4 above: the loader failure with only Python and
+`libasound2` installed, then every check after installing `libsoapysdr0.8` and
+the RTL-SDR, Airspy and HackRF modules. The container sees only the archive and
+the verifier, read-only. The runner itself is not the claimed platform, so no
+check runs there. A failure stops the upload, as above.
+
+If the `ubuntu-24.04-arm` runner label is unavailable to this repository, run
+the same job on `ubuntu-24.04` with `docker/setup-qemu-action` and
+`--platform linux/arm64` on both `docker run` lines. It is slower and gives the
+same result (`docs/DECISIONS/2026-11-08-man539-arm64-soapy-archive-and-image.md`,
+A1).
+
+### Checking a local build
+
+To run the verifier on a local x86_64 build (Linux, with `libsoapysdr-dev`
 installed):
 
 ```sh
@@ -482,6 +519,11 @@ target/release/manta man-pages --out man-pages-soapy
 python3 scripts/package-release.py --binary target/release/manta --artifact manta-linux-x86_64-soapy --format tar.gz --man-dir man-pages-soapy --out-dir .
 python3 scripts/check-soapy-release.py manta-linux-x86_64-soapy.tar.gz
 ```
+
+On an arm64 Debian bookworm or Raspberry Pi OS machine, run the same commands
+with `--target aarch64-unknown-linux-gnu` on the `cargo build` line, the binary
+at `target/aarch64-unknown-linux-gnu/release/manta`, and
+`--artifact manta-linux-arm64-soapy`; check `manta-linux-arm64-soapy.tar.gz`.
 
 After publishing, repeat the check on the downloaded archive once it
 passes `sha256sum -c` (see "Verifying a downloaded release"). An operator
@@ -519,11 +561,18 @@ receiver is still a separate, manual check.
   `libSoapySDR.so.0.8` dynamically. It needs `libsoapysdr0.8` and the
   receiver's SoapySDR module installed as well as `libasound2t64`; it
   bundles no SoapySDR library, device module or SDRplay API. See "The
-  SoapySDR archive" below.
+  SoapySDR archives" above.
+- **SoapySDR Linux arm64** (`manta-linux-arm64-soapy.tar.gz`, MAN-539):
+  the same files as the Linux arm64 archive, but the binary is built with
+  `--features soapy` in Debian bookworm, for 64-bit Raspberry Pi OS
+  bookworm and later. It needs `libasound2`, `libsoapysdr0.8` and the
+  receiver's SoapySDR module installed, and bundles none of them. See "The
+  SoapySDR archives" above.
 - **Man pages** (MAN-133, every archive): `man/man1/manta.1` and one page
   per command, rendered by the `validate-tag` job's man-page steps running
-  `manta man-pages` (the Soapy archive's by `build-soapy` from its own
-  binary, so they document the Soapy flags); `scripts/package-release.py --man-dir` refuses to
+  `manta man-pages` (the Soapy archives' by `build-soapy` and
+  `build-soapy-arm64` from their own binaries, so they document the Soapy
+  flags); `scripts/package-release.py --man-dir` refuses to
   build an archive without them.
 - **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line
   per archive above, bare file names, in `sha256sum` format. The same
@@ -535,7 +584,13 @@ receiver is still a separate, manual check.
   `linux/arm/v7` image is for 32-bit Raspberry Pi OS; its decode CPU budget
   is unmeasured (MAN-81). With no arguments the image runs the daemon from
   a config mounted at `/etc/manta/manta.toml`, and its `HEALTHCHECK` runs
-  `manta health` (see `packaging/README.md`).
+  `manta health` (see `packaging/README.md`). Since MAN-539 the image is
+  built with `--features soapy` and includes `libsoapysdr0.8` and the
+  RTL-SDR, Airspy and HackRF modules on every platform; each Docker job
+  builds the `linux/arm64` image alone and runs
+  `scripts/check-soapy-release.py --docker-image` on it before the
+  multi-platform push. A USB receiver needs `--device /dev/bus/usb` and
+  host group access (`packaging/README.md`).
 
 ## Verifying a downloaded release
 

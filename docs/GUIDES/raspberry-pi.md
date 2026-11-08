@@ -1,8 +1,10 @@
 # manta on a Raspberry Pi
 
-This quickstart builds manta on a Pi and installs the packaged systemd service
-for a network receiver. Use the [RBN node tutorial](rbn-node.md) alongside it for
-uplink dry-run and firewall setup.
+This quickstart installs a manta release binary on a Pi (or builds one) and the
+packaged systemd service for a network receiver. It also covers a USB SDR
+(RTL-SDR, Airspy, HackRF) through SoapySDR. Use the
+[RBN node tutorial](rbn-node.md) alongside it for uplink dry-run and firewall
+setup.
 
 ## Board and OS
 
@@ -26,24 +28,73 @@ uname -m
 It must print `aarch64`. Use the official power supply and a heatsink or fan so
 power or heat does not throttle the board during decoding.
 
-## 1. Install the build tools
+## 1. Install the tools
 
 ```sh
-sudo apt update && sudo apt install -y git build-essential pkg-config libasound2-dev telnet
-sudo apt install -y curl netcat-openbsd ufw
+sudo apt update && sudo apt install -y libasound2 telnet curl netcat-openbsd ufw
 ```
 
-ALSA headers are required even for a network-only receiver. Telnet is not
+The ALSA runtime, `libasound2` on Bookworm or `libasound2t64` on Debian
+13-based releases, is required even for a network-only receiver. Telnet is not
 installed by default; curl, netcat and UFW are used by the node tutorial.
+
+For a USB SDR, also install the SoapySDR runtime and your receiver's module:
+`soapysdr0.8-module-rtlsdr` for an RTL-SDR, `soapysdr0.8-module-airspy` for an
+Airspy R2 or Mini, or `soapysdr0.8-module-hackrf` for a HackRF:
+
+```sh
+sudo apt install -y --no-install-recommends libsoapysdr0.8 soapysdr0.8-module-rtlsdr
+```
+
+README's [SoapySDR on Linux x86_64](../../README.md#soapysdr-on-linux-x86_64)
+module table applies to the Pi too, including SDRplay's external prerequisites.
 
 ## 2. Get manta
 
-Today, build from source. Install rustup, which reads the checkout's
+Download a release archive. Two are built for 64-bit Raspberry Pi OS:
+
+- `manta-linux-arm64.tar.gz` for a network receiver (KiwiSDR, OpenHPSDR,
+  ka9q-radio) or a sound card;
+- `manta-linux-arm64-soapy.tar.gz` for a USB SDR through SoapySDR. It is
+  built and tested on Debian bookworm, the base of Raspberry Pi OS bookworm,
+  and needs the `libsoapysdr0.8` package from step 1.
+
+For a USB SDR:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64-soapy.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf manta-linux-arm64-soapy.tar.gz
+cd manta-linux-arm64-soapy
+sudo install -m 0755 manta /usr/local/bin/manta
+manta --version
+manta devices
+```
+
+For a network receiver, use `manta-linux-arm64.tar.gz` and the
+`manta-linux-arm64` directory in the same commands. `sha256sum` must print
+`OK` for the archive; [release verification](../RUNBOOKS/release.md#verifying-a-downloaded-release)
+also checks the build provenance. The version line includes `features: soapy`
+for the SoapySDR archive and `features: none` for the other; HPSDR is in both.
+`manta devices` lists each SoapySDR receiver it finds with the selector string
+for step 3, or `SoapySDR devices: none found.` when no receiver is attached.
+If the binary fails with `error while loading shared libraries:
+libSoapySDR.so.0.8`, install `libsoapysdr0.8` (step 1).
+
+Keep the extracted kit directory for the config and service files used below;
+all subsequent relative paths start there.
+
+### Build from source instead
+
+Build from source for a commit no release carries yet. Install the build tools,
+then rustup, which reads the checkout's
 [rust-toolchain.toml](../../rust-toolchain.toml). The Pi OS packaged `rustc` is
 older than manta's pinned 1.98.0 toolchain. The installer prompts for its options;
 use the default installation, then load Cargo's environment in this shell:
 
 ```sh
+sudo apt install -y git build-essential pkg-config libasound2-dev
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 git clone https://github.com/HagaleTechnologies/manta
@@ -53,16 +104,9 @@ sudo install -m 0755 target/release/manta /usr/local/bin/manta
 manta --version
 ```
 
-The version line includes `features: none`; HPSDR is included. Keep this source
-checkout for the config and service files used below; all subsequent relative
-paths start here.
-
-Once a release exists, its `manta-linux-arm64` archive replaces the build.
-Follow [release verification](../RUNBOOKS/release.md#verifying-a-downloaded-release),
-extract the archive, and install its `manta` binary at `/usr/local/bin/manta`.
-A Pi running a prebuilt binary needs only the ALSA runtime, `libasound2` on
-Bookworm or `libasound2t64` on Debian 13-based releases, plus the diagnostic tools
-above. Keep the extracted kit directory for the remaining steps.
+For a USB SDR, also install `libsoapysdr-dev` and build with
+`cargo build --release -p manta-cli --features soapy`. Keep this source
+checkout for the config and service files used below.
 
 ## 3. Configure your receiver
 
@@ -102,9 +146,40 @@ manta check --config manta.toml --duration 5
 ```
 
 The first command must print `valid`; the second must receive samples. Fix any
-error before continuing. This recipe supports network receivers only. A USB SDR
-needs a build with `soapy`, its driver, and a service user in the device groups;
-the packaged `DynamicUser` service grants no such access. For that setup use the
+error before continuing.
+
+For a USB SDR on the SoapySDR archive, this is a complete alternative minimal
+config. Run `manta devices` and copy your receiver's selector string into
+`driver`; `driver=rtlsdr` opens the first RTL-SDR. An RTL-SDR tunes HF only
+through an upconverter or direct sampling, so set `freq_hz` to what the receiver
+actually tunes:
+
+```toml
+[server]
+station_callsign = "N0CALL"
+
+[input]
+type = "soapy"
+driver = "driver=rtlsdr"
+freq_hz = 7030000.0
+rate_hz = 1024000.0
+```
+
+Check it, and test the receiver without a config file:
+
+```sh
+manta config check --config manta.toml
+manta doctor --config manta.toml
+manta doctor --soapy-driver driver=rtlsdr --soapy-freq-hz 7030000 --soapy-rate-hz 1024000 --duration 5
+```
+
+`manta doctor` must pass its receiver check. A `no match` error means the
+receiver's SoapySDR module is missing; `No RTL-SDR devices found!` means the
+module loaded but no receiver is attached or accessible.
+
+The SoapySDR archive opens a USB SDR, but the packaged `DynamicUser` service in
+step 5 cannot open USB devices: it needs a service user in the device groups.
+For a USB SDR as a service, use the
 [static-user field-node unit](../RUNBOOKS/secondary-skimmer-field-node.md#3-install).
 
 ## 4. Test it in the foreground
@@ -190,8 +265,11 @@ they are not a Pi benchmark result. Pi hardware has not been tested for this gui
 
 ## Upgrading
 
-Stop the service, build or download the new binary, then replace it. For a source
-build from your updated checkout:
+Stop the service, download or build the new binary, then replace it. For a
+release, download, verify and extract the new archive as in step 2, then run
+`sudo install -m 0755 manta /usr/local/bin/manta` from its directory in place of
+the `cargo build` and first `install` lines below. For a source build from your
+updated checkout:
 
 ```sh
 sudo systemctl stop manta
