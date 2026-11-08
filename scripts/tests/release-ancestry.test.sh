@@ -167,8 +167,8 @@ for job in docker-publish-release publish-latest release; do
     docker-publish-release) dependency='    needs: [validate-tag, build]' ;;
     publish-latest) dependency='    needs: [validate-tag, docker-publish-release]' ;;
     # MAN-298: the GitHub Release waits for the owner's approval, not for the image.
-    # MAN-82: and for both archive producers, so the Soapy archive is never left out.
-    release) dependency='    needs: [validate-tag, build, build-soapy]' ;;
+    # MAN-82, MAN-539: and for every archive producer, so no Soapy archive is left out.
+    release) dependency='    needs: [validate-tag, build, build-soapy, build-soapy-arm64]' ;;
   esac
   require "$block" "$dependency" "$job: dependency chain changed"
   require "$block" '    environment: ghcr-publish' "$job: missing production approval environment"

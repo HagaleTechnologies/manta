@@ -11,6 +11,11 @@ A failed, cancelled, skipped or missing dependency cannot pass the aggregate.
 Native jobs retain the trusted-author routing, reviewed checkout, inline merge
 with main, suppressed checkout credentials and main-push-only cache writes.
 
+**Superseded in part by MAN-516 (2026-11-08):** "The dispatch relay waits for
+both Unix aggregates and Windows" no longer holds. The relay is two jobs, so
+the Unix check-runs land when their aggregates finish; see
+[its record](2026-11-08-man516-relay-unix-check-runs-before-windows.md).
+
 This implements scheduling, not a measured 20-minute hosted outcome. The merge
 queue timeout remains 90 minutes until the rollout below passes. No decoder
 scene, test assertion, repetition count, ignore annotation or timeout changed.

@@ -24,6 +24,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-539: a SoapySDR release archive for 64-bit Raspberry Pi OS
+  (`manta-linux-arm64-soapy.tar.gz`, built and verified on Debian bookworm),
+  and SoapySDR with the RTL-SDR, Airspy and HackRF modules in the Docker
+  image on every platform. `manta devices` on a build without SoapySDR names
+  both archives.
 - MAN-493: the three remaining oracle-bypass experiments for
   `manta oracle --funnel`. `--funnel-bypass known-timing` seeds the bypass
   decoder at the truth speed, forcing the `usableTiming` stage (unavailable
@@ -398,6 +403,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-539: the Docker image is built with `--features soapy`, so its
+  `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
+  three device modules.
 - MAN-139: **breaking for scripts that parse `--json`.**
   `manta decode --json`, `manta run --json`/`listen --json` and
   `manta doctor --json` name fields as the JSON spot stream does:

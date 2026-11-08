@@ -12,6 +12,13 @@
 # dependency -- not behind any feature flag -- and its Linux backend links
 # against ALSA (`libasound2-dev`) at build time.
 #
+# The arm64 SoapySDR archive (manta-linux-arm64-soapy.tar.gz) is not built
+# here: cross-rs 0.2.5's aarch64 image is Ubuntu 16.04 and packages no
+# SoapySDR, so no `pre-build` line can add `libsoapysdr-dev:arm64`. The
+# release workflow's `build-soapy-arm64` job builds it natively in Debian
+# bookworm instead (MAN-539,
+# docs/DECISIONS/2026-11-08-man539-arm64-soapy-archive-and-image.md).
+#
 # x86_64-unknown-linux-gnu is built via `cross` too, not natively on the
 # runner -- deliberately, to build against cross-rs's older glibc
 # baseline rather than the current ubuntu-latest runner's, so the
