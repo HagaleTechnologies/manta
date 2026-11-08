@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Spacing, TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
 /// The modules MAN-548 split out of `main.rs`.
@@ -189,4 +189,71 @@ fn split_modules_keep_their_unit_tests_in_a_sibling_tests_rs() {
             sibling.display()
         );
     }
+}
+
+/// The `tracing` event macros. A span's target is not printed, so spans are
+/// not checked.
+const EVENT_MACROS: &[&str] = &["trace", "debug", "info", "warn", "error", "event"];
+
+/// Whether an event macro's arguments name a `target:`. tracing takes it among
+/// the leading `name:`/`target:`/`parent:` keys; a field is `target = ..`, and
+/// a struct literal's `target:` sits inside a nested group, not at top level.
+fn names_target(args: TokenStream) -> bool {
+    let args: Vec<TokenTree> = args.into_iter().collect();
+    args.windows(2).any(|w| {
+        matches!(
+            (&w[0], &w[1]),
+            (TokenTree::Ident(k), TokenTree::Punct(c))
+                if k == "target" && c.as_char() == ':' && c.spacing() == Spacing::Alone
+        )
+    })
+}
+
+/// The line of every event macro call that names no `target:`.
+fn untargeted_events(tokens: TokenStream, out: &mut Vec<usize>) {
+    let tokens: Vec<TokenTree> = tokens.into_iter().collect();
+    for (i, t) in tokens.iter().enumerate() {
+        match t {
+            TokenTree::Group(g) => untargeted_events(g.stream(), out),
+            TokenTree::Ident(id) if EVENT_MACROS.contains(&id.to_string().as_str()) => {
+                if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
+                    (tokens.get(i + 1), tokens.get(i + 2))
+                {
+                    if bang.as_char() != '!' {
+                        continue;
+                    }
+                    if !names_target(args.stream()) {
+                        out.push(id.span().start().line);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// An event's default target is its module path, and stderr prints it. Code
+/// that `main.rs` logged as `INFO manta:` would read `INFO manta::spot_server:`
+/// after the move, so every event in a split module's own file names its
+/// target. This reads `<module>.rs` only, not `<module>/tests.rs`.
+#[test]
+fn split_modules_name_the_target_of_every_tracing_event() {
+    let mut hits = Vec::new();
+    for name in SPLIT_MODULES {
+        let file = src().join(format!("{name}.rs"));
+        let text =
+            std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let tokens: TokenStream = text
+            .parse()
+            .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+        let mut lines = Vec::new();
+        untargeted_events(tokens, &mut lines);
+        hits.extend(lines.into_iter().map(|l| format!("{}:{l}", file.display())));
+    }
+    assert!(
+        hits.is_empty(),
+        "these tracing events take their module path as the target; \
+         add `target: \"manta\"` so stderr still reads `INFO manta:`:\n{}",
+        hits.join("\n")
+    );
 }

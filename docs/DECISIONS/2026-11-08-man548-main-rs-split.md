@@ -50,10 +50,16 @@ in main.rs". Eight modules hold the rest:
   `src/test_support.rs`.
 - **A guard keeps the layout.** `crates/manta-cli/tests/module_layout.rs`
   reads the source text with `syn`, so it also sees `cfg`-gated code that one
-  build does not compile. It has three tests:
+  build does not compile. It has four tests:
   `sibling_modules_reach_the_crate_root_only_for_what_main_rs_defines`,
-  `main_rs_keeps_its_unit_tests_in_src_tests_rs` and
-  `split_modules_keep_their_unit_tests_in_a_sibling_tests_rs`.
+  `main_rs_keeps_its_unit_tests_in_src_tests_rs`,
+  `split_modules_keep_their_unit_tests_in_a_sibling_tests_rs` and
+  `split_modules_name_the_target_of_every_tracing_event`. The last one reads
+  the source as `proc_macro2` tokens rather than a `syn` tree, so it also sees
+  events inside other macros' bodies. It exists because a `tracing` event's
+  default target is its module path. Moved out of
+  `main.rs`, the startup banner printed `INFO manta::spot_server:` instead of
+  `INFO manta:`. The six events that moved now name `target: "manta"`.
 - **Imports are explicit.** No module uses a glob import of `crate`. A sibling
   names a moved item by its module, for example
   `crate::cli_parse::parse_prior`. A name used only inside a `#[cfg(...)]`
