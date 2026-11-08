@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Check a built manta-linux-x86_64-soapy.tar.gz the way an operator would run it (MAN-82).
+"""Check a built SoapySDR release archive (manta-linux-x86_64-soapy.tar.gz or manta-linux-arm64-soapy.tar.gz) the way an operator would run it (MAN-82, MAN-539).
 
 Extracts ARCHIVE into a private temporary directory and runs only the extracted
-`manta`, never a build tree's binary:
+`manta`, never a build tree's binary. The archive's root directory is named
+after the file, so one check serves either architecture:
 
 - `--version` succeeds and lists the `soapy` feature;
 - `run`, `listen` and `check --help` succeed and offer every Soapy flag, and
@@ -17,6 +18,16 @@ With --expect-missing-soapy-library it instead checks that `--version` cannot
 start because libSoapySDR.so.0.8 is absent: the clean-runtime release step runs
 that before installing the library, so the missing-library failure operators
 see is the one README documents.
+
+With --docker-image IMAGE --platform PLATFORM (MAN-539) it checks a built
+Docker image instead of an archive, running each command as
+`docker run --rm --platform PLATFORM IMAGE <args>`. It makes the version,
+help, nonexistent-driver and devices checks above (the image ships no man
+pages), and one more: `check --soapy-driver driver=<d>` for each of the
+rtlsdr, airspy and hackrf modules the image installs must fail with that
+module's own open error (exit 1, `cannot open source`), never SoapySDR's
+`no match`, which is what a missing module looks like. The release workflow's
+Docker jobs run it on the arm64 image before the multi-platform push.
 
 Release tooling only: the release workflows run it after packaging and before
 upload, and this script is not itself shipped in the archive. Linux only; the
@@ -45,6 +56,11 @@ REQUIRED_FEATURES = {"soapy"}
 MISSING_DRIVER = ("check", "--soapy-driver", "driver=man82_nonexistent",
                   "--soapy-freq-hz", "14025000", "--soapy-rate-hz", "96000")
 NO_MATCH = "SoapySDR::Device::make() no match"
+# MAN-539: the device modules the Docker image installs. With no device attached each must load
+# and fail with its own error; a missing module makes SoapySDR answer NO_MATCH instead.
+MODULE_DRIVERS = ("rtlsdr", "airspy", "hackrf")
+MODULE_ARGS = ("--soapy-freq-hz", "14025000", "--soapy-rate-hz", "1024000")
+OPEN_FAILED = "cannot open source"
 MISSING_LIBRARY = "libSoapySDR.so.0.8: cannot open shared object file"
 LOADER_FAILURE = 127
 DEFAULT_TIMEOUT = 60.0
@@ -85,9 +101,11 @@ def safe_extract(archive, dest):
     return top
 
 
-def run(binary, args, timeout):
+def run(prefix, args, timeout):
+    """Run `manta ARGS` through PREFIX, the argv that starts manta: the extracted binary's path
+    in archive mode, `docker run --rm --platform P IMAGE` in image mode."""
     try:
-        return subprocess.run([binary, *args], capture_output=True, text=True,
+        return subprocess.run([*prefix, *args], capture_output=True, text=True,
                               errors="replace", timeout=timeout)
     except subprocess.TimeoutExpired as e:
         raise CheckFailed(f"`manta {' '.join(args)}` did not finish within {timeout:g} s") from e
@@ -106,6 +124,10 @@ def find_binary(top):
     if not os.stat(binary).st_mode & stat.S_IXUSR:
         raise CheckFailed(f"{os.path.basename(top)}/manta is not executable")
     return binary
+
+
+def image_prefix(image, platform):
+    return ["docker", "run", "--rm", "--platform", platform, image]
 
 
 def check_missing_library(binary, timeout):
@@ -175,11 +197,20 @@ def check_devices(binary, timeout):
     return len(soapy.get("devices") or [])
 
 
+def check_modules(binary, timeout):
+    for driver in MODULE_DRIVERS:
+        proc = run(binary, ["check", "--soapy-driver", f"driver={driver}", *MODULE_ARGS], timeout)
+        if proc.returncode != 1 or OPEN_FAILED not in proc.stderr or NO_MATCH in proc.stderr:
+            raise CheckFailed(f"expected the {driver} SoapySDR module to load and fail with its own "
+                              f"open error ({OPEN_FAILED!r}, exit 1, not {NO_MATCH!r}), "
+                              f"got {describe(proc)}")
+
+
 def verify(archive, expect_missing_library=False, timeout=DEFAULT_TIMEOUT):
     """Run every check against ARCHIVE; return report lines, or raise CheckFailed."""
     with tempfile.TemporaryDirectory(prefix="manta-soapy-check-") as tmp:
         top = safe_extract(archive, tmp)
-        binary = find_binary(top)
+        binary = [find_binary(top)]
         check_pages(top)
         if expect_missing_library:
             return check_missing_library(binary, timeout)
@@ -194,18 +225,48 @@ def verify(archive, expect_missing_library=False, timeout=DEFAULT_TIMEOUT):
                 f"devices --json: Soapy enumeration ok, {devices} device(s)"]
 
 
+def verify_image(image, platform, timeout=DEFAULT_TIMEOUT):
+    """Run the image checks against IMAGE on PLATFORM; return report lines, or raise CheckFailed."""
+    prefix = image_prefix(image, platform)
+    version = check_version(prefix, timeout)
+    check_help(prefix, timeout)
+    check_missing_driver(prefix, timeout)
+    devices = check_devices(prefix, timeout)
+    check_modules(prefix, timeout)
+    return [version,
+            f"run/listen/check --help offer {', '.join(SOAPY_FLAGS)} and --hpsdr-host",
+            f"nonexistent driver: exit 1, {NO_MATCH}",
+            f"devices --json: Soapy enumeration ok, {devices} device(s)",
+            f"modules {', '.join(MODULE_DRIVERS)} load: each driver fails with its own error, not no match"]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("archive", help="path to manta-linux-x86_64-soapy.tar.gz")
+    parser.add_argument("archive", nargs="?",
+                        help="path to a manta-linux-<arch>-soapy.tar.gz")
     parser.add_argument("--expect-missing-soapy-library", action="store_true",
-                        help="check that the binary cannot start without libSoapySDR.so.0.8")
+                        help="check that the binary cannot start without libSoapySDR.so.0.8 (archive only)")
+    parser.add_argument("--docker-image", metavar="IMAGE",
+                        help="check this local Docker image instead of an archive (needs --platform)")
+    parser.add_argument("--platform", help="the --docker-image platform to run, e.g. linux/arm64")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help=f"seconds allowed for each manta invocation (default {DEFAULT_TIMEOUT:g})")
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if (args.archive is None) == (args.docker_image is None):
+        parser.error("give exactly one of ARCHIVE or --docker-image")
+    if args.docker_image is not None and not args.platform:
+        parser.error("--docker-image needs --platform")
+    if args.docker_image is None and args.platform is not None:
+        parser.error("--platform goes with --docker-image")
+    if args.docker_image is not None and args.expect_missing_soapy_library:
+        parser.error("--expect-missing-soapy-library checks an archive, not --docker-image")
     try:
-        lines = verify(args.archive, args.expect_missing_soapy_library, args.timeout)
+        if args.docker_image is not None:
+            lines = verify_image(args.docker_image, args.platform, args.timeout)
+        else:
+            lines = verify(args.archive, args.expect_missing_soapy_library, args.timeout)
     except CheckFailed as e:
         print(f"check-soapy-release: FAIL: {e}", file=sys.stderr)
         return 1

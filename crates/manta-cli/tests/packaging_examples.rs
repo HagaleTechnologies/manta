@@ -756,6 +756,35 @@ fn compose_seconds(value: &str) -> u64 {
     micros / 1_000_000
 }
 
+/// MAN-539: the image carries SoapySDR, and Compose shows how to pass a USB
+/// receiver through, but leaves it off: Compose refuses a `devices:` entry
+/// whose host path is missing, which would stop a network-receiver node.
+#[test]
+fn compose_usb_passthrough_is_documented_but_off() {
+    let text = doc(COMPOSE);
+    let compose: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&text).expect("docker-compose.yml parses as YAML");
+    let manta = &compose["services"]["manta"];
+    for key in ["devices", "group_add"] {
+        assert!(
+            manta.get(key).is_none(),
+            "docker-compose.yml enables `{key}`; USB passthrough must stay opt-in"
+        );
+    }
+    let lines: Vec<&str> = text.lines().map(str::trim).collect();
+    for commented in [
+        "# devices:",
+        "#   - /dev/bus/usb:/dev/bus/usb",
+        "# group_add:",
+        "#   - plugdev",
+    ] {
+        assert!(
+            lines.contains(&commented),
+            "docker-compose.yml no longer carries the commented line `{commented}`"
+        );
+    }
+}
+
 #[test]
 fn compose_runs_the_mounted_config_and_outlasts_the_drain() {
     let compose: serde_yaml_ng::Value =
