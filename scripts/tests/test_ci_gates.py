@@ -1108,9 +1108,15 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             support = wf.job_block(text, f'{platform}-support')
             self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
             self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v')), 1)
-<<<<<<< HEAD
-        relay = wf.job_block(text, 'relay-check-runs')
-        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, windows-aggregate, ubuntu-aggregate, macos-aggregate]')
+        # MAN-516: Unix check-runs are relayed from the aggregates alone; Windows has its own relay.
+        self.assertNotIn('relay-check-runs', wf.job_ids(text))
+        unix = wf.job_block(text, 'relay-unix-check-runs')
+        self.assertEqual(wf.field(unix, 'needs'), '[create-ci-check, ubuntu-aggregate, macos-aggregate]')
+        windows = wf.job_block(text, 'relay-windows-check-run')
+        self.assertEqual(wf.field(windows, 'needs'), '[create-ci-check, windows-aggregate]')
+        for relay in (unix, windows):
+            self.assertEqual(wf.field(relay, 'if'), "always() && github.event_name == 'workflow_dispatch'")
+            self.assertEqual(wf.field(wf.sub(relay, 'environment'), 'name'), 'codex-review')
 
     def test_windows_graph_is_complete_and_independent(self):
         # MAN-517: Windows mirrors the Unix graph -- support, eight shards, an aggregate carrying
@@ -1174,17 +1180,6 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         caches = [s for s in wf.steps(shards) if (wf.field(s, 'uses') or '').startswith('Swatinem/rust-cache@')]
         self.assertEqual(len(caches), 1)
         self.assertEqual(wf.field(wf.sub(caches[0], 'with'), 'shared-key'), 'test')
-=======
-        # MAN-516: Unix check-runs are relayed from the aggregates alone; Windows has its own relay.
-        self.assertNotIn('relay-check-runs', wf.job_ids(text))
-        unix = wf.job_block(text, 'relay-unix-check-runs')
-        self.assertEqual(wf.field(unix, 'needs'), '[create-ci-check, ubuntu-aggregate, macos-aggregate]')
-        windows = wf.job_block(text, 'relay-windows-check-run')
-        self.assertEqual(wf.field(windows, 'needs'), '[create-ci-check, test]')
-        for relay in (unix, windows):
-            self.assertEqual(wf.field(relay, 'if'), "always() && github.event_name == 'workflow_dispatch'")
-            self.assertEqual(wf.field(wf.sub(relay, 'environment'), 'name'), 'codex-review')
->>>>>>> bd701c6ccf554bd0e7ed418b9787e4f22ce9c3ac
 
     def test_aggregate_verdict_fails_closed(self):
         text = wf.read('ci-full.yml')
@@ -1255,7 +1250,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         # relay() marks a job with no conclusion failed, so a relay naming a job outside its
         # `needs` would fail that check-run while the job is still running.
         text = wf.read('ci-full.yml')
-        owner = {CHECKS[0]: 'ubuntu-aggregate', CHECKS[1]: 'macos-aggregate', CHECKS[2]: 'test'}
+        owner = {CHECKS[0]: 'ubuntu-aggregate', CHECKS[1]: 'macos-aggregate', CHECKS[2]: 'windows-aggregate'}
         for job, expected in (('relay-unix-check-runs', {CHECKS[0], CHECKS[1]}),
                               ('relay-windows-check-run', {CHECKS[2]})):
             block = wf.job_block(text, job)

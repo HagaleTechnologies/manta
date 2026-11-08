@@ -118,11 +118,8 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - [Why is a call heard only as `X` in `X DE Y` never spotted?](../docs/DECISIONS/2026-11-02-man201-callsign-roles.md)
 - [Can a later repetition rescue an ambiguous decode?](../docs/DECISIONS/2026-11-05-man208-delayed-refinement.md) — Bounded replay (live single- and multi-input, offline decode) revises the same occurrence; the RF timestamp remains distinct from decision availability. Includes the fixture's measurement limits.
 - [How are required Unix CI tests sharded without dropping coverage?](../docs/DECISIONS/2026-11-05-man498-required-ci-runtime.md) MAN-498 keeps whole test binaries and explicit doctests behind independent OS aggregates.
-<<<<<<< HEAD
-- [Why does Windows CI run in eight shards?](../docs/DECISIONS/2026-11-08-man517-shard-the-windows-test-leg.md) MAN-517 gives Windows the Unix support, shard and aggregate jobs; `test (windows-latest)` keeps its name.
-=======
 - [Why do a PR's Linux and macOS test check-runs land before Windows?](../docs/DECISIONS/2026-11-08-man516-relay-unix-check-runs-before-windows.md) MAN-516: two relays; a PR can merge before its non-required Windows result.
->>>>>>> bd701c6ccf554bd0e7ed418b9787e4f22ce9c3ac
+- [Why does Windows CI run in eight shards?](../docs/DECISIONS/2026-11-08-man517-shard-the-windows-test-leg.md) MAN-517 gives Windows the Unix support, shard and aggregate jobs; `test (windows-latest)` keeps its name.
 
 - CW sub-segments and automatic daily/dated UTC coverage: [config reference](../docs/CONFIG.md#cw-sub-segments-and-utc-schedules) and [MAN-30 decision](../docs/DECISIONS/2026-11-04-man30-cw-segments.md).
 - [How is IQ correction calibrated and withheld?](../docs/DECISIONS/2026-11-05-man494-calibrated-iq-conditioning.md) MAN-494 fixes coefficients per stream and requires receiver-centre agreement.

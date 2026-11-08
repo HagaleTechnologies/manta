@@ -1261,17 +1261,6 @@ jobs:
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy --locked
 
-<<<<<<< HEAD
-  # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
-  # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single
-  # aggregate across every matrix combination (success only if ALL legs succeeded), which
-  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; each minted
-  # check-run needs its OWN independent, accurate conclusion. Looks up each leg's real
-  # conclusion from the Jobs API by its exact display name instead.
-  relay-check-runs:
-    name: Relay test results onto the reviewed SHA's check-runs
-    needs: [create-ci-check, windows-aggregate, ubuntu-aggregate, macos-aggregate]
-=======
   # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
   # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of
   # the jobs it needs onto the explicit check-runs create-ci-check made on head_sha -- a
@@ -1281,7 +1270,6 @@ jobs:
   relay-unix-check-runs:
     name: Relay Linux and macOS results onto the reviewed SHA's check-runs
     needs: [create-ci-check, ubuntu-aggregate, macos-aggregate]
->>>>>>> bd701c6ccf554bd0e7ed418b9787e4f22ce9c3ac
     if: always() && github.event_name == 'workflow_dispatch'
     # Q-0068: the app key lives in the main-only codex-review environment.
     environment:
@@ -1331,7 +1319,7 @@ jobs:
 
   relay-windows-check-run:
     name: Relay the Windows result onto the reviewed SHA's check-run
-    needs: [create-ci-check, test]
+    needs: [create-ci-check, windows-aggregate]
     if: always() && github.event_name == 'workflow_dispatch'
     # Q-0068: the app key lives in the main-only codex-review environment.
     environment:

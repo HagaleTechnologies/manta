@@ -15,7 +15,8 @@ serial `test` job is gone. In its place `ci-full.yml` has three jobs:
   cancelled, skipped or missing dependency fails it.
 
 The check name, MAN-371's `create-ci-check` and the relay's lookup by display
-name are unchanged. The relay now needs `windows-aggregate` in place of `test`.
+name are unchanged. MAN-516's Windows relay, `relay-windows-check-run`, now
+needs `windows-aggregate` in place of `test`.
 
 This changes scheduling. It is not a measured hosted outcome: every timing
 below is either measured on the old serial job, estimated from those logs, or
