@@ -1200,7 +1200,7 @@ jobs:
           # MAN-340: same dispatch-only full history as the support jobs' checkout, for merge-main below.
           fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 1 || 0 }}
           persist-credentials: false
-      # MAN-340: identical to `test`'s merge-main step (see the comment there).
+      # MAN-340: identical to the support jobs' merge-main step (see the comment there).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
