@@ -182,9 +182,9 @@ pub struct FloorBank {
     rise_floor_db: Vec<f64>,
 }
 
-/// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
-/// `10*log10(power)` (minus that function's epsilon, negligible outside
-/// the extreme floor).
+/// `10^(db/10)`. MAN-526: used only for `FloorBank::new`'s initial
+/// `smoothed_lin`; per-hop updates read the linear power directly
+/// (`channelizer::power_linear`) instead of undoing `power_db`.
 fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 10.0)
 }
