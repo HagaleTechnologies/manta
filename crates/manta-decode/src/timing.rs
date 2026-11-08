@@ -1085,8 +1085,9 @@ impl TimingEstimates {
 ///
 /// Values are stored in dits of the dit period at observation time (the
 /// caller passes `SpeedTracker::dit_estimate_ms`), so ratios survive slow
-/// speed drift. MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses)
-/// read `estimates()`; this model itself uses only the means.
+/// speed drift. MAN-111 (scored boundaries) reads `estimates()`; this
+/// model itself uses only the means. The MAN-544 speed hypothesis bank
+/// (`timing::bank`) reads neither and resets it on a switch.
 #[derive(Debug, Clone, Default)]
 pub struct SenderTiming {
     stats: [ClassStats; 5],

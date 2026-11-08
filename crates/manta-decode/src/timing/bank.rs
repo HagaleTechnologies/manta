@@ -29,7 +29,7 @@ const DECAY: f32 = 0.90;
 /// Lead over the primary, in nats, a challenger must hold to switch.
 const SWITCH_LEAD_NATS: f32 = 4.0;
 /// Consecutive marks the lead must hold, and the least age to switch.
-const SWITCH_CONFIRM_MARKS: u32 = 3;
+const SWITCH_CONFIRM_MARKS: u32 = 2;
 /// A gap of at least this many units of the slowest hypothesis is a pause
 /// and is scored by none.
 const PAUSE_DITS: f32 = 12.0;
@@ -265,6 +265,12 @@ impl TimingBank {
     /// Hypotheses alive, the primary included.
     pub fn hypotheses(&self) -> usize {
         1 + self.challengers.len()
+    }
+
+    /// Marks scored since the bank was built (`SwitchRecord::mark_index`'s
+    /// clock).
+    pub fn marks_seen(&self) -> u64 {
+        self.marks_seen
     }
 
     /// The challengers alive, in spawn order.

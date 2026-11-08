@@ -403,7 +403,10 @@ Per track, operating on the ~375 Hz complex channel stream:
    the classification/likelihood consumers that want it), tracked with EMA.
    Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
    inter-element and inter-word gap
-   thresholds (dit's speed-detector lesson).
+   thresholds (dit's speed-detector lesson). An optional bank of up to three
+   speed hypotheses (MAN-544, `timing::bank`, off by default) can replace
+   the tracker after a speed step or a mis-locked opening (legacy and
+   edge-legacy engines).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
    the Morse code tree** — small-Viterbi rather than hard thresholding, so a
