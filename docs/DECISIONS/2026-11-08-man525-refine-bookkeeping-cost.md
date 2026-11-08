@@ -57,34 +57,37 @@ per call at 25 tracks and 61.58 us at 125 tracks (quadratic in tracks).
 
 ## After
 
-Branch, release build, same container class, same probes
-(`man525_refine_cost::record_cost_by_track_count` and
+Both probes (`man525_refine_cost::record_cost_by_track_count` and
 `man208_late_rescue::refine_candidates_cost_by_track_count`, both
-`#[ignore]`d):
+`#[ignore]`d) ran in one session on the same host, in release, one after
+the other: first on main at bd701c6 (whose engine and validator code equals
+915db0e's), then on the branch.
 
-| Tracks | ns per `record` | Retained per track | Evictions in the timed window |
-|---|---|---|---|
-| 1 | 36.2 | 10.00 s | 0 |
-| 46 | 154.3 | 10.00 s | 0 |
-| 47 | 53.1 | 9.92 s | 299,954 |
-| 100 | 78.0 | 4.66 s | 300,000 |
-| 300 | 145.6 | 1.55 s | 300,000 |
-| 600 | 202.8 | 0.78 s | 300,000 |
+| Tracks | Main ns per `record` | Branch ns per `record` | Retained per track | Evictions in the timed window |
+|---|---|---|---|---|
+| 1 | 9.6 | 29.1 | 10.00 s | 0 |
+| 46 | 93.3 | 45.7 | 10.00 s | 0 |
+| 47 | 172.9 | 79.0 | 9.92 s | 299,954 |
+| 100 | 380.4 | 91.9 | 4.66 s | 300,000 |
+| 300 | 1125.8 | 165.3 | 1.55 s | 300,000 |
+| 600 | 2370.8 | 131.8 | 0.78 s | 300,000 |
 
-At 300 tracks a record falls from 1107 ns to 146 ns (7.6x). `refine_candidates`
-falls to 0.93 us at 25 tracks and 4.41 us at 125 tracks (14x). The before
-figures come from the plan phase's run, not from a same-session rerun of
-main; the plan phase's prototype gave 118 ns and 4.29 us on the same host
+At 300 tracks a record falls from 1126 ns to 165 ns (6.8x). Main's cost
+grows with the track count and the branch's does not. Retention and
+eviction counts are identical on both. `refine_candidates` falls from
+4.93 us to 0.94 us at 25 tracks and from 64.72 us to 4.36 us at 125 tracks
+(14.8x). The plan phase's prototype gave 118 ns and 4.29 us on the same host
 class.
 
 ## Accepted trade-off (D3)
 
 Under the bound, every at-capacity push moves its ring's front, so the index
-updates on every record. A single track's record rises from about 9 ns to
-about 36 ns, and the 46-track figure is noisy (68 ns before, 103 ns in the
-plan's prototype, 154 ns in this run on a shared host). At 46 tracks even
-154 ns is 46 x 375 x 154 ns = 2.7 ms per stream second, 0.27% of a core. A
-lazily built index would add a state transition to save that much.
+updates on every record. A single track's record rises from 9.6 ns to
+29.1 ns. The 46-track figure is noisy on a shared host: 93 ns on main and
+46 ns on the branch in this session, against 68 ns and 103 ns in the plan
+phase. Even at 103 ns, 46 x 375 x 103 ns is 1.8 ms per stream second, 0.18%
+of a core. A lazily built index would add a state transition to save that
+much.
 
 ## Equivalence evidence
 
@@ -101,14 +104,19 @@ lazily built index would add a state transition to save that much.
 - `man208_late_rescue::a_crowded_node_under_the_global_bound_refines_exactly_as_before`
   pins 24 tracks under three tight global bounds: retained and evicted
   counts, every scheduler counter, refined records and the rescue order.
-  The pins were taken on main at 915db0e and pass unchanged on the branch.
+  `refine_candidates_report_the_nearest_other_track_gap` pins the gap
+  values. Both pass on main's unmodified production code (bd701c6) and
+  unchanged on the branch.
 - `man208_refine_buffer::the_global_bound_keeps_the_newest_entries_across_300_tracks`
   and `equal_front_timestamps_evict_the_smallest_track_id_first` pin the
-  eviction order and tie-break, and also passed on main first.
-- The A/B grid (`man398_grid`) was not rerun in the implement session; its
-  expected hash at merge-base 915db0e is
-  `cb57e885664b7445f6b35a8f46381455a9a5cc29ae5e5eac9111cdb721dd142e`, which
-  the plan phase's prototype of this design reproduced.
+  eviction order and tie-break. They also pass on main's unmodified code.
+- The A/B grid (`man398_grid`, release, 288 rows) ran on the branch and on
+  its merge-base with main, bd701c6. `cmp` of the two `GRID` outputs exits
+  0, and both hash to SHA-256
+  `cb57e885664b7445f6b35a8f46381455a9a5cc29ae5e5eac9111cdb721dd142e`. That
+  is also the hash the research and plan phases recorded for main at
+  915db0e. Main's only commit between 915db0e and bd701c6 (MAN-516) changes
+  CI files and docs, not decode code.
 
 ## Unchanged
 
