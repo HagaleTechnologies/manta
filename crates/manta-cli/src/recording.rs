@@ -109,18 +109,17 @@ pub(crate) fn start_input_recording(
 /// 2 s of runtime shutdown) beyond this bound when the drain is shorter.
 /// With `RECORDING_PUBLICATION_GRACE` after it, it still ends inside that
 /// drain (MAN-453).
-pub(crate) const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RECORDING_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// MAN-453: how long after `RECORDING_FINISH_TIMEOUT` a writer that has
 /// already begun publishing may take to finish. One window for every
 /// recording of the run, as the timeout is one deadline, so recording's
 /// part of a stop ends 7 s after `close_recordings`, inside the drain.
-pub(crate) const RECORDING_PUBLICATION_GRACE: std::time::Duration =
-    std::time::Duration::from_secs(2);
+const RECORDING_PUBLICATION_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// MAN-453: what `finish` gets at `now` for a recording closed with
 /// `deadline`: the rest of the timeout, then the rest of the shared grace.
-pub(crate) fn recording_finish_budget(
+fn recording_finish_budget(
     deadline: std::time::Instant,
     now: std::time::Instant,
 ) -> (std::time::Duration, std::time::Duration) {
@@ -253,3 +252,6 @@ fn report_recording(recorded: &Path, outcome: manta_input::RecordingOutcome) -> 
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

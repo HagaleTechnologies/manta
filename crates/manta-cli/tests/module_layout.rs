@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 
+/// The modules MAN-548 split out of `main.rs`.
+const SPLIT_MODULES: &[&str] = &[
+    "cli_parse",
+    "daemon_client",
+    "recording",
+    "resolve",
+    "run_cmd",
+    "session_epoch",
+    "source_spec",
+    "spot_server",
+];
+
 fn src() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
@@ -152,4 +164,29 @@ fn main_rs_keeps_its_unit_tests_in_src_tests_rs() {
         "main.rs's `mod tests` is inline; move it to src/tests.rs"
     );
     assert!(src().join("tests.rs").is_file(), "src/tests.rs is missing");
+}
+
+#[test]
+fn split_modules_keep_their_unit_tests_in_a_sibling_tests_rs() {
+    for name in SPLIT_MODULES {
+        let file = src().join(format!("{name}.rs"));
+        assert!(file.is_file(), "{} is missing", file.display());
+        let parsed = parse(&file);
+        let tests = parsed.items.iter().find_map(|item| match item {
+            syn::Item::Mod(m) if m.ident == "tests" => Some(m),
+            _ => None,
+        });
+        assert!(
+            tests.is_some_and(|m| m.content.is_none()),
+            "{name}.rs must declare `#[cfg(test)] mod tests;`, not an inline module"
+        );
+        let sibling = src().join(name).join("tests.rs");
+        let text = std::fs::read_to_string(&sibling)
+            .unwrap_or_else(|e| panic!("{}: {e}", sibling.display()));
+        assert!(
+            text.contains("#[test]") || text.contains("#[tokio::test"),
+            "{} holds no test",
+            sibling.display()
+        );
+    }
 }

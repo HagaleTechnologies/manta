@@ -109,6 +109,8 @@ mod spot_server;
 mod stdio;
 #[cfg(test)]
 mod test_ports;
+#[cfg(test)]
+mod test_support;
 mod text_lines;
 use list_cache::ListKind;
 use stdio::{errln, out, outln};
@@ -1922,13 +1924,6 @@ fn validate_decode_config(
         );
     }
     Ok(cfg)
-}
-
-/// Test-only entry point over the production loader (`config::load`), kept
-/// so the `[decode]` validation tests exercise the real path unmodified.
-#[cfg(test)]
-fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
-    Ok(config::load(config, config::Env::Ignore)?.decode)
 }
 
 fn merge_cli_prior(

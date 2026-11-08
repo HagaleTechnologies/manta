@@ -98,7 +98,7 @@ pub(crate) struct RunArgs {
     /// Sound-card input device; matched by substring. Defaults to the
     /// system default input.
     #[arg(long, conflicts_with = "source", help_heading = "Audio input")]
-    pub(crate) device: Option<String>,
+    device: Option<String>,
     /// Replay a WAV file instead of listening to a live device.
     ///
     /// Decoded as fast as the machine manages, so a 60-second file usually
@@ -106,12 +106,12 @@ pub(crate) struct RunArgs {
     /// pace, or --loop to keep it playing. Useful for demos and repeatable
     /// testing.
     #[arg(long, conflicts_with = "device", help_heading = "Audio input")]
-    pub(crate) source: Option<PathBuf>,
+    source: Option<PathBuf>,
     /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
     #[arg(help_heading = "KiwiSDR source")]
     #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"], requires = "kiwi_freq_hz"))]
     #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"], requires = "kiwi_freq_hz"))]
-    pub(crate) kiwi_host: Option<String>,
+    kiwi_host: Option<String>,
     /// KiwiSDR receiver port.
     #[arg(
         long,
@@ -119,7 +119,7 @@ pub(crate) struct RunArgs {
         requires = "kiwi_host",
         help_heading = "KiwiSDR source"
     )]
-    pub(crate) kiwi_port: u16,
+    kiwi_port: u16,
     /// Receiver centre frequency, in Hz. Required with --kiwi-host.
     #[arg(
         long = "kiwi-freq-hz",
@@ -127,7 +127,7 @@ pub(crate) struct RunArgs {
         requires = "kiwi_host",
         help_heading = "KiwiSDR source"
     )]
-    pub(crate) kiwi_freq_hz: Option<f64>,
+    kiwi_freq_hz: Option<f64>,
     /// KiwiSDR password. Leave empty for public receivers that do not
     /// ask for one.
     #[arg(
@@ -136,7 +136,7 @@ pub(crate) struct RunArgs {
         default_value = "",
         help_heading = "KiwiSDR source"
     )]
-    pub(crate) kiwi_password: String,
+    kiwi_password: String,
     /// SoapySDR device arguments, e.g. "driver=rtlsdr".
     ///
     /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
@@ -144,7 +144,7 @@ pub(crate) struct RunArgs {
     #[cfg(feature = "soapy")]
     #[arg(help_heading = "SoapySDR source")]
     #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "kiwi_host"])]
-    pub(crate) soapy_driver: Option<String>,
+    soapy_driver: Option<String>,
     /// Receiver centre frequency, in Hz. Required with --soapy-driver.
     #[cfg(feature = "soapy")]
     #[arg(
@@ -153,7 +153,7 @@ pub(crate) struct RunArgs {
         requires = "soapy_driver",
         help_heading = "SoapySDR source"
     )]
-    pub(crate) soapy_freq_hz: Option<f64>,
+    soapy_freq_hz: Option<f64>,
     /// Sample rate, in Hz. Required with --soapy-driver.
     #[cfg(feature = "soapy")]
     #[arg(
@@ -162,7 +162,7 @@ pub(crate) struct RunArgs {
         requires = "soapy_driver",
         help_heading = "SoapySDR source"
     )]
-    pub(crate) soapy_rate_hz: Option<f64>,
+    soapy_rate_hz: Option<f64>,
     /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
     /// gain. Omit to let the device use AGC.
     ///
@@ -172,7 +172,7 @@ pub(crate) struct RunArgs {
     /// signal you know is present.
     #[cfg(feature = "soapy")]
     #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
-    pub(crate) soapy_gain: Option<f64>,
+    soapy_gain: Option<f64>,
     /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
     ///
     /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
@@ -181,17 +181,17 @@ pub(crate) struct RunArgs {
     #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
     #[arg(conflicts_with_all = ["device", "source"])]
     #[arg(conflicts_with = "hpsdr_mac")]
-    pub(crate) hpsdr_host: Option<String>,
+    hpsdr_host: Option<String>,
     /// Discover and select a radio by MAC address; omit host to discover.
     #[arg(long, value_parser = parse_hpsdr_mac, help_heading = "HPSDR source", conflicts_with_all = ["hpsdr_host", "device", "source"])]
-    pub(crate) hpsdr_mac: Option<[u8; 6]>,
+    hpsdr_mac: Option<[u8; 6]>,
     /// openHPSDR control port.
     ///
     /// Protocol 2 also sends to the three ports above it and receives IQ from this port + 11 (1035 by default).
     #[arg(long, help_heading = "HPSDR source")]
     #[arg(conflicts_with_all = ["device", "source"])]
     #[arg(value_parser = clap::value_parser!(u16).range(1..))]
-    pub(crate) hpsdr_port: Option<u16>,
+    hpsdr_port: Option<u16>,
     /// openHPSDR protocol the radio speaks.
     ///
     /// auto asks the radio and uses protocol 2 when it answers as protocol 2, protocol 1 otherwise; 1 and 2 skip the question.
@@ -202,7 +202,7 @@ pub(crate) struct RunArgs {
             requires = "hpsdr_selector",
             help_heading = "HPSDR source"
         )]
-    pub(crate) hpsdr_protocol: HpsdrProtocolArg,
+    hpsdr_protocol: HpsdrProtocolArg,
     /// Receiver centre frequency, in Hz. Required with the hpsdr source.
     #[arg(
             long = "hpsdr-freq-hz",
@@ -211,7 +211,7 @@ pub(crate) struct RunArgs {
             help_heading = "HPSDR source"
         )]
     #[arg(conflicts_with_all = ["device", "source"])]
-    pub(crate) hpsdr_freq_hz: Option<f64>,
+    hpsdr_freq_hz: Option<f64>,
     /// Sample rate, in Hz. Required with the hpsdr source.
     #[arg(
             long = "hpsdr-rate-hz",
@@ -220,7 +220,7 @@ pub(crate) struct RunArgs {
             help_heading = "HPSDR source"
         )]
     #[arg(conflicts_with_all = ["device", "source"])]
-    pub(crate) hpsdr_rate_hz: Option<f64>,
+    hpsdr_rate_hz: Option<f64>,
     /// Multicast data group of a ka9q-radio (radiod) IQ channel
     ///
     /// An IPv4 multicast address, or the name in the channel's `data =`
@@ -259,7 +259,7 @@ pub(crate) struct RunArgs {
     /// result must itself be a rate the channelizer supports. Omit to
     /// decode at the source's native rate.
     #[arg(long, value_parser = parse_capture_rate_hz)]
-    pub(crate) capture_rate_hz: Option<f64>,
+    capture_rate_hz: Option<f64>,
     /// Read --source as complex IQ rather than ordinary mono audio.
     ///
     /// IQ is a two-channel IQ WAV, a manta IQ recording (found by its
@@ -269,17 +269,17 @@ pub(crate) struct RunArgs {
     /// and a two-channel IQ capture cannot be told apart from the WAV
     /// header alone, so say which you have.
     #[arg(long)]
-    pub(crate) source_iq: bool,
+    source_iq: bool,
     /// Read headerless little-endian IQ: cf32 or ci16.
     ///
     /// Requires --source-iq, a sample rate and centre frequency
     /// (--sample-rate-hz, --dial-freq-hz). Omit for WAV or a manta
     /// recording with metadata.
     #[arg(long, value_name = "FORMAT", requires = "source_iq")]
-    pub(crate) iq_format: Option<manta_input::RawIqFormat>,
+    iq_format: Option<manta_input::RawIqFormat>,
     /// Sample rate of headerless IQ before any capture-rate decimation.
     #[arg(long, value_name = "HZ", value_parser = parse_iq_sample_rate_hz, requires = "iq_format")]
-    pub(crate) sample_rate_hz: Option<f64>,
+    sample_rate_hz: Option<f64>,
     /// Record the input IQ while decoding.
     ///
     /// Writes little-endian complex-float32 samples to PATH and its
@@ -287,7 +287,7 @@ pub(crate) struct RunArgs {
     /// overwritten. Recording stops if storage cannot keep up; decoding
     /// continues.
     #[arg(long, value_name = "PATH")]
-    pub(crate) record_iq: Option<PathBuf>,
+    record_iq: Option<PathBuf>,
     /// Replay the file at the recording's own pace instead of as fast as
     /// possible.
     ///
@@ -299,7 +299,7 @@ pub(crate) struct RunArgs {
     // No `requires = "source"`: the file source can come from the config
     // file, so the check runs after `resolve` (MAN-269 D4).
     #[arg(long)]
-    pub(crate) realtime: bool,
+    realtime: bool,
     /// Start the file again from the beginning each time it ends, until
     /// stopped.
     ///
@@ -310,11 +310,11 @@ pub(crate) struct RunArgs {
     /// minutes (type sh/dx on the telnet port to list earlier ones). Only for
     /// file replay. Also set by input.loop in the config file.
     #[arg(long = "loop")]
-    pub(crate) loop_replay: bool,
+    loop_replay: bool,
     /// Print each decode as a JSON object, one per line, instead of
     /// plain text.
     #[arg(long, help_heading = "Output")]
-    pub(crate) json: bool,
+    json: bool,
     /// Also print decoded text while the spotting daemon runs.
     ///
     /// Decoded text goes to stderr, one line per track, labelled with
@@ -323,7 +323,7 @@ pub(crate) struct RunArgs {
     /// that a service log holds spots and diagnostics only. This flag
     /// prints it there too.
     #[arg(long, conflicts_with = "json", help_heading = "Output")]
-    pub(crate) decoded_text: bool,
+    decoded_text: bool,
     /// TOML config file that turns this into the full spotting daemon.
     ///
     /// Needs a `[server]` table with the station callsign and ports.
@@ -336,7 +336,7 @@ pub(crate) struct RunArgs {
     // `--server-config` stays as a hidden alias for the flag's old
     // name; help advertises the canonical spelling only (D11/MAN-77).
     #[arg(long, alias = "server-config", help_heading = "Server")]
-    pub(crate) config: Option<PathBuf>,
+    config: Option<PathBuf>,
     /// Radio dial frequency, in Hz.
     ///
     /// For a sound card or an ordinary (real-audio) --source WAV this
@@ -359,7 +359,7 @@ pub(crate) struct RunArgs {
     /// pitch -- subtract it (for example 700-800 Hz) first, or spots read
     /// high by that amount (CW-R inverts the sign and doubles the error).
     #[arg(long, value_parser = parse_dial_freq_hz, help_heading = "Server")]
-    pub(crate) dial_freq_hz: Option<f64>,
+    dial_freq_hz: Option<f64>,
     /// Timestamp to treat as the start of a replayed file, in Unix
     /// seconds.
     ///
@@ -369,7 +369,7 @@ pub(crate) struct RunArgs {
     /// copied or downloaded. Set it explicitly when spot timestamps
     /// must be identical across machines.
     #[arg(long, value_parser = parse_replay_epoch, help_heading = "Server")]
-    pub(crate) replay_epoch: Option<i64>,
+    replay_epoch: Option<i64>,
     /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
     ///
     /// `hsmm` is experimental: it was tested and did not pass the accuracy
@@ -381,12 +381,12 @@ pub(crate) struct RunArgs {
     // accuracy and CPU budget:
     // docs/DECISIONS/2026-09-09-decode-core-v2-stage2-gate.md.
     #[arg(long, value_parser = parse_engine)]
-    pub(crate) engine: Option<Engine>,
+    engine: Option<Engine>,
     /// Reweight acoustically viable word readings: on or off. Overrides [decode].
     #[arg(long, value_parser = parse_prior)]
-    pub(crate) prior: Option<manta_decode::config_file::PriorSwitch>,
+    prior: Option<manta_decode::config_file::PriorSwitch>,
     #[command(flatten)]
-    pub(crate) filters: FilterOpts,
+    filters: FilterOpts,
     #[command(flatten)]
     pub(crate) rbn: RbnCompareOpts,
     #[command(flatten)]
@@ -1636,44 +1636,4 @@ pub(crate) fn publish_conditioned(
 }
 
 #[cfg(test)]
-#[test]
-fn conditioned_metric_registration_matches_producible_marks() {
-    use manta_dsp::condition::{ConditioningConfig, StageMode};
-    for (mode, impulse_marks, dc_marks) in [
-        (StageMode::Off, 0, 0),
-        (StageMode::Observe, 2, 0),
-        (StageMode::Apply, 3, 1),
-    ] {
-        let metrics = manta_server::metrics::Metrics::new();
-        publish_conditioned(
-            &metrics,
-            "rx",
-            &ConditioningConfig {
-                impulse: mode,
-                dc: mode,
-                ..Default::default()
-            },
-            &manta_engine::ConditioningObserver::default(),
-        );
-        let text = metrics.render_prometheus_text();
-        let samples: Vec<_> = text
-            .lines()
-            .filter(|l| l.starts_with("manta_input_conditioned_samples_total{"))
-            .collect();
-        assert_eq!(
-            samples
-                .iter()
-                .filter(|l| l.contains("stage=\"impulse\""))
-                .count(),
-            impulse_marks
-        );
-        assert_eq!(
-            samples
-                .iter()
-                .filter(|l| l.contains("stage=\"dc\""))
-                .count(),
-            dc_marks
-        );
-        assert!(samples.iter().all(|l| l.ends_with(" 0")));
-    }
-}
+mod tests;

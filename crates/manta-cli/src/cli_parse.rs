@@ -322,3 +322,6 @@ pub(crate) fn parse_prior(
         _ => Err("prior must be on or off".into()),
     }
 }
+
+#[cfg(test)]
+mod tests;

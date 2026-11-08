@@ -67,7 +67,7 @@ pub(crate) struct SpotServer {
     /// from `TcpListener::local_addr()`, so a port-0 bind is reachable by
     /// tests without guessing or binding a fixed port.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) metrics_addr: std::net::SocketAddr,
+    metrics_addr: std::net::SocketAddr,
     /// The JSON listener's real bound address, so a port-0 bind is reachable
     /// by tests -- `metrics_addr`'s MAN-44 precedent.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -840,3 +840,6 @@ pub(crate) fn start_spot_server(
         },
     ))
 }
+
+#[cfg(test)]
+mod tests;

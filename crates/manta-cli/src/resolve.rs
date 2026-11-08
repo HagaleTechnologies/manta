@@ -252,14 +252,14 @@ pub(crate) fn resolve_spot_pinned(
 /// applies it, and only to `LiveSourceSpec::File`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReplayMode {
-    pub(crate) paced: bool,
-    pub(crate) looped: bool,
+    paced: bool,
+    looped: bool,
 }
 
 impl ReplayMode {
     /// `--loop` implies `--realtime` (D2): an unpaced loop would decode
     /// endlessly and stamp spots ever further into the future.
-    pub(crate) fn from_flags(realtime: bool, looped: bool) -> Self {
+    fn from_flags(realtime: bool, looped: bool) -> Self {
         ReplayMode {
             paced: realtime || looped,
             looped,
@@ -767,3 +767,6 @@ pub(crate) fn report_iq_open_error(spec: &LiveSourceSpec, dial_freq_hz: Option<f
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -25,7 +25,7 @@ use std::path::Path;
 /// separate concern that originally motivated the content hash) is
 /// handled by `session_nonce_for_replay_path` below, independently of
 /// this epoch.
-pub(crate) fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
+fn epoch_for_replay_path(path: &std::path::Path) -> Result<std::time::SystemTime> {
     // MAN-309: a manta IQ recording knows when its sample zero was taken,
     // so a copy with a new mtime keeps its timestamps.
     if manta_input::is_native_recording(path) {
@@ -212,7 +212,7 @@ fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 /// FNV-1a-64 over `path`'s bytes, continuing from `hash`.
-pub(crate) fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
+fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
     use std::io::Read;
 
     let mut file = std::fs::File::open(path)
@@ -229,3 +229,6 @@ pub(crate) fn fnv1a_file(mut hash: u64, path: &std::path::Path) -> Result<u64> {
     }
     Ok(hash)
 }
+
+#[cfg(test)]
+mod tests;

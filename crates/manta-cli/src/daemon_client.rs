@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 /// first, reporting a healthy daemon as unreachable whenever that guess
 /// was wrong. `fetch_status` tries every returned address in turn (same
 /// precedent as `uplink::connect_first_reachable`).
-pub(crate) fn resolve_status_addr(
+fn resolve_status_addr(
     addr: Option<&str>,
     server: Option<&manta_server::config::ServerConfig>,
 ) -> Result<Vec<std::net::SocketAddr>> {
@@ -65,7 +65,7 @@ pub(crate) fn resolve_status_addr(
             Ok(ip) => Ok(vec![std::net::SocketAddr::new(ip, server.metrics_port)]),
             // CR-B: the daemon itself binds `metrics_bind_addr` through
             // `TcpListener::bind((host, port))`, which resolves a
-            // hostname via `ToSocketAddrs` (main.rs's `start_spot_server`)
+            // hostname via `ToSocketAddrs` (`spot_server::start_spot_server`)
             // rather than requiring a literal IP -- so `metrics_bind_addr =
             // "localhost"` is a config the daemon happily runs on. `manta
             // status` must resolve the same way instead of rejecting a
@@ -321,7 +321,7 @@ async fn connect_any(
 /// not a refusal) consumed `fetch_status`'s ENTIRE outer timeout before a
 /// later, live candidate was ever dialled -- the exact failure this
 /// function exists to prevent, defeated by having no bound of its own.
-pub(crate) async fn connect_any_bounded<T, F, Fut>(
+async fn connect_any_bounded<T, F, Fut>(
     addrs: &[std::net::SocketAddr],
     overall_timeout: std::time::Duration,
     connect: F,
@@ -519,3 +519,6 @@ fn invalid_status_doc(e: serde_json::Error) -> anyhow::Error {
         manta_server::status_doc::escape_for_terminal(&e.to_string())
     )
 }
+
+#[cfg(test)]
+mod tests;

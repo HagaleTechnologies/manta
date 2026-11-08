@@ -559,9 +559,9 @@ pub(crate) fn open_iq_source_file(
 /// frequency of their own that `--dial-freq-hz` is allowed to supersede, and
 /// for raw-IQ WAV replay, which has no native dial setter. See
 /// `--dial-freq-hz`.
-pub(crate) struct FixedCenterFreqSource {
-    pub(crate) inner: reconnect::SendSource,
-    pub(crate) freq_hz: f64,
+struct FixedCenterFreqSource {
+    inner: reconnect::SendSource,
+    freq_hz: f64,
 }
 
 impl IqSource for FixedCenterFreqSource {
@@ -678,7 +678,7 @@ pub(crate) fn trusted_band_notice(fs_out_hz: f64, lo_hz: f64, hi_hz: f64) -> Str
 /// stream opens and the callback hands over silence). A warning, not an
 /// error: a muted input is a legitimate state, and `doctor` still reports
 /// NO_SIGNAL on its own.
-pub(crate) fn audio_silence_warning(device: &str) -> String {
+fn audio_silence_warning(device: &str) -> String {
     format!(
         "warning: audio input {device} is delivering digital silence at {} Hz \
           (every sample is exactly zero) -- {}",
@@ -693,7 +693,7 @@ pub(crate) fn audio_silence_warning(device: &str) -> String {
 /// overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read never
 /// reaches here (see `SoapySdrIqSource::read`), hence "overflow error".
 #[cfg(feature = "soapy")]
-pub(crate) fn soapy_overflow_warning(driver: &str) -> String {
+fn soapy_overflow_warning(driver: &str) -> String {
     format!(
         "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
          stream overflow -- the host is not keeping up; every overflow error is counted in \
@@ -730,7 +730,7 @@ pub(crate) fn attenuation_line(c: &manta_input::hpsdr::AttenuationChange) -> Str
 
 /// MAN-308 D1: `input.auto_attenuation` on a radio `"auto"` found speaking
 /// protocol 1.
-pub(crate) fn protocol_1_attenuation_warning(host: &str, port: u16) -> String {
+fn protocol_1_attenuation_warning(host: &str, port: u16) -> String {
     format!(
         "warning: HPSDR radio {host}:{port} speaks openHPSDR protocol 1; input.auto_attenuation \
          needs protocol 2, so manta leaves this radio's attenuator alone"
@@ -755,7 +755,7 @@ pub(crate) fn warn_if_attenuation_needs_protocol_2(
 /// MAN-140 D18: a radiod channel with AGC on rescales every signal in its
 /// passband whenever one strong signal comes and goes. A warning on each
 /// open, not an error: some operators run AGC on purpose.
-pub(crate) fn ka9q_agc_warning(ssrc: u32) -> String {
+fn ka9q_agc_warning(ssrc: u32) -> String {
     format!(
         "warning: ka9q-radio channel ssrc {ssrc} has AGC on; set agc = off and a fixed gain \
          in its radiod section, or one strong signal changes the gain for every signal in \
@@ -765,7 +765,7 @@ pub(crate) fn ka9q_agc_warning(ssrc: u32) -> String {
 
 /// A stderr line printed when an HPSDR radio opens (MAN-305 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HpsdrOpenLine {
+enum HpsdrOpenLine {
     Note(String),
     Warning(String),
 }
@@ -773,7 +773,7 @@ pub(crate) enum HpsdrOpenLine {
 /// MAN-305 §4: how the protocol was chosen, rendered from what
 /// `open_receiver` returned. `None` under `--hpsdr-protocol 1`, which
 /// prints nothing new.
-pub(crate) fn hpsdr_open_line(
+fn hpsdr_open_line(
     host: &str,
     port: u16,
     protocol: manta_input::hpsdr::HpsdrProtocol,
@@ -943,3 +943,6 @@ pub(crate) fn apply_raw_iq(
         _ => bail!("--iq-format applies to one IQ file source (--source PATH --source-iq)"),
     }
 }
+
+#[cfg(test)]
+mod tests;
