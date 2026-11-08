@@ -135,7 +135,10 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
-  native SoapySDR library (CI, contributors without hardware).
+  native SoapySDR library (CI, contributors without hardware). In `manta-cli`,
+  `soapy_opts` is the one module that names the feature: its `SoapyArgs` flags
+  exist only in a `soapy` build, and the `SoapyOpts` settings exist in every
+  build (MAN-550).
 - **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
   (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
