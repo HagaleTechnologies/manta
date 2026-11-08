@@ -120,6 +120,7 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - [Can a later repetition rescue an ambiguous decode?](../docs/DECISIONS/2026-11-05-man208-delayed-refinement.md) — Bounded replay (live single- and multi-input, offline decode) revises the same occurrence; the RF timestamp remains distinct from decision availability. Includes the fixture's measurement limits.
 - [Why does recording a refinement hop stay cheap at 300 tracks?](../docs/DECISIONS/2026-11-08-man525-refine-bookkeeping-cost.md) MAN-525 keeps a running count and an ordered index of ring fronts; eviction order and outcomes are unchanged.
 - [How are required Unix CI tests sharded without dropping coverage?](../docs/DECISIONS/2026-11-05-man498-required-ci-runtime.md) MAN-498 keeps whole test binaries and explicit doctests behind independent OS aggregates.
+- [How do the Unix test shards run without compiling?](../docs/DECISIONS/2026-11-08-man518-build-test-executables-once-per-os.md) MAN-518 builds once per OS and ships each shard its slice.
 - [Why do a PR's Linux and macOS test check-runs land before Windows?](../docs/DECISIONS/2026-11-08-man516-relay-unix-check-runs-before-windows.md) MAN-516: two relays; a PR can merge before its non-required Windows result.
 
 - CW sub-segments and automatic daily/dated UTC coverage: [config reference](../docs/CONFIG.md#cw-sub-segments-and-utc-schedules) and [MAN-30 decision](../docs/DECISIONS/2026-11-04-man30-cw-segments.md).
