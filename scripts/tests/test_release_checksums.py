@@ -31,9 +31,10 @@ RUNBOOK = "docs/RUNBOOKS/release.md"
 RUNBOOK_HEADING = "## Verifying a downloaded release"
 RUNBOOK_LINK = RUNBOOK + "#verifying-a-downloaded-release"
 RETRY_HEADING = "## If the image publish fails"
-# The release's six archives: the build matrix's five and build-soapy's one (MAN-82); sorted under
-# any collation.
+# The release's seven archives: the build matrix's five, build-soapy's one (MAN-82) and
+# build-soapy-arm64's one (MAN-539); sorted under any collation.
 ARCHIVES = (
+    "manta-linux-arm64-soapy.tar.gz",
     "manta-linux-arm64.tar.gz",
     "manta-linux-x86_64-soapy.tar.gz",
     "manta-linux-x86_64.tar.gz",
@@ -43,9 +44,10 @@ ARCHIVES = (
 )
 DOWNLOADED = "manta-linux-x86_64.tar.gz"
 # MAN-82: the jobs whose `manta-*` uploads the release job publishes, and the jobs it must not wait for.
-ARCHIVE_PRODUCERS = ("build", "build-soapy")
+ARCHIVE_PRODUCERS = ("build", "build-soapy", "build-soapy-arm64")
 IMAGE_JOBS = ("docker-publish-release", "docker-build-dispatch", "publish-latest")
 SOAPY_ARCHIVE = "manta-linux-x86_64-soapy.tar.gz"
+SOAPY_ARM64_ARCHIVE = "manta-linux-arm64-soapy.tar.gz"
 # The commands the runbook gives operators; the executed tests below run exactly these.
 LINUX_CHECK = "sha256sum -c --ignore-missing SHA256SUMS"
 MACOS_CHECK = "shasum -a 256 -c --ignore-missing SHA256SUMS"
@@ -189,12 +191,15 @@ class ReleaseJobTests(unittest.TestCase):
         uploads = [s for s in wf.steps(build) if uses(s).startswith("actions/upload-artifact@")]
         self.assertEqual(len(uploads), 1)
         self.assertEqual(with_field(uploads[0], "name"), "${{ matrix.artifact }}")
-        # MAN-82: build-soapy uploads one archive under a literal name.
-        soapy = [s for s in wf.steps(wf.job_block(text, "build-soapy"))
-                 if uses(s).startswith("actions/upload-artifact@")]
-        self.assertEqual(len(soapy), 1)
-        names.append(with_field(soapy[0], "name"))
-        self.assertEqual(with_field(soapy[0], "path"), SOAPY_ARCHIVE)
+        # MAN-82, MAN-539: build-soapy and build-soapy-arm64 each upload one archive under a
+        # literal name.
+        for job, archive in (("build-soapy", SOAPY_ARCHIVE), ("build-soapy-arm64", SOAPY_ARM64_ARCHIVE)):
+            with self.subTest(job=job):
+                soapy = [s for s in wf.steps(wf.job_block(text, job))
+                         if uses(s).startswith("actions/upload-artifact@")]
+                self.assertEqual(len(soapy), 1)
+                names.append(with_field(soapy[0], "name"))
+                self.assertEqual(with_field(soapy[0], "path"), archive)
         self.assertEqual(sorted(n + (".zip" if "windows" in n else ".tar.gz") for n in names), list(ARCHIVES))
         for name in names:
             self.assertTrue(fnmatch.fnmatchcase(name, "manta-*"), f"pattern manta-* drops {name}")
@@ -204,7 +209,7 @@ class ReleaseJobTests(unittest.TestCase):
         # download runs; MAN-298 keeps the image's outcome out of the release.
         text = wf.read(WORKFLOW)
         needs = wf.field(wf.job_block(text, "release"), "needs")
-        self.assertEqual(needs, "[validate-tag, build, build-soapy]")
+        self.assertEqual(needs, "[validate-tag, build, build-soapy, build-soapy-arm64]")
         listed = {n.strip() for n in needs.strip("[]").split(",")}
         producers = set()
         for job in wf.job_ids(text):
@@ -244,11 +249,12 @@ class ReleaseJobTests(unittest.TestCase):
                          "the body is prepended to the generated notes")
 
     def test_release_notes_point_soapy_users_at_their_archive(self):
-        # MAN-82: the notes keep the alpha label, the verification link and the ALSA note, and
-        # say which archive SoapySDR users take and what to install first.
+        # MAN-82, MAN-539: the notes keep the alpha label, the verification link and the ALSA
+        # note, and say which archive SoapySDR users take and what to install first.
         body = " ".join((with_field(publish_step(), "body") or "").split())
         for needle in (D7_PHRASE, "#verifying-a-downloaded-release", "libasound2", SOAPY_ARCHIVE,
-                       "Ubuntu 24.04 x86_64", "libsoapysdr0.8", "SoapySDR module", "SDRplay"):
+                       "Ubuntu 24.04 x86_64", "libsoapysdr0.8", "SoapySDR module", "SDRplay",
+                       SOAPY_ARM64_ARCHIVE, "Raspberry Pi OS"):
             with self.subTest(needle=needle):
                 self.assertIn(needle.lower(), body.lower())
 

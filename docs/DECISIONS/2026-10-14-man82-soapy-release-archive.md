@@ -5,6 +5,12 @@ Status: implemented in the branch. A hosted release run, the published
 archive and a run with a real receiver are still outstanding (see
 "Verification limits").
 
+MAN-539 (2026-11) adds `manta-linux-arm64-soapy.tar.gz`, built in Debian
+bookworm by `build-soapy-arm64`, and SoapySDR in the Docker image, which
+changes D5's "the image does not" only in that the image now carries
+SoapySDR; the Release still does not wait for the image. See
+[the MAN-539 record](2026-11-08-man539-arm64-soapy-archive-and-image.md).
+
 README's quickstart named `--soapy-driver`, but every release binary was
 built with `--features hpsdr` only, so an RTL-SDR, Airspy, SDRplay or
 HackRF operator needed a Rust toolchain and a source build. A downloaded
