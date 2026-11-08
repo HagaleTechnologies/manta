@@ -102,6 +102,27 @@ The graph shows `[dependencies]` only; dev-only edges (for example
 `manta-cli → coppa-channel` and `manta-engine → manta-testkit`) are test
 fixtures and left out.
 
+Inside `manta-cli`, `src/main.rs` holds the clap tree (`Cli`, `enum Command`)
+and the dispatch in `run_command`. MAN-548 moved each piece of the daemon's
+wiring into its own module
+([decision record](docs/DECISIONS/2026-11-08-man548-main-rs-split.md)):
+
+- `run_cmd.rs`: `RunArgs` (the `run`/`listen` flags) and `run`, the daemon.
+- `source_spec.rs`: `LiveSourceSpec`, source opening and the source warnings.
+- `recording.rs`: `--record-iq` checks, start, finish and report.
+- `cli_parse.rs`: the clap `value_parser` functions and their ranges.
+- `session_epoch.rs`: the session epoch and spot-id nonce for replays.
+- `resolve.rs`: `CliOverrides`, `Resolved`, `resolve` and `spec_from_file`.
+- `daemon_client.rs`: `manta status`'s client and the `http_get` that
+  `manta health` shares.
+- `spot_server.rs`: `start_spot_server` and its `SpotServerParams`.
+
+Unit tests do not sit inline in these files. Each module's tests are in
+`src/<module>/tests.rs`, the tests of what stays in `main.rs` are in
+`src/tests.rs`, and fixtures that two or more of them share are in
+`src/test_support.rs`. `crates/manta-cli/tests/module_layout.rs` checks this
+layout.
+
 ### Reused from coppa vs. new
 
 | Capability | Source |

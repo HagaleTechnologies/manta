@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7ff72f447f8b2dd8d04c8ce0ea03c30ea4176fb5c436a0ed101aee68b4adf217",
+      "hash": "sha256:e3bfa62980783f19f895db5acb7881ff021ec43c9e6e943f5948893fc4e440e0",
       "id": "uplink-health-observability",
       "kind": "interface",
       "links": [

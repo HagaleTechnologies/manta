@@ -1,6 +1,6 @@
 //! MAN-261: the daemon's single config file. One TOML parse, a strict
 //! top-level check, the `MANTA_*` environment overlay, then one typed parse
-//! per table. CLI flags are merged on top in main.rs (`resolve`), giving the
+//! per table. CLI flags are merged on top in resolve.rs (`resolve`), giving the
 //! precedence CLI flag > `MANTA_<TABLE>_<KEY>` > file > built-in default.
 //! See docs/SPEC-decode-core.md §9 and
 //! docs/DECISIONS/2026-10-06-man261-config-surface.md.
