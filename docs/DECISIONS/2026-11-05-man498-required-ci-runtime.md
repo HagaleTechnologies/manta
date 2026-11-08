@@ -9,9 +9,16 @@ A failed, cancelled, skipped or missing dependency cannot pass the aggregate.
 Native jobs retain the trusted-author routing, reviewed checkout, inline merge
 with main, suppressed checkout credentials and main-push-only cache writes.
 
+<<<<<<< HEAD
 **Superseded in part (2026-11-08):** MAN-517 shards Windows the same way;
 Windows no longer runs `cargo test --workspace --locked` serially. See
 [its record](2026-11-08-man517-shard-the-windows-test-leg.md).
+=======
+**Superseded in part by MAN-516 (2026-11-08):** "The dispatch relay waits for
+both Unix aggregates and Windows" no longer holds. The relay is two jobs, so
+the Unix check-runs land when their aggregates finish; see
+[its record](2026-11-08-man516-relay-unix-check-runs-before-windows.md).
+>>>>>>> bd701c6ccf554bd0e7ed418b9787e4f22ce9c3ac
 
 This implements scheduling, not a measured 20-minute hosted outcome. The merge
 queue timeout remains 90 minutes until the rollout below passes. No decoder
