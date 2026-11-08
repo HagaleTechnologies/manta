@@ -248,6 +248,11 @@ fn readme_installation_offers_every_release_archive() {
         uploads.contains(&"manta-linux-x86_64-soapy"),
         "release-publish.yml no longer uploads `manta-linux-x86_64-soapy` by name"
     );
+    // MAN-539: `build-soapy-arm64`'s literal upload name.
+    assert!(
+        uploads.contains(&"manta-linux-arm64-soapy"),
+        "release-publish.yml no longer uploads `manta-linux-arm64-soapy` by name"
+    );
     artifacts.extend(uploads);
     for artifact in artifacts {
         let ext = if artifact.contains("windows") {
@@ -320,6 +325,79 @@ fn readme_installation_documents_the_soapy_archive() {
         notes.contains("bundles neither the vendor api nor driver modules"),
         "README must say the Soapy archive bundles no SDRplay API or device modules"
     );
+}
+
+/// MAN-539: a Raspberry Pi operator can pick the arm64 SoapySDR archive from
+/// Installation and install what it needs on Pi OS bookworm, without a Rust
+/// toolchain. The arm64 section points at the x86_64 section's module table
+/// and error messages instead of repeating them.
+#[test]
+fn readme_installation_documents_the_arm64_soapy_archive() {
+    let readme = doc("README.md");
+    let install = squash_whitespace(section(&readme, "Installation"));
+    for needle in [
+        "| Linux arm64 with SoapySDR, 64-bit Raspberry Pi OS bookworm | `manta-linux-arm64-soapy.tar.gz` |",
+        "### SoapySDR on Raspberry Pi OS (arm64)",
+        "releases/latest/download/manta-linux-arm64-soapy.tar.gz",
+    ] {
+        assert!(
+            install.contains(needle),
+            "README Installation never says `{needle}`"
+        );
+    }
+    let arm64 = squash_whitespace(subsection(&readme, "SoapySDR on Raspberry Pi OS (arm64)"));
+    for needle in [
+        "libsoapysdr0.8",
+        "soapysdr0.8-module-rtlsdr",
+        "bookworm",
+        "features: soapy",
+        "(#soapysdr-on-linux-x86_64)",
+        "`manta-linux-arm64.tar.gz`",
+    ] {
+        assert!(
+            arm64.contains(needle),
+            "README's arm64 SoapySDR section never says `{needle}`"
+        );
+    }
+}
+
+/// MAN-539: the maintainer and operator docs that name the x86_64 SoapySDR
+/// archive also name the arm64 one, and the MAN-82 record points at the
+/// MAN-539 record that extends it.
+#[test]
+fn soapy_archive_docs_name_both_architectures() {
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/release.md"));
+    for needle in [
+        "manta-linux-arm64-soapy.tar.gz",
+        "build-soapy-arm64",
+        "debian:bookworm",
+    ] {
+        assert!(
+            runbook.contains(needle),
+            "docs/RUNBOOKS/release.md never says `{needle}`"
+        );
+    }
+    assert!(
+        doc("docs/GUIDES/rbn-node.md").contains("manta-linux-arm64-soapy.tar.gz"),
+        "docs/GUIDES/rbn-node.md never names manta-linux-arm64-soapy.tar.gz"
+    );
+    let man82 = "docs/DECISIONS/2026-10-14-man82-soapy-release-archive.md";
+    let record = doc(man82);
+    let targets: Vec<&str> = record
+        .split("](")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next())
+        .map(|t| t.split('#').next().unwrap_or(t))
+        .filter(|t| t.contains("man539"))
+        .collect();
+    assert!(!targets.is_empty(), "{man82} never links a man539 record");
+    for target in targets {
+        let path = repo_root().join("docs/DECISIONS").join(target);
+        assert!(
+            path.is_file(),
+            "{man82} links {target}, which does not exist"
+        );
+    }
 }
 
 /// MAN-82: `soapysdr0.8-module-airspy` drives the Airspy R2/Mini only. The
@@ -2647,6 +2725,33 @@ fn docker_docs_describe_the_bare_run_and_the_health_check() {
     assert!(
         norm(&doc("README.md")).contains("manta health"),
         "README.md never says manta health"
+    );
+}
+
+/// MAN-539: the image carries SoapySDR, and the Docker docs say how to give
+/// it a USB receiver: the device passthrough, the `plugdev` group, and the
+/// host udev rule that grants that group access.
+#[test]
+fn docker_docs_explain_usb_receivers() {
+    let guide = doc("packaging/README.md");
+    let docker = squash_whitespace(section(&guide, "Docker Compose"));
+    for needle in [
+        "--device /dev/bus/usb",
+        "--group-add plugdev",
+        "plugdev",
+        "librtlsdr0",
+        "udev",
+    ] {
+        assert!(
+            docker.contains(needle),
+            "packaging/README.md's Docker section never says {needle:?}"
+        );
+    }
+    let readme = doc("README.md");
+    let readme_docker = squash_whitespace(subsection(&readme, "Docker")).to_lowercase();
+    assert!(
+        readme_docker.contains("soapysdr"),
+        "README's Docker section never says the image includes SoapySDR"
     );
 }
 

@@ -20,6 +20,9 @@
 # cty.dat and MASTER.SCP copies across container restarts. Refresh stays
 # off until you set refresh_lists = true in manta.toml; it then needs
 # outbound TCP port 80. See packaging/README.md.
+#
+# USB receivers need the commented devices/group_add lines below; see
+# packaging/README.md.
 
 services:
   manta:
@@ -46,6 +49,12 @@ services:
       RUST_LOG: info
       MANTA_SERVER_METRICS_BIND_ADDR: "0.0.0.0"
       MANTA_SPOT_LIST_CACHE_DIR: "/var/cache/manta"
+    # USB receivers (RTL-SDR, Airspy, HackRF): uncomment both, then see
+    # packaging/README.md, "USB receivers".
+    # devices:
+    #   - /dev/bus/usb:/dev/bus/usb
+    # group_add:
+    #   - plugdev
     logging:
       driver: json-file
       options:

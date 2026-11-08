@@ -22,9 +22,12 @@ there.
 
 - **A network receiver.** The recipes are written for a KiwiSDR, which
   every build supports and which needs no device permissions. An HPSDR
-  radio on the network works the same way. None of the recipes gives manta
-  access to a local sound card or USB SDR. Every build includes KiwiSDR
-  and HPSDR; SoapySDR is optional and has a separate Linux x86_64 release archive.
+  radio on the network works the same way. As shipped, none of the recipes
+  gives manta access to a local sound card or USB SDR; the Docker recipe
+  can pass a USB receiver through (see "USB receivers" under Docker
+  Compose). Every build includes KiwiSDR
+  and HPSDR; SoapySDR is optional and has separate Linux x86_64 and arm64
+  release archives, and the Docker image includes it.
   Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
@@ -390,8 +393,20 @@ is invalid.
   `listen` without a config) has nothing to probe and shows `(unhealthy)`.
   Turn the check off for those with `docker run --no-healthcheck`, or with
   `healthcheck: disable: true` under the service in Compose.
-- **Not enabled.** No device passthrough, privileged mode or host
-  networking: use a network receiver.
+- **USB receivers.** The image includes SoapySDR and Debian's modules for
+  RTL-SDR, Airspy R2 and Mini, and HackRF. Compose passes no device by
+  default. To use a USB receiver, uncomment the `devices:` and
+  `group_add:` lines in `docker-compose.yml`, or add
+  `--device /dev/bus/usb --group-add plugdev` to `docker run`. The
+  container's `manta` user can open the receiver only if a udev rule on
+  the host gives the `plugdev` group access to it. Debian's `librtlsdr0`
+  and `libhackrf0` packages install such a rule; Airspy's package does
+  not, so add one for it. Docker resolves `plugdev` inside the image (GID
+  46, Debian's); if the host's `plugdev` GID differs, pass the host's
+  number instead. Replug the receiver after adding a rule. A receiver
+  plugged in after the container started is not visible until it
+  restarts. This setup has not yet been tested with a receiver.
+  Privileged mode and host networking stay off.
 
 ### Without Compose
 
@@ -402,6 +417,8 @@ With no arguments, the image runs the daemon from a config mounted at
 docker run -d --name manta --restart unless-stopped --stop-timeout 60 --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly -p 7300:7300 -p 7301:7301 ghcr.io/hagaletechnologies/manta:latest
 docker logs -f manta
 docker ps    # STATUS shows (healthy) once the daemon answers
+# A USB receiver: list what SoapySDR finds through the passthrough
+docker run --rm --device /dev/bus/usb --group-add plugdev ghcr.io/hagaletechnologies/manta:latest devices
 ```
 
 - Use `--mount`, not `-v`. When `manta.toml` is missing on the host,
