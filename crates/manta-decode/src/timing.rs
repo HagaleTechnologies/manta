@@ -2,6 +2,9 @@
 
 use std::collections::VecDeque;
 
+mod bank;
+pub use bank::{SpeedBankConfig, SwitchRecord, TimingBank, TimingHypothesis};
+
 const CLUSTER_ALPHA: f32 = 0.15; // SPEC §9 decode.cluster_alpha
 const RATIO_MIN: f32 = 2.2; // SPEC §9 decode.mu_ratio_bounds
                             // SPEC §9 decode.mu_ratio_bounds upper end, **[DEVIATION]** (MAN-315 D5):

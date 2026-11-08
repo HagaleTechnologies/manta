@@ -215,6 +215,34 @@ pub fn render_signal_with_route(
     Ok((acc, text))
 }
 
+/// MAN-544: place a prebuilt keyed envelope at `offset_hz` with the direct
+/// route's complex NCO and `amplitude_for_snr_2500` scaling (no QSB, no
+/// noise, no `MASTER_SCALE`): the contribution `render_signal` makes for an
+/// unfaded, QSB-free signal whose envelope is `env`. For envelopes no
+/// `SignalSpec` can describe, such as `keyer::key_text_steps`. One output
+/// sample per envelope sample.
+pub fn place_envelope(env: &[f32], offset_hz: f64, snr_2500_db: f32, fs: f64) -> Vec<Complex32> {
+    let amp = amplitude_for_snr_2500(snr_2500_db, fs);
+    let mut out = vec![Complex32::new(0.0, 0.0); env.len()];
+    let dphi = std::f64::consts::TAU * offset_hz / fs;
+    let mut phi = 0.0f64;
+    for (o, &a) in out.iter_mut().zip(env.iter()) {
+        let e = a * amp;
+        if e != 0.0 {
+            let (s, c) = phi.sin_cos();
+            o.re += e * c as f32;
+            o.im += e * s as f32;
+        }
+        phi += dphi;
+        if phi > std::f64::consts::PI {
+            phi -= std::f64::consts::TAU;
+        } else if phi < -std::f64::consts::PI {
+            phi += std::f64::consts::TAU;
+        }
+    }
+    out
+}
+
 /// Sum contributions in slice order into a zeroed buffer of `n` samples,
 /// add unit AWGN when `noise_seed` is set, then apply `MASTER_SCALE`.
 pub fn mix(contributions: &[&[Complex32]], n: usize, noise_seed: Option<u64>) -> Vec<Complex32> {
@@ -340,6 +368,34 @@ mod tests {
             x.iter().position(|c| c.norm() >= 0.5 * peak).unwrap()
         };
         assert_eq!(first(&r) - first(&d), 64);
+    }
+
+    #[test]
+    fn place_envelope_matches_the_direct_route() {
+        let mut sig = vectors::v2().signals[0].clone();
+        sig.qsb = None;
+        sig.watterson = None;
+        let fs = 96_000.0;
+        let (want, _) = render_signal(&sig, fs, 3.0).unwrap();
+        let spec = KeyerSpec {
+            wpm: sig.wpm,
+            char_wpm: sig.char_wpm,
+            rise_ms: sig.rise_ms,
+            jitter: sig.jitter,
+            weight: sig.weight,
+            char_gap_units: sig.char_gap_units,
+            word_gap_units: sig.word_gap_units,
+            dit_units: sig.dit_units,
+            element_gap_units: sig.element_gap_units,
+        };
+        let (env, _) = if sig.loop_text {
+            key_text_loop(&sig.text, &spec, fs, 3.0).unwrap()
+        } else {
+            key_text(&sig.text, &spec, fs).unwrap()
+        };
+        let mut got = place_envelope(&env, sig.offset_hz, sig.snr_2500_db, fs);
+        got.resize(want.len(), Complex32::new(0.0, 0.0));
+        assert_eq!(got, want);
     }
 
     #[test]
