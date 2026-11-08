@@ -123,3 +123,4 @@ not used; disabling it remains an owner step ([decision](../docs/DECISIONS/2026-
 - CW sub-segments and automatic daily/dated UTC coverage: [config reference](../docs/CONFIG.md#cw-sub-segments-and-utc-schedules) and [MAN-30 decision](../docs/DECISIONS/2026-11-04-man30-cw-segments.md).
 - [How is IQ correction calibrated and withheld?](../docs/DECISIONS/2026-11-05-man494-calibrated-iq-conditioning.md) MAN-494 fixes coefficients per stream and requires receiver-centre agreement.
 - [How does the WSJT-X multicast relay share a port with other consumers?](../docs/DECISIONS/2026-11-06-man471-multicast-relay-port-sharing.md) MAN-471 sets address reuse before the wildcard bind; unicast remains exclusive.
+- [Why does docs_consistency fail when CI gains a script suite or CLAUDE.md grows?](../docs/DECISIONS/2026-11-08-man547-brief-matches-ci.md) MAN-547 pins CLAUDE.md's pre-push list to ci-full.yml's commands and suites, and the brief to 100 lines.
