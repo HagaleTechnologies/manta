@@ -134,7 +134,8 @@ fn word_boundary_fraction_lives_in_manta_testkit() {
 }
 
 /// The pending list only shrinks: an entry whose file no longer carries a
-/// copy must leave the list, so the follow-up cannot stop half way unseen.
+/// copy (its own `fn manta` and scrub loop) must leave the list, so a
+/// converted file loses its exemption from both rules above.
 #[test]
 fn pending_launcher_copies_are_still_copies() {
     let sources = sources();
@@ -142,13 +143,16 @@ fn pending_launcher_copies_are_still_copies() {
         .iter()
         .copied()
         .filter(|name| {
-            !sources
-                .iter()
-                .any(|(rel, text)| rel == name && text.contains("fn manta("))
+            !sources.iter().any(|(rel, text)| {
+                rel == name
+                    && text.contains("fn manta(")
+                    && text.contains("starts_with(b\"MANTA_\")")
+            })
         })
         .collect();
     assert!(
         stale.is_empty(),
-        "remove from PENDING_LAUNCHER_COPIES, they no longer define `fn manta`: {stale:?}"
+        "remove from PENDING_LAUNCHER_COPIES, they no longer carry their own scrubbing \
+         `fn manta`: {stale:?}"
     );
 }

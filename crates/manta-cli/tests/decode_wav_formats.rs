@@ -8,7 +8,7 @@ mod launch;
 use launch::manta;
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 /// V1 shortened to 30 s, written into `dir` as Float32 with its sidecar;
 /// returns the WAV path. The same fixture as `cli.rs`'s `short_v1`: a 15 s
@@ -185,7 +185,7 @@ fn decode_runs_in_bounded_memory() {
     // same binary completes in <96 MiB on an idle machine (uncapped VSZ:
     // ~420 MiB, almost all lazy arena/stack reservations). With one arena
     // the cap measures manta's own streaming footprint deterministically.
-    let out = launch::without_manta_env(Command::new("sh"))
+    let out = launch::without_manta_env(std::process::Command::new("sh"))
         .args(["-c", "ulimit -v 98304 && exec \"$0\" \"$@\""])
         .arg(env!("CARGO_BIN_EXE_manta"))
         .args(["decode", wav.to_str().unwrap(), "--json"])

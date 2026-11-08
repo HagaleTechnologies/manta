@@ -10,7 +10,7 @@ use manta_input::recording_format::MetadataRecord;
 use manta_input::{metadata_path, EndReason, RecordingHeader};
 use num_complex::Complex32;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn run_ok(args: &[&std::ffi::OsStr]) -> Output {
     let out = manta().args(args).output().unwrap();
@@ -1042,7 +1042,7 @@ fn v1_fixture_secs(dir: &Path, seconds: f64) -> PathBuf {
 /// fails with EFBIG instead of raising SIGXFSZ): a storage failure for the
 /// recorder only, since stdout and stderr are pipes.
 #[cfg(unix)]
-fn manta_with_file_size_limit(bytes: u64) -> Command {
+fn manta_with_file_size_limit(bytes: u64) -> std::process::Command {
     use std::os::unix::process::CommandExt;
     let mut cmd = manta();
     // SAFETY: async-signal-safe libc calls only, between fork and exec.
