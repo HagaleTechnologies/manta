@@ -23,12 +23,6 @@ pub(crate) fn write_temp_file(contents: &[u8]) -> tempfile::NamedTempFile {
     f
 }
 
-// MAN-136 round-1 validate code-review finding 1: the increment
-// condition for `manta_spots_unresolved_geography_total` must match the
-// condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
-// sentinels -- the RESOLVED ADIF entity number, not merely whether
-// `cty.lookup` returned an entry.
-
 pub(crate) const GEOGRAPHY_CTY_FIXTURE: &str = "\
 United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     K,W,N;
@@ -37,8 +31,6 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 /// One `dxcc.tsv` row for the fixture above, in the vendored file's
 /// `<primary-prefix>\t<adif-number>\t<name>` shape.
 pub(crate) const GEOGRAPHY_DXCC_FIXTURE: &str = "K\t291\tUnited States\n";
-
-// ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
 
 pub(crate) fn cli_overrides() -> CliOverrides {
     CliOverrides::none()
@@ -62,11 +54,6 @@ pub(crate) fn ka9q_opts(ssrc: Option<u32>) -> Ka9qOpts {
         ..Ka9qOpts::unset()
     }
 }
-
-// MAN-86 review: the two ways the source-to-SETT wiring can advertise
-// coverage manta cannot hear. Both go through `station_profile`, the
-// exact code path `start_spot_server` uses, rather than calling
-// `segments_for_passband` directly.
 
 pub(crate) fn test_server_config(callsign: &str) -> manta_server::config::ServerConfig {
     let cfg_file = write_temp_file(

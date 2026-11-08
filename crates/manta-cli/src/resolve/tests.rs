@@ -307,6 +307,8 @@ const THREE_KA9Q: &str = "[[input]]\nname = \"40m\"\ntype = \"ka9q\"\ngroup = \"
         [[input]]\nname = \"15m\"\ntype = \"kiwi\"\nhost = \"127.0.0.1\"\n\
         freq_hz = 21030000.0\ncenter_freq_hz = 21000000.0\nfreq_correction_ppm = 0.8\n";
 
+// ---- MAN-261: CLI > env > file precedence (`resolve`) and coverage
+
 #[test]
 fn resolve_returns_one_resolved_input_per_entry_with_its_own_ppm_dial_and_capture_rate() {
     let loaded = loaded_from(THREE_KA9Q);

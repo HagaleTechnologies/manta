@@ -2036,6 +2036,12 @@ fn kiwi_like_source_counters_reach_metrics_under_kiwi_label() {
     assert!(text.contains(r#"manta_input_dropped_packets_total{source="kiwi"} 3"#));
 }
 
+// MAN-136 round-1 validate code-review finding 1: the increment
+// condition for `manta_spots_unresolved_geography_total` must match the
+// condition under which `SpotMessage::from_spot` emits the `UNKNOWN_*`
+// sentinels -- the RESOLVED ADIF entity number, not merely whether
+// `cty.lookup` returned an entry.
+
 #[test]
 fn a_callsign_with_a_resolved_entity_number_is_not_counted_as_unresolved() {
     let cty =
@@ -2508,6 +2514,11 @@ fn every_flag_key_is_accepted_by_the_loader() {
         }
     }
 }
+
+// MAN-86 review: the two ways the source-to-SETT wiring can advertise
+// coverage manta cannot hear. Both go through `station_profile`, the
+// exact code path `start_spot_server` uses, rather than calling
+// `segments_for_passband` directly.
 
 #[test]
 fn sett_advertises_the_configured_minimal_validation_level() {
