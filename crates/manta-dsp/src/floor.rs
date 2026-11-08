@@ -2,6 +2,8 @@
 //! §2.1-2.2. Pure, stateful-per-channel — no track lifecycle here (that's
 //! `manta-engine::track`).
 
+use crate::channelizer::power_linear;
+
 /// SPEC §2.1: 250-entry ring = 10 s at 25 Hz decimation (push every 15th hop
 /// at the channelizer's fixed 375 Hz hop rate).
 const RING_LEN: usize = 250;
@@ -140,9 +142,11 @@ fn median(vals: &[f64]) -> f64 {
 }
 
 /// Per-channel noise floor across the whole channelizer output. SPEC
-/// §2.1-2.2. Call `update` once per hop with that hop's per-channel dB
-/// power (`manta_dsp::channelizer::power_db` applied to each
-/// `HopOutput.power[k]`); query `effective_floor_db` any time.
+/// §2.1-2.2. Call `update` once per hop with that hop's per-channel power
+/// in both units, the same hop each time: dB (`manta_dsp::channelizer::power_db`
+/// applied to each `HopOutput.power[k]`) and the linear `HopOutput.power`
+/// itself (MAN-526: the linear EMA reads it directly instead of undoing the
+/// `log10`); query `effective_floor_db` any time.
 pub struct FloorBank {
     channels: Vec<ChannelFloor>,
     floor_db: Vec<f64>,
@@ -172,6 +176,10 @@ pub struct FloorBank {
     /// first `SEED_PUSHES` decimated hops, and how many were summed.
     seed_sum_db: Vec<f64>,
     seed_pushes: Vec<u32>,
+    /// MAN-526: each channel's rise floor `F_rise` (SPEC §2.3), recomputed
+    /// after every decimated push, the only place its inputs change.
+    /// `Gate` keys its cached linear rise threshold on this value.
+    rise_floor_db: Vec<f64>,
 }
 
 /// `10^(db/10)`, the inverse of `manta_dsp::channelizer::power_db`'s
@@ -199,6 +207,7 @@ impl FloorBank {
             smoothed_init: false,
             seed_sum_db: vec![0.0; n_blocks],
             seed_pushes: vec![0; n_blocks],
+            rise_floor_db: vec![HIST_MIN_DB; n_channels],
         }
     }
 
@@ -207,10 +216,12 @@ impl FloorBank {
         self.channels.len()
     }
 
-    /// One hop's per-channel dB power. Internally decimates to 25 Hz (every
-    /// 15th hop) per SPEC §2.1; cheap to call every hop.
-    pub fn update(&mut self, power_db: &[f64]) {
-        self.update_holding_reference(power_db, false);
+    /// One hop's per-channel power, in dB (`power_db`) and linear
+    /// (`power`, the hop's `HopOutput.power`), both for the same hop.
+    /// Internally decimates to 25 Hz (every 15th hop) per SPEC §2.1; cheap
+    /// to call every hop.
+    pub fn update(&mut self, power_db: &[f64], power: &[f32]) {
+        self.update_holding_reference(power_db, power, false);
     }
 
     /// `update`, except that with `hold_reference` set the spectral
@@ -221,7 +232,12 @@ impl FloorBank {
     /// the crash. The floor rings still take their decimated push, so the
     /// order-statistic floor and its timing are unchanged. The first call
     /// always seeds the reference: there is nothing to hold yet.
-    pub fn update_holding_reference(&mut self, power_db: &[f64], hold_reference: bool) {
+    pub fn update_holding_reference(
+        &mut self,
+        power_db: &[f64],
+        power: &[f32],
+        hold_reference: bool,
+    ) {
         assert_eq!(
             power_db.len(),
             self.channels.len(),
@@ -229,14 +245,21 @@ impl FloorBank {
             power_db.len(),
             self.channels.len()
         );
+        assert_eq!(
+            power.len(),
+            power_db.len(),
+            "FloorBank::update: power length {} does not match power_db length {}",
+            power.len(),
+            power_db.len()
+        );
         if !self.smoothed_init {
-            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
-                *s = db_to_linear(p);
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power) {
+                *s = power_linear(p);
             }
             self.smoothed_init = true;
         } else if !hold_reference {
-            for (s, &p) in self.smoothed_lin.iter_mut().zip(power_db) {
-                let p_lin = db_to_linear(p);
+            for (s, &p) in self.smoothed_lin.iter_mut().zip(power) {
+                let p_lin = power_linear(p);
                 *s += GATE_EMA_ALPHA * (p_lin - *s);
             }
         }
@@ -273,8 +296,30 @@ impl FloorBank {
                 let end = (start + BLOCK_CHANNELS).min(self.channels.len());
                 *block_floor = median(&self.usable_floor_db[start..end]);
             }
+            for k in 0..self.channels.len() {
+                self.rise_floor_db[k] = self.compute_rise_floor_db(k);
+            }
         }
         self.hop_counter += 1;
+    }
+
+    /// SPEC §2.3's rise floor `F_rise[k]`, from the decimated state. Only
+    /// the decimated branch of `update_holding_reference` changes its
+    /// inputs, so it is computed there and cached in `rise_floor_db`.
+    fn compute_rise_floor_db(&self, k: usize) -> f64 {
+        let f = self.effective_floor_db(k);
+        // A channel quartile can underestimate noise relative to integrated
+        // means. Clamp rise to the block quartile and retain the same
+        // block seed for rise until the full ten-second ring is available.
+        // Drop and SNR continue to use the unmodified effective floor.
+        let block = k / BLOCK_CHANNELS;
+        let pushes = self.seed_pushes[block];
+        let block_floor = f.max(self.block_floor_db[block]);
+        if self.channels[k].usable_len() < RING_LEN && pushes > 0 {
+            block_floor.max(self.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
+        } else {
+            block_floor
+        }
     }
 
     /// Raw per-channel lower quartile, before the neighborhood clamp. SPEC §2.1.
@@ -331,6 +376,17 @@ pub struct Gate {
     looks: Vec<PowerLooks>,
     /// Optional EMA rise threshold, ORed with the two-look rise.
     ema_on_snr_db: Option<f32>,
+    /// MAN-526: the `F_rise` (`FloorBank::rise_floor_db`) each channel's
+    /// cached `thr_lin` was computed from, NaN until the first judge.
+    /// Keyed by value, not by an update counter, so a gate judged against
+    /// a different or changed `FloorBank` recomputes on its own.
+    thr_src_db: Vec<f64>,
+    /// MAN-526: `10^((F_rise + on_snr_db)/10)`, the linear window
+    /// threshold, recomputed only when `thr_src_db` no longer matches.
+    thr_lin: Vec<f64>,
+    /// How many times `refresh_threshold` recomputed a threshold.
+    #[cfg(test)]
+    thr_recomputes: u64,
 }
 
 /// MAN-109: the two-look rise applies only on a channel whose recent
@@ -430,6 +486,10 @@ impl Gate {
             off_snr_db,
             looks,
             ema_on_snr_db: None,
+            thr_src_db: vec![f64::NAN; n_channels],
+            thr_lin: vec![0.0; n_channels],
+            #[cfg(test)]
+            thr_recomputes: 0,
         }
     }
 
@@ -446,7 +506,15 @@ impl Gate {
     /// two full disjoint windows clearing the on threshold. The window path
     /// is withheld when the channel's wrapping ±2 neighbourhood holds a
     /// stronger recent window (`beside_stronger`). Drop uses the EMA.
-    pub fn update(&mut self, power_db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
+    ///
+    /// `power_db` and `power` are the same hop in dB and linear units: the
+    /// EMA runs in dB (SPEC §2.3), the windows integrate linear power.
+    pub fn update(
+        &mut self,
+        power_db: &[f64],
+        power: &[f32],
+        floor: &FloorBank,
+    ) -> (Vec<bool>, Vec<bool>) {
         assert_eq!(
             power_db.len(),
             self.smoothed_db.len(),
@@ -454,17 +522,23 @@ impl Gate {
             power_db.len(),
             self.smoothed_db.len()
         );
+        assert_eq!(
+            power.len(),
+            power_db.len(),
+            "Gate::update: power length {} does not match power_db length {}",
+            power.len(),
+            power_db.len()
+        );
         let mut rise = vec![false; power_db.len()];
         let mut drop = vec![false; power_db.len()];
-        for (k, &power) in power_db.iter().enumerate() {
+        for (k, (&p_db, &p)) in power_db.iter().zip(power).enumerate() {
             self.smoothed_db[k] = if self.initialized[k] {
-                self.smoothed_db[k] + GATE_EMA_ALPHA * (power - self.smoothed_db[k])
+                self.smoothed_db[k] + GATE_EMA_ALPHA * (p_db - self.smoothed_db[k])
             } else {
                 self.initialized[k] = true;
-                power
+                p_db
             };
-            // Inverse of channelizer::power_db, including its 1e-20 guard.
-            let linear = 10.0_f64.powf(power / 10.0);
+            let linear = power_linear(p);
             for look in &mut self.looks {
                 look.push(k, linear);
             }
@@ -473,7 +547,8 @@ impl Gate {
             look.advance();
         }
         for k in 0..power_db.len() {
-            (rise[k], drop[k]) = self.judge(k, floor);
+            let threshold = self.refresh_threshold(k, floor);
+            (rise[k], drop[k]) = self.judge(k, floor, threshold);
         }
         (rise, drop)
     }
@@ -484,7 +559,11 @@ impl Gate {
     /// otherwise carry every channel's `S[k]` over the rise threshold and
     /// keep it there for tens of hops after the crash ends. A channel no
     /// `update` has seeded yet reports `(false, false)`.
-    pub fn hold(&self, floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
+    ///
+    /// MAN-526: `&mut` only to refresh the cached linear rise threshold
+    /// when `floor`'s `F_rise` moved (a crash can hold for many decimated
+    /// pushes); the EMA and the power windows never step here.
+    pub fn hold(&mut self, floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
         assert_eq!(
             floor.n_channels(),
             self.smoothed_db.len(),
@@ -497,7 +576,8 @@ impl Gate {
         let mut drop = vec![false; n];
         for k in 0..n {
             if self.initialized[k] {
-                (rise[k], drop[k]) = self.judge(k, floor);
+                let threshold = self.refresh_threshold(k, floor);
+                (rise[k], drop[k]) = self.judge(k, floor, threshold);
             }
         }
         (rise, drop)
@@ -512,23 +592,30 @@ impl Gate {
                 .is_some_and(|on| self.smoothed_db[k] >= floor.effective_floor_db(k) + on as f64)
     }
 
+    /// MAN-526: channel `k`'s linear window threshold
+    /// `10^((F_rise + on_snr_db)/10)`, recomputed only when `floor`'s
+    /// `F_rise[k]` differs from the value the cache holds. `F_rise` moves
+    /// only on a decimated push (every `DECIMATION_HOPS` hops), so the
+    /// `powf` runs at most once per channel per decimated push instead of
+    /// once per channel per hop. Same expression and inputs as before, so
+    /// the threshold is bit-identical.
+    fn refresh_threshold(&mut self, k: usize, floor: &FloorBank) -> f64 {
+        let rise_floor = floor.rise_floor_db[k];
+        if rise_floor != self.thr_src_db[k] {
+            self.thr_src_db[k] = rise_floor;
+            self.thr_lin[k] = 10.0_f64.powf((rise_floor + self.on_snr_db as f64) / 10.0);
+            #[cfg(test)]
+            {
+                self.thr_recomputes += 1;
+            }
+        }
+        self.thr_lin[k]
+    }
+
     /// Judge frozen power windows (and the EMA, if enabled) for rise and
-    /// the EMA for drop.
-    fn judge(&self, k: usize, floor: &FloorBank) -> (bool, bool) {
+    /// the EMA for drop. `threshold` is `refresh_threshold(k, floor)`.
+    fn judge(&self, k: usize, floor: &FloorBank, threshold: f64) -> (bool, bool) {
         let f = floor.effective_floor_db(k);
-        // A channel quartile can underestimate noise relative to integrated
-        // means. Clamp rise to the block quartile and retain the same
-        // block seed for rise until the full ten-second ring is available.
-        // Drop and SNR continue to use the unmodified effective floor.
-        let block = k / BLOCK_CHANNELS;
-        let pushes = floor.seed_pushes[block];
-        let block_floor = f.max(floor.block_floor_db[block]);
-        let rise_floor = if floor.channels[k].usable_len() < RING_LEN && pushes > 0 {
-            block_floor.max(floor.seed_sum_db[block] / pushes as f64 - SEED_OFFSET_DB)
-        } else {
-            block_floor
-        };
-        let threshold = 10.0_f64.powf((rise_floor + self.on_snr_db as f64) / 10.0);
         let ema_rise = self
             .ema_on_snr_db
             .is_some_and(|on| self.smoothed_db[k] >= f + on as f64);
@@ -552,18 +639,43 @@ impl Gate {
 mod tests {
     use super::*;
 
+    /// The f32 linear power `power_db` would read as `db` (inverts its
+    /// 1e-20 guard, so -200 dB is digital silence, 0.0).
+    fn lin(db: &[f64]) -> Vec<f32> {
+        db.iter()
+            .map(|&d| (10f64.powf(d / 10.0) - 1e-20).max(0.0) as f32)
+            .collect()
+    }
+
+    /// MAN-526: the tests below speak dB; production passes the hop's
+    /// dB and linear power side by side.
+    impl FloorBank {
+        fn update_db(&mut self, db: &[f64]) {
+            self.update(db, &lin(db));
+        }
+        fn update_holding_reference_db(&mut self, db: &[f64], hold: bool) {
+            self.update_holding_reference(db, &lin(db), hold);
+        }
+    }
+
+    impl Gate {
+        fn update_db(&mut self, db: &[f64], floor: &FloorBank) -> (Vec<bool>, Vec<bool>) {
+            self.update(db, &lin(db), floor)
+        }
+    }
+
     #[test]
     fn integrated_rise_does_not_follow_a_low_channel_quartile_below_its_block() {
         let mut floor = warmed_up_bank(32, -90.0);
         let mut powers = [-90.0; 32];
         powers[0] = -110.0;
         for _ in 0..4000 {
-            floor.update(&powers);
+            floor.update_db(&powers);
         }
         assert!(floor.effective_floor_db(0) < -100.0);
         let mut gate = Gate::new(32, 10.0, 3.0, &[23, 38]);
         for _ in 0..500 {
-            let (rise, drop) = gate.update(&[-90.0; 32], &floor);
+            let (rise, drop) = gate.update_db(&[-90.0; 32], &floor);
             assert!(!rise[0], "the integrated mean must clear the block floor");
             assert!(!drop[0], "drop must still use the channel's original floor");
         }
@@ -577,7 +689,7 @@ mod tests {
         let mut gate = Gate::new(8, 10.0, 3.0, &[38]);
         let mut rise = Vec::new();
         for _ in 0..100 {
-            (rise, _) = gate.update(
+            (rise, _) = gate.update_db(
                 &[-90.0, -90.0, -45.0, -78.0, -78.0, -90.0, -90.0, -78.0],
                 &bank,
             );
@@ -587,7 +699,7 @@ mod tests {
         assert!(rise[7], "a local window maximum rises on its windows");
         let mut ema = Gate::new(8, 10.0, 3.0, &[38]).with_ema_rise(10.0);
         for _ in 0..100 {
-            (rise, _) = ema.update(
+            (rise, _) = ema.update_db(
                 &[-90.0, -90.0, -45.0, -78.0, -78.0, -90.0, -90.0, -78.0],
                 &bank,
             );
@@ -607,7 +719,7 @@ mod tests {
             let mut gate = Gate::new(16, 10.0, 3.0, &[38]);
             let mut rise = Vec::new();
             for _ in 0..100 {
-                (rise, _) = gate.update(&powers, &bank);
+                (rise, _) = gate.update_db(&powers, &bank);
             }
             assert!(rise[strong], "the strong channel {strong} rises");
             assert!(!rise[skirt], "channel {skirt} is {strong}'s skirt");
@@ -620,20 +732,20 @@ mod tests {
         for m in [23, 38] {
             let mut gate = Gate::new(1, 11.0, 3.0, &[m]);
             for _ in 0..2 * m {
-                gate.update(&[80.0], &floor);
+                gate.update_db(&[80.0], &floor);
             }
             // Finite, supported powers separated by 180 dB. A bare rolling
             // subtraction loses every weak sample and never rises again.
             let mut rise = false;
             for _ in 0..2 * m {
-                rise = gate.update(&[-100.0], &floor).0[0];
+                rise = gate.update_db(&[-100.0], &floor).0[0];
             }
             assert!(
                 rise,
                 "M={m}: weak signal lost after old power leaves the ring"
             );
             for _ in 0..1000 {
-                assert!(gate.update(&[-100.0], &floor).0[0]);
+                assert!(gate.update_db(&[-100.0], &floor).0[0]);
             }
         }
     }
@@ -659,7 +771,7 @@ mod tests {
                     && history[n - m..].iter().sum::<f64>() >= threshold * m as f64
                     && history[n - 2 * m..n - m].iter().sum::<f64>() >= threshold * m as f64
             });
-            assert_eq!(gate.update(&[db], &bank).0[0], expected, "hop={hop}");
+            assert_eq!(gate.update_db(&[db], &bank).0[0], expected, "hop={hop}");
         }
     }
 
@@ -673,7 +785,7 @@ mod tests {
             seed ^= seed >> 7;
             seed ^= seed << 17;
             let u = ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
-            assert!(!gate.update(&[10.0 * (-u.ln()).log10()], &bank).0[0]);
+            assert!(!gate.update_db(&[10.0 * (-u.ln()).log10()], &bank).0[0]);
         }
     }
 
@@ -706,7 +818,7 @@ mod tests {
                         continue;
                     }
                     let db: Vec<_> = hop.power.iter().map(|&p| power_db(p)).collect();
-                    floor.update(&db);
+                    floor.update(&db, &hop.power);
                     for (j, w) in windows.iter_mut().enumerate() {
                         for (k, &p) in hop.power.iter().enumerate() {
                             w.push(k, f64::from(p));
@@ -738,7 +850,7 @@ mod tests {
         for m in [23, 38] {
             let mut gate = Gate::new(1, 10.0, 3.0, &[m]);
             for hop in 1..=2 * m {
-                let (rise, drop) = gate.update(&[-78.0], &bank);
+                let (rise, drop) = gate.update_db(&[-78.0], &bank);
                 assert_eq!(rise[0], hop == 2 * m, "m={m} hop={hop}");
                 assert!(!drop[0]);
                 for _ in 0..3 {
@@ -758,7 +870,7 @@ mod tests {
             if i > 0 {
                 expected += GATE_EMA_ALPHA * (x - expected);
             }
-            let (_, drop) = gate.update(&[x], &bank);
+            let (_, drop) = gate.update_db(&[x], &bank);
             assert!((gate.smoothed_db(0) - expected).abs() < 1e-10);
             assert_eq!(drop[0], expected < bank.effective_floor_db(0) + 3.0);
         }
@@ -769,7 +881,7 @@ mod tests {
         let mut bank = FloorBank::new(64);
         let mut powers = vec![-100.0; 64];
         powers[31] = -40.0;
-        bank.update(&powers);
+        bank.update_db(&powers);
         assert_eq!(bank.channel_floor_db(31), -39.75);
         assert_eq!(bank.effective_floor_db(31), -96.75);
     }
@@ -843,7 +955,7 @@ mod tests {
         for _ in 0..hops_needed {
             let mut power_db = vec![-90.0; 64];
             power_db[5] = -10.0;
-            bank.update(&power_db);
+            bank.update_db(&power_db);
         }
         let f5 = bank.effective_floor_db(5);
         assert!(
@@ -857,7 +969,7 @@ mod tests {
         let mut bank = FloorBank::new(64);
         let hops_needed = RING_LEN as u64 * DECIMATION_HOPS;
         for _ in 0..hops_needed {
-            bank.update(&vec![-90.0; 64]); // uniform quiet band
+            bank.update_db(&vec![-90.0; 64]); // uniform quiet band
         }
         let f = bank.effective_floor_db(10);
         assert!(
@@ -874,7 +986,7 @@ mod tests {
         let mut bank = FloorBank::new(64);
         let mut p = vec![-90.0; 64];
         p[3] = -110.0;
-        bank.update(&p);
+        bank.update_db(&p);
         bank
     }
 
@@ -911,7 +1023,7 @@ mod tests {
         let seed = -90.0 - SEED_OFFSET_DB;
         for push in 1..=SEED_PUSHES + 1 {
             for _ in 0..DECIMATION_HOPS {
-                bank.update(&p);
+                bank.update_db(&p);
             }
             let f = bank.effective_floor_db(3);
             if push < SEED_PUSHES {
@@ -937,9 +1049,9 @@ mod tests {
         p[3] = -110.0;
         // Eight silent decimated pushes (320 ms), then noise at -90 dB.
         for _ in 0..8 * DECIMATION_HOPS {
-            bank.update(&[-200.0; 64]);
+            bank.update_db(&[-200.0; 64]);
         }
-        bank.update(&p);
+        bank.update_db(&p);
         let f = bank.effective_floor_db(3);
         assert!(
             (f - seed).abs() < 1e-9,
@@ -948,7 +1060,7 @@ mod tests {
         // 29 ring entries, past SEED_PUSHES but only 21 after the silence;
         // the raw quartile rank ceil(29/4) = 8 is still a silent entry.
         for _ in 0..20 * DECIMATION_HOPS {
-            bank.update(&p);
+            bank.update_db(&p);
         }
         assert_eq!(bank.channel_floor_db(3), -139.75);
         let f = bank.effective_floor_db(3);
@@ -966,15 +1078,15 @@ mod tests {
         for low in [-139.6, -200.0] {
             let mut bank = FloorBank::new(64);
             for _ in 0..RING_LEN as u64 * DECIMATION_HOPS {
-                bank.update(&[-90.0; 64]);
+                bank.update_db(&[-90.0; 64]);
             }
             for _ in 0..RING_LEN as u64 * DECIMATION_HOPS {
-                bank.update(&[-110.0; 64]);
+                bank.update_db(&[-110.0; 64]);
             }
             let mut p = vec![-110.0; 64];
             p[3] = low;
             for _ in 0..DECIMATION_HOPS {
-                bank.update(&p);
+                bank.update_db(&p);
             }
             assert_eq!(
                 bank.effective_floor_db(3),
@@ -993,7 +1105,7 @@ mod tests {
         let mut p = vec![-90.0; 64];
         p[3] = -200.0;
         for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
-            bank.update(&p);
+            bank.update_db(&p);
         }
         assert_eq!(bank.effective_floor_db(3), -139.75);
     }
@@ -1006,16 +1118,16 @@ mod tests {
     fn effective_floor_follows_real_input_past_leading_silence() {
         let mut bank = FloorBank::new(64);
         for _ in 0..20 * DECIMATION_HOPS {
-            bank.update(&[-200.0; 64]);
+            bank.update_db(&[-200.0; 64]);
         }
         for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
-            bank.update(&[-90.0; 64]);
+            bank.update_db(&[-90.0; 64]);
         }
         // 45 entries, quartile rank 12: the raw floor is a silent entry.
         assert_eq!(bank.channel_floor_db(3), -139.75);
         assert_eq!(bank.effective_floor_db(3), -89.75);
         for _ in 0..SEED_PUSHES as u64 * DECIMATION_HOPS {
-            bank.update(&[-110.0; 64]);
+            bank.update_db(&[-110.0; 64]);
         }
         assert_eq!(bank.channel_floor_db(3), -139.75);
         assert_eq!(bank.effective_floor_db(3), -109.75);
@@ -1025,7 +1137,7 @@ mod tests {
         let mut bank = FloorBank::new(n);
         let hops_needed = RING_LEN as u64 * DECIMATION_HOPS;
         for _ in 0..hops_needed {
-            bank.update(&vec![floor_db; n]);
+            bank.update_db(&vec![floor_db; n]);
         }
         bank
     }
@@ -1037,7 +1149,7 @@ mod tests {
         let mut rise = vec![false; 4];
         // Feed a steady +10 dB-above-floor signal on channel 0 until the EMA settles.
         for _ in 0..200 {
-            let (r, _) = gate.update(&[-80.0, -90.0, -90.0, -90.0], &bank);
+            let (r, _) = gate.update_db(&[-80.0, -90.0, -90.0, -90.0], &bank);
             rise = r;
         }
         assert!(
@@ -1053,7 +1165,7 @@ mod tests {
         let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
         let mut drop = vec![false];
         for _ in 0..200 {
-            let (_, d) = gate.update(&[-89.0], &bank); // 1 dB above floor, below off_snr=3
+            let (_, d) = gate.update_db(&[-89.0], &bank); // 1 dB above floor, below off_snr=3
             drop = d;
         }
         assert!(drop[0], "1 dB above floor is below the 3 dB off threshold");
@@ -1068,7 +1180,7 @@ mod tests {
         let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
         let mut last = (false, false);
         for _ in 0..200 {
-            let (r, d) = gate.update(&[-85.5], &bank);
+            let (r, d) = gate.update_db(&[-85.5], &bank);
             last = (r[0], d[0]);
         }
         assert_eq!(
@@ -1084,10 +1196,10 @@ mod tests {
         // S_n = x - (x - S_0)*(1-alpha)^n, not an instant jump to the input.
         let bank = warmed_up_bank(1, -90.0);
         let mut gate = Gate::new(1, 6.0, 3.0, &[23, 38]);
-        gate.update(&[-90.0], &bank); // hop 1: initializes S_0 = -90.0 exactly
+        gate.update_db(&[-90.0], &bank); // hop 1: initializes S_0 = -90.0 exactly
         assert_eq!(gate.smoothed_db(0), -90.0);
 
-        gate.update(&[-70.0], &bank); // hop 2: one EMA step toward -70.0
+        gate.update_db(&[-70.0], &bank); // hop 2: one EMA step toward -70.0
         let expected_s1 = -90.0 + GATE_EMA_ALPHA * (-70.0 - -90.0); // = -90 + alpha*20
         assert!(
             (gate.smoothed_db(0) - expected_s1).abs() < 1e-9,
@@ -1102,7 +1214,7 @@ mod tests {
 
         // Many more hops at the same target: should now have converged close to it.
         for _ in 0..500 {
-            gate.update(&[-70.0], &bank);
+            gate.update_db(&[-70.0], &bank);
         }
         assert!(
             (gate.smoothed_db(0) - -70.0).abs() < 0.01,
@@ -1124,7 +1236,7 @@ mod tests {
         p[7] = -95.0;
         p[6] = -75.0; // c-2..c-4
         for _ in 0..400 {
-            bank.update(&p);
+            bank.update_db(&p);
         } // let the EMA settle
         let r = bank.spectral_reference_db(10);
         assert!(
@@ -1139,7 +1251,7 @@ mod tests {
         let mut p = vec![-90.0; 64];
         p[62] = -99.0; // c = 0 -> c-2 wraps to 62
         for _ in 0..400 {
-            bank.update(&p);
+            bank.update_db(&p);
         }
         assert!((bank.spectral_reference_db(0) - -99.0).abs() < 0.2);
     }
@@ -1157,13 +1269,13 @@ mod tests {
         let mut bank = FloorBank::new(64);
         let steady = vec![-90.0; 64];
         for _ in 0..400 {
-            bank.update(&steady);
+            bank.update_db(&steady);
         }
         let mut bumped = steady.clone();
         for &k in &[6usize, 7, 8, 12, 13, 14] {
             bumped[k] = -30.0;
         }
-        bank.update(&bumped);
+        bank.update_db(&bumped);
         let r = bank.spectral_reference_db(10);
         assert!(
             (r - -42.0).abs() < 1.0,
@@ -1177,7 +1289,7 @@ mod tests {
     /// not seeded reports neither rise nor drop.
     #[test]
     fn gate_hold_does_not_advance_the_ema() {
-        let fresh = Gate::new(2, 6.0, 3.0, &[23, 38]);
+        let mut fresh = Gate::new(2, 6.0, 3.0, &[23, 38]);
         assert_eq!(
             fresh.hold(&warmed_up_bank(2, -90.0)),
             (vec![false, false], vec![false, false]),
@@ -1188,7 +1300,7 @@ mod tests {
         let mut gate = Gate::new(2, 6.0, 3.0, &[23, 38]);
         let mut last = (Vec::new(), Vec::new());
         for _ in 0..200 {
-            last = gate.update(&[-80.0, -90.0], &quiet);
+            last = gate.update_db(&[-80.0, -90.0], &quiet);
         }
         let before = [gate.smoothed_db(0), gate.smoothed_db(1)];
         for _ in 0..50 {
@@ -1210,20 +1322,20 @@ mod tests {
         let mut plain = FloorBank::new(64);
         let mut held = FloorBank::new(64);
         // The first hop seeds the reference even when asked to hold it.
-        plain.update(&[-90.0; 64]);
-        held.update_holding_reference(&[-90.0; 64], true);
+        plain.update_db(&[-90.0; 64]);
+        held.update_holding_reference_db(&[-90.0; 64], true);
         assert_eq!(held.smoothed_lin, plain.smoothed_lin);
         for _ in 1..DECIMATION_HOPS {
-            plain.update(&[-90.0; 64]);
-            held.update(&[-90.0; 64]);
+            plain.update_db(&[-90.0; 64]);
+            held.update_db(&[-90.0; 64]);
         }
         let ref_before = held.spectral_reference_db(10);
         assert_eq!(plain.channel_floor_db(10), -89.75);
 
         // Hop 15 is a decimated push: the -120 dB entry becomes the
         // lower quartile of a two-entry ring in both banks.
-        plain.update_holding_reference(&[-120.0; 64], false);
-        held.update_holding_reference(&[-120.0; 64], true);
+        plain.update_holding_reference_db(&[-120.0; 64], false);
+        held.update_holding_reference_db(&[-120.0; 64], true);
         assert_eq!(held.spectral_reference_db(10), ref_before);
         let stepped = plain.spectral_reference_db(10);
         assert!(
@@ -1238,9 +1350,70 @@ mod tests {
         assert_eq!(held.hop_counter, plain.hop_counter);
 
         // Released, the reference steps again from its held value.
-        held.update_holding_reference(&[-120.0; 64], false);
-        let lin = db_to_linear(-90.0);
-        let want = 10.0 * (lin + GATE_EMA_ALPHA * (db_to_linear(-120.0) - lin)).log10();
+        held.update_holding_reference_db(&[-120.0; 64], false);
+        // What the bank received: the f32 linear power that reads as
+        // -90 dB and -120 dB, each plus `power_db`'s 1e-20 guard.
+        let l90 = power_linear(lin(&[-90.0])[0]);
+        let l120 = power_linear(lin(&[-120.0])[0]);
+        let want = 10.0 * (l90 + GATE_EMA_ALPHA * (l120 - l90)).log10();
         assert!((held.spectral_reference_db(10) - want).abs() < 1e-9);
+    }
+
+    /// MAN-526: the window threshold is recomputed only on a hop whose
+    /// floor update was a decimated push (the only place `F_rise` changes),
+    /// at most once per channel, and always equals the per-hop formula it
+    /// replaced, bit for bit, in `update` and in `hold`.
+    #[test]
+    fn rise_threshold_is_recomputed_only_when_the_floor_changes() {
+        const N: usize = 64;
+        const ON: f32 = 11.5;
+        let mut floor = FloorBank::new(N);
+        let mut gate = Gate::new(N, ON, 3.0, &[38]).with_ema_rise(12.0);
+        let mut seed = 0x5EED_u64;
+        let mut changed_hops = 0;
+        for hop in 0..300 * DECIMATION_HOPS {
+            let db: Vec<f64> = (0..N)
+                .map(|k| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let u = ((seed >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+                    let level = if k == 9 && (hop / 200) % 2 == 0 {
+                        -70.0
+                    } else {
+                        -90.0
+                    };
+                    level + 10.0 * (-u.ln()).log10()
+                })
+                .collect();
+            floor.update_db(&db);
+            let before = gate.thr_recomputes;
+            if hop % 7 == 3 {
+                gate.hold(&floor);
+            } else {
+                gate.update_db(&db, &floor);
+            }
+            let n = gate.thr_recomputes - before;
+            if hop % DECIMATION_HOPS == 0 {
+                assert!(n <= N as u64, "hop {hop}: {n} recomputes");
+                changed_hops += usize::from(n > 0);
+            } else {
+                assert_eq!(n, 0, "hop {hop}: recomputed without a floor change");
+            }
+            for k in 0..N {
+                let rf = floor.compute_rise_floor_db(k);
+                assert_eq!(
+                    floor.rise_floor_db[k].to_bits(),
+                    rf.to_bits(),
+                    "hop {hop} k {k}"
+                );
+                let want = 10.0_f64.powf((rf + ON as f64) / 10.0);
+                assert_eq!(gate.thr_lin[k].to_bits(), want.to_bits(), "hop {hop} k {k}");
+            }
+        }
+        assert!(
+            changed_hops > 10,
+            "the floor must actually move: {changed_hops}"
+        );
     }
 }

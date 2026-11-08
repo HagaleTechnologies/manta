@@ -506,7 +506,7 @@ impl IqSource for FloorTapSource {
                 for (value, &power) in state.db.iter_mut().zip(&hop.power) {
                     *value = manta_dsp::channelizer::power_db(power);
                 }
-                state.floor.update(&state.db);
+                state.floor.update(&state.db, &hop.power);
                 state.any_hop = true;
             }
         }

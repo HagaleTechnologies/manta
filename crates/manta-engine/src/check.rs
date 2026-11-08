@@ -204,7 +204,7 @@ fn check_source_with_clock(
                 ensure!(power.is_finite(), "nonfinite channel power");
                 *value = power_db(power);
             }
-            floor.update(&db);
+            floor.update(&db, &hop.power);
             any_hop = true;
         }
         if deadline_reached {
@@ -388,8 +388,12 @@ mod tests {
         loud[32] = -50.0;
         let mut a = FloorBank::new(128);
         let mut b = FloorBank::new(128);
-        a.update(&quiet);
-        b.update(&loud);
+        // The summary reads dB floors only; the linear power feeds the
+        // spectral reference EMA, which it never looks at.
+        let linear =
+            |db: &[f64]| -> Vec<f32> { db.iter().map(|&d| 10f64.powf(d / 10.0) as f32).collect() };
+        a.update(&quiet, &linear(&quiet));
+        b.update(&loud, &linear(&loud));
         let summary = summarize_floor(&a, &eligible);
         assert_eq!(summary, summarize_floor(&b, &eligible));
         assert_eq!(
