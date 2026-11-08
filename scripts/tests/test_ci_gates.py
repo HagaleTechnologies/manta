@@ -221,6 +221,37 @@ class CodeOwnersTests(unittest.TestCase):
 
 SHA = "cb4fff9290f643bc4d9ebc1ef26fd8707ed9852d"
 CHECKS = ("test (ubuntu-latest)", "test (macos-latest)", "test (windows-latest)")
+# MAN-517: the serial Windows `test` job's `run:` commands and `if:` values at 915db0e, less the
+# merge-main body (test_ci_trust_boundary.py pins it) and `cargo test --workspace --locked`,
+# which shards plus `cargo test --workspace --doc --locked` replaced. Each support job keeps them.
+SERIAL_COMMANDS = (
+    ("sudo apt-get update && sudo apt-get install -y libasound2-dev", "runner.os == 'Linux'"),
+    ("scripts/check-rust-toolchain-pin.sh", None),
+    ("cargo fmt --all --check", None),
+    ("cargo clippy --workspace --all-targets --locked -- -D warnings", None),
+    ("cargo doc --no-deps --workspace --locked", "runner.os == 'Linux'"),
+    ("cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings",
+     "runner.os != 'Windows'"),
+    ("cargo test -p manta-engine --features ftx --locked --lib ftx", "runner.os != 'Windows'"),
+    ("cargo test -p manta-engine --features ftx --locked --test ftx_band_stream", "runner.os != 'Windows'"),
+    ("cargo test -p manta-cli --features ftx --locked --test ftx_acceptance", "runner.os != 'Windows'"),
+    ("bash scripts/tests/release-version.test.sh", "runner.os != 'Windows'"),
+    ("bash scripts/tests/release-ancestry.test.sh", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_ci_trust_boundary -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_release_checksums -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_soapy_release -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_packaging -v", "runner.os != 'Windows'"),
+    ('py=python3\nif [ "${{ runner.os }}" = "Windows" ]; then py=python; fi\n'
+     '"$py" -m unittest scripts.tests.test_package_release -v', None),
+    ("python3 -m unittest scripts.tests.test_score_against_rbn_replay -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_corpus -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_score_transcript -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_engine_overlap -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_ci_gates -v", "runner.os == 'Linux'"),
+    ("python3 -m unittest scripts.tests.test_decisions_index -v", "runner.os == 'Linux'"),
+    ("python3 -m unittest scripts.tests.test_field_node -v", "runner.os != 'Windows'"),
+    ("python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v", "runner.os == 'Linux'"),
+)
 
 
 def run(number=1, status="completed", conclusion="success"):
@@ -239,9 +270,21 @@ class WindowsVisibilityTests(unittest.TestCase):
     def setUp(self):
         self.text = wf.read("ci-full.yml")
 
-    def test_windows_stays_in_the_test_matrix(self):
-        self.assertIn("os: [windows-latest]",
-                      "\n".join(wf.job_block(self.text, "test")))
+    def test_windows_runs_in_its_own_support_and_shard_jobs(self):
+        # MAN-517: the serial Windows `test` job is gone; Windows has the Unix job shape.
+        self.assertNotIn("test", wf.job_ids(self.text))
+        for job in ("windows-support", "windows-shards"):
+            with self.subTest(job=job):
+                self.assertIn("os: [windows-latest]", "\n".join(wf.job_block(self.text, job)))
+
+    def test_each_required_name_has_exactly_one_job(self):
+        # MAN-371/MAN-517: the relay finds each check's job by display name, so exactly one job
+        # may carry it -- for Windows that is windows-aggregate.
+        for name in CHECKS:
+            with self.subTest(name=name):
+                owners = [job for job in wf.job_ids(self.text)
+                          if wf.field(wf.job_block(self.text, job), "name") == name]
+                self.assertEqual(len(owners), 1, owners)
 
     def test_create_ci_check_mints_the_windows_check_run(self):
         job = wf.job_block(self.text, "create-ci-check")
@@ -1065,7 +1108,70 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
             self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v')), 1)
         relay = wf.job_block(text, 'relay-check-runs')
-        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, test, ubuntu-aggregate, macos-aggregate]')
+        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, windows-aggregate, ubuntu-aggregate, macos-aggregate]')
+
+    def test_windows_graph_is_complete_and_independent(self):
+        # MAN-517: Windows mirrors the Unix graph -- support, eight shards, an aggregate carrying
+        # `test (windows-latest)` -- with a 60-minute stuck-job timeout and the pwsh shard step.
+        text = wf.read('ci-full.yml')
+        aggregate = wf.job_block(text, 'windows-aggregate')
+        self.assertEqual(wf.field(aggregate, 'name'), 'test (windows-latest)')
+        self.assertEqual(wf.field(aggregate, 'needs'), '[windows-support, windows-shards]')
+        self.assertEqual(wf.field(aggregate, 'runs-on'), 'ubuntu-latest')
+        self.assertEqual(wf.field(aggregate, 'timeout-minutes'), '5')
+        self.assertIn('always() &&', wf.field(aggregate, 'if'))
+        self.assertIn('github.event.pull_request.head.repo.full_name != github.repository', wf.field(aggregate, 'if'))
+        shards = wf.job_block(text, 'windows-shards')
+        joined = '\n'.join(shards)
+        self.assertIn('os: [windows-latest]', joined)
+        self.assertIn('shard: [0, 1, 2, 3, 4, 5, 6, 7]', joined)
+        self.assertIn('fail-fast: false', joined)
+        self.assertNotIn('max-parallel', joined)
+        self.assertNotIn('continue-on-error', joined)
+        self.assertEqual(wf.field(shards, 'timeout-minutes'), '60')
+        prefix = 'python scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} '
+        runs = [s for s in wf.steps(shards) if (wf.run_body(s) or '').strip().startswith(prefix)]
+        self.assertEqual(len(runs), 1)
+        self.assertIsNone(wf.field(runs[0], 'shell'), 'the shard step runs in the default shell (pwsh)')
+        upload = next(s for s in wf.steps(shards) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or ''))
+        self.assertEqual(wf.field(upload, 'if'), 'always()')
+        support = wf.job_block(text, 'windows-support')
+        self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
+        self.assertEqual(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v'), [])
+        record = next(s for s in wf.steps(support) if wf.field(s, 'name') == 'Record support and doctest results')
+        self.assertEqual(wf.field(record, 'if'), 'always()')
+        self.assertEqual(wf.field(record, 'shell'), 'bash')
+        self.assertTrue(wf.run_body(record).startswith("python - <<'PYTHON'"))
+        uploads = [s for s in wf.steps(support) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or '')]
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(wf.field(uploads[0], 'if'), 'always()')
+        self.assertEqual(wf.field(wf.sub(uploads[0], 'with'), 'name'), 'support-windows')
+        relays = [job for job in wf.job_ids(text) if job.startswith('relay-')
+                  and 'relay "test (windows-latest)"' in '\n'.join(wf.job_block(text, job))]
+        self.assertEqual(len(relays), 1)
+        needs = wf.field(wf.job_block(text, relays[0]), 'needs')
+        self.assertIn('windows-aggregate', [n.strip() for n in needs.strip('[]').split(',')])
+
+    def test_windows_aggregate_verdict_fails_closed(self):
+        aggregate = wf.job_block(wf.read('ci-full.yml'), 'windows-aggregate')
+        body = wf.run_body(wf.steps(aggregate)[0])
+        for shard, support, expected in [('success', 'success', 0), ('failure', 'success', 1),
+                                         ('cancelled', 'success', 1), ('skipped', 'success', 1),
+                                         ('success', 'failure', 1), (None, 'success', 1)]:
+            with self.subTest(shards=shard, support=support):
+                results = {'windows-support': {'result': support}}
+                if shard:
+                    results['windows-shards'] = {'result': shard}
+                proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
+                self.assertEqual(proc.returncode, expected, proc.stderr)
+
+    def test_windows_shards_restore_the_serial_jobs_cache(self):
+        # MAN-517: rust-cache keys on the job id unless shared-key is set; `test` was the serial
+        # Windows job's id, so the shards restore its warm entry instead of building cold.
+        shards = wf.job_block(wf.read('ci-full.yml'), 'windows-shards')
+        caches = [s for s in wf.steps(shards) if (wf.field(s, 'uses') or '').startswith('Swatinem/rust-cache@')]
+        self.assertEqual(len(caches), 1)
+        self.assertEqual(wf.field(wf.sub(caches[0], 'with'), 'shared-key'), 'test')
 
     def test_aggregate_verdict_fails_closed(self):
         text = wf.read('ci-full.yml')
@@ -1110,20 +1216,19 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 self.assertIn('check-runs/12', written[1])
                 self.assertIn('conclusion=success', written[2])
 
-    def test_every_unix_command_has_a_required_home(self):
+    def test_every_serial_command_has_a_required_home_on_every_os(self):
+        # MAN-517: the serial `test` job this list came from is gone, so the reference is frozen;
+        # the fixed length keeps the loop from passing vacuously. Every support job keeps every
+        # command with its condition; the serial suite became shards plus explicit doctests.
+        self.assertEqual(len(SERIAL_COMMANDS), 24)
         text = wf.read('ci-full.yml')
-        # Windows retains the old commands and conditions. Both Unix supports retain the
-        # same steps except the serial suite, replaced by shards plus explicit doctests.
-        reference = wf.job_block(text, 'test')
-        for platform in ('ubuntu', 'macos'):
-            support = wf.job_block(text, f'{platform}-support')
-            for step in wf.steps(reference):
-                command = (wf.run_body(step) or '').strip()
-                if not command or command == 'cargo test --workspace --locked':
-                    continue
-                matches = steps_running(support, command)
-                self.assertEqual(len(matches), 1, command)
-                self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
+        for job in wf.SUPPORT_JOBS:
+            support = wf.job_block(text, job)
+            for command, condition in SERIAL_COMMANDS:
+                with self.subTest(job=job, command=command):
+                    matches = steps_running(support, command)
+                    self.assertEqual(len(matches), 1, command)
+                    self.assertEqual(wf.field(matches[0], 'if'), condition, command)
 
 
 if __name__ == '__main__':

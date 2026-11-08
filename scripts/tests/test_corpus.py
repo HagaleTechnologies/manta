@@ -573,13 +573,15 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, ref)), f"corpus.yml names missing {ref}")
 
     def test_ci_full_runs_both_unittest_modules(self):
-        test_job = wf.job_block(wf.read("ci-full.yml"), "test")
-        for module in ("scripts.tests.test_corpus", "scripts.tests.test_score_transcript"):
-            wanted = "python3 -m unittest %s -v" % module
-            with self.subTest(module=module):
-                matches = [s for s in wf.steps(test_job) if wf.field(s, "run") == wanted]
-                self.assertEqual(len(matches), 1, f"job test has no step running {wanted!r}")
-                self.assertEqual(wf.field(matches[0], "if"), "runner.os != 'Windows'")
+        # MAN-517: every OS's support job carries the old serial job's steps.
+        for job in wf.SUPPORT_JOBS:
+            test_job = wf.job_block(wf.read("ci-full.yml"), job)
+            for module in ("scripts.tests.test_corpus", "scripts.tests.test_score_transcript"):
+                wanted = "python3 -m unittest %s -v" % module
+                with self.subTest(job=job, module=module):
+                    matches = [s for s in wf.steps(test_job) if wf.field(s, "run") == wanted]
+                    self.assertEqual(len(matches), 1, f"job {job} has no step running {wanted!r}")
+                    self.assertEqual(wf.field(matches[0], "if"), "runner.os != 'Windows'")
 
 
 if __name__ == "__main__":

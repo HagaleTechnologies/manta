@@ -710,15 +710,18 @@ class OracleModeTests(Base):
 
 class WiringTests(unittest.TestCase):
     def test_this_module_runs_in_the_required_test_job(self):
-        job = wf.job_block(wf.read("ci-full.yml"), "test")
-        all_steps = wf.steps(job)
-        found = [s for s in all_steps if (wf.run_body(s) or "").strip() == TEST_COMMAND]
-        self.assertEqual(len(found), 1)
-        self.assertEqual(wf.field(found[0], "if"), "runner.os != 'Windows'")
-        here = next(i for i, s in enumerate(all_steps) if (wf.run_body(s) or "").strip() == TEST_COMMAND)
-        pins = [i for i, s in enumerate(all_steps)
-                if (wf.field(s, "uses") or "").startswith("actions/setup-python@")]
-        self.assertTrue(pins and all(here < i for i in pins), "run before the setup-python pin")
+        # MAN-517: every OS's support job carries the old serial job's steps.
+        for name in wf.SUPPORT_JOBS:
+            with self.subTest(job=name):
+                job = wf.job_block(wf.read("ci-full.yml"), name)
+                all_steps = wf.steps(job)
+                found = [s for s in all_steps if (wf.run_body(s) or "").strip() == TEST_COMMAND]
+                self.assertEqual(len(found), 1)
+                self.assertEqual(wf.field(found[0], "if"), "runner.os != 'Windows'")
+                here = next(i for i, s in enumerate(all_steps) if (wf.run_body(s) or "").strip() == TEST_COMMAND)
+                pins = [i for i, s in enumerate(all_steps)
+                        if (wf.field(s, "uses") or "").startswith("actions/setup-python@")]
+                self.assertTrue(pins and all(here < i for i in pins), "run before the setup-python pin")
 
     def test_claude_md_pre_push_list_names_this_module(self):
         with open(os.path.join(ROOT, "CLAUDE.md"), encoding="utf-8") as f:

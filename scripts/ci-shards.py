@@ -3,6 +3,8 @@
 
 Doctests are deliberately a separate required `cargo test --workspace --doc --locked`.
 Timing weights affect placement only. Every discovered executable is always assigned.
+Runs on Linux, macOS and Windows (MAN-517), and sets the dynamic-library search path the
+way `cargo test` does on each.
 """
 import argparse
 import collections
@@ -46,7 +48,15 @@ def assign(items, weights, count):
     return shards
 
 
-def child_env(package, target_dir, rustlib):
+def dylib_path_variable(platform=sys.platform):
+    """Where Cargo puts the dynamic-library search path for `cargo test` (cargo-util's
+    dylib_path_envvar): PATH on Windows, DYLD_FALLBACK_LIBRARY_PATH on macOS, else LD_LIBRARY_PATH."""
+    if platform == 'win32':
+        return 'PATH'
+    return 'DYLD_FALLBACK_LIBRARY_PATH' if platform == 'darwin' else 'LD_LIBRARY_PATH'
+
+
+def child_env(package, target_dir, rustlib, platform=sys.platform):
     env = os.environ.copy()
     env.update(CARGO_MANIFEST_DIR=str(Path(package['manifest_path']).parent),
                CARGO_MANIFEST_PATH=package['manifest_path'], CARGO_PKG_NAME=package['name'],
@@ -67,14 +77,14 @@ def child_env(package, target_dir, rustlib):
     # native outputs from this build, as well as deps and the toolchain's Rust libraries.
     paths = [str(p) for p in (target_dir/'debug/build').glob('*/out')]
     paths += [str(target_dir/'debug/deps'), str(target_dir/'debug'), rustlib, str(Path(rustlib).parents[2])]
-    variable = 'DYLD_FALLBACK_LIBRARY_PATH' if sys.platform == 'darwin' else 'LD_LIBRARY_PATH'
+    variable = dylib_path_variable(platform)
     env[variable] = os.pathsep.join(paths + ([env[variable]] if env.get(variable) else []))
     return env
 
 
 def listing(item, cwd, env, ignored=False):
     command = [item['executable'], '--list', '--format', 'terse'] + (['--ignored'] if ignored else [])
-    proc = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=True)
+    proc = subprocess.run(command, cwd=cwd, env=env, encoding='utf-8', capture_output=True, check=True)
     names = []
     for line in proc.stdout.splitlines():
         if not line:
@@ -120,7 +130,7 @@ def main():
     parser.add_argument('--inventory-only', action='store_true')
     args = parser.parse_args()
     if args.audit:
-        bundle = json.loads(args.audit.read_text())
+        bundle = json.loads(args.audit.read_text(encoding='utf-8'))
         elapsed = audit_evidence(bundle['shards'], bundle['support'], bundle['workflowStarted'], bundle['completed'], bundle['reference'])
         args.output.write_text(json.dumps(dict(coverage='complete', elapsedSeconds=elapsed)) + '\n')
         return 0
@@ -132,7 +142,7 @@ def main():
     try:
         meta = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--locked', '--format-version=1']))
         started = time.monotonic()
-        proc = subprocess.run(['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json'], text=True, stdout=subprocess.PIPE)
+        proc = subprocess.run(['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json'], encoding='utf-8', stdout=subprocess.PIPE)
         record['buildSeconds'] = time.monotonic() - started
         if proc.returncode:
             raise RuntimeError(f'Cargo build exited {proc.returncode}')
@@ -140,14 +150,14 @@ def main():
         if not items:
             raise ValueError('empty workspace inventory')
         packages = {p['id']: p for p in meta['packages']}
-        sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True).strip()
+        sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], encoding='utf-8').strip()
         for item in items:
             package = packages[item['package']]
             env = child_env(package, Path(meta['target_directory']), sysroot)
             cwd = Path(package['manifest_path']).parent
             item['tests'] = listing(item, cwd, env)
             item['ignored'] = listing(item, cwd, env, True)
-        weights = json.loads(Path(__file__).with_name('ci-test-weights.json').read_text())['weights']
+        weights = json.loads(Path(__file__).with_name('ci-test-weights.json').read_text(encoding='utf-8'))['weights']
         groups = assign(items, weights, args.count)
         # All groups are computed on each host; assert complete/disjoint placement before running.
         record['inventory'] = items

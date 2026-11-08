@@ -23,7 +23,11 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "ubuntu-support", "ubuntu-shards", "macos-support", "macos-shards", "test-soapy")
+CI_TEST_JOBS = ("windows-support", "windows-shards", "ubuntu-support", "ubuntu-shards",
+                "macos-support", "macos-shards", "test-soapy")
+# MAN-517: each OS has one support job carrying the serial job's non-test steps; with the
+# serial Windows `test` job gone, these are where workflow-wiring tests look for a step.
+SUPPORT_JOBS = ("windows-support", "ubuntu-support", "macos-support")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 NATIVE_IF = ("github.event_name != 'pull_request' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
@@ -406,8 +410,20 @@ class CiFullNativePathTests(unittest.TestCase):
         command = re.search(r'^name = "test-workspace"\nrun = (\[[^\n]*\])$', config, re.M)
         self.assertIsNotNone(command, "Catalyst must retain the workspace test gate")
         self.assertEqual(json.loads(command.group(1)), ["cargo", "test", "--workspace", "--locked"])
-        self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --locked"
-                            for s in steps(job_block(self.text, "test"))))
+        # MAN-517: every OS runs its test binaries in eight shards and its doctests in its support
+        # job; no job runs the serial `cargo test --workspace --locked` any more.
+        for os_name in ("windows", "ubuntu", "macos"):
+            with self.subTest(os=os_name):
+                shard_steps = [s for s in steps(job_block(self.text, f"{os_name}-shards"))
+                               if "scripts/ci-shards.py --count 8 " in (run_body(s) or "")]
+                self.assertEqual(len(shard_steps), 1)
+                doc_steps = [s for s in steps(job_block(self.text, f"{os_name}-support"))
+                             if (run_body(s) or "").strip() == "cargo test --workspace --doc --locked"]
+                self.assertEqual(len(doc_steps), 1)
+        for job in job_ids(self.text):
+            with self.subTest(job=job):
+                self.assertFalse(any((run_body(s) or "").strip() == "cargo test --workspace --locked"
+                                     for s in steps(job_block(self.text, job))))
 
     def test_test_jobs_run_natively_for_non_dispatch_eligible_prs(self):
         for job in CI_TEST_JOBS:
@@ -463,8 +479,9 @@ def test_job_head(job):
 
 
 def merge_step_body():
-    """The run: body of the merge-main step in ci-full.yml's `test` job, or None."""
-    step = step_by_id(job_block(read("ci-full.yml"), "test"), MERGE_STEP_ID)
+    """The run: body of the merge-main step in ci-full.yml's first test job, or None. Every test
+    job's body is byte-identical (test_merge_step_bodies_are_byte_identical)."""
+    step = step_by_id(job_block(read("ci-full.yml"), CI_TEST_JOBS[0]), MERGE_STEP_ID)
     return None if step is None else run_body(step)
 
 
@@ -525,8 +542,8 @@ class CiFullDispatchMergeWiringTests(unittest.TestCase):
             self.assertIsNotNone(step, f"{job}: no merge-main step")
             bodies[job] = run_body(step)
             self.assertTrue(bodies[job] and bodies[job].strip(), f"{job}: merge-main has no run: body")
-        self.assertEqual(bodies["test"], bodies["test-soapy"],
-                         "the two merge-main steps' run: bodies must be byte-identical")
+        self.assertEqual(len(set(bodies.values())), 1,
+                         "every test job's merge-main run: body must be byte-identical")
 
     def test_merge_step_holds_no_credentials(self):
         for job in CI_TEST_JOBS:

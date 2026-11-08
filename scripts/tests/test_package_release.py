@@ -675,20 +675,26 @@ class BuildSoapyJobTests(unittest.TestCase):
 
 
 class CiFullTests(unittest.TestCase):
-    def runs(self, module):
-        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), "test"))
+    # MAN-517: every OS's support job carries the old serial job's steps. This suite also runs on
+    # Windows; it only reads workflow text.
+    def runs(self, module, job):
+        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), job))
         return [s for s in steps if f"-m unittest scripts.tests.{module} -v" in executable(wf.run_body(s))]
 
     def test_packaging_tests_run_on_unix_legs(self):
-        found = self.runs("test_packaging")
-        self.assertEqual(len(found), 1, "ci-full.yml test job must run scripts.tests.test_packaging")
-        self.assertEqual(wf.field(found[0], "if"), "runner.os != 'Windows'")
+        for job in wf.SUPPORT_JOBS:
+            with self.subTest(job=job):
+                found = self.runs("test_packaging", job)
+                self.assertEqual(len(found), 1, f"ci-full.yml {job} must run scripts.tests.test_packaging")
+                self.assertEqual(wf.field(found[0], "if"), "runner.os != 'Windows'")
 
     def test_archive_tests_run_on_every_leg(self):
-        found = self.runs("test_package_release")
-        self.assertEqual(len(found), 1, "ci-full.yml test job must run scripts.tests.test_package_release")
-        self.assertIsNone(wf.field(found[0], "if"), "Windows keeps zip coverage: no if: gate")
-        self.assertEqual(wf.field(found[0], "shell"), "bash")
+        for job in wf.SUPPORT_JOBS:
+            with self.subTest(job=job):
+                found = self.runs("test_package_release", job)
+                self.assertEqual(len(found), 1, f"ci-full.yml {job} must run scripts.tests.test_package_release")
+                self.assertIsNone(wf.field(found[0], "if"), "Windows keeps zip coverage: no if: gate")
+                self.assertEqual(wf.field(found[0], "shell"), "bash")
 
 
 if __name__ == "__main__":

@@ -9,6 +9,10 @@ A failed, cancelled, skipped or missing dependency cannot pass the aggregate.
 Native jobs retain the trusted-author routing, reviewed checkout, inline merge
 with main, suppressed checkout credentials and main-push-only cache writes.
 
+**Superseded in part (2026-11-08):** MAN-517 shards Windows the same way;
+Windows no longer runs `cargo test --workspace --locked` serially. See
+[its record](2026-11-08-man517-shard-the-windows-test-leg.md).
+
 This implements scheduling, not a measured 20-minute hosted outcome. The merge
 queue timeout remains 90 minutes until the rollout below passes. No decoder
 scene, test assertion, repetition count, ignore annotation or timeout changed.
