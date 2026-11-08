@@ -4692,12 +4692,11 @@ impl TrackManager {
     /// whenever any unrelated track closed (validate round 2, PR #520). A
     /// no-op returning nothing while `[decode.refine] enabled = false`.
     pub fn refine_step(&mut self, validator: &mut manta_spot::Validator) -> Vec<manta_spot::Spot> {
-        let decode_cfg = self.decode_cfg.clone();
         let before = *self.refine.counters();
         let spots = self.refine.step(
             &mut self.refine_buf,
             validator,
-            &decode_cfg,
+            &self.decode_cfg,
             self.refine_now_ts,
         );
         crate::refine::publish_refine_deltas(
@@ -4839,7 +4838,9 @@ impl TrackManager {
         // track_id; `values_mut` below loses the key) before the parallel
         // pass consumes them. Retention is off at `lookback_secs == 0`.
         if self.decode_cfg.refine.enabled && self.decode_cfg.refine.lookback_secs > 0.0 {
-            let feed: Vec<(u32, crate::refine::ReplayEntry)> = self
+            // MAN-525: recorded straight from the tracks, in the same
+            // order, with no intermediate `Vec` (disjoint field borrows).
+            let feed = self
                 .tracks
                 .iter()
                 .filter(|(_, t)| t.decoder.is_some())
@@ -4850,13 +4851,11 @@ impl TrackManager {
                             crate::refine::replay_entry((e.0, e.1, e.2, e.3, e.4, e.5, false)),
                         )
                     })
-                })
-                .collect();
+                });
             match self.refine_export.as_mut() {
-                Some(out) => out.extend(
-                    feed.into_iter()
-                        .map(|(id, e)| crate::refine::RefineFeed::Entry(id, e)),
-                ),
+                Some(out) => {
+                    out.extend(feed.map(|(id, e)| crate::refine::RefineFeed::Entry(id, e)))
+                }
                 None => {
                     for (id, entry) in feed {
                         self.refine_buf.record(id, entry);
