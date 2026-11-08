@@ -109,16 +109,33 @@ score better under the slower challenger.
 
 **Grid baseline** (`man398_grid`, now parallel, 32 workers, 3 min): 288
 rows, mean CER14 0.0919, mean CER30 0.0423, 140 rows at CER30 0, 24 rows at
-CER30 ≥ 0.25, identical to the research's sequential numbers. With the bank
+CER30 ≥ 0.25, identical to the research's sequential numbers. A second run
+with `MAN398_GRID_BASELINE` set to the first reported 288 identical rows at
+both durations and 0 worse. With the bank
 off the decode is main's by construction, and
 `observe_only_bank_leaves_events_identical` pins that observe-only mode
 changes no event on five streams (two speeds of `CQ TEST W1AW`, `HH` from a
 mid-element hop, `MO`, a 30 → 12 hops-per-dit step).
 
-Not measured in this round: the D12 step sweep, the 300-track criterion
-bench (`legacy_300_tracks`, committed with `default`, `width1` and
-`width3_observe` per scene), `manta bench sensitivity` with
-`engine-overlap.py`, and every switching-mode gate (the plan's Phases 3–4).
+**Cost** (`cargo bench -p manta-decode --bench legacy_300_tracks`, one run
+on a shared 32-core container, criterion median of 10 samples, 300 tracks ×
+20 s each):
+
+| Scene | `default` | `width1` | `width3_observe` | observe / width1 |
+|---|---|---|---|---|
+| steady | 52.99 ms | 50.83 ms | 52.64 ms | +3.6 % |
+| steps | 48.42 ms | 50.00 ms | 54.16 ms | +8.3 % |
+| noisy | 52.25 ms | 63.96 ms | 61.81 ms | −3.4 % |
+
+`default` and `width1` are the same configuration, so their spread (up to
+22 % on `noisy`) is this machine's noise; the observe-only bank, which pays
+the full three-hypothesis scoring cost, sits inside it and under the
+ticket's 25 % bound on every scene. A quiet-machine run against a
+`--save-baseline main` is still owed.
+
+Not measured in this round: the D12 step sweep (`speed_step_sweep`),
+`manta bench sensitivity` with `engine-overlap.py`, and every
+switching-mode gate (the plan's Phases 3–4).
 
 ## Alternatives
 
