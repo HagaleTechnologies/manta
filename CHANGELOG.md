@@ -24,6 +24,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
+  segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
+  reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
+  `tuning_range_hz` overlaps its segment, so plans on the default range are
+  unchanged. An `"all"` entry whose range already reached 50 MHz now also
+  plans 6m, and refuses a bare centre inside 6m such as `"50050"` as a
+  repeat. See
+  [docs/DECISIONS/2026-11-08-man543-6m-band.md](docs/DECISIONS/2026-11-08-man543-6m-band.md).
 - MAN-539: a SoapySDR release archive for 64-bit Raspberry Pi OS
   (`manta-linux-arm64-soapy.tar.gz`, built and verified on Debian bookworm),
   and SoapySDR with the RTL-SDR, Airspy and HackRF modules in the Docker
