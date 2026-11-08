@@ -1,16 +1,21 @@
 //! MAN-494: exercise calibration through config-driven production paths.
-#[path = "common/launch.rs"]
-mod launch;
-use launch::manta;
-
 #[path = "../../manta-engine/tests/support/man203.rs"]
 mod support;
 
 use manta_dsp::condition::iq::{IqCalibration, ToneMeter, ToneResult};
 use num_complex::Complex32;
 use std::path::Path;
-use std::process::Output;
+use std::process::{Command, Output};
 
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
 fn write_wav(path: &Path, samples: &[Complex32]) {
     let mut writer = hound::WavWriter::create(
         path,

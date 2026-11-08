@@ -61,6 +61,19 @@ use `vars_os()`, which only removes a panic on a non-Unicode variable.
 
 ## Not done
 
+This change ships in two slices, to stay within the 40-file pull-request
+limit. Eighteen roots without `mod common;` still define the byte-identical
+scrubbing `fn manta`: `build_identity`, `cli`, `cli_json_consumers`,
+`completions_and_man_pages`, `config_command`, `decode_observations`,
+`decode_sidecar`, `ftx_acceptance`, `grade_cmd`, `hpsdr_discovery`,
+`iq_correction`, `live_audio_errors`, `live_state_acceptance`,
+`operator_guides`, `oracle_funnel`, `packaging_examples`,
+`replay_acceptance` and `source_check`. Each needs only the `#[path]`
+include and `use launch::manta;`. `shared_test_helpers.rs` names them in
+`PENDING_LAUNCHER_COPIES`, which may only shrink: a listed file that no
+longer defines `fn manta` fails the guard. The follow-up converts them and
+empties the list.
+
 Spawns that never scrubbed keep their inline `Command::new(env!("CARGO_BIN_EXE_manta"))`:
 routing them through `manta()` would change what they send the child.
 `free_port` (singular), `free_udp_port` and `list_refresh.rs`'s

@@ -4,13 +4,20 @@
 //! checks run where the shell is installed and skip with a notice where it
 //! is not; the shell-free tests also run on Windows.
 
-#[path = "common/launch.rs"]
-mod launch;
-use launch::manta;
-
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    // MAN-261: inherited MANTA_* variables must never reach the child.
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
 
 fn run(args: &[&str]) -> Output {
     manta().args(args).output().unwrap()

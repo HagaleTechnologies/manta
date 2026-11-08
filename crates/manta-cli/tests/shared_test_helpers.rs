@@ -36,6 +36,32 @@ fn sources() -> Vec<(String, String)> {
     out
 }
 
+/// Roots that still carry their own byte-identical scrubbing `fn manta`.
+/// MAN-549 shipped in two slices to stay within the pull-request size
+/// limit; the follow-up deletes each copy (include `common/launch.rs` by
+/// `#[path]` and `use launch::manta;`) and empties this list. Never add to
+/// it.
+const PENDING_LAUNCHER_COPIES: [&str; 18] = [
+    "build_identity.rs",
+    "cli.rs",
+    "cli_json_consumers.rs",
+    "completions_and_man_pages.rs",
+    "config_command.rs",
+    "decode_observations.rs",
+    "decode_sidecar.rs",
+    "ftx_acceptance.rs",
+    "grade_cmd.rs",
+    "hpsdr_discovery.rs",
+    "iq_correction.rs",
+    "live_audio_errors.rs",
+    "live_state_acceptance.rs",
+    "operator_guides.rs",
+    "oracle_funnel.rs",
+    "packaging_examples.rs",
+    "replay_acceptance.rs",
+    "source_check.rs",
+];
+
 /// Files containing any of `needles`, other than `allowed`.
 fn offenders(needles: &[&str], allowed: &[&str]) -> Vec<String> {
     sources()
@@ -49,9 +75,11 @@ fn offenders(needles: &[&str], allowed: &[&str]) -> Vec<String> {
 
 #[test]
 fn only_common_launch_scrubs_manta_variables() {
+    let mut allowed = vec!["common/launch.rs"];
+    allowed.extend(PENDING_LAUNCHER_COPIES);
     let found = offenders(
         &["starts_with(b\"MANTA_\")", "starts_with(\"MANTA_\")"],
-        &["common/launch.rs"],
+        &allowed,
     );
     assert!(
         found.is_empty(),
@@ -77,7 +105,7 @@ fn only_common_launch_and_doctor_checks_define_free_ports() {
 fn every_local_manta_launcher_wraps_the_shared_one() {
     // These add one step (stdin, RUST_LOG, args) around `launch::manta()`
     // or `common::manta()`; any other `fn manta` is a copy.
-    let wrappers = [
+    let mut allowed = vec![
         "common/launch.rs",
         "bench_sensitivity.rs",
         "calibrate.rs",
@@ -85,7 +113,8 @@ fn every_local_manta_launcher_wraps_the_shared_one() {
         "man234_bad_samples.rs",
         "output_style.rs",
     ];
-    let found = offenders(&["fn manta("], &wrappers);
+    allowed.extend(PENDING_LAUNCHER_COPIES);
+    let found = offenders(&["fn manta("], &allowed);
     assert!(
         found.is_empty(),
         "use common/launch.rs's `manta()`: {found:?}"
@@ -101,5 +130,25 @@ fn word_boundary_fraction_lives_in_manta_testkit() {
     assert!(
         found.is_empty(),
         "call `manta_testkit::cer::word_boundary_fraction`: {found:?}"
+    );
+}
+
+/// The pending list only shrinks: an entry whose file no longer carries a
+/// copy must leave the list, so the follow-up cannot stop half way unseen.
+#[test]
+fn pending_launcher_copies_are_still_copies() {
+    let sources = sources();
+    let stale: Vec<&str> = PENDING_LAUNCHER_COPIES
+        .iter()
+        .copied()
+        .filter(|name| {
+            !sources
+                .iter()
+                .any(|(rel, text)| rel == name && text.contains("fn manta("))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "remove from PENDING_LAUNCHER_COPIES, they no longer define `fn manta`: {stale:?}"
     );
 }

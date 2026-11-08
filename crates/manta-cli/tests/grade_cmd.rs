@@ -3,12 +3,8 @@
 //! (`tests/fixtures/rbn_grade/`), determinism, input handling and
 //! refusals.
 
-#[path = "common/launch.rs"]
-mod launch;
-use launch::manta;
-
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rbn_grade")
@@ -20,6 +16,19 @@ fn fixture(name: &str) -> PathBuf {
 
 fn read_fixture(name: &str) -> String {
     std::fs::read_to_string(fixture(name)).unwrap()
+}
+
+/// The binary, with every `MANTA_*` variable of the test runner removed so
+/// none can leak into the child. Tests that exercise the environment set
+/// theirs explicitly.
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
 }
 
 /// `manta grade --spots <fixture spots> --rbn <fixture csv>` plus `extra`.

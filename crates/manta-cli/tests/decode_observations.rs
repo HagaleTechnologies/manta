@@ -2,12 +2,19 @@
 //! writes why each callsign candidate was or was not spotted
 //! (docs/OBSERVATIONS.md), and leaves stdout unchanged.
 
-#[path = "common/launch.rs"]
-mod launch;
-use launch::manta;
-
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
+
+/// The binary with every `MANTA_*` variable removed, as in `cli.rs`.
+fn manta() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
+    for (key, _) in std::env::vars_os() {
+        if key.as_encoded_bytes().starts_with(b"MANTA_") {
+            cmd.env_remove(key);
+        }
+    }
+    cmd
+}
 
 /// `CQ DE K5ARH K` sent once in 12 s: decoded, never repeated, so the
 /// repetition gate withholds K5ARH.
