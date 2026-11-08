@@ -4038,3 +4038,91 @@ fn docs_consistency_lists_refine_options() {
     assert!(doc("ARCHITECTURE.md").contains("TrackManager::refine_step"));
     assert!(doc("README.md").contains("[decode.refine]"));
 }
+
+/// MAN-547: CLAUDE.md (which AGENTS.md symlinks to) is a standing brief of at
+/// most 100 lines; a ticket's outcome goes in its decision record (MAN-238).
+#[test]
+fn claude_md_stays_a_short_standing_brief() {
+    let lines = doc("CLAUDE.md").lines().count();
+    assert!(
+        lines <= 100,
+        "CLAUDE.md is {lines} lines; the standing brief stays at 100 or fewer \
+         (MAN-238, MAN-547): move ticket outcomes to their decision record"
+    );
+}
+
+/// The fenced block under CLAUDE.md's `## Build and test`, with `\`
+/// continuations joined and `#` comments dropped.
+fn claude_md_pre_push_commands() -> Vec<String> {
+    let claude = doc("CLAUDE.md");
+    let build = section(&claude, "Build and test");
+    let fence = build
+        .split_once("```sh\n")
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(body, _)| body)
+        .expect("CLAUDE.md's Build and test has a ```sh block");
+    fence
+        .replace("\\\n", "")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// MAN-547: every command CLAUDE.md tells a contributor to run before pushing
+/// is one a `ci-full.yml` job runs. A `test-hpsdr` leg outlived the job
+/// MAN-239 deleted, because `--features hpsdr` is an empty compatibility
+/// feature and the command still passed.
+#[test]
+fn claude_md_pre_push_commands_are_ci_full_commands() {
+    let ci = doc(".github/workflows/ci-full.yml");
+    let strip = |c: &str| c.trim().trim_start_matches("bash ").to_owned();
+    let ci_runs: std::collections::BTreeSet<String> = ci
+        .lines()
+        .filter_map(|l| {
+            l.trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("run: ")
+        })
+        .map(strip)
+        .collect();
+    let env = regex::Regex::new(r#"^[A-Z_]+="[^"]*" "#).unwrap();
+    for line in claude_md_pre_push_commands() {
+        if line.starts_with("python3 -m unittest -v scripts.tests.test_{") {
+            continue; // the brace list: see claude_md_lists_every_ci_script_suite
+        }
+        for cmd in line.split(" && ") {
+            let cmd = strip(&env.replace(cmd, ""));
+            assert!(
+                ci_runs.contains(&cmd),
+                "CLAUDE.md's Build and test runs `{cmd}`, which no ci-full.yml job runs"
+            );
+        }
+    }
+}
+
+/// MAN-547: CLAUDE.md's unittest brace list names exactly the
+/// `scripts/tests` suites that `ci-full.yml` runs, no more and no fewer.
+#[test]
+fn claude_md_lists_every_ci_script_suite() {
+    let suite = regex::Regex::new(r"-m unittest scripts\.tests\.test_(\w+)").unwrap();
+    let ci: std::collections::BTreeSet<String> = suite
+        .captures_iter(&doc(".github/workflows/ci-full.yml"))
+        .map(|c| c[1].to_owned())
+        .collect();
+    let brace =
+        regex::Regex::new(r"python3 -m unittest -v scripts\.tests\.test_\{([^}]*)\}").unwrap();
+    let claude = doc("CLAUDE.md");
+    let listed: std::collections::BTreeSet<String> = brace
+        .captures(&claude)
+        .expect("CLAUDE.md names a `scripts.tests.test_{...}` brace list")[1]
+        .split([',', '\\', '\n', ' '])
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        listed, ci,
+        "CLAUDE.md's unittest brace list vs ci-full.yml's suites"
+    );
+}
