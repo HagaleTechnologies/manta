@@ -9,7 +9,8 @@
 //! - `steps`: the same with a speed step at 10 s, even tracks twice as fast,
 //!   odd tracks half as fast;
 //! - `noisy`: `steady` under a 0.5 Hz `0.55 + 0.45 sin` fade, with a 10 ms
-//!   (4 hop) dropout in the middle of every 31st mark.
+//!   (4 hop) dropout starting half a dit into every 31st mark (the middle
+//!   of a dit, the first sixth of a dah).
 //!
 //! Each scene runs `default` (`DecodeConfig::default()`), `width1` (the
 //! bank off) and `width3_observe` (three hypotheses scored, never switched:

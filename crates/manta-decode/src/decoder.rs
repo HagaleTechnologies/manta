@@ -1193,13 +1193,15 @@ impl TrackDecoder {
                 self.tracker.resolve_unimodal_bootstrap(&gaps);
                 // MAN-544: the other reading of an ambiguous bootstrap
                 // becomes a challenger, scored from the replay on.
-                let marks: Vec<f32> = self
-                    .pending
-                    .iter()
-                    .filter(|r| r.mark)
-                    .map(|r| r.hops as f32 * HOP_MS as f32)
-                    .collect();
-                self.bank.on_ready(&self.tracker, &marks);
+                if self.cfg.speed_bank.width > 1 {
+                    let marks: Vec<f32> = self
+                        .pending
+                        .iter()
+                        .filter(|r| r.mark)
+                        .map(|r| r.hops as f32 * HOP_MS as f32)
+                        .collect();
+                    self.bank.on_ready(&self.tracker, &marks);
+                }
                 // Retroactively assemble the buffered runs; their marks
                 // already fed the tracker, so mark updates are skipped,
                 // while their element gaps are learned here (MAN-315 D3).

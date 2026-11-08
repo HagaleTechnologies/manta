@@ -1338,7 +1338,7 @@ and each classified gap against 1, 3 and 7 of its own §4.1a units
 (σ 0.35), max component, equal class weights, floored at −3 nats, decayed
 ×0.9 per observation; a gap of 12 units of the slowest hypothesis is scored
 by none. A challenger switches in when it leads by 4 nats on 2 consecutive
-marks, is at least 2 marks old, and its gap score is not behind the
+marks, is at least 2 marks old, and its gap score is ahead of the
 primary's; observe-only mode (`switching: false`) records the switch
 instead. On a switch the old primary is kept for 24 marks and can switch
 back, and the §4.2 gap classifier, flushed one-character-word gaps and the

@@ -7,8 +7,8 @@
 //! scores every hypothesis on every mark and gap with a max-component
 //! log-normal fit, and names a challenger as the new primary only when it
 //! leads by `SWITCH_LEAD_NATS` on `SWITCH_CONFIRM_MARKS` consecutive marks
-//! and its gap score is not behind the primary's (the gap veto: marks
-//! alone never switch). With `switching: false` it only records the
+//! and its gap score is ahead of the primary's (the gap veto: marks alone
+//! never switch). With `switching: false` it only records the
 //! switches it would make. `width: 1` is the single-tracker decode: every
 //! method returns at its first line.
 
@@ -374,6 +374,11 @@ impl TimingBank {
         }
         self.marks_seen += 1;
         let x = dur_ms.ln();
+        // The primary has already learned this mark (the decoder feeds it
+        // first) while challengers are scored before they learn it: a
+        // deliberate bias toward the primary. Scoring the primary's
+        // pre-mark centroids instead measured 7 false would-switches in the
+        // spike against 2 (MAN-544 record).
         let (p_lo, p_hi) = ln_centroids(primary);
         self.primary_score = DECAY * self.primary_score + mark_ll(x, p_lo, p_hi);
         for c in &mut self.challengers {
@@ -491,7 +496,7 @@ impl TimingBank {
             }
             let qualifies = c.lead_marks >= SWITCH_CONFIRM_MARKS
                 && c.age_marks >= SWITCH_CONFIRM_MARKS
-                && c.gap_score >= primary_gap_score;
+                && c.gap_score > primary_gap_score;
             if qualifies && best.is_none_or(|(_, s)| c.score > s) {
                 best = Some((i, c.score));
             }
@@ -870,7 +875,7 @@ mod tests {
         let mut b = TimingBank::new(OBSERVE);
         let t = SpeedTracker::from_marks(&[30.0, 90.0, 30.0, 30.0], &[]);
         for _ in 0..2 {
-            let mut h = TimingHypothesis::new(t.clone(), Origin::Streak, 10.0, 0.0);
+            let mut h = TimingHypothesis::new(t.clone(), Origin::Streak, 10.0, 1.0);
             h.lead_marks = SWITCH_CONFIRM_MARKS;
             h.age_marks = SWITCH_CONFIRM_MARKS;
             b.challengers.push(h);

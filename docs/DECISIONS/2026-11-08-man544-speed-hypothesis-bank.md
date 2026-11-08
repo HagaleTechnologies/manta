@@ -52,8 +52,9 @@ What the bank does when enabled:
   the slowest hypothesis is scored by none.
 - **Switching.** A challenger qualifies when it leads the primary by
   `SWITCH_LEAD_NATS` on `SWITCH_CONFIRM_MARKS` consecutive marks, is at least
-  that many marks old, and its gap score is not behind the primary's (the gap
-  veto: `corroborated_lock_is_not_resplit_by_a_bimodal_streak`'s fading
+  that many marks old, and its gap score is strictly ahead of the primary's
+  (the gap veto, so a challenger with no scored gap since its spawn cannot
+  switch: `corroborated_lock_is_not_resplit_by_a_bimodal_streak`'s fading
   streak is the case marks alone cannot settle). With `switching: false` the
   bank only records the would-switch (`SwitchRecord { applied: false }`).
   With switching on, the trackers swap, the old primary stays as a
@@ -94,6 +95,13 @@ clean/noise/fade. Steps: the 8 acceptance rungs with ratio ≥ 1.75 or ≤ 0.55.
 | streak 4, confirm 3 (plan start) | 3 (`IS`, `T0M` ×2; all 12 WPM, ±0.05 noise) | 2 of 8 (others at 9–10; 32 → 16 none) |
 | streak 3, confirm 2 | 3 (`T0M` ×2, `EEE`; all 12 WPM noise) | 7 of 8 (32 → 16 at 9) |
 | streak 4, confirm 2 (kept) | 2 (`T0M` ×2; 12 WPM, ±0.05 noise) | 3 of 8 (others at 9; 32 → 16 none) |
+
+The primary is scored on a mark after it has learned it (the decoder feeds
+it first), challengers before: a deliberate bias toward the primary. Scoring
+the primary's pre-mark centroids instead (self-review finding) measured 7
+false would-switches (`EE`, `EE EE` at 20 WPM, `EIS 5` at 16 WPM, `IS`,
+`EEE`, `T0M` ×2 at 12 WPM, all under noise) and 6 of 8 steps in time, so the
+bias stays.
 
 Streak 3 also broke the bank's own `half_speed_down_step` unit test: its
 three-mark streak included the last pre-step dah and proposed a 72.75 ms dit
