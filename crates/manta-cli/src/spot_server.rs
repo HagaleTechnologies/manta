@@ -346,6 +346,7 @@ pub(crate) fn start_spot_server(
             // from the decode loop's first batch (see `format_pipeline_ready`'s
             // call site).
             tracing::info!(
+                target: "manta",
                 "{}",
                 manta_server::status::format_startup_banner(&manta_server::status::StartupInfo {
                     version: env!("CARGO_PKG_VERSION"),
@@ -390,6 +391,7 @@ pub(crate) fn start_spot_server(
             // and the live-passband segments for the SETT reply.
             if cfg.operator_grid.is_none() || cfg.operator_qth.is_none() {
                 tracing::warn!(
+                    target: "manta",
                     "telnet greeting will omit QTH/grid -- set [server].operator_qth and \
                  operator_grid so RBN Aggregator can record this node's location \
                  (Aggregator manual v6.0 §9.2)"
@@ -399,6 +401,7 @@ pub(crate) fn start_spot_server(
             // deGrid/deLat/deLon is null -- legal, but a map shows nothing.
             if station_location.is_none() {
                 tracing::warn!(
+                    target: "manta",
                     "JSON spots will carry no station position -- set [server].operator_grid, or \
                  operator_lat and operator_lon, so deGrid/deLat/deLon name this node's location"
                 );

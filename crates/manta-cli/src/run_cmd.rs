@@ -1167,9 +1167,10 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
         && crash_live < manta_engine::CRASH_MIN_LIVE_CHANNELS
     {
         tracing::info!(
-                    "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
-                    manta_engine::CRASH_MIN_LIVE_CHANNELS
-                );
+            target: "manta",
+            "static-crash filter inactive: the source passband holds {crash_live} channels, fewer than the {} it needs",
+            manta_engine::CRASH_MIN_LIVE_CHANNELS
+        );
     }
     // MAN-196: a decimated capture states its usable passband
     // once, at the same point as the crash notice -- after the
@@ -1180,7 +1181,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
     // without a decimator: the non-decimated path is unchanged
     // in every observable respect.
     if let Some((lo, hi)) = trusted_band {
-        tracing::info!("{}", trusted_band_notice(trusted_band_fs_hz, lo, hi));
+        tracing::info!(target: "manta", "{}", trusted_band_notice(trusted_band_fs_hz, lo, hi));
     }
     if reload_enabled {
         logging::note(
@@ -1443,6 +1444,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                 {
                     pipeline_ready_logged = true;
                     tracing::info!(
+                        target: "manta",
                         "{}",
                         manta_server::status::format_pipeline_ready(
                             env!("CARGO_PKG_VERSION"),
