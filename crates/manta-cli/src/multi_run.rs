@@ -1046,8 +1046,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 server.metrics.record_spot(spot);
                 hearing.record(&server.metrics, &names, spot);
                 let cty = server.lists.cty.load();
-                if crate::geography_is_unresolved(&cty, &spot.callsign)
-                    || crate::station_geography_unresolved(&cty, &server.station_callsign)
+                if manta_server::spot_message::geography_is_unresolved(&cty, &spot.callsign)
+                    || manta_server::spot_message::station_geography_unresolved(
+                        &cty,
+                        &server.station_callsign,
+                    )
                 {
                     server.metrics.record_unresolved_geography();
                 }
