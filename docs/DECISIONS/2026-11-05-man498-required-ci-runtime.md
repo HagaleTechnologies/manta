@@ -1,5 +1,7 @@
 # MAN-498: shard required Unix workspace tests by executable
 
+> **Superseded in part (MAN-518, 2026-11-08).** Shards no longer compile; one build job per OS does, and each shard runs a prebuilt slice. See [MAN-518](2026-11-08-man518-build-test-executables-once-per-os.md).
+
 Required Ubuntu and macOS CI now use eight whole-binary shards and a concurrent
 support job per OS. The OS aggregate retains `test (ubuntu-latest)` or
 `test (macos-latest)` and requires both dependencies to succeed. Windows keeps

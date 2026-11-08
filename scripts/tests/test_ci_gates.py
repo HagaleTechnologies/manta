@@ -1050,7 +1050,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         for platform in ('ubuntu', 'macos'):
             aggregate = wf.job_block(text, f'{platform}-aggregate')
             self.assertEqual(wf.field(aggregate, 'name'), f'test ({platform}-latest)')
-            self.assertEqual(wf.field(aggregate, 'needs'), f'[{platform}-support, {platform}-shards]')
+            self.assertEqual(wf.field(aggregate, 'needs'), f'[{platform}-support, {platform}-build, {platform}-shards]')
             self.assertIn('always() &&', wf.field(aggregate, 'if'))
             self.assertIn('github.event.pull_request.head.repo.full_name != github.repository', wf.field(aggregate, 'if'))
             shards = wf.job_block(text, f'{platform}-shards')
@@ -1058,7 +1058,17 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertIn('fail-fast: false', '\n'.join(shards))
             self.assertNotIn('max-parallel', '\n'.join(shards))
             self.assertEqual(wf.field(shards, 'timeout-minutes'), '35')
-            self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '') for s in wf.steps(shards)))
+            self.assertEqual(wf.field(shards, 'needs'), f'{platform}-build')
+            self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')
+                                and '--from-bundle' in (wf.run_body(s) or '') for s in wf.steps(shards)))
+            # MAN-518: one build job per OS compiles every test executable once.
+            build = wf.job_block(text, f'{platform}-build')
+            self.assertEqual(wf.field(build, 'timeout-minutes'), '35')
+            self.assertIn('fail-fast: false', '\n'.join(build))
+            self.assertIn(f'os: [{platform}-latest]', '\n'.join(build))
+            builds = [s for s in wf.steps(build) if 'scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')]
+            self.assertEqual(len(builds), 1)
+            self.assertIn('--build-bundles test-bundles', wf.run_body(builds[0]))
             upload = next(s for s in wf.steps(shards) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or ''))
             self.assertEqual(wf.field(upload, 'if'), 'always()')
             support = wf.job_block(text, f'{platform}-support')
@@ -1072,14 +1082,88 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         for platform in ('ubuntu', 'macos'):
             aggregate = wf.job_block(text, f'{platform}-aggregate')
             body = wf.run_body(wf.steps(aggregate)[0])
-            for shard, support, expected in [('success', 'success', 0), ('failure', 'success', 1),
-                                             ('cancelled', 'success', 1), ('skipped', 'success', 1),
-                                             ('success', 'failure', 1), (None, 'success', 1)]:
+            # (build, shards, support, expected); None leaves the key out. A failed build skips
+            # the shards, and the old two-key shape (no build) must not pass either.
+            for build, shard, support, expected in [
+                    ('success', 'success', 'success', 0),
+                    ('success', 'failure', 'success', 1), ('success', 'cancelled', 'success', 1),
+                    ('success', 'skipped', 'success', 1), ('success', 'success', 'failure', 1),
+                    ('success', None, 'success', 1),
+                    ('failure', 'skipped', 'success', 1), ('cancelled', 'skipped', 'success', 1),
+                    ('skipped', 'skipped', 'success', 1), ('failure', 'success', 'success', 1),
+                    ('cancelled', 'success', 'success', 1), ('skipped', 'success', 'success', 1),
+                    (None, 'success', 'success', 1)]:
                 results = {f'{platform}-support': {'result': support}}
+                if build:
+                    results[f'{platform}-build'] = {'result': build}
                 if shard:
                     results[f'{platform}-shards'] = {'result': shard}
                 proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
-                self.assertEqual(proc.returncode, expected, proc.stderr)
+                self.assertEqual(proc.returncode, expected, (build, shard, support, proc.stderr))
+
+    def test_build_job_uploads_one_bundle_per_shard(self):
+        # MAN-518: the build job cuts one slice per shard; every shard index has its own upload.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            shards = wf.job_block(text, f'{platform}-shards')
+            m = re.search(r'^\s*shard: \[([0-9, ]+)\]$', '\n'.join(shards), re.M)
+            self.assertIsNotNone(m, f'{platform}-shards: no shard matrix list')
+            indices = [int(x) for x in m.group(1).split(',')]
+            self.assertEqual(indices, list(range(len(indices))))
+            build = wf.job_block(text, f'{platform}-build')
+            for job in (shards, build):
+                counts = {int(c) for s in wf.steps(job)
+                          for c in re.findall(r'scripts/ci-shards\.py --count (\d+)', wf.run_body(s) or '')}
+                self.assertEqual(counts, {len(indices)})
+            uploads = [s for s in wf.steps(build) if (wf.field(s, 'uses') or '').startswith('actions/upload-artifact@')]
+            bundles = {}
+            for step in uploads:
+                with_block = wf.sub(step, 'with')
+                self.assertIsNotNone(with_block)
+                name = wf.field(with_block, 'name')
+                if name == 'build-${{ matrix.os }}':
+                    self.assertEqual(wf.field(step, 'if'), 'always()')
+                    self.assertEqual(wf.field(with_block, 'path'), 'build-evidence/*.json')
+                    self.assertEqual(wf.field(with_block, 'if-no-files-found'), 'error')
+                    bundles.setdefault('evidence', []).append(step)
+                    continue
+                m = re.fullmatch(r'test-bundle-\$\{\{ matrix\.os \}\}-(\d+)', name or '')
+                self.assertIsNotNone(m, f'{platform}-build: unexpected upload {name}')
+                i = int(m.group(1))
+                self.assertNotIn(i, bundles, f'{platform}-build: two uploads for slice {i}')
+                bundles[i] = step
+                self.assertEqual(wf.field(with_block, 'path'), f'test-bundles/slice-{i}.tar.gz')
+                self.assertEqual(wf.field(with_block, 'compression-level'), '0')
+                self.assertEqual(wf.field(with_block, 'retention-days'), '1')
+                self.assertEqual(wf.field(with_block, 'if-no-files-found'), 'error')
+            self.assertEqual(len(bundles.pop('evidence', [])), 1, f'{platform}-build: one evidence upload')
+            self.assertEqual(sorted(bundles), indices)
+
+    def test_shards_run_their_bundle_without_a_compiler(self):
+        # MAN-518: a shard downloads its slice and runs it; nothing in the job compiles.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            job_steps = wf.steps(wf.job_block(text, f'{platform}-shards'))
+            downloads = [i for i, s in enumerate(job_steps)
+                         if (wf.field(s, 'uses') or '').startswith('actions/download-artifact@')]
+            self.assertEqual(len(downloads), 1, f'{platform}-shards: expected one download step')
+            with_block = wf.sub(job_steps[downloads[0]], 'with')
+            self.assertIsNotNone(with_block)
+            self.assertEqual(wf.field(with_block, 'name'), 'test-bundle-${{ matrix.os }}-${{ matrix.shard }}')
+            self.assertEqual(wf.field(with_block, 'path'), 'test-bundle')
+            runs = [i for i, s in enumerate(job_steps) if 'scripts/ci-shards.py' in (wf.run_body(s) or '')]
+            self.assertEqual(len(runs), 1, f'{platform}-shards: expected one ci-shards.py step')
+            self.assertLess(downloads[0], runs[0])
+            self.assertIn('--from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz', wf.run_body(job_steps[runs[0]]))
+            for step in job_steps:
+                uses = wf.field(step, 'uses') or ''
+                self.assertFalse(uses.startswith(('dtolnay/rust-toolchain@', 'Swatinem/rust-cache@')), uses)
+                body = wf.run_body(step) or ''
+                self.assertNotIn('check-rust-toolchain-pin', body)
+                self.assertIsNone(re.search(r'\b(cargo|rustc|rustup)\b', body), body)
+            apt = [s for s in job_steps if 'apt-get install -y libasound2-dev' in (wf.run_body(s) or '')]
+            self.assertEqual(len(apt), 1, f'{platform}-shards: the Linux apt step is gone')
+            self.assertEqual(wf.field(apt[0], 'if'), "runner.os == 'Linux'")
 
     def test_relay_uses_independent_actual_job_results(self):
         relay = wf.job_block(wf.read('ci-full.yml'), 'relay-check-runs')
