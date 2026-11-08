@@ -9,7 +9,7 @@ Linux/ARM/headless platforms it has no native build for.
 
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run this list; `ci-full.yml`'s `*-support` and
-`*-shards` jobs run it for `test (ubuntu-latest)`/`test (macos-latest)`. On
+`*-shards` jobs cover it for `test (ubuntu-latest)`/`test (macos-latest)`. On
 Windows CI runs only `test_package_release` of the script suites; `ci_gates`,
 `decisions_index` and `verify_dependabot_diff_safe` are Linux-only.
 

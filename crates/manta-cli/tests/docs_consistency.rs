@@ -4103,10 +4103,12 @@ fn claude_md_pre_push_commands_are_ci_full_commands() {
 }
 
 /// MAN-547: CLAUDE.md's unittest brace list names exactly the
-/// `scripts/tests` suites that `ci-full.yml` runs, no more and no fewer.
+/// `scripts/tests` suites that `ci-full.yml` runs, no more and no fewer. Any
+/// `scripts.tests.test_<name>` in the workflow counts, whatever flags or
+/// sibling modules share its `unittest` line.
 #[test]
 fn claude_md_lists_every_ci_script_suite() {
-    let suite = regex::Regex::new(r"-m unittest scripts\.tests\.test_(\w+)").unwrap();
+    let suite = regex::Regex::new(r"\bscripts\.tests\.test_(\w+)").unwrap();
     let ci: std::collections::BTreeSet<String> = suite
         .captures_iter(&doc(".github/workflows/ci-full.yml"))
         .map(|c| c[1].to_owned())
