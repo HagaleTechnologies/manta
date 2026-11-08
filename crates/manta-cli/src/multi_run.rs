@@ -791,26 +791,27 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let factor = manta_spot::calibration_factor_from_ppm(m.inputs[0].freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let silent_window = setup.cfg.silent_input_window();
-            let (rt, server) = crate::spot_server::start_spot_server(
-                setup.cfg,
-                setup.rbn_uplink,
-                setup.rbn_compare,
-                crate::spot_server::SourceInfo {
-                    name: &label,
-                    sample_rate_hz: opened.common_rate_hz(),
-                    dial_freq_hz: first.center_freq_hz,
-                    rf_passband_hz: first.rf_passband_hz,
-                    freq_calibration: factor,
-                    coverage: &coverage,
-                    inputs: Some(&names),
-                },
-                epoch,
-                nonce,
-                lists.clone(),
-                m.cfg,
-                setup.relays,
-                setup.outputs,
-            )?;
+            let (rt, server) =
+                crate::spot_server::start_spot_server(crate::spot_server::SpotServerParams {
+                    cfg: setup.cfg,
+                    rbn_uplink_cfgs: setup.rbn_uplink,
+                    rbn_compare_cfg: setup.rbn_compare,
+                    source: crate::spot_server::SourceInfo {
+                        name: &label,
+                        sample_rate_hz: opened.common_rate_hz(),
+                        dial_freq_hz: first.center_freq_hz,
+                        rf_passband_hz: first.rf_passband_hz,
+                        freq_calibration: factor,
+                        coverage: &coverage,
+                        inputs: Some(&names),
+                    },
+                    epoch,
+                    session_nonce: nonce,
+                    lists: lists.clone(),
+                    pipeline: m.cfg,
+                    relays: setup.relays,
+                    outputs: setup.outputs,
+                })?;
             // MAN-324: one `bandState` per input per stream second, each
             // naming its input; track and decision records as with one.
             if server.live_addr.is_some() {

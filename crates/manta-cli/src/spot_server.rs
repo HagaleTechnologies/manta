@@ -96,7 +96,7 @@ pub(crate) struct UplinkDryRun {
 }
 
 /// What the MAN-122 startup banner names about the live source; carried as
-/// one struct so `start_spot_server`'s argument list stays at four.
+/// one struct, which is one field of `SpotServerParams`.
 pub(crate) struct SourceInfo<'a> {
     pub(crate) name: &'a str,
     pub(crate) sample_rate_hz: f64,
@@ -136,6 +136,21 @@ pub(crate) struct RelayConfigs {
     pub wsjtx: Vec<manta_server::config::WsjtxRelayConfig>,
 }
 
+/// Everything `start_spot_server` needs, by name (MAN-548: replaces its
+/// ten-parameter list and the clippy argument-count allow it needed).
+pub(crate) struct SpotServerParams<'a> {
+    pub(crate) cfg: manta_server::config::ServerConfig,
+    pub(crate) rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
+    pub(crate) rbn_compare_cfg: Option<manta_server::config::RbnCompareConfig>,
+    pub(crate) source: SourceInfo<'a>,
+    pub(crate) epoch: std::time::SystemTime,
+    pub(crate) session_nonce: u128,
+    pub(crate) lists: std::sync::Arc<manta_engine::ReferenceLists>,
+    pub(crate) pipeline: &'a PipelineConfig,
+    pub(crate) relays: RelayConfigs,
+    pub(crate) outputs: spot_outputs::SpotOutputs,
+}
+
 /// Starts the telnet/JSON-Lines-and-WebSocket/metrics servers on their own
 /// tokio runtime (ARCHITECTURE §7-§8). The returned `Runtime` must be kept
 /// alive for the servers to keep running -- dropping it stops them.
@@ -150,19 +165,21 @@ pub(crate) struct RelayConfigs {
 /// spot-`id`-uniqueness-only value -- pass a fixed one (e.g.
 /// `session_nonce_for_replay_path`) when replaying a file, or two runs of
 /// the same fixture emit colliding spot `id`s.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_spot_server(
-    cfg: manta_server::config::ServerConfig,
-    rbn_uplink_cfgs: Vec<manta_server::config::RbnUplinkConfig>,
-    rbn_compare_cfg: Option<manta_server::config::RbnCompareConfig>,
-    source: SourceInfo<'_>,
-    epoch: std::time::SystemTime,
-    session_nonce: u128,
-    lists: std::sync::Arc<manta_engine::ReferenceLists>,
-    pipeline: &PipelineConfig,
-    relays: RelayConfigs,
-    outputs: spot_outputs::SpotOutputs,
+    params: SpotServerParams<'_>,
 ) -> Result<(tokio::runtime::Runtime, SpotServer)> {
+    let SpotServerParams {
+        cfg,
+        rbn_uplink_cfgs,
+        rbn_compare_cfg,
+        source,
+        epoch,
+        session_nonce,
+        lists,
+        pipeline,
+        relays,
+        outputs,
+    } = params;
     let validation_level = pipeline.validation_level;
     // MAN-320 (D11): every enabled `[[wsjtx_relay]]` socket is bound before
     // anything is spawned, so a taken UDP port fails startup with the

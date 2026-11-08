@@ -583,11 +583,11 @@ fn start_spot_server_uses_the_cty_table_it_is_given() {
     let loaded = loaded_from(
             "[server]\nstation_callsign = 'W1AW'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
         );
-    let (test_runtime, server) = start_spot_server(
-        loaded.server.unwrap(),
-        vec![],
-        None,
-        SourceInfo {
+    let (test_runtime, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: vec![],
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -596,19 +596,19 @@ fn start_spot_server_uses_the_cty_table_it_is_given() {
             coverage: &[],
             inputs: None,
         },
-        std::time::UNIX_EPOCH,
-        0,
-        std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
+        epoch: std::time::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
             table.clone(),
             std::sync::Arc::new(manta_spot::scp::Set::bundled()),
         )),
-        &PipelineConfig {
+        pipeline: &PipelineConfig {
             cty: Some(table.clone()),
             ..Default::default()
         },
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
     let cty = server.lists.cty.load();
     assert!(std::sync::Arc::ptr_eq(&cty, &table));
@@ -638,11 +638,11 @@ fn published_spot_geography_follows_a_swapped_cty_table() {
     let loaded = loaded_from(
             "[server]\nstation_callsign = 'QQ9ZZZ'\nbind_addr = '127.0.0.1'\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
         );
-    let (test_runtime, server) = start_spot_server(
-        loaded.server.unwrap(),
-        vec![],
-        None,
-        SourceInfo {
+    let (test_runtime, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: vec![],
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -651,13 +651,13 @@ fn published_spot_geography_follows_a_swapped_cty_table() {
             coverage: &[],
             inputs: None,
         },
-        std::time::UNIX_EPOCH,
-        0,
-        lists.clone(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: lists.clone(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
     let cty = server.lists.cty.load();
     assert!(geography_is_unresolved(&cty, "QQ9ZZZ"));
@@ -1099,11 +1099,11 @@ fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -1112,13 +1112,13 @@ fn the_status_line_task_is_retained_and_joins_promptly_on_shutdown() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let handle = server
@@ -1164,11 +1164,11 @@ fn the_status_line_task_has_exited_before_client_shutdown_is_broadcast() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -1177,13 +1177,13 @@ fn the_status_line_task_has_exited_before_client_shutdown_is_broadcast() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let status_task = server
@@ -2294,11 +2294,11 @@ fn disabled_uplink_makes_no_connection_attempt_from_the_daemon() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, _server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, _server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2307,13 +2307,13 @@ fn disabled_uplink_makes_no_connection_attempt_from_the_daemon() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let accepted = rt.block_on(async {
@@ -2359,11 +2359,11 @@ fn enabled_uplink_connects_to_its_configured_target() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, _server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, _server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2372,13 +2372,13 @@ fn enabled_uplink_connects_to_its_configured_target() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let accepted = rt.block_on(async {
@@ -2422,11 +2422,11 @@ fn server_config_accepts_the_operator_identity_keys() {
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore)
         .expect("a config with the operator-identity keys present must load");
-    let result = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let result = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_040_000.0,
@@ -2435,13 +2435,13 @@ fn server_config_accepts_the_operator_identity_keys() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    );
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    });
     assert!(
         result.is_ok(),
         "a config with the operator-identity keys present must still start: {:?}",
@@ -2461,11 +2461,11 @@ fn json_spot_from_a_daemon(callsign: &str, location_keys: &str) -> serde_json::V
         .as_bytes(),
     );
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2474,13 +2474,13 @@ fn json_spot_from_a_daemon(callsign: &str, location_keys: &str) -> serde_json::V
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let line = rt.block_on(async {
@@ -2578,11 +2578,11 @@ fn start_spot_server_rejects_an_inconsistent_station_location() {
         operator_lat: Some(41.7),
         ..test_server_config("W1AW")
     };
-    let Err(err) = start_spot_server(
+    let Err(err) = start_spot_server(SpotServerParams {
         cfg,
-        Vec::new(),
-        None,
-        SourceInfo {
+        rbn_uplink_cfgs: Vec::new(),
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2591,13 +2591,13 @@ fn start_spot_server_rejects_an_inconsistent_station_location() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    ) else {
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    }) else {
         panic!("half a lat/lon pair must not start the servers");
     };
     let err = format!("{err:#}");
@@ -2609,11 +2609,11 @@ fn start_spot_server_rejects_an_inconsistent_station_location() {
 fn relay_test_start(body: &str) -> Result<(tokio::runtime::Runtime, SpotServer)> {
     let cfg_file = write_temp_file(body.as_bytes());
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2622,16 +2622,16 @@ fn relay_test_start(body: &str) -> Result<(tokio::runtime::Runtime, SpotServer)>
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs {
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs {
             skimmer: loaded.skimmer_relay,
             wsjtx: loaded.wsjtx_relay,
         },
-        spot_outputs::SpotOutputs::default(),
-    )
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
 }
 
 const RELAY_SERVER: &str = "[server]\nstation_callsign = \"W3XYZ\"\nbind_addr = \"127.0.0.1\"\n\
@@ -2716,11 +2716,11 @@ fn two_enabled_uplink_targets_each_independently_connect() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, _server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, _server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -2729,13 +2729,13 @@ fn two_enabled_uplink_targets_each_independently_connect() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     async fn wait_for_accept(listener: &std::net::TcpListener) -> bool {
@@ -5372,11 +5372,11 @@ fn every_configured_uplink_target_is_registered_even_when_disabled() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (_rt, server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (_rt, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -5385,13 +5385,13 @@ fn every_configured_uplink_target_is_registered_even_when_disabled() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let snap = server.metrics.uplink_snapshot();
@@ -5425,11 +5425,11 @@ fn status_reports_a_configured_uplink_target_from_a_live_daemon() {
     );
 
     let loaded = config::load(Some(cfg_file.path()), config::Env::Ignore).unwrap();
-    let (rt, server) = start_spot_server(
-        loaded.server.unwrap(),
-        loaded.rbn_uplink,
-        None,
-        SourceInfo {
+    let (rt, server) = start_spot_server(SpotServerParams {
+        cfg: loaded.server.unwrap(),
+        rbn_uplink_cfgs: loaded.rbn_uplink,
+        rbn_compare_cfg: None,
+        source: SourceInfo {
             name: "file",
             sample_rate_hz: 96_000.0,
             dial_freq_hz: 14_000_000.0,
@@ -5438,13 +5438,13 @@ fn status_reports_a_configured_uplink_target_from_a_live_daemon() {
             coverage: &[],
             inputs: None,
         },
-        std::time::SystemTime::UNIX_EPOCH,
-        0,
-        bundled_reference_lists(),
-        &PipelineConfig::default(),
-        RelayConfigs::default(),
-        spot_outputs::SpotOutputs::default(),
-    )
+        epoch: std::time::SystemTime::UNIX_EPOCH,
+        session_nonce: 0,
+        lists: bundled_reference_lists(),
+        pipeline: &PipelineConfig::default(),
+        relays: RelayConfigs::default(),
+        outputs: spot_outputs::SpotOutputs::default(),
+    })
     .unwrap();
 
     let doc = rt

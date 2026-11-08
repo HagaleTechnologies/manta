@@ -60,6 +60,7 @@ use crate::spot_outputs;
 use crate::spot_server::start_spot_server;
 use crate::spot_server::RelayConfigs;
 use crate::spot_server::SourceInfo;
+use crate::spot_server::SpotServerParams;
 use crate::stale_cty_warning;
 use crate::start_callsign_lookup;
 use crate::start_list_refresh;
@@ -878,11 +879,11 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             // so all three are read HERE, from `first` (the
             // startup connection), before it is moved into the
             // pipeline below.
-            let (rt, server) = start_spot_server(
-                server_cfg,
-                loaded.rbn_uplink.clone(),
-                resolved.rbn_compare.clone(),
-                SourceInfo {
+            let (rt, server) = start_spot_server(SpotServerParams {
+                cfg: server_cfg,
+                rbn_uplink_cfgs: loaded.rbn_uplink.clone(),
+                rbn_compare_cfg: resolved.rbn_compare.clone(),
+                source: SourceInfo {
                     name: source_name,
                     sample_rate_hz: first.sample_rate(),
                     dial_freq_hz: first.center_freq_hz(),
@@ -893,18 +894,18 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                 },
                 epoch,
                 session_nonce,
-                lists.clone(),
-                &cfg,
-                RelayConfigs {
+                lists: lists.clone(),
+                pipeline: &cfg,
+                relays: RelayConfigs {
                     skimmer: loaded.skimmer_relay.clone(),
                     wsjtx: loaded.wsjtx_relay.clone(),
                 },
-                spot_outputs::SpotOutputs::for_run(
+                outputs: spot_outputs::SpotOutputs::for_run(
                     loaded.pskreporter.as_ref(),
                     &loaded.wsjtx_output,
                     replay_path.is_some(),
                 ),
-            )?;
+            })?;
             // MAN-45 (round-9 finding): the daemon's own copy of the
             // gauge `manta_engine::listen_with_observers` updates as
             // it runs (on the MAIN thread, outside this tokio
