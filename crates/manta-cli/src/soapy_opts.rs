@@ -265,8 +265,9 @@ mod tests {
     /// outside this file only once, in main.rs (its feature-off config test).
     #[test]
     fn only_soapy_opts_names_the_soapy_feature() {
-        // Built with concat! so this line does not count itself.
-        const NEEDLE: &str = concat!("feature", " = \"soapy\"");
+        // Matched with whitespace stripped, so a gate spelled without spaces
+        // counts too; built with concat! so this line does not count itself.
+        const NEEDLE: &str = concat!("feature", "=\"soapy\"");
         fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
@@ -285,7 +286,7 @@ mod tests {
             let rel = file.strip_prefix(&src).unwrap().display().to_string();
             let text = std::fs::read_to_string(file).unwrap();
             for (n, line) in text.lines().enumerate() {
-                if line.contains(NEEDLE) {
+                if line.split_whitespace().collect::<String>().contains(NEEDLE) {
                     total += 1;
                     if rel != "soapy_opts.rs" {
                         outside.push(format!("{rel}:{}", n + 1));
