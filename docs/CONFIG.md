@@ -590,7 +590,7 @@ type = "kiwi"
 host = "kiwi.example.net"
 bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
 #tuning_range_hz = [3000000.0, 30000000.0]
-#bands = ["6m"] with tuning_range_hz = [0.0, 61440000.0]
+#bands = ["6m"] with tuning_range_hz = [0.0, 61440000.0] (hpsdr or soapy that tunes 50 MHz)
 ```
 
 The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;

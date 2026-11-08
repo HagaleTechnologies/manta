@@ -1347,7 +1347,7 @@ fn an_unknown_band_lists_the_vocabulary() {
 
 // MAN-543: 6m is a named band, skimmed when the tuning range reaches it.
 
-const HL2_192K_6M: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\n\
+const HPSDR_192K_6M: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\n\
                            rate_hz = 192000.0\nbands = [\"6m\"]\n";
 
 /// Scenario 1: `bands = ["6m"]` on a receiver that tunes 50 MHz lists the
@@ -1355,7 +1355,7 @@ const HL2_192K_6M: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\n\
 #[test]
 fn six_metres_on_a_192k_hpsdr_radio_is_one_stream_at_50050_khz() {
     let o = check_body(&format!(
-        "{HL2_192K_6M}tuning_range_hz = [0.0, 61440000.0]\n"
+        "{HPSDR_192K_6M}tuning_range_hz = [0.0, 61440000.0]\n"
     ));
     assert_eq!(
         input_lines(&succeeds(&o)),
@@ -1370,7 +1370,7 @@ fn six_metres_on_a_192k_hpsdr_radio_is_one_stream_at_50050_khz() {
 
 #[test]
 fn six_metres_needs_a_tuning_range_that_reaches_it() {
-    let err = fails(&check_body(HL2_192K_6M));
+    let err = fails(&check_body(HPSDR_192K_6M));
     assert!(
         err.ends_with(
             "[input]: input.bands leaves nothing to skim inside the receiver's tuning range, 0 \

@@ -670,6 +670,11 @@ mod tests {
             plan(&items(&["all", "6m"]), (0.0, 61_440_000.0), U96).unwrap_err(),
             "input.bands lists 6m, which \"all\" already includes"
         );
+        // A bare centre inside 6m repeats "all" on such a range, too.
+        assert_eq!(
+            plan(&items(&["all", "50050"]), (0.0, 61_440_000.0), U96).unwrap_err(),
+            "input.bands lists \"50050\", which is inside 6m (50000 to 50100 kHz), already listed"
+        );
         let p = plan(&items(&["all", "6m"]), DEFAULT_TUNING_RANGE_HZ, U96).unwrap();
         assert_eq!(p.streams.len(), 14);
         assert_eq!(
