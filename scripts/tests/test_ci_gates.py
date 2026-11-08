@@ -282,7 +282,8 @@ class WindowsVisibilityTests(unittest.TestCase):
                     self.assertEqual([w for w in written if w.endswith("=")], [], "no empty check-run id")
 
     def test_relay_reports_the_windows_leg(self):
-        relay = wf.job_block(self.text, "relay-check-runs")
+        # MAN-516: the Windows check-run has its own relay, waiting only on the Windows job.
+        relay = wf.job_block(self.text, "relay-windows-check-run")
         step = wf.steps(relay)[-1]
         self.assertEqual(wf.field(wf.sub(step, "env"), "WINDOWS_CHECK_ID"),
                          "${{ needs.create-ci-check.outputs.windows_check_id }}")
@@ -1064,8 +1065,15 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             support = wf.job_block(text, f'{platform}-support')
             self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
             self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v')), 1)
-        relay = wf.job_block(text, 'relay-check-runs')
-        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, test, ubuntu-aggregate, macos-aggregate]')
+        # MAN-516: Unix check-runs are relayed from the aggregates alone; Windows has its own relay.
+        self.assertNotIn('relay-check-runs', wf.job_ids(text))
+        unix = wf.job_block(text, 'relay-unix-check-runs')
+        self.assertEqual(wf.field(unix, 'needs'), '[create-ci-check, ubuntu-aggregate, macos-aggregate]')
+        windows = wf.job_block(text, 'relay-windows-check-run')
+        self.assertEqual(wf.field(windows, 'needs'), '[create-ci-check, test]')
+        for relay in (unix, windows):
+            self.assertEqual(wf.field(relay, 'if'), "always() && github.event_name == 'workflow_dispatch'")
+            self.assertEqual(wf.field(wf.sub(relay, 'environment'), 'name'), 'codex-review')
 
     def test_aggregate_verdict_fails_closed(self):
         text = wf.read('ci-full.yml')
@@ -1081,34 +1089,83 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
                 self.assertEqual(proc.returncode, expected, proc.stderr)
 
-    def test_relay_uses_independent_actual_job_results(self):
-        relay = wf.job_block(wf.read('ci-full.yml'), 'relay-check-runs')
+    def run_relay(self, job, results, ids):
+        """PATCH calls (one string each) of a relay job's real step body, against stub gh."""
+        relay = wf.job_block(wf.read('ci-full.yml'), job)
         body = wf.run_body(wf.steps(relay)[-1]).replace('${{ github.run_id }}', '123')
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, 'gh')
+            with open(stub, 'w') as f:
+                f.write('#!/usr/bin/env python3\nimport os,sys\n'
+                        'if "--paginate" in sys.argv: print(os.environ["JOBS"])\n'
+                        'else:\n with open(os.environ["CALLS"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
+            os.chmod(stub, 0o755)
+            calls = os.path.join(tmp, 'calls')
+            env = {**os.environ, 'PATH': tmp+os.pathsep+os.environ['PATH'], 'CALLS': calls,
+                   'JOBS': json.dumps({'jobs': results}), 'REPO': 'o/r', 'APP_TOKEN': 'stub', **ids}
+            proc = subprocess.run(['bash', '-e', '-c', body], env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            if not os.path.exists(calls):
+                return []
+            with open(calls) as f:
+                return f.read().splitlines()
+
+    def test_relay_uses_independent_actual_job_results(self):
+        unix_ids = {'UBUNTU_CHECK_ID': '11', 'MACOS_CHECK_ID': '12'}
         for mac in ('failure', 'cancelled', 'skipped', None):
-            with tempfile.TemporaryDirectory() as tmp:
-                stub = os.path.join(tmp, 'gh')
-                with open(stub, 'w') as f:
-                    f.write('#!/usr/bin/env python3\nimport os,sys\n'
-                            'if "--paginate" in sys.argv: print(os.environ["JOBS"])\n'
-                            'else:\n with open(os.environ["CALLS"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
-                os.chmod(stub, 0o755)
-                results = [{'name': CHECKS[0], 'conclusion': 'success'},
-                           {'name': CHECKS[2], 'conclusion': 'success'}]
-                if mac is not None:
-                    results.append({'name': CHECKS[1], 'conclusion': mac})
-                calls = os.path.join(tmp, 'calls')
-                env = {**os.environ, 'PATH': tmp+os.pathsep+os.environ['PATH'], 'CALLS': calls,
-                       'JOBS': json.dumps({'jobs': results}), 'REPO': 'o/r', 'APP_TOKEN': 'stub',
-                       'UBUNTU_CHECK_ID': '11', 'MACOS_CHECK_ID': '12', 'WINDOWS_CHECK_ID': '13'}
-                proc = subprocess.run(['bash', '-e', '-c', body], env=env, capture_output=True, text=True)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                with open(calls) as f:
-                    written = f.read().splitlines()
+            results = [{'name': CHECKS[0], 'conclusion': 'success'},
+                       # MAN-516: Windows is still running when the Unix relay fires.
+                       {'name': CHECKS[2], 'conclusion': None, 'status': 'in_progress'}]
+            if mac is not None:
+                results.append({'name': CHECKS[1], 'conclusion': mac})
+            with self.subTest(mac=mac):
+                written = self.run_relay('relay-unix-check-runs', results, unix_ids)
+                self.assertEqual(len(written), 2, written)
                 self.assertIn('conclusion=success', written[0])
                 self.assertIn('check-runs/11', written[0])
                 self.assertIn(f'conclusion={mac or "failure"}', written[1])
                 self.assertIn('check-runs/12', written[1])
-                self.assertIn('conclusion=success', written[2])
+
+    def test_windows_relay_marks_only_the_windows_check_run(self):
+        # The Unix legs were relayed green; the Windows job then fails (or is missing).
+        for windows, expected in (('success', 'success'), ('failure', 'failure'),
+                                  ('cancelled', 'cancelled'), (None, 'failure')):
+            results = [{'name': CHECKS[0], 'conclusion': 'success'},
+                       {'name': CHECKS[1], 'conclusion': 'success'}]
+            if windows is not None:
+                results.append({'name': CHECKS[2], 'conclusion': windows})
+            with self.subTest(windows=windows):
+                written = self.run_relay('relay-windows-check-run', results, {'WINDOWS_CHECK_ID': '13'})
+                self.assertEqual(len(written), 1, written)
+                self.assertIn('check-runs/13', written[0])
+                self.assertIn(f'conclusion={expected}', written[0])
+
+    def test_each_relay_reads_only_jobs_it_waits_for(self):
+        # relay() marks a job with no conclusion failed, so a relay naming a job outside its
+        # `needs` would fail that check-run while the job is still running.
+        text = wf.read('ci-full.yml')
+        owner = {CHECKS[0]: 'ubuntu-aggregate', CHECKS[1]: 'macos-aggregate', CHECKS[2]: 'test'}
+        for job, expected in (('relay-unix-check-runs', {CHECKS[0], CHECKS[1]}),
+                              ('relay-windows-check-run', {CHECKS[2]})):
+            block = wf.job_block(text, job)
+            body = wf.run_body(wf.steps(block)[-1])
+            named = set(re.findall(r'^\s*relay "(test \([a-z]+-latest\))" "\$[A-Z_]+"$', body, re.M))
+            self.assertEqual(named, expected, job)
+            needs = {n.strip() for n in wf.field(block, 'needs').strip('[]').split(',')}
+            self.assertTrue({owner[n] for n in named} <= needs, job)
+
+    def test_relays_share_one_fail_closed_relay_function(self):
+        # MAN-516: the two relay jobs carry the same relay() so neither drifts from the
+        # fail-closed rule (no conclusion found -> the check-run is marked failed).
+        text = wf.read('ci-full.yml')
+        defs = []
+        for job in ('relay-unix-check-runs', 'relay-windows-check-run'):
+            body = wf.run_body(wf.steps(wf.job_block(text, job))[-1])
+            m = re.search(r'^relay\(\) \{\n.*?^\}$', body, re.M | re.S)
+            self.assertIsNotNone(m, job)
+            defs.append(m.group(0))
+        self.assertEqual(defs[0], defs[1])
+        self.assertIn('conclusion="failure"', defs[0])
 
     def test_every_unix_command_has_a_required_home(self):
         text = wf.read('ci-full.yml')

@@ -1106,15 +1106,15 @@ jobs:
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy --locked
 
-  # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
-  # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single
-  # aggregate across every matrix combination (success only if ALL legs succeeded), which
-  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; each minted
-  # check-run needs its OWN independent, accurate conclusion. Looks up each leg's real
-  # conclusion from the Jobs API by its exact display name instead.
-  relay-check-runs:
-    name: Relay test results onto the reviewed SHA's check-runs
-    needs: [create-ci-check, test, ubuntu-aggregate, macos-aggregate]
+  # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
+  # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of
+  # the jobs it needs onto the explicit check-runs create-ci-check made on head_sha -- a
+  # job-level `needs.<job>.result` is one aggregate, so each check-run gets its OWN conclusion
+  # from the Jobs API by exact display name. Neither may look up a job outside its own `needs`:
+  # a leg still running has no conclusion, and relay() marks a missing one failed.
+  relay-unix-check-runs:
+    name: Relay Linux and macOS results onto the reviewed SHA's check-runs
+    needs: [create-ci-check, ubuntu-aggregate, macos-aggregate]
     if: always() && github.event_name == 'workflow_dispatch'
     # Q-0068: the app key lives in the main-only codex-review environment.
     environment:
@@ -1126,6 +1126,8 @@ jobs:
     steps:
       # Only the App that created a check-run can update it, so the PATCH uses the same
       # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      # Minted here, after this job's needs finish, never in create-ci-check: an installation
+      # token lives an hour and the Windows leg can run longer than that.
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -1134,14 +1136,13 @@ jobs:
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-      - name: Patch each required check-run with its own matrix leg's real conclusion
+      - name: Patch the Linux and macOS check-runs with their aggregates' real conclusions
         env:
           GH_TOKEN: ${{ github.token }}
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           UBUNTU_CHECK_ID: ${{ needs.create-ci-check.outputs.ubuntu_check_id }}
           MACOS_CHECK_ID: ${{ needs.create-ci-check.outputs.macos_check_id }}
-          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
         run: |
           jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
           relay() {
@@ -1160,4 +1161,51 @@ jobs:
           }
           relay "test (ubuntu-latest)" "$UBUNTU_CHECK_ID"
           relay "test (macos-latest)" "$MACOS_CHECK_ID"
+
+  relay-windows-check-run:
+    name: Relay the Windows result onto the reviewed SHA's check-run
+    needs: [create-ci-check, test]
+    if: always() && github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # Only the App that created a check-run can update it, so the PATCH uses the same
+      # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      # Minted here, after this job's needs finish, never in create-ci-check: an installation
+      # token lives an hour and the Windows leg can run longer than that.
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Patch the Windows check-run with its leg's real conclusion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
+        run: |
+          jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
+          relay() {
+            local job_name="$1" check_id="$2"
+            if [ -z "$check_id" ]; then
+              echo "::warning::No check-run id for '$job_name' -- create-ci-check must not have run or already failed."
+              return
+            fi
+            local conclusion
+            conclusion=$(echo "$jobs_json" | jq -r --arg n "$job_name" '.jobs[] | select(.name==$n) | .conclusion // empty')
+            if [ -z "$conclusion" ]; then
+              echo "::error::Could not find a conclusion for job '$job_name' in this run -- marking its check-run failed rather than leaving it stuck in_progress."
+              conclusion="failure"
+            fi
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="$conclusion"
+          }
           relay "test (windows-latest)" "$WINDOWS_CHECK_ID"
