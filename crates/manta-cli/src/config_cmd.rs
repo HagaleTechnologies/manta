@@ -46,8 +46,13 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // rejects source types this build cannot open), blocklist/notch reads.
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
-    let prepared =
-        crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true, None)?;
+    let prepared = crate::prepare_live(
+        crate::resolve::CliOverrides::none(),
+        path.clone(),
+        None,
+        true,
+        None,
+    )?;
     crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
@@ -814,7 +819,11 @@ fn input_summary(file: &crate::config::InputFile) -> String {
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
 /// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
-fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
+fn notes(
+    loaded: &Loaded,
+    resolved: &crate::resolve::Resolved,
+    source: ConfigSource,
+) -> Vec<String> {
     let mut notes = Vec::new();
     for group in crate::config::hpsdr_allocations(&loaded.inputs) {
         if group.members.len() > 1 {
@@ -842,7 +851,8 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
     if resolved.dial_freq_hz.is_none()
         && matches!(
             resolved.spec,
-            crate::LiveSourceSpec::AudioDevice(_) | crate::LiveSourceSpec::File { .. }
+            crate::source_spec::LiveSourceSpec::AudioDevice(_)
+                | crate::source_spec::LiveSourceSpec::File { .. }
         )
     {
         notes.push(
@@ -1023,8 +1033,8 @@ mod tests {
         load_text(body).unwrap_or_else(|e| panic!("{body:?} did not load: {e:#}"))
     }
 
-    fn resolved(loaded: &Loaded) -> crate::Resolved {
-        crate::resolve(crate::CliOverrides::none(), loaded).unwrap()
+    fn resolved(loaded: &Loaded) -> crate::resolve::Resolved {
+        crate::resolve::resolve(crate::resolve::CliOverrides::none(), loaded).unwrap()
     }
 
     fn lines_of(body: &str) -> Vec<String> {

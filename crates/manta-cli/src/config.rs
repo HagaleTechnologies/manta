@@ -676,7 +676,7 @@ fn cw_utc(v: &toml::value::Datetime) -> Option<i64> {
         + i64::from(t.hour) * 3600
         + i64::from(t.minute) * 60
         + i64::from(t.second.unwrap_or(0));
-    crate::check_replay_epoch("UTC", seconds).ok()
+    crate::cli_parse::check_replay_epoch("UTC", seconds).ok()
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -1795,7 +1795,7 @@ fn take_entry(
         .ok_or_else(|| "input.bands needs input.type (one of kiwi, soapy, hpsdr)".to_string())?;
     let rate_hz = match kind {
         InputKind::Kiwi => None,
-        InputKind::Hpsdr => Some(crate::check_hpsdr_rate_hz(
+        InputKind::Hpsdr => Some(crate::cli_parse::check_hpsdr_rate_hz(
             "input.rate_hz",
             t.rate_hz
                 .ok_or("input.rate_hz is required when input.type = \"hpsdr\"")?,
@@ -1808,7 +1808,7 @@ fn take_entry(
     };
     let capture_rate_hz = t
         .capture_rate_hz
-        .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+        .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
         .transpose()?;
     let width_hz = crate::band_streams::stream_width_hz(kind, rate_hz, capture_rate_hz);
     let usable_hz = crate::band_streams::usable_width_hz(width_hz);
@@ -2064,7 +2064,7 @@ fn raw_iq(t: &InputToml) -> std::result::Result<Option<(manta_input::RawIqFormat
 }
 
 fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
-    let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
+    let mac = crate::cli_parse::parse_hpsdr_mac(text).map_err(|_| {
         "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
             .to_string()
     })?;
@@ -2148,7 +2148,7 @@ fn validate_input(
         conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
-            .map(crate::check_freq_correction_ppm)
+            .map(crate::cli_parse::check_freq_correction_ppm)
             .transpose()?,
         dc_block: t
             .dc_block
@@ -2162,15 +2162,15 @@ fn validate_input(
             .transpose()?,
         center_freq_hz: t
             .center_freq_hz
-            .map(|v| crate::check_dial_freq_hz("input.center_freq_hz", v))
+            .map(|v| crate::cli_parse::check_dial_freq_hz("input.center_freq_hz", v))
             .transpose()?,
         capture_rate_hz: t
             .capture_rate_hz
-            .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+            .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
             .transpose()?,
         replay_epoch: t
             .replay_epoch
-            .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
+            .map(|v| crate::cli_parse::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
         record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
         spectrum: spectrum_out(&t)?,
@@ -2238,7 +2238,7 @@ fn validate_input(
                         .ok_or_else(|| "receivers must be an integer from 1 to 255".to_string())
                 })
                 .transpose()?,
-            port: port(crate::HPSDR_CONTROL_PORT)?,
+            port: port(crate::cli_parse::HPSDR_CONTROL_PORT)?,
             host: {
                 if t.host.is_some() && t.mac.is_some() {
                     return Err("input.host and input.mac cannot both be set".into());
@@ -2252,8 +2252,11 @@ fn validate_input(
                 .map(ProtocolValue::protocol)
                 .transpose()?
                 .unwrap_or_default(),
-            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
-            rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+            freq_hz: crate::cli_parse::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
+            rate_hz: crate::cli_parse::check_hpsdr_rate_hz(
+                "input.rate_hz",
+                req(t.rate_hz, "rate_hz", name)?,
+            )?,
             // MAN-308 D1: `protocol` parsed above, so this re-read cannot fail.
             auto_attenuation: match t.auto_attenuation {
                 Some(true)

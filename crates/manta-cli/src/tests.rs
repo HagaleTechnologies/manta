@@ -1,4 +1,10 @@
 use super::*;
+use crate::daemon_client::*;
+use crate::recording::*;
+use crate::resolve::*;
+use crate::session_epoch::*;
+use crate::source_spec::*;
+use crate::spot_server::*;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]

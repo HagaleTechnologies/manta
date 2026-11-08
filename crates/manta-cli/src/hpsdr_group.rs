@@ -3,7 +3,7 @@
 
 use crate::config::HpsdrAllocation;
 use crate::reconnect::{InputHealthTotals, SendSource};
-use crate::ResolvedInput;
+use crate::resolve::ResolvedInput;
 use anyhow::{anyhow, bail, Context, Result};
 use manta_input::IqSource;
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
@@ -671,7 +671,7 @@ fn resolve(group: &HpsdrAllocation) -> std::result::Result<SocketAddr, String> {
         let mac = group
             .mac
             .as_deref()
-            .map(crate::parse_hpsdr_mac)
+            .map(crate::cli_parse::parse_hpsdr_mac)
             .transpose()?;
         return select_radio(port, &broadcast_destinations(port), mac)
             .map(|radio| SocketAddr::new(radio.ip, port))
@@ -780,13 +780,13 @@ pub(crate) fn prepare(
                     auto_attenuation: attenuation.clone(),
                 };
                 let opened = manta_input::hpsdr::open_receiver(&cfg, allocation.protocol)?;
-                crate::log_hpsdr_open_line(&host, port, &opened);
-                crate::warn_if_attenuation_needs_protocol_2(&cfg, &opened);
+                crate::source_spec::log_hpsdr_open_line(&host, port, &opened);
+                crate::source_spec::warn_if_attenuation_needs_protocol_2(&cfg, &opened);
                 // MAN-259: the open call's runtime before the radio started
                 // streaming is outage, not samples.
                 let started_at = entered + opened.source.acquisition_start_offset();
                 let (capture, dial) = transforms[0];
-                let source = crate::transform_source(opened.source, capture, dial)
+                let source = crate::source_spec::transform_source(opened.source, capture, dial)
                     .context("prepare HPSDR receivers")?;
                 return Ok(Opened {
                     sources: vec![source],
@@ -812,7 +812,7 @@ pub(crate) fn prepare(
                 .into_iter()
                 .zip(&transforms)
                 .map(|(raw, &(capture, dial))| {
-                    crate::transform_source(Box::new(raw), capture, dial)
+                    crate::source_spec::transform_source(Box::new(raw), capture, dial)
                 })
                 .collect::<Result<Vec<_>>>();
             match sources {

@@ -11,7 +11,7 @@
 // SIGHUP, so no reload.
 #![cfg_attr(not(unix), allow(dead_code))]
 
-use crate::{config_cmd, prepare_config, CliOverrides, UplinkDryRun};
+use crate::{config_cmd, prepare_config, resolve::CliOverrides, spot_server::UplinkDryRun};
 use anyhow::Result;
 use manta_decode::decoder::Engine;
 use manta_engine::{OperatorLists, OperatorListsUpdate};
