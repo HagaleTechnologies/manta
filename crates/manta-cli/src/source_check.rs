@@ -253,7 +253,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
                 password: args.kiwi_password,
             },
             #[cfg(feature = "soapy")]
-            soapy: SoapyOpts {
+            soapy: crate::source_spec::SoapyOpts {
                 driver: args.soapy_driver,
                 freq: args.soapy_freq_hz,
                 rate: args.soapy_rate_hz,

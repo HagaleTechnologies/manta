@@ -891,7 +891,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
-                crate::publish_conditioned(
+                crate::run_cmd::publish_conditioned(
                     &server.metrics,
                     name,
                     &m.inputs[index].conditioning,
@@ -1092,7 +1092,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_input_bad_samples(&names[input], n_bad);
-                crate::publish_conditioned(
+                crate::run_cmd::publish_conditioned(
                     &server.metrics,
                     &names[input],
                     &m.inputs[input].conditioning,

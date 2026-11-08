@@ -25,11 +25,11 @@ pub(crate) struct KiwiOpts {
 /// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
 #[cfg(feature = "soapy")]
 #[derive(Clone)]
-struct SoapyOpts {
-    driver: Option<String>,
-    freq: Option<f64>,
-    rate: Option<f64>,
-    gain: Option<f64>,
+pub(crate) struct SoapyOpts {
+    pub(crate) driver: Option<String>,
+    pub(crate) freq: Option<f64>,
+    pub(crate) rate: Option<f64>,
+    pub(crate) gain: Option<f64>,
 }
 
 /// HPSDR/Hermes connection flags, grouped for the same reason.
@@ -693,7 +693,7 @@ pub(crate) fn audio_silence_warning(device: &str) -> String {
 /// overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read never
 /// reaches here (see `SoapySdrIqSource::read`), hence "overflow error".
 #[cfg(feature = "soapy")]
-fn soapy_overflow_warning(driver: &str) -> String {
+pub(crate) fn soapy_overflow_warning(driver: &str) -> String {
     format!(
         "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
          stream overflow -- the host is not keeping up; every overflow error is counted in \

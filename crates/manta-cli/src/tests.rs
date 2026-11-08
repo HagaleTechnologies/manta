@@ -1,10 +1,14 @@
 use super::*;
+use crate::cli_parse::*;
 use crate::daemon_client::*;
 use crate::recording::*;
 use crate::resolve::*;
+use crate::run_cmd::RunArgs;
 use crate::session_epoch::*;
 use crate::source_spec::*;
 use crate::spot_server::*;
+use manta_server::spot_message::geography_is_unresolved;
+use manta_server::spot_message::station_geography_unresolved;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -4734,13 +4738,13 @@ fn ka9q_flag_selects_the_source_and_replaces_a_typed_input() {
         "192.168.1.20",
     ])
     .unwrap();
-    let Command::Run {
+    let Command::Run(RunArgs {
         ka9q_group,
         ka9q_port,
         ka9q_ssrc,
         ka9q_interface,
         ..
-    } = parsed.command
+    }) = parsed.command
     else {
         unreachable!("parsed `run`");
     };
@@ -5016,7 +5020,7 @@ const CLI_ONLY: &[&str] = &[
 fn run_log_opts(extra: &[&str]) -> Result<logging::LogOpts, clap::Error> {
     let argv = ["manta", "run"].iter().chain(extra);
     match Cli::try_parse_from(argv)?.command {
-        Command::Run { logging, .. } => Ok(logging),
+        Command::Run(RunArgs { logging, .. }) => Ok(logging),
         _ => unreachable!("parsed `run`"),
     }
 }
@@ -5059,7 +5063,7 @@ fn log_flags_parse_on_run_and_its_listen_alias() {
         .unwrap()
         .command
     {
-        Command::Run { logging, .. } => assert_eq!(logging.quiet, 1),
+        Command::Run(RunArgs { logging, .. }) => assert_eq!(logging.quiet, 1),
         _ => panic!("`listen` is `run`'s alias"),
     }
 }
@@ -5937,7 +5941,7 @@ async fn fetch_status_times_out_instead_of_hanging_on_a_silent_server() {
 fn run_rbn_opts(extra: &[&str]) -> Result<RbnCompareOpts, clap::Error> {
     let argv = ["manta", "run"].iter().chain(extra);
     match Cli::try_parse_from(argv)?.command {
-        Command::Run { rbn, .. } => Ok(rbn),
+        Command::Run(RunArgs { rbn, .. }) => Ok(rbn),
         _ => unreachable!("`manta run` parses as Command::Run"),
     }
 }

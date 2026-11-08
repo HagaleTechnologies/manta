@@ -32,7 +32,7 @@ pub(crate) struct CliOverrides {
     pub(crate) loop_replay: bool,
     pub(crate) kiwi: KiwiOpts,
     #[cfg(feature = "soapy")]
-    soapy: SoapyOpts,
+    pub(crate) soapy: crate::source_spec::SoapyOpts,
     pub(crate) hpsdr: HpsdrOpts,
     pub(crate) ka9q: Ka9qOpts,
     pub(crate) freq_correction_ppm: Option<f64>,
@@ -70,7 +70,7 @@ impl CliOverrides {
                 password: String::new(),
             },
             #[cfg(feature = "soapy")]
-            soapy: SoapyOpts {
+            soapy: crate::source_spec::SoapyOpts {
                 driver: None,
                 freq: None,
                 rate: None,
@@ -601,7 +601,7 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             freq_hz,
             rate_hz,
             gain_db,
-        } => LiveSourceSpec::Soapy(SoapyOpts {
+        } => LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
             driver: Some(driver.clone()),
             freq: Some(*freq_hz),
             rate: Some(*rate_hz),
