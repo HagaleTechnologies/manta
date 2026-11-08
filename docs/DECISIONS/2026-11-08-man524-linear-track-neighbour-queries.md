@@ -51,6 +51,11 @@ channel's `spawn_phase_position` once and passes it to `cw_spawn_admits`,
 `spawn_admits` and `spawn_positioned`, which used to recompute it (the
 function is pure).
 
+`step_hop` no longer holds the per-track channel selection or the spawn
+scan. `select_channels` (reading the hop's inputs through a
+`HopSelection`) and `spawn_pass` hold them, moved without changing what
+they compute. `step_hop` is 698 lines, against 837 at 915db0e.
+
 The 1e-6 slack: the plan's standalone check found 1 mismatch in 3,888,308
 randomized checks with no slack (float rounding at a window edge after
 `rem_euclid`) and none with 1e-6. Centres stay within a few spans of
@@ -113,10 +118,14 @@ window.
   lines). All three are byte-identical: `diff` of the 46 `FINGERPRINT`
   lines (every exit code 0), of the 288 `GRID` rows and of the 181 sorted
   sweep result lines prints nothing. The branch binaries were built from
-  the working tree at 11:28 UTC, before two later edits: the clippy-driven
-  `short_of` spelling (same truth table) and `CenterIndex::insert`
+  the working tree at 11:28 UTC, before three later edits: the
+  clippy-driven `short_of` spelling (same truth table), `CenterIndex::insert`
   replacing an id still present, which only an id wrap onto a live track
-  reaches.
+  reaches, and the move of the selection chain and the spawn scan out of
+  `step_hop` (see Decision). After the move, `decode_fingerprints` was
+  re-run on both trees (release builds, `MANTA_GIT_SHA=man524cmp`): 46
+  identical lines, every exit code 0. The grid and the sweep were not
+  re-run.
 - The close-pair sweep reports `merged: 0` on all 181 lines at 915db0e,
   so it does not exercise the merge path end to end. Merge equivalence
   rests on the unit tests above and the differential test's merge-pair
@@ -129,8 +138,11 @@ window.
 bench (10 samples, 150 s measurement, 1 s warm-up), base saved as baseline
 `main` and the branch compared against it, back to back on one host: AMD
 Ryzen 9 5950X (32 threads), rustc 1.98.0 (88d9e12ae 2026-08-18). The host
-was shared and loaded throughout (load averages 15–23), so both figures
-are slower than the research's quiet 15.161 s reading.
+was shared and loaded throughout (load averages 15–23, against 6–8 in
+the research run). Each figure is slower than its counterpart from the
+research run on the same host model: 18.888 s against 15.161 s at base,
+and 6.404 s against 6.370 s for the research's uncommitted spike of the
+same change.
 
 | Build | Criterion time [low mean high] | Per hop (mean / 5,625 hops) | Load average at start |
 |---|---|---|---|
@@ -139,7 +151,8 @@ are slower than the research's quiet 15.161 s reading.
 
 Criterion reports the change as [−68.348% −66.096% −63.823%] (p = 0.00 <
 0.05), "Performance has improved". The base ran first, then the branch,
-four minutes apart.
+four minutes apart. Both runs predate the move of the selection chain
+and the spawn scan out of `step_hop`, which was not re-benched.
 
 The bench scene holds 286 tracks, not 300: MAN-311's FT8/JS8/FT4 windows
 veto the 14 signals at +74.3 to +82.8 kHz. This record supersedes, as the
@@ -159,5 +172,3 @@ change, and neither record is edited.
   research measured about 467 µs per hop of it at 297 tracks.
 - The envelope-correlation cost for dense pairs 0.5 to 1.0 channel apart
   is unmeasured.
-- The plan's extraction of `select_channels` and `spawn_pass` out of
-  `step_hop` was not done in this change.
