@@ -427,7 +427,8 @@ class ImageModeTests(unittest.TestCase):
     def test_a_full_commit_name_matches_its_lowercase_12_hex_prefix(self):
         # build.rs cuts a 40- or 64-hex override to 12 lower-case characters; so does the check.
         for full in ((FAKE_SHA + "cdef0123456789abcdef01234567").upper(),
-                     FAKE_SHA + "cd" * 26):
+                     FAKE_SHA + "cd" * 26,
+                     f" {FAKE_SHA}cdef0123456789abcdef01234567\n"):
             with self.subTest(full=full):
                 proc = self.check_commit(full)
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

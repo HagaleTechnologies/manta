@@ -296,8 +296,10 @@ def main(argv=None):
         parser.error("--expect-missing-soapy-library checks an archive, not --docker-image")
     if args.docker_image is None and args.expect_git_sha is not None:
         parser.error("--expect-git-sha goes with --docker-image")
-    if args.expect_git_sha is not None and not args.expect_git_sha.strip():
-        parser.error("--expect-git-sha needs a commit, not an empty value")
+    if args.expect_git_sha is not None:
+        args.expect_git_sha = args.expect_git_sha.strip()
+        if not args.expect_git_sha:
+            parser.error("--expect-git-sha needs a commit, not an empty value")
     try:
         if args.docker_image is not None:
             lines = verify_image(args.docker_image, args.platform, args.timeout, args.expect_git_sha)
