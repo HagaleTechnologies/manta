@@ -134,10 +134,10 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("detector", "crash_filter"),
 ];
 
-/// MAN-316: where `refresh_lists` downloads each list when `cty_url` /
-/// `scp_url` is unset. Plain HTTP: manta has no TLS support.
-pub(crate) const DEFAULT_CTY_URL: &str = "http://www.country-files.com/cty/cty.dat";
-pub(crate) const DEFAULT_SCP_URL: &str = "http://www.supercheckpartial.com/MASTER.SCP";
+/// MAN-316, MAN-536: where `refresh_lists` downloads each list when
+/// `cty_url`/`scp_url` is unset, over HTTPS.
+pub(crate) const DEFAULT_CTY_URL: &str = "https://www.country-files.com/cty/cty.dat";
+pub(crate) const DEFAULT_SCP_URL: &str = "https://www.supercheckpartial.com/MASTER.SCP";
 
 /// MAN-316: a list pin (`--cty-sha256`/`--scp-sha256`, `[spot].cty_sha256`/
 /// `scp_sha256`): exactly 64 hexadecimal digits, returned lowercased so it
@@ -324,7 +324,7 @@ pub(crate) struct SpotFile {
     /// MAN-316: where downloaded lists persist; resolved like `cty_path`.
     pub list_cache_dir: Option<PathBuf>,
     /// MAN-316: `None` is [`DEFAULT_CTY_URL`]; a value parsed as an
-    /// `http://` URL at load. See [`SpotFile::cty_url`].
+    /// `https://` or `http://` URL at load. See [`SpotFile::cty_url`].
     pub cty_url: Option<String>,
     pub scp_url: Option<String>,
     /// MAN-542: where `refresh_lists` downloads the callsign-pattern list.
@@ -390,9 +390,10 @@ fn deserialize_validation_level<'de, D: serde::Deserializer<'de>>(
     }
 }
 
-/// MAN-316: a `[spot]` list URL must be one `list_http` can fetch. Checked at
-/// load, so a bad URL fails `config check`/`run` before any source opens
-/// rather than at the first refresh days later.
+/// MAN-316, MAN-536: a `[spot]` list URL must be an `https://` or `http://`
+/// URL `list_http` can fetch. Checked at load, so a bad URL fails `config
+/// check`/`run` before any source opens rather than at the first refresh
+/// days later.
 fn check_list_url(key: &str, url: Option<String>) -> std::result::Result<Option<String>, String> {
     let Some(url) = url else {
         return Ok(None);
@@ -400,13 +401,13 @@ fn check_list_url(key: &str, url: Option<String>) -> std::result::Result<Option<
     match crate::list_http::HttpUrl::parse(&url) {
         Ok(_) => Ok(Some(url)),
         Err(reason) => {
-            let mut e =
-                format!("{key} must be an http:// URL (manta has no TLS support), got \"{url}\"");
-            // An `http://` value that still fails says why.
-            if url
-                .get(..7)
-                .is_some_and(|p| p.eq_ignore_ascii_case("http://"))
-            {
+            let mut e = format!("{key} must be an https:// or http:// URL, got \"{url}\"");
+            // An `https://` or `http://` value that still fails says why.
+            let has_prefix = |prefix: &str| {
+                url.get(..prefix.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(prefix))
+            };
+            if has_prefix("https://") || has_prefix("http://") {
                 e.push_str(&format!(": {reason}"));
             }
             Err(e)
@@ -4387,10 +4388,10 @@ mod tests {
         );
         assert_eq!(spot.cty_url(), DEFAULT_CTY_URL);
         assert_eq!(spot.scp_url(), DEFAULT_SCP_URL);
-        assert_eq!(DEFAULT_CTY_URL, "http://www.country-files.com/cty/cty.dat");
+        assert_eq!(DEFAULT_CTY_URL, "https://www.country-files.com/cty/cty.dat");
         assert_eq!(
             DEFAULT_SCP_URL,
-            "http://www.supercheckpartial.com/MASTER.SCP"
+            "https://www.supercheckpartial.com/MASTER.SCP"
         );
         assert_eq!((spot.cty_sha256, spot.scp_sha256), (None, None));
 
@@ -4465,14 +4466,14 @@ mod tests {
     }
 
     #[test]
-    fn pattern_url_must_be_http() {
-        let url = "https://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+    fn pattern_url_must_be_http_or_https() {
+        let url = "ftp://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
         let f = write_cfg(&format!("[spot]\npattern_url = \"{url}\"\n"));
         let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
         assert_eq!(
             err,
             format!(
-                "{}: [spot]: pattern_url must be an http:// URL (manta has no TLS support), got \
+                "{}: [spot]: pattern_url must be an https:// or http:// URL, got \
                  \"{url}\"",
                 f.path().display()
             )
@@ -4492,41 +4493,70 @@ mod tests {
     }
 
     #[test]
-    fn an_https_or_malformed_list_url_is_refused_before_io() {
+    fn the_default_list_urls_parse_as_https_on_port_443() {
+        for url in [DEFAULT_CTY_URL, DEFAULT_SCP_URL] {
+            let u = crate::list_http::HttpUrl::parse(url).unwrap();
+            assert_eq!(
+                (u.scheme, u.port),
+                (crate::list_http::Scheme::Https, 443),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_list_urls_load_from_the_file_and_the_environment() {
         let f = write_cfg("[spot]\ncty_url = \"https://www.country-files.com/cty/cty.dat\"\n");
+        let v = vars(&[
+            ("MANTA_SPOT_SCP_URL", "https://10.0.0.1:8443/MASTER.SCP"),
+            ("MANTA_SPOT_PATTERN_URL", "https://mirror.lan/patterns.lst"),
+        ]);
+        let spot = load(Some(f.path()), Env::Read(&v)).unwrap().spot;
+        assert_eq!(spot.cty_url(), "https://www.country-files.com/cty/cty.dat");
+        assert_eq!(spot.scp_url(), "https://10.0.0.1:8443/MASTER.SCP");
+        assert_eq!(
+            spot.pattern_url.as_deref(),
+            Some("https://mirror.lan/patterns.lst")
+        );
+    }
+
+    #[test]
+    fn a_malformed_or_non_http_list_url_is_refused_before_io() {
+        let f = write_cfg("[spot]\ncty_url = \"ftp://mirror.lan/cty.dat\"\n");
         let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
         assert_eq!(
             err,
             format!(
-                "{}: [spot]: cty_url must be an http:// URL (manta has no TLS support), got \
-                 \"https://www.country-files.com/cty/cty.dat\"",
+                "{}: [spot]: cty_url must be an https:// or http:// URL, got \
+                 \"ftp://mirror.lan/cty.dat\"",
                 f.path().display()
             )
         );
-        for bad in [
-            "ftp://mirror.lan/MASTER.SCP",
-            "www.supercheckpartial.com/MASTER.SCP",
-            "",
-        ] {
+        for bad in ["www.supercheckpartial.com/MASTER.SCP", ""] {
             let err = err_of(&format!("[spot]\nscp_url = \"{bad}\"\n"));
             assert!(
                 err.contains(&format!(
-                    "[spot]: scp_url must be an http:// URL (manta has no TLS support), got \
-                     \"{bad}\""
+                    "[spot]: scp_url must be an https:// or http:// URL, got \"{bad}\""
                 )),
                 "{err}"
             );
         }
-        // An http:// URL with no host still fails, with the parser's reason.
-        let err = err_of("[spot]\ncty_url = \"http://\"\n");
-        assert!(
-            err.contains("[spot]: cty_url must be an http:// URL (manta has no TLS support), got \"http://\": "),
-            "{err}"
-        );
+        // An https:// or http:// URL with no host still fails, with the
+        // parser's reason.
+        for bad in ["http://", "https://"] {
+            let err = err_of(&format!("[spot]\ncty_url = \"{bad}\"\n"));
+            assert!(
+                err.contains(&format!(
+                    "[spot]: cty_url must be an https:// or http:// URL, got \"{bad}\": it has \
+                     no host"
+                )),
+                "{err}"
+            );
+        }
         // From the environment, the variable is named.
         let err = format!(
             "{:#}",
-            load_env(None, &[("MANTA_SPOT_SCP_URL", "https://x/MASTER.SCP")]).unwrap_err()
+            load_env(None, &[("MANTA_SPOT_SCP_URL", "ftp://x/MASTER.SCP")]).unwrap_err()
         );
         assert!(
             err.starts_with("environment: [spot]: scp_url must be"),

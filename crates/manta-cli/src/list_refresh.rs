@@ -1473,7 +1473,10 @@ mod tests {
         let st = cache.load_state(ListKind::Scp).unwrap().unwrap();
         assert_eq!(st.checked_at, unix_secs(later));
         let requests = server.requests.lock().unwrap();
-        assert!(requests[1].contains("If-Modified-Since: Fri, 09 Oct 2026 00:00:00 GMT"));
+        // Header names are case-insensitive; ureq sends them lower case.
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("if-modified-since: fri, 09 oct 2026 00:00:00 gmt"));
     }
 
     #[test]

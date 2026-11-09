@@ -985,6 +985,7 @@ dependencies = [
  "num-complex",
  "proc-macro2",
  "regex",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",
