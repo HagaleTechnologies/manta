@@ -7,9 +7,9 @@ use manta_input::IqSource;
 use num_complex::Complex32;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -19,16 +19,6 @@ pub const SSRC: u32 = 14_000_000;
 pub const RATE: u64 = 96_000;
 pub const PER_PACKET: usize = 180;
 pub const READY_MARKER: &str = "manta: listening;";
-
-pub fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 static NEXT: AtomicU8 = AtomicU8::new(1);
 
@@ -41,15 +31,6 @@ pub fn unique_group() -> Ipv4Addr {
         (pid / 250 % 250) as u8,
         NEXT.fetch_add(1, Ordering::Relaxed),
     )
-}
-
-/// `N` distinct ports nothing listens on right now. All `N` listeners are
-/// held until every port is read: releasing each before binding the next
-/// lets the OS hand the same port out twice (Windows does, and then the
-/// config is rejected as "two servers cannot share a port").
-pub fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 pub fn free_udp_port() -> u16 {

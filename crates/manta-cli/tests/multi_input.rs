@@ -3,25 +3,17 @@
 //! receivers hear included -- plus the config refusals that name an input.
 //! File inputs only, so it runs on every platform.
 
+mod common;
+use common::{free_ports, manta};
+
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-
-/// `manta` with no `MANTA_*` variable from the test runner's environment.
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 fn station(text: &str, offset_hz: f64) -> SignalSpec {
     SignalSpec {
@@ -245,13 +237,6 @@ fn single_input_banner_and_metrics_labels_are_unchanged() {
         !stderr.contains("inputs=") && !stderr.contains("hearing="),
         "a one-input run must not grow the multi-input fields: {stderr}"
     );
-}
-
-/// `N` distinct ports nothing listens on right now, every listener held
-/// until all are read (MAN-371).
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// `GET /metrics` over a raw TCP connection; the body, or `None` while the
@@ -709,9 +694,6 @@ fn bad_samples_in_one_input_warn_naming_it() {
 }
 
 // MAN-310: a band plan opens one KiwiSDR session per planned stream.
-
-#[cfg(unix)]
-mod common;
 
 /// Runs `manta run` on a Kiwi `[input]` (`extra` adds its plan keys) against
 /// a fake KiwiSDR expecting `sessions` sessions, until `count` stderr lines

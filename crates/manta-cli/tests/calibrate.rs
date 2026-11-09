@@ -18,12 +18,7 @@ const CARRIER_2_5_PPM: f64 = 10e6 / (1.0 + 2.5e-6);
 const SECS: f64 = 12.0;
 
 fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = common::manta();
     cmd.stdin(Stdio::null());
     cmd
 }

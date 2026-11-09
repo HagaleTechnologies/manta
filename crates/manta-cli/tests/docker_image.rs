@@ -505,13 +505,7 @@ mod script {
 
     /// A command with no inherited `MANTA_*` variable.
     pub(super) fn clean(program: &Path) -> Command {
-        let mut cmd = Command::new(program);
-        for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"MANTA_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd
+        super::common::without_manta_env(Command::new(program))
     }
 
     /// Runs `make()`'s command to completion, retrying while the kernel

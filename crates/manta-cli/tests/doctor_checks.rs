@@ -4,24 +4,18 @@
 //! (TCP listener, SNTP responder, held or closed port), and every run
 //! passes `--ntp-server 127.0.0.1:<fake>`, so no test reaches the internet.
 //!
-//! Helpers are copied from `metrics_bind.rs`; the repo's test files are
-//! self-contained.
+//! `manta()` comes from `common/launch.rs` (MAN-549); the port band below
+//! is this file's own (MAN-333, MAN-410).
+
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
 
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 /// `seconds` of 48 kHz mono silence: enough for doctor's 3 s minimum.
 fn silent_48k_wav(dir: &Path, seconds: u32) -> PathBuf {
