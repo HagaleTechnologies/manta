@@ -27,3 +27,7 @@ harness = false
 [[bench]]
 name = "evidence_300_tracks"
 harness = false
+
+[[bench]]
+name = "legacy_300_tracks"
+harness = false

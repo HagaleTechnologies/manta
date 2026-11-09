@@ -145,6 +145,9 @@ jobs:
 
   # MAN-498: Unix shards and support jobs feed independent required OS aggregates.
   # Windows retains its native matrix check. No coverage moves to scheduled jobs.
+  # MAN-518: one build job per Unix OS compiles the test executables once and cuts a slice per shard.
+  # Each shard downloads its slice and runs it with no Rust toolchain installed. See
+  # docs/DECISIONS/2026-11-08-man518-build-test-executables-once-per-os.md.
   # No longer gated on codex-clean (HAG-46): this whole workflow only ever gets
   # workflow_dispatch'd once wait-for-codex.yml's codex-review-response job has already
   # confirmed Codex is clean for this revision (or it's a merge_group/push run with no PR
@@ -195,6 +198,8 @@ jobs:
       # logic is inline, not a script, because a script would be missing from an older PR head too.
       # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
       # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -220,7 +225,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -386,6 +393,8 @@ jobs:
       # logic is inline, not a script, because a script would be missing from an older PR head too.
       # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
       # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -411,7 +420,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -562,7 +573,181 @@ jobs:
           name: support-ubuntu
           path: support-evidence.json
           if-no-files-found: error
+  ubuntu-build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+    timeout-minutes: 35
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # workflow_dispatch runs at the default branch (see the head_sha input at the top of
+          # this file) -- github.sha there is main's tip, not the reviewed revision, so this
+          # must explicitly check out the actual PR head Codex confirmed clean (the merge-main
+          # step below then merges github.sha into it, MAN-340). push/merge_group already name
+          # the right commit via github.sha.
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          # MAN-340: full history on workflow_dispatch only, for the merge-main step below. Written
+          # `!= ... && 1 || 0` because `== ... && 0 || 1` is always 1 (0 is falsy in expressions).
+          fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 1 || 0 }}
+          # checkout persists the ambient GITHUB_TOKEN as a git credential by default -- for the
+          # is_dependabot dispatch flavor (or any PR-controlled code path generally), a
+          # compromised dependency executed during a cargo build/test could use that persisted,
+          # write-scoped credential to push directly to the repository, a strictly worse outcome
+          # than merely reading a withheld secret (same lesson as cqdx#470 P1, round 8). This job
+          # doesn't push anything back to the repo, so disabling this is safe unconditionally.
+          persist-credentials: false
+      # MAN-340: a dispatched run executes ci-full.yml as it is at github.sha (main's tip when
+      # wait-for-codex.yml dispatched it), but checks out the PR head, which may predate a step
+      # added since. Merge that main commit in -- what refs/pull/N/merge gives the native path --
+      # so every step this file runs finds its files, and the PR is judged as it would land. The
+      # logic is inline, not a script, because a script would be missing from an older PR head too.
+      # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
+      # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
+      - name: Merge the main commit this workflow came from into the PR head
+        id: merge-main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$(git rev-parse --verify --quiet "$HEAD_SHA^{commit}")" ]; then
+            echo "::error title=Unexpected checkout::checked out $head, expected $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error title=Shallow checkout::merging $BASE_SHA needs full history (checkout fetch-depth: 0)"
+            exit 1
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error title=Default-branch commit missing::$BASE_SHA is not in this checkout"
+            exit 1
+          fi
+          if git merge-base --is-ancestor "$BASE_SHA" "$head"; then
+            echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
+            exit 0
+          fi
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              -c commit.gpgsign=false \
+              merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
+            conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            conflicts=${conflicts% }
+            git merge --abort 2>/dev/null || true
+            echo "::error title=PR head conflicts with main::$HEAD_SHA does not merge cleanly with $BASE_SHA (${conflicts:-see the git output above}). Merge main into the branch, resolve the conflicts and push."
+            exit 1
+          fi
+          echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      # MAN-36: fail loudly if this runner is not compiling with the exact
+      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
+      # (which itself invokes cargo to fingerprint the cache key) so this is
+      # the first rustup-proxy call made from inside the checkout, and thus
+      # where the pinned toolchain actually gets auto-installed -- a
+      # toolchain mismatch is reported as itself rather than as a confusing
+      # downstream fmt/clippy diff or cache-key anomaly.
+      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
+      # windows-latest -- a bare `run:` step defaults to pwsh there, which
+      # silently no-ops this Bash script (11ms, zero output, no error)
+      # instead of running it, defeating the toolchain guard on that leg
+      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
+      # already the default shell.
+      - run: scripts/check-rust-toolchain-pin.sh
+        shell: bash
+      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
+      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
+      # pull_request runs restore and never save. Not a security boundary on its own -- code
+      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
+      # dispatches trusted heads.
+      # MAN-518: the build job restores and saves under the key the shards used to write
+      # (`v0-rust-ubuntu-shards-...`), so its first runs start from warm dependencies.
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          shared-key: ubuntu-shards
+      - run: python3 scripts/ci-shards.py --count 8 --build-bundles test-bundles --output build-evidence/${{ matrix.os }}.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-${{ matrix.os }}
+          path: build-evidence/*.json
+          if-no-files-found: error
+      # MAN-518: one slice per shard (test_ci_gates.py ties these to the shard matrix). Each is a
+      # gzip tar cut by ci-shards.py, which keeps execute bits; the action zips it uncompressed.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-0
+          path: test-bundles/slice-0.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-1
+          path: test-bundles/slice-1.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-2
+          path: test-bundles/slice-2.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-3
+          path: test-bundles/slice-3.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-4
+          path: test-bundles/slice-4.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-5
+          path: test-bundles/slice-5.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-6
+          path: test-bundles/slice-6.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-7
+          path: test-bundles/slice-7.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
   ubuntu-shards:
+    needs: ubuntu-build
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name != github.repository ||
@@ -600,6 +785,8 @@ jobs:
       # logic is inline, not a script, because a script would be missing from an older PR head too.
       # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
       # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -625,7 +812,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -638,33 +827,14 @@ jobs:
           echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # MAN-518: no toolchain, pin check or cache here. The shard downloads the slice its OS's
+      # build job cut for it and runs the prebuilt executables; ci-shards.py puts cargo, rustc and
+      # rustup tripwires first on every test's PATH.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          components: rustfmt, clippy
-      # MAN-36: fail loudly if this runner is not compiling with the exact
-      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
-      # (which itself invokes cargo to fingerprint the cache key) so this is
-      # the first rustup-proxy call made from inside the checkout, and thus
-      # where the pinned toolchain actually gets auto-installed -- a
-      # toolchain mismatch is reported as itself rather than as a confusing
-      # downstream fmt/clippy diff or cache-key anomaly.
-      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
-      # windows-latest -- a bare `run:` step defaults to pwsh there, which
-      # silently no-ops this Bash script (11ms, zero output, no error)
-      # instead of running it, defeating the toolchain guard on that leg
-      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
-      # already the default shell.
-      - run: scripts/check-rust-toolchain-pin.sh
-        shell: bash
-      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
-      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
-      # pull_request runs restore and never save. Not a security boundary on its own -- code
-      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
-      # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
-        with:
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+          name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
+          path: test-bundle
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -673,7 +843,7 @@ jobs:
           if-no-files-found: error
   ubuntu-aggregate:
     name: test (ubuntu-latest)
-    needs: [ubuntu-support, ubuntu-shards]
+    needs: [ubuntu-support, ubuntu-build, ubuntu-shards]
     if: >-
       always() && (
       github.event_name != 'pull_request' ||
@@ -686,7 +856,7 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
-          echo "$RESULTS" | jq -e 'length == 2 and all(.[]; .result == "success")'
+          echo "$RESULTS" | jq -e 'length == 3 and all(.[]; .result == "success")'
   macos-support:
     if: >-
       github.event_name != 'pull_request' ||
@@ -723,6 +893,8 @@ jobs:
       # logic is inline, not a script, because a script would be missing from an older PR head too.
       # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
       # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -748,7 +920,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -899,7 +1073,181 @@ jobs:
           name: support-macos
           path: support-evidence.json
           if-no-files-found: error
+  macos-build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    timeout-minutes: 35
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # workflow_dispatch runs at the default branch (see the head_sha input at the top of
+          # this file) -- github.sha there is main's tip, not the reviewed revision, so this
+          # must explicitly check out the actual PR head Codex confirmed clean (the merge-main
+          # step below then merges github.sha into it, MAN-340). push/merge_group already name
+          # the right commit via github.sha.
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.head_sha || github.sha) || github.sha }}
+          # MAN-340: full history on workflow_dispatch only, for the merge-main step below. Written
+          # `!= ... && 1 || 0` because `== ... && 0 || 1` is always 1 (0 is falsy in expressions).
+          fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 1 || 0 }}
+          # checkout persists the ambient GITHUB_TOKEN as a git credential by default -- for the
+          # is_dependabot dispatch flavor (or any PR-controlled code path generally), a
+          # compromised dependency executed during a cargo build/test could use that persisted,
+          # write-scoped credential to push directly to the repository, a strictly worse outcome
+          # than merely reading a withheld secret (same lesson as cqdx#470 P1, round 8). This job
+          # doesn't push anything back to the repo, so disabling this is safe unconditionally.
+          persist-credentials: false
+      # MAN-340: a dispatched run executes ci-full.yml as it is at github.sha (main's tip when
+      # wait-for-codex.yml dispatched it), but checks out the PR head, which may predate a step
+      # added since. Merge that main commit in -- what refs/pull/N/merge gives the native path --
+      # so every step this file runs finds its files, and the PR is judged as it would land. The
+      # logic is inline, not a script, because a script would be missing from an older PR head too.
+      # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
+      # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
+      - name: Merge the main commit this workflow came from into the PR head
+        id: merge-main
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.head_sha || github.sha }}
+          BASE_SHA: ${{ github.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$(git rev-parse --verify --quiet "$HEAD_SHA^{commit}")" ]; then
+            echo "::error title=Unexpected checkout::checked out $head, expected $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$(git rev-parse --is-shallow-repository)" != "false" ]; then
+            echo "::error title=Shallow checkout::merging $BASE_SHA needs full history (checkout fetch-depth: 0)"
+            exit 1
+          fi
+          if ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo "::error title=Default-branch commit missing::$BASE_SHA is not in this checkout"
+            exit 1
+          fi
+          if git merge-base --is-ancestor "$BASE_SHA" "$head"; then
+            echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
+            exit 0
+          fi
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              -c commit.gpgsign=false \
+              merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
+            conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+            conflicts=${conflicts% }
+            git merge --abort 2>/dev/null || true
+            echo "::error title=PR head conflicts with main::$HEAD_SHA does not merge cleanly with $BASE_SHA (${conflicts:-see the git output above}). Merge main into the branch, resolve the conflicts and push."
+            exit 1
+          fi
+          echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      # MAN-36: fail loudly if this runner is not compiling with the exact
+      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
+      # (which itself invokes cargo to fingerprint the cache key) so this is
+      # the first rustup-proxy call made from inside the checkout, and thus
+      # where the pinned toolchain actually gets auto-installed -- a
+      # toolchain mismatch is reported as itself rather than as a confusing
+      # downstream fmt/clippy diff or cache-key anomaly.
+      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
+      # windows-latest -- a bare `run:` step defaults to pwsh there, which
+      # silently no-ops this Bash script (11ms, zero output, no error)
+      # instead of running it, defeating the toolchain guard on that leg
+      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
+      # already the default shell.
+      - run: scripts/check-rust-toolchain-pin.sh
+        shell: bash
+      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
+      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
+      # pull_request runs restore and never save. Not a security boundary on its own -- code
+      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
+      # dispatches trusted heads.
+      # MAN-518: the build job restores and saves under the key the shards used to write
+      # (`v0-rust-macos-shards-...`), so its first runs start from warm dependencies.
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          shared-key: macos-shards
+      - run: python3 scripts/ci-shards.py --count 8 --build-bundles test-bundles --output build-evidence/${{ matrix.os }}.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: build-${{ matrix.os }}
+          path: build-evidence/*.json
+          if-no-files-found: error
+      # MAN-518: one slice per shard (test_ci_gates.py ties these to the shard matrix). Each is a
+      # gzip tar cut by ci-shards.py, which keeps execute bits; the action zips it uncompressed.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-0
+          path: test-bundles/slice-0.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-1
+          path: test-bundles/slice-1.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-2
+          path: test-bundles/slice-2.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-3
+          path: test-bundles/slice-3.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-4
+          path: test-bundles/slice-4.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-5
+          path: test-bundles/slice-5.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-6
+          path: test-bundles/slice-6.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-bundle-${{ matrix.os }}-7
+          path: test-bundles/slice-7.tar.gz
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
   macos-shards:
+    needs: macos-build
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name != github.repository ||
@@ -937,6 +1285,8 @@ jobs:
       # logic is inline, not a script, because a script would be missing from an older PR head too.
       # Keep all executable jobs byte-identical here; test_ci_trust_boundary.py enforces it.
       # See docs/DECISIONS/2026-10-20-man340-dispatched-ci-tests-the-merge-with-main.md.
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -962,7 +1312,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -975,33 +1327,14 @@ jobs:
           echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # MAN-518: no toolchain, pin check or cache here. The shard downloads the slice its OS's
+      # build job cut for it and runs the prebuilt executables; ci-shards.py puts cargo, rustc and
+      # rustup tripwires first on every test's PATH.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          components: rustfmt, clippy
-      # MAN-36: fail loudly if this runner is not compiling with the exact
-      # release rust-toolchain.toml pins. Placed before Swatinem/rust-cache
-      # (which itself invokes cargo to fingerprint the cache key) so this is
-      # the first rustup-proxy call made from inside the checkout, and thus
-      # where the pinned toolchain actually gets auto-installed -- a
-      # toolchain mismatch is reported as itself rather than as a confusing
-      # downstream fmt/clippy diff or cache-key anomaly.
-      # MAN-212 (Codex, PR #184): explicit `shell: bash` is required on
-      # windows-latest -- a bare `run:` step defaults to pwsh there, which
-      # silently no-ops this Bash script (11ms, zero output, no error)
-      # instead of running it, defeating the toolchain guard on that leg
-      # entirely. Harmless on ubuntu-latest/macos-latest, where bash is
-      # already the default shell.
-      - run: scripts/check-rust-toolchain-pin.sh
-        shell: bash
-      # MAN-243: restore-only except on a push to main. Only merged code writes the cache scope that
-      # main and merge-queue runs restore from; dispatched PR runs, merge-group runs and native
-      # pull_request runs restore and never save. Not a security boundary on its own -- code
-      # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
-      # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
-        with:
-          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+          name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
+          path: test-bundle
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -1010,7 +1343,7 @@ jobs:
           if-no-files-found: error
   macos-aggregate:
     name: test (macos-latest)
-    needs: [macos-support, macos-shards]
+    needs: [macos-support, macos-build, macos-shards]
     if: >-
       always() && (
       github.event_name != 'pull_request' ||
@@ -1023,7 +1356,7 @@ jobs:
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
-          echo "$RESULTS" | jq -e 'length == 2 and all(.[]; .result == "success")'
+          echo "$RESULTS" | jq -e 'length == 3 and all(.[]; .result == "success")'
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently
@@ -1046,6 +1379,8 @@ jobs:
           fetch-depth: ${{ github.event_name != 'workflow_dispatch' && 1 || 0 }}
           persist-credentials: false
       # MAN-340: identical to `test`'s merge-main step (see the comment there).
+      # MAN-518: the merge's dates are its newest parent's, so every job of a run creates the same
+      # merge commit (the build job's binaries embed it).
       - name: Merge the main commit this workflow came from into the PR head
         id: merge-main
         if: github.event_name == 'workflow_dispatch'
@@ -1071,7 +1406,9 @@ jobs:
             echo "$HEAD_SHA already contains $BASE_SHA; testing it as is."
             exit 0
           fi
-          if ! git -c user.name='github-actions[bot]' \
+          merge_date="@$(git show -s --format=%ct "$BASE_SHA" "$head" | sort -n | tail -n 1) +0000"
+          if ! GIT_AUTHOR_DATE="$merge_date" GIT_COMMITTER_DATE="$merge_date" \
+              git -c user.name='github-actions[bot]' \
               -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
               -c commit.gpgsign=false \
               merge --no-ff --no-edit -m "CI: test $HEAD_SHA merged with $BASE_SHA" "$BASE_SHA"; then
@@ -1106,15 +1443,15 @@ jobs:
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
       - run: cargo test -p manta-input -p manta-cli --features soapy --locked
 
-  # Relays each matrix leg's OWN real conclusion onto the corresponding explicit check-run
-  # create-ci-check made on head_sha -- a job-level `needs.test.result` alone is a single
-  # aggregate across every matrix combination (success only if ALL legs succeeded), which
-  # cannot tell "ubuntu passed, macos failed" apart from "both failed"; each minted
-  # check-run needs its OWN independent, accurate conclusion. Looks up each leg's real
-  # conclusion from the Jobs API by its exact display name instead.
-  relay-check-runs:
-    name: Relay test results onto the reviewed SHA's check-runs
-    needs: [create-ci-check, test, ubuntu-aggregate, macos-aggregate]
+  # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
+  # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of
+  # the jobs it needs onto the explicit check-runs create-ci-check made on head_sha -- a
+  # job-level `needs.<job>.result` is one aggregate, so each check-run gets its OWN conclusion
+  # from the Jobs API by exact display name. Neither may look up a job outside its own `needs`:
+  # a leg still running has no conclusion, and relay() marks a missing one failed.
+  relay-unix-check-runs:
+    name: Relay Linux and macOS results onto the reviewed SHA's check-runs
+    needs: [create-ci-check, ubuntu-aggregate, macos-aggregate]
     if: always() && github.event_name == 'workflow_dispatch'
     # Q-0068: the app key lives in the main-only codex-review environment.
     environment:
@@ -1126,6 +1463,8 @@ jobs:
     steps:
       # Only the App that created a check-run can update it, so the PATCH uses the same
       # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      # Minted here, after this job's needs finish, never in create-ci-check: an installation
+      # token lives an hour and the Windows leg can run longer than that.
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
@@ -1134,14 +1473,13 @@ jobs:
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ github.event.repository.name }}
-      - name: Patch each required check-run with its own matrix leg's real conclusion
+      - name: Patch the Linux and macOS check-runs with their aggregates' real conclusions
         env:
           GH_TOKEN: ${{ github.token }}
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           REPO: ${{ github.repository }}
           UBUNTU_CHECK_ID: ${{ needs.create-ci-check.outputs.ubuntu_check_id }}
           MACOS_CHECK_ID: ${{ needs.create-ci-check.outputs.macos_check_id }}
-          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
         run: |
           jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
           relay() {
@@ -1160,4 +1498,51 @@ jobs:
           }
           relay "test (ubuntu-latest)" "$UBUNTU_CHECK_ID"
           relay "test (macos-latest)" "$MACOS_CHECK_ID"
+
+  relay-windows-check-run:
+    name: Relay the Windows result onto the reviewed SHA's check-run
+    needs: [create-ci-check, test]
+    if: always() && github.event_name == 'workflow_dispatch'
+    # Q-0068: the app key lives in the main-only codex-review environment.
+    environment:
+      name: codex-review
+      deployment: false
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    steps:
+      # Only the App that created a check-run can update it, so the PATCH uses the same
+      # hagale-agent identity as create-ci-check; github.token still reads this run's jobs.
+      # Minted here, after this job's needs finish, never in create-ci-check: an installation
+      # token lives an hour and the Windows leg can run longer than that.
+      - name: Mint a hagale-agent installation token for the test check-runs
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: 4696353
+          private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+      - name: Patch the Windows check-run with its leg's real conclusion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPO: ${{ github.repository }}
+          WINDOWS_CHECK_ID: ${{ needs.create-ci-check.outputs.windows_check_id }}
+        run: |
+          jobs_json=$(gh api --paginate "repos/$REPO/actions/runs/${{ github.run_id }}/jobs")
+          relay() {
+            local job_name="$1" check_id="$2"
+            if [ -z "$check_id" ]; then
+              echo "::warning::No check-run id for '$job_name' -- create-ci-check must not have run or already failed."
+              return
+            fi
+            local conclusion
+            conclusion=$(echo "$jobs_json" | jq -r --arg n "$job_name" '.jobs[] | select(.name==$n) | .conclusion // empty')
+            if [ -z "$conclusion" ]; then
+              echo "::error::Could not find a conclusion for job '$job_name' in this run -- marking its check-run failed rather than leaving it stuck in_progress."
+              conclusion="failure"
+            fi
+            GH_TOKEN="$APP_TOKEN" gh api -X PATCH "repos/$REPO/check-runs/$check_id" -f status="completed" -f conclusion="$conclusion"
+          }
           relay "test (windows-latest)" "$WINDOWS_CHECK_ID"

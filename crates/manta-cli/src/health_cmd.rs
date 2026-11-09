@@ -10,8 +10,8 @@
 //! health endpoint, a connect failure, a timeout or a config error. Never 2:
 //! Docker reserves it, and `manta status` uses it for "couldn't ask".
 //! Address resolution, the end-to-end deadline and the bounded reads are
-//! `manta status`'s (MAN-44), shared through `crate::query_daemon` and
-//! `crate::http_get`.
+//! `manta status`'s (MAN-44), shared through `crate::daemon_client::query_daemon` and
+//! `crate::daemon_client::http_get`.
 
 use anyhow::{bail, Context, Result};
 use std::path::Path;
@@ -69,7 +69,7 @@ fn probe(config: Option<&Path>, addr: Option<&str>, timeout_secs: u64) -> Result
         // listener until a restart, and an edit after which the file no
         // longer loads, or has no `[server]` table, fails the probe until
         // it is fixed. The operator docs say so.
-        let (path, server) = crate::daemon_server_config(config)?;
+        let (path, server) = crate::daemon_client::daemon_server_config(config)?;
         // A config with no `[server]` table is one `run` serves no
         // listener for; falling back to 127.0.0.1:7302 would probe
         // whatever else happens to own that port.
@@ -81,14 +81,19 @@ fn probe(config: Option<&Path>, addr: Option<&str>, timeout_secs: u64) -> Result
         }
         server
     };
-    let reply = crate::query_daemon(addr, server, timeout_secs, |targets, left| async move {
-        let label = crate::format_addrs(&targets);
-        tokio::time::timeout(left, fetch_healthz(&targets, left))
-            .await
-            .map_err(|_| anyhow::anyhow!("timed out talking to {label}"))
-            .and_then(|r| r)
-            .with_context(|| format!("could not reach daemon at {label}"))
-    })?;
+    let reply = crate::daemon_client::query_daemon(
+        addr,
+        server,
+        timeout_secs,
+        |targets, left| async move {
+            let label = crate::daemon_client::format_addrs(&targets);
+            tokio::time::timeout(left, fetch_healthz(&targets, left))
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out talking to {label}"))
+                .and_then(|r| r)
+                .with_context(|| format!("could not reach daemon at {label}"))
+        },
+    )?;
     judge(reply)
 }
 
@@ -96,9 +101,10 @@ async fn fetch_healthz(
     addrs: &[std::net::SocketAddr],
     timeout: std::time::Duration,
 ) -> Result<Reply> {
-    let (addr, status_line, reader) = crate::http_get(addrs, "/healthz", "health", timeout).await?;
+    let (addr, status_line, reader) =
+        crate::daemon_client::http_get(addrs, "/healthz", "health", timeout).await?;
     let body = if is_status(&status_line, 200) || is_status(&status_line, 503) {
-        Some(crate::read_http_body(reader, MAX_HEALTH_BODY_BYTES, "health").await?)
+        Some(crate::daemon_client::read_http_body(reader, MAX_HEALTH_BODY_BYTES, "health").await?)
     } else {
         None
     };

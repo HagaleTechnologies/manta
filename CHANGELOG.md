@@ -24,6 +24,19 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
+  segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
+  reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
+  `tuning_range_hz` overlaps its segment, so plans on the default range are
+  unchanged. An `"all"` entry whose range already reached 50 MHz now also
+  plans 6m, and refuses a bare centre inside 6m such as `"50050"` as a
+  repeat. See
+  [docs/DECISIONS/2026-11-08-man543-6m-band.md](docs/DECISIONS/2026-11-08-man543-6m-band.md).
+- MAN-539: a SoapySDR release archive for 64-bit Raspberry Pi OS
+  (`manta-linux-arm64-soapy.tar.gz`, built and verified on Debian bookworm),
+  and SoapySDR with the RTL-SDR, Airspy and HackRF modules in the Docker
+  image on every platform. `manta devices` on a build without SoapySDR names
+  both archives.
 - MAN-493: the three remaining oracle-bypass experiments for
   `manta oracle --funnel`. `--funnel-bypass known-timing` seeds the bypass
   decoder at the truth speed, forcing the `usableTiming` stage (unavailable
@@ -40,8 +53,13 @@ the git history and `docs/DECISIONS/`.
   between callsigns (in the repetition gate and the rival ledger) without adding
   repetitions, and spots retain the later supporting RF timestamp. A speed
   change triggers a replay only once it has held across two words.
-  `[decode.refine]` controls the budget; five `manta_refine_*` counters report
+  `[decode.refine]` controls the budget; eight `manta_refine_*` counters report
   activity. RF recall remains unmeasured.
+- MAN-515: Refinement no longer flips a legacy or edge-legacy base to HSMM,
+  replays a seeded timing hypothesis once per speed, and never moves a
+  callsign's support to a reading that cannot be spotted.
+  `manta_refine_replays_total`, `manta_refine_changed_total` and
+  `manta_refine_rejected_total` report how many replays changed a word.
 - MAN-494: optional per-input IQ correction uses a controlled-tone calibration
   to remove receiver images. It defaults to off. Observe and a centre mismatch
   preserve samples; mirror evidence never enables correction by itself.
@@ -398,6 +416,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-539: the Docker image is built with `--features soapy`, so its
+  `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
+  three device modules.
 - MAN-139: **breaking for scripts that parse `--json`.**
   `manta decode --json`, `manta run --json`/`listen --json` and
   `manta doctor --json` name fields as the JSON spot stream does:

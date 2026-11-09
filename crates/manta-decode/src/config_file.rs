@@ -55,6 +55,7 @@ use crate::envelope::DemodConfig;
 use crate::evidence::EvidenceConfig;
 use crate::hsmm::HsmmConfig;
 use crate::noise::NoiseConfig;
+use crate::timing::SpeedBankConfig;
 use serde::Deserialize;
 
 fn default_engine() -> Engine {
@@ -335,7 +336,11 @@ impl DecodeConfigToml {
             },
             refine_bw_hz: self.refine_bw_hz,
             steered_frontend: false,
+            legacy_alternatives: false,
             refine: self.refine.into_refine_config(),
+            // MAN-544: not a TOML option; a config file keeps the runtime
+            // default, never a literal off value.
+            speed_bank: SpeedBankConfig::default(),
         }
     }
 }
@@ -422,6 +427,22 @@ pub struct DecodeConfigFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAN-545: the legacy runner-up switch is a Rust-only research knob;
+    /// `deny_unknown_fields` keeps a config file from reaching it.
+    #[test]
+    fn legacy_alternatives_is_not_a_toml_key() {
+        let err = toml::from_str::<DecodeConfigFile>("[decode]\nlegacy_alternatives = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy_alternatives"), "{err}");
+    }
+
+    #[test]
+    fn toml_decode_config_keeps_legacy_alternatives_off() {
+        let file: DecodeConfigFile = toml::from_str("").unwrap();
+        assert!(!file.decode.into_decode_config().legacy_alternatives);
+    }
 
     #[test]
     fn absent_decode_table_parses_to_all_defaults() {
@@ -594,6 +615,22 @@ mod tests {
         // but weren't overridden in this instance -- still equal defaults.
         assert_eq!(cfg.flush_gap_dits, default.flush_gap_dits);
         assert_eq!(cfg.beam.width, default.beam.width);
+    }
+
+    #[test]
+    fn into_decode_config_keeps_the_runtime_speed_bank() {
+        let file: DecodeConfigFile = toml::from_str("[decode]\n").unwrap();
+        assert_eq!(
+            file.decode.into_decode_config().speed_bank,
+            DecodeConfig::default().speed_bank
+        );
+        let result: Result<DecodeConfigFile, _> = toml::from_str(
+            r#"
+            [decode]
+            speed_bank = 3
+            "#,
+        );
+        assert!(result.is_err(), "speed_bank is not a TOML option");
     }
 
     // ---- MAN-208: the [decode.refine] sub-table ----

@@ -727,33 +727,74 @@ pub struct RefinedWord {
     /// The re-decode's whole-word confidence (geometric mean).
     pub word_confidence: f32,
     /// Which alternate configuration produced this reading (e.g.
-    /// `"engine:hsmm"`, `"wpm:25"`), for the scheduler's own bookkeeping.
+    /// `"engine:legacy"`, `"wpm-seed"`), for the scheduler's own
+    /// bookkeeping.
     pub hypothesis: &'static str,
 }
 
+/// MAN-515: what [`Validator::apply_refinement_with_outcome`] did with one
+/// refined reading, for the scheduler's outcome counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefinementOutcome {
+    /// The occurrence's word had left the window (or its track was gone):
+    /// the record was revised, nothing was re-evaluated.
+    Orphaned,
+    /// The reading equals the word's decoded text.
+    Unchanged,
+    /// The reading replaced the word's decoded text, and the occurrence's
+    /// repetition support moved to it.
+    Changed,
+    /// The reading would have turned a spottable callsign into a string
+    /// that can never be spotted, so it was refused: the decoded word,
+    /// its support and its ledger entry are untouched.
+    Rejected,
+}
+
+/// MAN-525: the nearest other track's frequency distance from `freq_hz`,
+/// read from `sorted` (finite frequencies, ascending by `(frequency,
+/// track_id)`) by binary search: the closest entry below `freq_hz`, and the
+/// first entry at or above it that is not `track_id` itself. Exact against
+/// the fold over every track because rounding is monotone (for
+/// `a <= b <= f`, `fl(f - b) <= fl(f - a)`). `None` for a non-finite
+/// `freq_hz`, which the caller answers with the fold.
+fn nearest_gap_hz(sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> Option<f64> {
+    if !freq_hz.is_finite() {
+        return None;
+    }
+    let p = sorted.partition_point(|&(f, _)| f < freq_hz);
+    let mut gap = f64::INFINITY;
+    if p > 0 {
+        gap = gap.min((sorted[p - 1].0 - freq_hz).abs());
+    }
+    if let Some(&(f, _)) = sorted[p..].iter().find(|&&(_, id)| id != track_id) {
+        gap = gap.min((f - freq_hz).abs());
+    }
+    Some(gap)
+}
+
 /// MAN-208: one retained occurrence the refinement scheduler may re-decode
-/// (`Validator::refine_candidates`). A read-only snapshot; deciding
-/// anything stays with the validator.
-#[derive(Debug, Clone)]
-pub struct RefineCandidate {
+/// (`Validator::refine_candidates`). A read-only view borrowing the
+/// validator; a caller that keeps a candidate across a mutation copies the
+/// plain fields it needs (MAN-525). Deciding anything stays with the
+/// validator.
+#[derive(Debug, Clone, Copy)]
+pub struct RefineCandidate<'a> {
     pub episode_wpm: f32,
     pub neighbor_gap_hz: f64,
     pub latest_word_seq: u64,
     pub track_id: u32,
     pub word_seq: u64,
     /// The occurrence's currently decoded call.
-    pub call: String,
+    pub call: &'a str,
     /// `(start_ts, end_ts)` of the occurrence, for replay range selection
     /// and span-matching the refined words back to occurrences.
     pub span: (u64, u64),
     /// The repetition count the occurrence's evaluation last saw.
     pub reps: u32,
-    /// What its pattern tier requires.
-    pub required_reps: u32,
     /// The track's latest speed, used by a seeded replay.
     pub wpm: f32,
     /// The better-supported rival that withheld it, if any.
-    pub rival: Option<String>,
+    pub rival: Option<&'a str>,
     /// How many of its characters carried unresolved decoder alternatives.
     pub alternatives: usize,
     /// Whether `wpm` is a reliable estimate: the track has decoded at
@@ -1078,10 +1119,20 @@ impl Validator {
     /// its span ends inside the last `lookback_samples` before `now_ts`.
     /// Ordered by `(track_id, word_seq)` so the caller's admission order is
     /// stable. Decides nothing and records nothing.
-    pub fn refine_candidates(&self, now_ts: u64, lookback_samples: u64) -> Vec<RefineCandidate> {
+    ///
+    /// MAN-525: neighbour gaps come from one frequency-sorted pass per
+    /// call, built on the first candidate, and each track's gap is computed
+    /// once, on its first candidate; the text is borrowed, not cloned.
+    pub fn refine_candidates(
+        &self,
+        now_ts: u64,
+        lookback_samples: u64,
+    ) -> Vec<RefineCandidate<'_>> {
         let mut out = Vec::new();
         let cutoff = now_ts.saturating_sub(lookback_samples);
+        let mut sorted: Option<Vec<(f64, u32)>> = None;
         for (&track_id, track) in &self.tracks {
+            let mut gap: Option<f64> = None;
             for word in &track.words {
                 if !word.attempted {
                     continue;
@@ -1097,23 +1148,21 @@ impl Validator {
                 if !word.refine_hint && alternatives == 0 {
                     continue;
                 }
+                let neighbor_gap_hz = *gap.get_or_insert_with(|| {
+                    let s = sorted.get_or_insert_with(|| self.sorted_track_freqs());
+                    self.neighbor_gap_hz(s, track_id, track.freq_hz)
+                });
                 out.push(RefineCandidate {
                     episode_wpm: word.decoded_wpm,
                     latest_word_seq: track.next_word_seq,
-                    neighbor_gap_hz: self
-                        .tracks
-                        .iter()
-                        .filter(|(id, _)| **id != track_id)
-                        .map(|(_, other)| (other.freq_hz - track.freq_hz).abs())
-                        .fold(f64::INFINITY, f64::min),
+                    neighbor_gap_hz,
                     track_id,
                     word_seq: word.seq,
-                    call: word.text.clone(),
+                    call: &word.text,
                     span: (word.start_ts, word.end_ts),
                     reps: word.last_reps,
-                    required_reps: self.level.required_reps(self.patterns.tier(&word.text)),
                     wpm: track.wpm,
-                    rival: word.rival.clone(),
+                    rival: word.rival.as_deref(),
                     alternatives,
                     wpm_stable: track.wpm_confirmed
                         && track.next_word_seq - track.wpm_since_word_seq >= STABLE_SPEED_WORDS,
@@ -1121,6 +1170,37 @@ impl Validator {
             }
         }
         out
+    }
+
+    /// MAN-525: every track's finite frequency with its id, sorted by
+    /// `(frequency, track_id)`: the one pass `refine_candidates` reads
+    /// neighbour gaps from. Non-finite frequencies are left out; against a
+    /// finite own frequency they only ever contribute NaN or infinity,
+    /// which the gap's `f64::min` from `INFINITY` ignores.
+    fn sorted_track_freqs(&self) -> Vec<(f64, u32)> {
+        let mut sorted: Vec<(f64, u32)> = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.freq_hz.is_finite())
+            .map(|(&id, t)| (t.freq_hz, id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        sorted
+    }
+
+    /// MAN-208's neighbour gap: the distance to the nearest OTHER track's
+    /// frequency, `INFINITY` with no other track. Reads `sorted`
+    /// ([`Self::sorted_track_freqs`]) by binary search (MAN-525); a
+    /// non-finite own frequency falls back to the original fold over every
+    /// track, so the value is bit-identical either way.
+    fn neighbor_gap_hz(&self, sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> f64 {
+        nearest_gap_hz(sorted, track_id, freq_hz).unwrap_or_else(|| {
+            self.tracks
+                .iter()
+                .filter(|(id, _)| **id != track_id)
+                .map(|(_, other)| (other.freq_hz - freq_hz).abs())
+                .fold(f64::INFINITY, f64::min)
+        })
     }
 
     /// MAN-208: applies one externally computed refinement of a retained
@@ -1139,7 +1219,90 @@ impl Validator {
     /// `decision_sample_ts` is the stream position at the re-decode: the
     /// earliest time the refined identity could have been known. It stamps
     /// the observation record, never the spot.
+    ///
+    /// MAN-515: a reading that would turn a spottable callsign (allowlisted,
+    /// or grammar-plausible with an allocated prefix) into a string that can
+    /// never be spotted is refused before anything moves: the word keeps its
+    /// text and support, and a `Refined` withheld decision records why
+    /// (`Grammar` or `Cty`). [`Validator::apply_refinement_with_outcome`]
+    /// reports which case applied.
     pub fn apply_refinement(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> Vec<Spot> {
+        self.apply_refinement_with_outcome(track_id, word_seq, refined, decision_sample_ts)
+            .0
+    }
+
+    /// MAN-515: whether `call` could ever be spotted by the permanent
+    /// checks: allowlisted, or grammar-plausible with an allocated prefix.
+    fn spottable(&self, call: &str) -> bool {
+        self.allowlist.contains(call)
+            || (grammar::is_plausible(call) && self.cty.is_allocated(call))
+    }
+
+    /// MAN-515: [`Validator::apply_refinement`], also reporting what it did
+    /// with the reading ([`RefinementOutcome`]) so the scheduler can count
+    /// the replays that changed a word and the ones the guard refused.
+    pub fn apply_refinement_with_outcome(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> (Vec<Spot>, RefinementOutcome) {
+        let current = self.tracks.get(&track_id).and_then(|t| {
+            t.words.iter().find(|w| w.seq == word_seq).map(|w| {
+                (
+                    w.text.clone(),
+                    w.last_spot_type.unwrap_or(SpotType::Unknown),
+                )
+            })
+        });
+        let outcome = match &current {
+            None => RefinementOutcome::Orphaned,
+            Some((old_call, _)) if *old_call == refined.call => RefinementOutcome::Unchanged,
+            Some((old_call, _)) if self.spottable(old_call) && !self.spottable(&refined.call) => {
+                RefinementOutcome::Rejected
+            }
+            Some(_) => RefinementOutcome::Changed,
+        };
+        if let (RefinementOutcome::Rejected, Some((_, spot_type))) = (outcome, current) {
+            // The guard returns before `move_occurrence`, the ledger
+            // revision and any write to the word: the causal reading keeps
+            // everything it had.
+            self.advance_clock(decision_sample_ts);
+            let reason = if grammar::is_plausible(&refined.call) {
+                Reason::Cty
+            } else {
+                Reason::Grammar
+            };
+            let freq_hz = self.tracks[&track_id].freq_hz * self.freq_calibration;
+            let at = At::new(track_id, word_seq, Cause::Refined);
+            self.decide(at, Some(reason), || {
+                Decision::withheld(
+                    track_id,
+                    decision_sample_ts,
+                    &refined.call,
+                    freq_hz,
+                    spot_type,
+                    reason,
+                )
+            });
+            return (Vec::new(), outcome);
+        }
+        (
+            self.apply_refinement_inner(track_id, word_seq, refined, decision_sample_ts),
+            outcome,
+        )
+    }
+
+    /// The MAN-208 refinement path behind [`Validator::apply_refinement`],
+    /// after the MAN-515 guard has let the reading through.
+    fn apply_refinement_inner(
         &mut self,
         track_id: u32,
         word_seq: u64,
@@ -1631,6 +1794,13 @@ impl Validator {
     pub fn replace_reference_tables(&mut self, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) {
         self.cty = cty;
         self.scp = scp;
+    }
+
+    /// MAN-542: replaces the pattern table for a scheduled list refresh.
+    /// Tracks, repetition counts and `suppression_counts` are untouched; the
+    /// new tiers apply from the next evaluation.
+    pub fn replace_patterns(&mut self, patterns: Arc<pattern::Table>) {
+        self.patterns = patterns;
     }
 
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
@@ -4957,6 +5127,29 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn replaced_pattern_table_lowers_the_repetition_bar() {
+        // QQ9@@@ is unlisted in the bundled patterns: five repetitions.
+        let with_qq9 = cty::Table::parse(&format!("{}{QQ9_ENTITY}", crate::CTY_DAT));
+        let mut v =
+            Validator::from_tables(FS, Arc::new(with_qq9), Some(Arc::new(scp::Set::bundled())))
+                .with_patterns(Arc::new(pattern::Table::bundled()));
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let words = ["CQ", "DE", "QQ9ZZZ", "QQ9ZZZ", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        let before = v.suppression_counts();
+        v.replace_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
+        assert_eq!(v.suppression_counts(), before);
+        let mut spots = run(&transmission_events(2, &words, 200_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 300_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    #[test]
     fn replaced_reference_tables_leave_operator_lists_and_counts_alone() {
         let mut v =
             Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
@@ -6402,6 +6595,154 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         );
     }
 
+    // ---- MAN-515: the narrow refinement guard and its outcomes ----
+
+    /// The `N3NXI` -> `EEETT` loss in miniature: a refinement that would
+    /// turn a spottable call into garbage is refused, the word keeps its
+    /// text and support, and a later clean repetition still spots it.
+    #[test]
+    fn refinement_never_turns_a_spottable_call_into_garbage() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000);
+        assert!(
+            run(&events, &mut v).is_empty(),
+            "one repetition never spots"
+        );
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let counted = v.gate.counted_total();
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert!(spots.is_empty());
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq, "the word keeps its text");
+        assert_eq!(v.gate.counted_total(), counted, "nothing moved");
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABD", v.now_ts)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 1, "the occurrence still counts");
+        assert!(
+            v.gate
+                .support_snapshot(14_000_000.0, "EEETT", v.now_ts)
+                .is_none_or(|s| s.counted.is_empty()),
+            "no support moved to the garbage reading"
+        );
+        let later = transmission_events(1, &["DE", "K3ABD", "K"], 1_768_000);
+        let spots = run(&later, &mut v);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|s| s.callsign.as_str())
+                .collect::<Vec<_>>(),
+            ["K3ABD"],
+            "the kept occurrence plus a clean repetition spots"
+        );
+    }
+
+    /// The HSMM `AC3GYH` context case: a non-call word is not spottable,
+    /// so a refinement of it still applies (`NEE` -> `DE`).
+    #[test]
+    fn refinement_of_a_non_call_word_still_applies() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["NEE", "K3ABD", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "NEE");
+        let mut fix = refined("DE", span, "engine:legacy");
+        fix.confidences = vec![0.95; 2];
+        let (_, outcome) = v.apply_refinement_with_outcome(1, seq, fix, 1_100_000);
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(word_named(&v, 1, "DE").0, seq, "the word now reads DE");
+    }
+
+    #[test]
+    fn plausible_to_plausible_refinement_still_moves_support() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("K3ABD", span, "engine:legacy"),
+            1_800_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K3ABD");
+        assert_eq!(spots[0].sample_ts, 1_768_800);
+    }
+
+    #[test]
+    fn unchanged_and_orphaned_outcomes() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("K3ABC", span, "wpm-seed"), 1_050_000);
+        assert_eq!(outcome, RefinementOutcome::Unchanged);
+        for i in 0..17u64 {
+            run(
+                &transmission_events(1, &["QSL"], 1_100_000 + i * 100_000),
+                &mut v,
+            );
+        }
+        let (spots, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("EEETT", span, "wpm-seed"), 3_000_000);
+        assert!(spots.is_empty());
+        assert_eq!(
+            outcome,
+            RefinementOutcome::Orphaned,
+            "an evicted word is orphaned, never rejected"
+        );
+    }
+
+    /// The rejection is recorded once, as a withheld decision about the
+    /// refined reading, under the permanent check it failed.
+    #[test]
+    fn a_rejected_refinement_records_one_grammar_or_cty_decision() {
+        let mut v = recording(CTY_FIXTURE).with_observations(ObservationPolicy::records());
+        run(
+            &transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000),
+            &mut v,
+        );
+        v.take_decisions();
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let (_, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].call, "EEETT");
+        assert_eq!(log[0].reason, Some(Reason::Grammar));
+        let records: Vec<_> = v
+            .observations()
+            .iter()
+            .filter(|o| o.draft.cause == Cause::Refined)
+            .collect();
+        assert_eq!(records.len(), 1, "one Refined record");
+        assert_eq!(
+            records[0].draft.decision().and_then(|d| d.reason),
+            Some(Reason::Grammar)
+        );
+        // A plausible reading whose prefix the table does not allocate
+        // fails cty instead.
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("Z3ABD", span, "wpm-seed"), 1_150_000);
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].reason, Some(Reason::Cty));
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq);
+    }
+
     /// A beacon-shaped transmission (`V V V` + call, twice) whose first
     /// callsign word carries an unresolved per-character alternative --
     /// the shape `refine_candidates` admits (the word is attempted, from
@@ -6520,5 +6861,67 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert!(spots.is_empty(), "got {spots:?}");
         assert!(v.suppression_counts().pending_beacon_rejected_wpm >= 1);
+    }
+}
+
+#[cfg(test)]
+mod man525_tests {
+    use super::nearest_gap_hz;
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn nearest_gap_equals_the_fold_bit_for_bit() {
+        // MAN-525: the binary-searched gap equals main's fold over every
+        // other track, bit for bit, including NaN, +inf, -0.0 and
+        // duplicate frequencies (a non-finite own frequency falls back to
+        // the fold itself).
+        let mut compared = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = seed ^ 0x5EED_0525;
+            let n = 1 + (splitmix64(&mut rng) % 80) as u32;
+            let mut tracks: Vec<(u32, f64)> = Vec::new();
+            for i in 0..n {
+                let id = i * 3 + 1;
+                let f = match splitmix64(&mut rng) % 23 {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => -0.0,
+                    3 if !tracks.is_empty() => {
+                        tracks[(splitmix64(&mut rng) % tracks.len() as u64) as usize].1
+                    }
+                    _ => 14e6 + (splitmix64(&mut rng) % 200_000) as f64 * 0.37,
+                };
+                tracks.push((id, f));
+            }
+            let mut sorted: Vec<(f64, u32)> = tracks
+                .iter()
+                .filter(|(_, f)| f.is_finite())
+                .map(|&(id, f)| (f, id))
+                .collect();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for &(id, f) in &tracks {
+                let fold = tracks
+                    .iter()
+                    .filter(|(other, _)| *other != id)
+                    .map(|(_, other)| (other - f).abs())
+                    .fold(f64::INFINITY, f64::min);
+                let gap = nearest_gap_hz(&sorted, id, f).unwrap_or(fold);
+                assert_eq!(
+                    gap.to_bits(),
+                    fold.to_bits(),
+                    "seed {seed} track {id} freq {f}: {gap} vs {fold}"
+                );
+                compared += 1;
+            }
+        }
+        println!("MAN-525 gap differential: {compared} gaps compared");
+        assert!(compared > 5_000, "only {compared} gaps compared");
     }
 }

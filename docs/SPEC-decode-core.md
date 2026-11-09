@@ -1323,6 +1323,30 @@ discarded scale), and the track's §4.2 gap classifier is
 reset too: its clusters were bootstrapped from gap ratios against the wrong
 `μ_dit`.
 
+**Speed hypothesis bank** — **[DEVIATION]** (MAN-544,
+`docs/DECISIONS/2026-11-08-man544-speed-hypothesis-bank.md`): optional and
+**off by default** (`DecodeConfig::speed_bank`, `width: 1`; not a TOML
+option). With `width > 1` the tracker above is the primary of up to `width`
+hypotheses. Challengers spawn from evidence only: at readiness, the other
+reading of an ambiguous bootstrap (a unimodal lock's 3:1 twin; for a split
+whose dit cluster is one mark, a tracker from the other marks); later, from
+4 consecutive marks on one side of the primary's boundary (their unimodal
+3:1 alternative when they duplicate the primary). A candidate within 0.25 of
+a live hypothesis on both `ln μ_dit` and `ln μ_dah` is not spawned. Every
+hypothesis scores each mark against its two centroids (log-normal, σ 0.25)
+and each closed gap (classified, or a word gap the §4.2 flush resolved, at
+its closed length) against 1, 3 and 7 of its own §4.1a units
+(σ 0.35), max component, equal class weights, floored at −3 nats, decayed
+×0.9 per observation; a gap of 12 units of the slowest hypothesis is scored
+by none. A challenger switches in when it leads by 4 nats on 2 consecutive
+marks, is at least 2 marks old, and its gap score is ahead of the
+primary's; observe-only mode (`switching: false`) records the switch
+instead. On a switch the old primary is kept for 24 marks and can switch
+back, and the §4.2 gap classifier, flushed one-character-word gaps and the
+§4.1b sender model reset. A challenger trailing by 12 nats, duplicating the
+primary, or 64 marks old is dropped. The rules above (regime change,
+fragment-seeded lock, §4.1 MAN-402 bootstrap) are unchanged.
+
 #### 4.1a WPM reporting: symmetric mark/gap dit-period estimate
 
 **[DEVIATION]** (MAN-103, `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md`):
@@ -1390,8 +1414,9 @@ the first sample sets `mean = x`, `var = 0`.
 | word gap | closed gaps classified inter-word, and flushed gaps at their closed length (flush length + the space that follows, or the flush length alone when the next mark absorbs a remainder shorter than the demod's debounce window); a gap ≥ `max(15, 4·char-gap mean)` dits is a pause and is not learned |
 
 Uses: §4.1's ratio re-anchor target and §4.2's sender word boundary.
-MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses) read the means
-and variances; this section uses only the means. A §4.1 drift re-init
+MAN-111 (scored boundaries) reads the means and variances; this section
+uses only the means. The MAN-544 speed hypothesis bank (§4.1) reads neither
+and resets this model when it switches the primary. A §4.1 drift re-init
 resets every class. Legacy and EdgeLegacy only; the HSMM engine (SPEC v2)
 keeps its own per-token speed and learns none of this.
 
@@ -2368,15 +2393,17 @@ allowlist = []
 # Same path rule. Unset: bundled. --scp overrides it.
 # scp_path = "MASTER.SCP"
 # Scheduled list refresh (MAN-316). Opt-in; only `run` from a live
-# receiver downloads. cty.dat is checked every 7 days and MASTER.SCP every
-# day (If-Modified-Since); a download replaces the table in use only after
+# receiver downloads. cty.dat is checked every 7 days, MASTER.SCP every
+# day and, with pattern_url set (MAN-542), the pattern list every 7 days
+# (If-Modified-Since); a download replaces the table in use only after
 # it parses and passes the acceptance checks, and a failure keeps the
 # current table and retries in 1 hour. File replay never downloads and
 # never reads the cache's latest copy. Skipped for a list that a path or
 # a SHA-256 pin below sets.
 # refresh_lists = false
 # Accepted downloads, content-addressed (cty/<sha256>.dat,
-# scp/<sha256>.scp, state.json). Same path rule. Unset: memory only.
+# scp/<sha256>.scp, patterns/<sha256>.lst, state.json). Same path rule.
+# Unset: memory only.
 # list_cache_dir = "/var/cache/manta"
 # http:// only (no TLS); https:// is refused at load.
 # cty_url = "http://www.country-files.com/cty/cty.dat"
@@ -2397,6 +2424,10 @@ repetition_fusion = false
 # Leading # comments; @ for later letters, # for later digits. Same path rule.
 # Unset: bundled. --patterns overrides it.
 # pattern_path = "patterns.lst"
+# MAN-542: where refresh_lists downloads the pattern list ([+]PATTERN or
+# RBN's Patt3Ch.lst). No default: unset, nothing is fetched. http:// only;
+# not used when pattern_path is set.
+# pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders

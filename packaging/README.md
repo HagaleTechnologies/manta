@@ -22,9 +22,12 @@ there.
 
 - **A network receiver.** The recipes are written for a KiwiSDR, which
   every build supports and which needs no device permissions. An HPSDR
-  radio on the network works the same way. None of the recipes gives manta
-  access to a local sound card or USB SDR. Every build includes KiwiSDR
-  and HPSDR; SoapySDR is optional and has a separate Linux x86_64 release archive.
+  radio on the network works the same way. As shipped, none of the recipes
+  gives manta access to a local sound card or USB SDR; the Docker recipe
+  can pass a USB receiver through (see "USB receivers" under Docker
+  Compose). Every build includes KiwiSDR
+  and HPSDR; SoapySDR is optional and has separate Linux x86_64 and arm64
+  release archives, and the Docker image includes it.
   Before you run the service against a receiver you don't own, read [the KiwiSDR guide](../docs/GUIDES/kiwisdr.md).
 - **Linux:** the binary needs the ALSA runtime library even when it never
   opens a sound card: `sudo apt install libasound2` on Debian, Ubuntu and
@@ -390,8 +393,20 @@ is invalid.
   `listen` without a config) has nothing to probe and shows `(unhealthy)`.
   Turn the check off for those with `docker run --no-healthcheck`, or with
   `healthcheck: disable: true` under the service in Compose.
-- **Not enabled.** No device passthrough, privileged mode or host
-  networking: use a network receiver.
+- **USB receivers.** The image includes SoapySDR and Debian's modules for
+  RTL-SDR, Airspy R2 and Mini, and HackRF. Compose passes no device by
+  default. To use a USB receiver, uncomment the `devices:` and
+  `group_add:` lines in `docker-compose.yml`, or add
+  `--device /dev/bus/usb --group-add plugdev` to `docker run`. The
+  container's `manta` user can open the receiver only if a udev rule on
+  the host gives the `plugdev` group access to it. Debian's `librtlsdr0`
+  and `libhackrf0` packages install such a rule; Airspy's package does
+  not, so add one for it. Docker resolves `plugdev` inside the image (GID
+  46, Debian's); if the host's `plugdev` GID differs, pass the host's
+  number instead. Replug the receiver after adding a rule. A receiver
+  plugged in after the container started is not visible until it
+  restarts. This setup has not yet been tested with a receiver.
+  Privileged mode and host networking stay off.
 
 ### Without Compose
 
@@ -402,6 +417,8 @@ With no arguments, the image runs the daemon from a config mounted at
 docker run -d --name manta --restart unless-stopped --stop-timeout 60 --mount type=bind,src="$PWD/manta.toml",dst=/etc/manta/manta.toml,readonly -p 7300:7300 -p 7301:7301 ghcr.io/hagaletechnologies/manta:latest
 docker logs -f manta
 docker ps    # STATUS shows (healthy) once the daemon answers
+# A USB receiver: list what SoapySDR finds through the passthrough
+docker run --rm --device /dev/bus/usb --group-add plugdev ghcr.io/hagaletechnologies/manta:latest devices
 ```
 
 - Use `--mount`, not `-v`. When `manta.toml` is missing on the host,
@@ -451,8 +468,29 @@ is logged as a `warning: list refresh:` line, counted in
 copy already in use stays. Without network access manta runs on the
 built-in copies. File replay never downloads. Refresh is off by default.
 
+The callsign-pattern list (which calls need 2, 3 or 5 repetitions) is
+downloaded too only if you also name a source for it:
+
+```toml
+[spot]
+refresh_lists = true
+pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
+```
+
+It is then checked every 7 days under the same rules. manta accepts its
+own `[+]PATTERN` files and RBN's `Patt3Ch.lst`, and skips the lines no
+call it accepts can match. `pattern_url` has no default: the URL above is
+an example, not a recommendation. RBN's list is a different policy from
+the built-in one, not just a newer copy. It lists about 10,190 patterns
+against the built-in 6,036, but leaves about 3% of MASTER.SCP's calls
+unlisted (5 repetitions) where the built-in list leaves 0.34%. See
+`docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md` in the source
+repository.
+
 - **Firewall.** Downloads are plain HTTP: allow outbound TCP port 80 to
-  `www.country-files.com` and `www.supercheckpartial.com`. To keep the
+  `www.country-files.com` and `www.supercheckpartial.com`, and to the
+  `pattern_url` host if you set one (`data.reversebeacon.net` for RBN's
+  list). To keep the
   node off the internet, or to share one download between nodes, serve
   the two files from a local web server and set `cty_url` and `scp_url`
   in `[spot]` to its `http://` URLs. manta has no TLS support and refuses
@@ -472,19 +510,21 @@ built-in copies. File replay never downloads. Refresh is off by default.
   `manta_list_last_success_timestamp_seconds` (`docs/METRICS.md` in the
   source repository). Alert when
   `time() - manta_list_last_success_timestamp_seconds{list="cty"}` passes
-  8 days.
+  8 days, and likewise for `{list="patterns"}` when `pattern_url` is set.
 - **Replaying a recording with the list the daemon used.** Copy the hash
   from the `lists:` line and pass it to `decode`, `run`, `soak` or
   `doctor` as `--cty-sha256` or `--scp-sha256`, with a config whose
   `list_cache_dir` holds that version (or `--cty`/`--scp` naming the
   file). manta stops before reading the recording if no copy has that
   hash.
-- **Choosing a list yourself.** A list that `cty_path`/`scp_path` or
-  `cty_sha256`/`scp_sha256` sets is never downloaded.
+- **Choosing a list yourself.** A list that `cty_path`/`scp_path`/
+  `pattern_path` or `cty_sha256`/`scp_sha256` sets is never downloaded.
+  `pattern_path` takes manta's `[+]PATTERN` format only.
 
 Every `[spot]` key is described in `manta.example.toml` and in
 [SPEC-decode-core.md](../docs/SPEC-decode-core.md) §9; the design is in
-`docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md` in the source
+`docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md` and
+`docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md` in the source
 repository.
 
 ## Network exposure

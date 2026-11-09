@@ -107,8 +107,9 @@ with a `[server]` table) re-reads the file and applies `[spot]` `allowlist`,
 `blocklist_path` and `notch_path`, and each `[[rbn_uplink]]` block's `dry_run`.
 Every other key, `cty_path`, `scp_path` and the list-refresh keys included,
 needs a restart; a reload logs the changed keys it did not apply. A
-`refresh_lists` download replaces `cty.dat` or `MASTER.SCP` on its own
-schedule, not on `SIGHUP`. A file that fails the checks above is
+`refresh_lists` download replaces `cty.dat`, `MASTER.SCP` or, with
+`pattern_url` set, the callsign-pattern list on its own schedule, not on
+`SIGHUP`. A file that fails the checks above is
 logged and ignored. See
 [DECISIONS/2026-10-10-man78-live-reload.md](DECISIONS/2026-10-10-man78-live-reload.md).
 
@@ -466,7 +467,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. On an SDRplay this is an attenuation scale: a higher value is less sensitive, and `0` is the most sensitive setting. On the RSP1B measured, `40` already puts the IF stage at its maximum reduction and `46` to `48` failed to start the stream ([gain record](DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md)). |
 | `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr unless `bands` is set | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
-| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
+| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. `"all"` is 160m to 10m, plus 6m when `tuning_range_hz` overlaps its segment (MAN-543). See [Band plans: bands](#band-plans-bands) (MAN-310). |
 | `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
 | `receivers` | none; example `4` | live: `type = "hpsdr"` | Optional hardware capacity declaration, integer 1 to 255, on the first entry for a radio only. Shared HL2 radios report capacity at startup; other gateware needs this fallback. The smaller reported/declared count applies. This is not the active receiver count. |
@@ -590,6 +591,7 @@ type = "kiwi"
 host = "kiwi.example.net"
 bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
 #tuning_range_hz = [3000000.0, 30000000.0]
+#bands = ["6m"] with tuning_range_hz = [0.0, 61440000.0] (hpsdr or soapy that tunes 50 MHz)
 ```
 
 The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;
@@ -609,6 +611,16 @@ beacon. The segment limits are not configurable.
 | 15m | 21000–21070 | 21150 | 21000–21150 |
 | 12m | 24890–24915 | 24930 | 24890–24930 |
 | 10m | 28000–28070 | 28200 | 28000–28200 |
+| 6m | 50000–50100 | – | 50000–50100 |
+
+6m is the one band above 30 MHz (MAN-543). Its segment is the CW-only part
+of the 6 m band plans, and its bottom is the 6 m beacon sub-band, so beacon
+callsigns are spotted from it. NCDXF has no 6 m beacon. To skim 6m, set
+`tuning_range_hz` to reach it (the default stops at 30 MHz), and give the
+stream at least 110.5 kHz (192000 Hz in practice): at 96000 Hz it is two
+streams, which an hpsdr or soapy entry refuses. `"all"` adds 6m only when
+`tuning_range_hz` overlaps its segment. See
+[the 6m decision record](DECISIONS/2026-11-08-man543-6m-band.md).
 
 How a plan is made:
 
@@ -626,7 +638,9 @@ How a plan is made:
   the cross-input dedupe spots it once. A running track is never stopped.
 - **Tuning range.** A band outside `tuning_range_hz` is skipped, a band
   partly outside it is clipped, and a bare centre outside it is skipped,
-  each with a note. Nothing left to skim is an error.
+  each with a note. Nothing left to skim is an error. `"all"` is 160m to
+  10m, plus 6m when `tuning_range_hz` overlaps its segment, so the default
+  range never adds a 6m note.
 - **Repeats.** A band listed twice, a band `"all"` already includes, or a
   bare centre inside a listed band is refused.
 
@@ -729,9 +743,11 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 
 Which decodes become spots. `allowlist`, `blocklist_path` and `notch_path`
 reload on SIGHUP; every other key needs a restart. With `refresh_lists` on,
-`run` from a live receiver also replaces `cty.dat` and `MASTER.SCP` on its
-own schedule. See
-[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md).
+`run` from a live receiver also replaces `cty.dat`, `MASTER.SCP` and, when
+`pattern_url` is set, the callsign-pattern list on its own schedule. See
+[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md)
+and
+[DECISIONS/2026-11-09-man542-pattern-list-refresh.md](DECISIONS/2026-11-09-man542-pattern-list-refresh.md).
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -741,15 +757,16 @@ own schedule. See
 | `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
 | `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
 | `calls_heard_path` | none; example `"calls-heard.txt"` | restart-only: `run`, `soak`, `doctor`, `decode` | Optional local calls-heard file. One CALL per line with an optional count, e.g. `W1AW 12`. Blank and `#`/`!!` comment lines are skipped; a missing file supplies no frequency evidence. Relative paths resolve against the config file directory, or the working directory for `MANTA_SPOT_CALLS_HEARD_PATH`. SIGHUP does not reload this file. No download is performed. |
-| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url`, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
-| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
+| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url` and, when `pattern_url` is set, the callsign-pattern list every 7 days, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path`/`pattern_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
+| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, `patterns/<sha256>.lst`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
 | `cty_url` | `"http://www.country-files.com/cty/cty.dat"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `cty.dat`. Only `http://` URLs: `https://` is refused at load, because manta has no TLS support. Redirects and chunked responses count as failures. Point it at a local mirror to share one download. |
 | `scp_url` | `"http://www.supercheckpartial.com/MASTER.SCP"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `MASTER.SCP`. Same rules as `cty_url`. |
+| `pattern_url` | none; example `"http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"`; unset downloads no pattern list | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads the callsign-pattern list, checked every 7 days under the same rules as `cty_url`. Unset: the pattern list is never downloaded. Not used when `pattern_path` is set. Accepts manta's `[+]PATTERN` format and RBN's `Patt3Ch.lst`; lines longer than 7 characters or in a shape manta's rule never produces are skipped and counted in the `updated` line. A download that is not pattern-shaped, lacks a canary call's pattern or lists under half the built-in copy's patterns is rejected. Changing it changes which calls need 2, 3 or 5 repetitions; see [DECISIONS/2026-11-09-man542-pattern-list-refresh.md](DECISIONS/2026-11-09-man542-pattern-list-refresh.md). `MANTA_SPOT_PATTERN_URL` sets it. |
 | `cty_sha256` | none; example `"e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"`; unset uses `cty_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `cty.dat` whose SHA-256 is this (64 hex digits, as in the `lists:` log line). If `cty_path` is set, that file must match and nothing else is tried; otherwise manta looks in the built-in copy, then `list_cache_dir`. manta stops before reading the source if no copy matches. A pinned list is never refreshed. `--cty-sha256` overrides it; `MANTA_SPOT_CTY_SHA256` sets it. |
 | `scp_sha256` | none; example `"00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"`; unset uses `scp_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `MASTER.SCP` whose SHA-256 is this, looked up like `cty_sha256`. `--scp-sha256` overrides it; `MANTA_SPOT_SCP_SHA256` sets it. |
 | `validation_level` | `"normal"` | live: `run`, `soak`, `doctor`, `decode` | `"normal"`: 2 repetitions for a common pattern, 3 for a listed pattern, 5 for an unlisted pattern. `"minimal"`: 2 for every call. Allowlisted calls and beacons are exempt. Advertised to the Aggregator as `vlNormal` or `vlMinimal`. `MANTA_SPOT_VALIDATION_LEVEL` overrides the file for live commands. |
 | `repetition_fusion` | `false` | restart-only: `run`, `soak`, `doctor`, `decode` | `true` lets damaged copies of one station's CQ, DE or UP self-ID count toward its repetition requirement. Copies on one input within one channel (93.75 Hz) and 90 s, each at most 2 edits from every other, are lined up character by character. A call is confirmed when every position holds a strict majority of the copies with a lead of at least half a copy, from at least as many separate messages as the call's pattern tier needs. Copies of the same samples (a replay, a second track on one signal) count once. No character is used that no copy read or listed as an alternative. The confirmed call then passes the usual checks, and its `candidateDecision` carries `"confirmation": "fused"`. The default stays off until recorded and live RBN regression gates pass. `MANTA_SPOT_REPETITION_FUSION` overrides the file for live commands. See [DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md](DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md). |
-| `pattern_path` | none; example `"patterns.lst"`; unset uses the built-in list | live: `run`, `soak`, `doctor`, `decode` | Callsign-pattern list, independent of `scp_path`. One pattern per line; `+K5@@@` marks a common pattern, `K5@@@` a listed one. Leading `#` starts a comment; `@` represents a letter, `#` a digit after the literal prefix. A relative path set in the file is relative to the file's directory; `--patterns` or `MANTA_SPOT_PATTERN_PATH` overrides it relative to the working directory. |
+| `pattern_path` | none; example `"patterns.lst"`; unset uses the built-in list | live: `run`, `soak`, `doctor`, `decode` | Callsign-pattern list, independent of `scp_path`. One pattern per line; `+K5@@@` marks a common pattern, `K5@@@` a listed one. Leading `#` starts a comment; `@` represents a letter, `#` a digit after the literal prefix. A relative path set in the file is relative to the file's directory; `--patterns` or `MANTA_SPOT_PATTERN_PATH` overrides it relative to the working directory. `pattern_path` takes manta's format only; to use RBN's list, set `pattern_url`. A set `pattern_path` is never refreshed. |
 
 ## [detector]
 

@@ -1,6 +1,6 @@
 //! MAN-261: the daemon's single config file. One TOML parse, a strict
 //! top-level check, the `MANTA_*` environment overlay, then one typed parse
-//! per table. CLI flags are merged on top in main.rs (`resolve`), giving the
+//! per table. CLI flags are merged on top in resolve.rs (`resolve`), giving the
 //! precedence CLI flag > `MANTA_<TABLE>_<KEY>` > file > built-in default.
 //! See docs/SPEC-decode-core.md §9 and
 //! docs/DECISIONS/2026-10-06-man261-config-surface.md.
@@ -123,6 +123,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "list_cache_dir"),
     ("spot", "cty_url"),
     ("spot", "scp_url"),
+    // MAN-542.
+    ("spot", "pattern_url"),
     ("spot", "cty_sha256"),
     ("spot", "scp_sha256"),
     ("spot", "pattern_path"),
@@ -325,6 +327,10 @@ pub(crate) struct SpotFile {
     /// `http://` URL at load. See [`SpotFile::cty_url`].
     pub cty_url: Option<String>,
     pub scp_url: Option<String>,
+    /// MAN-542: where `refresh_lists` downloads the callsign-pattern list.
+    /// No default: unset, the pattern list is never downloaded. An
+    /// `http://` URL, checked at load like `cty_url`.
+    pub pattern_url: Option<String>,
     /// MAN-316: a pinned list version, validated and lowercased by
     /// [`parse_sha256`] at load.
     pub cty_sha256: Option<String>,
@@ -361,6 +367,7 @@ struct SpotToml {
     list_cache_dir: Option<PathBuf>,
     cty_url: Option<String>,
     scp_url: Option<String>,
+    pattern_url: Option<String>,
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
     pattern_path: Option<PathBuf>,
@@ -676,7 +683,7 @@ fn cw_utc(v: &toml::value::Datetime) -> Option<i64> {
         + i64::from(t.hour) * 3600
         + i64::from(t.minute) * 60
         + i64::from(t.second.unwrap_or(0));
-    crate::check_replay_epoch("UTC", seconds).ok()
+    crate::cli_parse::check_replay_epoch("UTC", seconds).ok()
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -1078,6 +1085,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             .map(|p| resolve_path("spot", "list_cache_dir", p)),
         cty_url: check_list_url("cty_url", spot_toml.cty_url).map_err(&spot_err)?,
         scp_url: check_list_url("scp_url", spot_toml.scp_url).map_err(&spot_err)?,
+        pattern_url: check_list_url("pattern_url", spot_toml.pattern_url).map_err(&spot_err)?,
         cty_sha256: check_pin("cty_sha256", spot_toml.cty_sha256).map_err(&spot_err)?,
         scp_sha256: check_pin("scp_sha256", spot_toml.scp_sha256).map_err(&spot_err)?,
         pattern_path: spot_toml
@@ -1795,7 +1803,7 @@ fn take_entry(
         .ok_or_else(|| "input.bands needs input.type (one of kiwi, soapy, hpsdr)".to_string())?;
     let rate_hz = match kind {
         InputKind::Kiwi => None,
-        InputKind::Hpsdr => Some(crate::check_hpsdr_rate_hz(
+        InputKind::Hpsdr => Some(crate::cli_parse::check_hpsdr_rate_hz(
             "input.rate_hz",
             t.rate_hz
                 .ok_or("input.rate_hz is required when input.type = \"hpsdr\"")?,
@@ -1808,7 +1816,7 @@ fn take_entry(
     };
     let capture_rate_hz = t
         .capture_rate_hz
-        .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+        .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
         .transpose()?;
     let width_hz = crate::band_streams::stream_width_hz(kind, rate_hz, capture_rate_hz);
     let usable_hz = crate::band_streams::usable_width_hz(width_hz);
@@ -2064,7 +2072,7 @@ fn raw_iq(t: &InputToml) -> std::result::Result<Option<(manta_input::RawIqFormat
 }
 
 fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
-    let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
+    let mac = crate::cli_parse::parse_hpsdr_mac(text).map_err(|_| {
         "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
             .to_string()
     })?;
@@ -2148,7 +2156,7 @@ fn validate_input(
         conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
-            .map(crate::check_freq_correction_ppm)
+            .map(crate::cli_parse::check_freq_correction_ppm)
             .transpose()?,
         dc_block: t
             .dc_block
@@ -2162,15 +2170,15 @@ fn validate_input(
             .transpose()?,
         center_freq_hz: t
             .center_freq_hz
-            .map(|v| crate::check_dial_freq_hz("input.center_freq_hz", v))
+            .map(|v| crate::cli_parse::check_dial_freq_hz("input.center_freq_hz", v))
             .transpose()?,
         capture_rate_hz: t
             .capture_rate_hz
-            .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+            .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
             .transpose()?,
         replay_epoch: t
             .replay_epoch
-            .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
+            .map(|v| crate::cli_parse::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
         record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
         spectrum: spectrum_out(&t)?,
@@ -2238,7 +2246,7 @@ fn validate_input(
                         .ok_or_else(|| "receivers must be an integer from 1 to 255".to_string())
                 })
                 .transpose()?,
-            port: port(crate::HPSDR_CONTROL_PORT)?,
+            port: port(crate::cli_parse::HPSDR_CONTROL_PORT)?,
             host: {
                 if t.host.is_some() && t.mac.is_some() {
                     return Err("input.host and input.mac cannot both be set".into());
@@ -2252,8 +2260,11 @@ fn validate_input(
                 .map(ProtocolValue::protocol)
                 .transpose()?
                 .unwrap_or_default(),
-            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
-            rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+            freq_hz: crate::cli_parse::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
+            rate_hz: crate::cli_parse::check_hpsdr_rate_hz(
+                "input.rate_hz",
+                req(t.rate_hz, "rate_hz", name)?,
+            )?,
             // MAN-308 D1: `protocol` parsed above, so this re-read cannot fail.
             auto_attenuation: match t.auto_attenuation {
                 Some(true)
@@ -4426,6 +4437,57 @@ mod tests {
         assert_eq!(
             loaded.raw["spot"]["list_cache_dir"],
             toml::Value::String("2026".into())
+        );
+    }
+
+    #[test]
+    fn pattern_url_has_no_default_and_parses_from_file_and_environment() {
+        assert_eq!(load_file("[spot]\n").unwrap().spot.pattern_url, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\npattern_url = \"http://mirror.lan/Patt3Ch.lst\"\n",
+        )
+        .unwrap();
+        let spot = load(Some(&path), Env::Ignore).unwrap().spot;
+        assert_eq!(
+            spot.pattern_url.as_deref(),
+            Some("http://mirror.lan/Patt3Ch.lst")
+        );
+        let v = vars(&[("MANTA_SPOT_PATTERN_URL", "http://10.0.0.1:8080/patt3ch.lst")]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_url.as_deref(),
+            Some("http://10.0.0.1:8080/patt3ch.lst"),
+            "the environment wins over the file"
+        );
+    }
+
+    #[test]
+    fn pattern_url_must_be_http() {
+        let url = "https://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+        let f = write_cfg(&format!("[spot]\npattern_url = \"{url}\"\n"));
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [spot]: pattern_url must be an http:// URL (manta has no TLS support), got \
+                 \"{url}\"",
+                f.path().display()
+            )
+        );
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_SPOT_PATTERN_URL", url)]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [spot]: pattern_url must be"),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("(environment: MANTA_SPOT_PATTERN_URL)"),
+            "{err}"
         );
     }
 

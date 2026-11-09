@@ -1,9 +1,11 @@
-"""Tests for scripts/check-soapy-release.py and the release workflows' build-soapy job (MAN-82).
+"""Tests for scripts/check-soapy-release.py and the release workflow's SoapySDR jobs (MAN-82, MAN-539).
 
-stdlib unittest only. Builds manta-linux-x86_64-soapy.tar.gz fixtures around a fake `manta` shell
-script whose answers each test chooses, runs the verifier against them, and reads both release
-workflows as text through test_ci_trust_boundary.py's helpers. The real binary's check is the
-release job itself; docs/RUNBOOKS/release.md says how to run the verifier on a local build.
+stdlib unittest only. Builds manta-linux-<arch>-soapy.tar.gz fixtures around a fake `manta` shell
+script whose answers each test chooses, runs the verifier against them, drives the verifier's
+--docker-image mode through a fake `docker` on PATH, and reads the release workflow as text through
+test_ci_trust_boundary.py's helpers: the build-soapy and build-soapy-arm64 archive jobs and the
+Docker jobs' pre-push image check. The real binary's check is the release job itself;
+docs/RUNBOOKS/release.md says how to run the verifier on a local build.
 Run: python3 -m unittest scripts.tests.test_soapy_release -v
 """
 import importlib.util
@@ -25,8 +27,23 @@ wf = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wf)
 
 ARTIFACT = "manta-linux-x86_64-soapy"
+ARM64_ARTIFACT = "manta-linux-arm64-soapy"
 RELEASE_WORKFLOWS = ("release-publish.yml",)
-VERIFY = f"python3 scripts/check-soapy-release.py {ARTIFACT}.tar.gz"
+# One row per SoapySDR archive job (MAN-82, MAN-539). `runtime` is the clean operator image the
+# archive is verified in; `alsa` is that distribution's ALSA runtime package; `host_verify` says
+# whether the job also runs the verifier on the build runner itself.
+SOAPY_JOBS = {
+    "build-soapy": {"artifact": ARTIFACT, "runtime": "ubuntu:24.04",
+                    "alsa": "libasound2t64", "host_verify": True},
+    "build-soapy-arm64": {"artifact": ARM64_ARTIFACT, "runtime": "debian:bookworm",
+                          "alsa": "libasound2", "host_verify": False},
+}
+SOAPY_TEST = "cargo test --release --locked -p manta-input --features soapy --lib soapy::tests"
+IMAGE_JOBS = ("docker-publish-release", "docker-build-dispatch")
+CHECK_IMAGE = "manta-soapy-check:local"
+CHECK_PLATFORM = "linux/arm64"
+IMAGE_VERIFY = f"python3 scripts/check-soapy-release.py --docker-image {CHECK_IMAGE} --platform {CHECK_PLATFORM}"
+THREE_PLATFORMS = "linux/amd64,linux/arm64,linux/arm/v7"
 FLAGS = ("--soapy-driver", "--soapy-freq-hz", "--soapy-rate-hz", "--soapy-gain")
 HELP = "Usage: manta run [OPTIONS]\n" + "".join(f"      {f} <X>\n" for f in FLAGS + ("--hpsdr-host",))
 ROFF_FLAGS = "".join(f"\\fB{f.replace('-', chr(92) + '-')}\\fR\n" for f in FLAGS)
@@ -43,19 +60,45 @@ UNEXPECTED = ("error: unexpected argument '--soapy-driver' found\n\n"
               "Usage: manta check [OPTIONS] [SOURCE]\n")
 LOADER = ("./manta: error while loading shared libraries: libSoapySDR.so.0.8: "
           "cannot open shared object file: No such file or directory")
+# What each installed module answers with no device attached (MAN-539 planning runs, E1).
+MODULES = {
+    "rtlsdr": ("error: cannot open source: Other: No RTL-SDR devices found!", 1),
+    "airspy": ("error: cannot open source: Other: Unable to open AirSpy device", 1),
+    "hackrf": ("error: cannot open source: Other: no hackrf device matches", 1),
+}
+IMAGE_OK = [
+    "OK: manta 0.1.0 (git 0123456789ab; features: soapy)",
+    "OK: run/listen/check --help offer --soapy-driver, --soapy-freq-hz, --soapy-rate-hz, --soapy-gain "
+    "and --hpsdr-host",
+    "OK: nonexistent driver: exit 1, SoapySDR::Device::make() no match",
+    "OK: devices --json: Soapy enumeration ok, 0 device(s)",
+    "OK: modules rtlsdr, airspy, hackrf load: each driver fails with its own error, not no match",
+]
+
+
+def q(text):
+    return "'" + text.replace("'", "'\\''") + "'"
 
 
 def fake_manta(version="manta 0.1.0 (git 0123456789ab; features: soapy)", help_text=HELP,
                driver=(NO_MATCH, 1), devices=(json.dumps(OK_DEVICES), 0), version_sleep=0,
-               loader=None):
+               loader=None, modules=MODULES):
     """A POSIX sh stand-in for the release binary. `loader` makes every call fail as the
     dynamic loader does when libSoapySDR is missing."""
-    def q(text):
-        return "'" + text.replace("'", "'\\''") + "'"
     if loader is not None:
         return f"#!/bin/sh\nprintf '%s\\n' {q(loader[0])} >&2\nexit {loader[1]}\n"
-    return f"""#!/bin/sh
-case "$1" in
+    return "#!/bin/sh\n" + manta_answers(version, help_text, driver, devices, version_sleep, modules)
+
+
+def manta_answers(version, help_text, driver, devices, version_sleep, modules):
+    """The sh `case` that answers manta's arguments in $1.., shared by the fake manta and docker."""
+    module_answers = "".join(
+        f"""    if [ "$1" = check ] && [ "$2" = --soapy-driver ] && [ "$3" = driver={name} ]; then
+      printf '%s\\n' {q(text)} >&2
+      exit {code}
+    fi
+""" for name, (text, code) in modules.items())
+    return f"""case "$1" in
   --version)
     sleep {version_sleep}
     printf '%s\\n' {q(version)}
@@ -65,13 +108,31 @@ case "$1" in
     if [ "$1" = check ] && [ "$2" = --soapy-driver ] && [ "$3" = driver=man82_nonexistent ]; then
       printf '%s\\n' {q(driver[0])} >&2
       exit {driver[1]}
-    fi ;;
+    fi
+{module_answers}    ;;
   devices)
     if [ "$2" = "--json" ]; then printf '%s\\n' {q(devices[0])}; exit {devices[1]}; fi ;;
 esac
 echo "fake manta: unexpected arguments: $*" >&2
 exit 99
 """
+
+
+def fake_docker(record, **answers):
+    """A POSIX sh stand-in for `docker`: it appends its argv to RECORD, insists on
+    `run --rm --platform <p> <image>` and answers the rest as fake_manta does with ANSWERS."""
+    kwargs = dict(version="manta 0.1.0 (git 0123456789ab; features: soapy)", help_text=HELP,
+                  driver=(NO_MATCH, 1), devices=(json.dumps(OK_DEVICES), 0), version_sleep=0,
+                  modules=MODULES)
+    kwargs.update(answers)
+    return f"""#!/bin/sh
+printf '%s\\n' "$*" >> {q(record)}
+if [ "$1" != run ] || [ "$2" != --rm ] || [ "$3" != --platform ] || [ -z "$4" ] || [ -z "$5" ]; then
+  echo "fake docker: unexpected arguments: $*" >&2
+  exit 125
+fi
+shift 5
+""" + manta_answers(**kwargs)
 
 
 def add(tar, name, data=b"", mode=0o644, kind=tarfile.REGTYPE, linkname=""):
@@ -128,6 +189,16 @@ class VerifierTests(unittest.TestCase):
         self.assertIn("OK: manta 0.1.0 (git 0123456789ab; features: soapy)", proc.stdout)
         self.assertIn("OK: nonexistent driver: exit 1, SoapySDR::Device::make() no match", proc.stdout)
         self.assertIn("OK: devices --json: Soapy enumeration ok, 0 device(s)", proc.stdout)
+
+    def test_an_arm64_archive_passes_with_its_own_root(self):
+        # MAN-539: the root directory comes from the file name, so the arm64 archive needs no
+        # verifier change.
+        archive = build_archive(self.tmp, fake_manta(), root=ARM64_ARTIFACT, name=ARM64_ARTIFACT + ".tar.gz")
+        proc = verify(archive)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("OK: devices --json: Soapy enumeration ok, 0 device(s)", proc.stdout)
+        wrong = build_archive(self.tmp, fake_manta(), root=ARTIFACT, name=ARM64_ARTIFACT + ".tar.gz")
+        self.assert_fails(verify(wrong), ARM64_ARTIFACT)
 
     def test_feature_order_and_extra_features_are_accepted(self):
         proc = verify(build_archive(self.tmp, fake_manta(
@@ -269,18 +340,101 @@ class VerifierTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
 
 
-def build_soapy_steps(name):
-    return wf.steps(wf.job_block(wf.read(name), "build-soapy"))
+@unittest.skipUnless(os.name == "posix", "the fake docker is a POSIX shell script")
+class ImageModeTests(unittest.TestCase):
+    """MAN-539: --docker-image runs every manta call as `docker run --rm --platform P IMAGE`."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = os.path.join(self._tmp.name, "image work")  # a space in every path
+        os.makedirs(self.tmp)
+        self.bin = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin)
+        self.record = os.path.join(self.tmp, "docker-argv")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def check(self, *args, **answers):
+        docker = os.path.join(self.bin, "docker")
+        with open(docker, "w", encoding="utf-8") as f:
+            f.write(fake_docker(self.record, **answers))
+        os.chmod(docker, 0o755)
+        env = dict(os.environ, PATH=self.bin + os.pathsep + os.environ.get("PATH", ""))
+        argv = args or ("--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM)
+        return subprocess.run([sys.executable, VERIFIER, *argv], capture_output=True, text=True, env=env)
+
+    def recorded(self):
+        with open(self.record, encoding="utf-8") as f:
+            return f.read().splitlines()
+
+    def assert_fails(self, proc, needle):
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("FAIL", proc.stderr)
+        self.assertIn(needle, proc.stderr)
+        self.assertNotIn("OK:", proc.stdout)
+
+    def test_a_soapy_image_passes_every_check(self):
+        proc = self.check()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(), IMAGE_OK)
+        calls = self.recorded()
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertTrue(call.startswith(f"run --rm --platform {CHECK_PLATFORM} {CHECK_IMAGE} "), call)
+        for name in MODULES:
+            self.assertIn(f"{CHECK_IMAGE} check --soapy-driver driver={name} --soapy-freq-hz 14025000 "
+                          "--soapy-rate-hz 1024000", "\n".join(calls))
+
+    def test_a_missing_module_fails_naming_its_driver(self):
+        modules = dict(MODULES, rtlsdr=(NO_MATCH, 1))
+        proc = self.check(modules=modules)
+        self.assert_fails(proc, "rtlsdr")
+        self.assertIn("no match", proc.stderr)
+
+    def test_a_module_that_opens_or_fails_otherwise_fails(self):
+        for answer in ((MODULES["airspy"][0], 0), ("error: unexpected argument", 2),
+                       ("error: something else", 1)):
+            with self.subTest(answer=answer):
+                self.assert_fails(self.check(modules=dict(MODULES, airspy=answer)), "airspy")
+
+    def test_an_image_without_the_soapy_feature_fails(self):
+        self.assert_fails(self.check(version="manta 0.1.0 (git 0123456789ab; features: none)"),
+                          "does not list features")
+
+    def test_the_image_shares_the_archive_checks(self):
+        self.assert_fails(self.check(driver=(UNEXPECTED, 2)), "unexpected argument '--soapy-driver'")
+        bad = {"audio": OK_DEVICES["audio"], "soapy": {"status": "disabled", "devices": [], "error": None}}
+        self.assert_fails(self.check(devices=(json.dumps(bad), 0)), "Soapy")
+
+    def test_usage_errors_exit_2(self):
+        archive = build_archive(self.tmp, fake_manta())
+        cases = (
+            (archive, "--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM),
+            ("--timeout", "5"),
+            ("--docker-image", CHECK_IMAGE),
+            ("--platform", CHECK_PLATFORM, archive),
+            ("--expect-missing-soapy-library", "--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                proc = self.check(*args)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertFalse(os.path.exists(self.record), "a usage error must not run docker")
+
+
+def build_soapy_steps(name, job="build-soapy"):
+    return wf.steps(wf.job_block(wf.read(name), job))
 
 
 def executable(body):
     return "\n".join(wf.code_lines(body or ""))
 
 
-def index_of(steps, pred, what):
+def index_of(steps, pred, what, job="build-soapy"):
     found = [i for i, s in enumerate(steps) if pred(s)]
     if len(found) != 1:
-        raise AssertionError(f"build-soapy: expected one {what} step, found {len(found)}")
+        raise AssertionError(f"{job}: expected one {what} step, found {len(found)}")
     return found[0]
 
 
@@ -289,73 +443,99 @@ def is_upload(step):
 
 
 class WorkflowWiringTests(unittest.TestCase):
-    def runtime_body(self, name):
-        steps = build_soapy_steps(name)
-        i = index_of(steps, lambda s: "docker run" in executable(wf.run_body(s)), "clean-runtime")
+    def each_job(self):
+        for name in RELEASE_WORKFLOWS:
+            for job, row in SOAPY_JOBS.items():
+                with self.subTest(workflow=name, job=job):
+                    yield name, job, row
+
+    def runtime_body(self, name, job, row):
+        # Selected by the clean runtime's image name: build-soapy-arm64's build step is a
+        # `docker run` too, in rust:1-slim-bookworm.
+        steps = build_soapy_steps(name, job)
+        i = index_of(steps, lambda s: "docker run" in executable(wf.run_body(s))
+                     and re.search(r"(?<![\w:/.-])" + re.escape(row["runtime"]) + r"\s",
+                                   executable(wf.run_body(s))) is not None,
+                     "clean-runtime", job)
         return i, executable(wf.run_body(steps[i]))
 
     def test_the_workflow_verifies_the_archive_before_upload(self):
-        for name in RELEASE_WORKFLOWS:
-            with self.subTest(workflow=name):
-                steps = build_soapy_steps(name)
-                self.assertTrue(steps, f"{name} has no build-soapy job")
-                package = index_of(steps, lambda s: "scripts/package-release.py" in executable(wf.run_body(s)),
-                                   "Package")
-                host = index_of(steps, lambda s: executable(wf.run_body(s)).strip() == VERIFY, "verifier")
-                runtime, body = self.runtime_body(name)
-                upload = index_of(steps, is_upload, "upload")
+        for name, job, row in self.each_job():
+            steps = build_soapy_steps(name, job)
+            self.assertTrue(steps, f"{name} has no {job} job")
+            package = index_of(steps, lambda s: "scripts/package-release.py" in executable(wf.run_body(s)),
+                               "Package", job)
+            runtime, body = self.runtime_body(name, job, row)
+            upload = index_of(steps, is_upload, "upload", job)
+            self.assertLess(package, runtime)
+            self.assertLess(runtime, upload, "a failed smoke check must stop the upload")
+            smoke = [runtime, upload]
+            verify_line = f"python3 scripts/check-soapy-release.py {row['artifact']}.tar.gz"
+            if row["host_verify"]:
+                host = index_of(steps, lambda s: executable(wf.run_body(s)).strip() == verify_line,
+                                "verifier", job)
                 self.assertLess(package, host)
                 self.assertLess(host, runtime)
-                self.assertLess(runtime, upload, "a failed smoke check must stop the upload")
-                for step in (steps[host], steps[runtime], steps[upload]):
-                    self.assertIsNone(wf.field(step, "if"), "no smoke step may be skipped")
-                    self.assertIsNone(wf.field(step, "continue-on-error"))
+                smoke.insert(0, host)
+            else:
+                outside = [i for i, s in enumerate(steps)
+                           if "check-soapy-release.py" in executable(wf.run_body(s))
+                           and "docker run" not in executable(wf.run_body(s))]
+                self.assertEqual(outside, [], f"{job} verifies only inside the clean runtime")
+            for i in smoke:
+                self.assertIsNone(wf.field(steps[i], "if"), "no smoke step may be skipped")
+                self.assertIsNone(wf.field(steps[i], "continue-on-error"))
 
     def test_runtime_container_sees_only_the_archive_and_verifier_read_only(self):
-        for name in RELEASE_WORKFLOWS:
-            with self.subTest(workflow=name):
-                _, body = self.runtime_body(name)
-                self.assertIn("ubuntu:24.04", body)
-                mounts = re.findall(r"-v \"([^\"]+)\"", body)
-                self.assertEqual(sorted(mounts), sorted([
-                    f"$PWD/{ARTIFACT}.tar.gz:/release/{ARTIFACT}.tar.gz:ro",
-                    "$PWD/scripts/check-soapy-release.py:/release/check-soapy-release.py:ro",
-                ]))
-                for forbidden in ("--privileged", "--device", "-p ", "--volume", "$HOME", ".cargo",
-                                  "GITHUB_TOKEN", "--env", " -e "):
-                    self.assertNotIn(forbidden, body)
+        for name, job, row in self.each_job():
+            _, body = self.runtime_body(name, job, row)
+            artifact = row["artifact"]
+            self.assertIn(row["runtime"], body)
+            mounts = re.findall(r"-v \"([^\"]+)\"", body)
+            self.assertEqual(sorted(mounts), sorted([
+                f"$PWD/{artifact}.tar.gz:/release/{artifact}.tar.gz:ro",
+                "$PWD/scripts/check-soapy-release.py:/release/check-soapy-release.py:ro",
+            ]))
+            for forbidden in ("--privileged", "--device", "-p ", "--volume", "$HOME", ".cargo",
+                              "GITHUB_TOKEN", "--env", " -e "):
+                self.assertNotIn(forbidden, body)
 
     def test_runtime_container_checks_the_missing_library_then_the_installed_one(self):
-        for name in RELEASE_WORKFLOWS:
-            with self.subTest(workflow=name):
-                _, body = self.runtime_body(name)
-                missing = body.index(f"check-soapy-release.py --expect-missing-soapy-library /release/{ARTIFACT}.tar.gz")
-                install = body.index("libsoapysdr0.8 ")
-                guard = body.index("command -v cargo || command -v rustc")
-                dev_guard = body.index("dpkg-query")
-                final = body.index(f"check-soapy-release.py /release/{ARTIFACT}.tar.gz")
-                self.assertLess(missing, install, "the missing-library check must run before the install")
-                self.assertLess(install, guard)
-                self.assertLess(guard, final)
-                self.assertLess(dev_guard, final)
-                installs = re.findall(r"apt-get install ([^\n]*)", body)
-                self.assertEqual(len(installs), 2)
-                packages = set()
-                for line in installs:
-                    self.assertIn("--no-install-recommends", line)
-                    packages |= {w for w in line.split() if not w.startswith("-")}
-                self.assertEqual(packages, {"python3", "libasound2t64", "libsoapysdr0.8",
-                                            "soapysdr0.8-module-rtlsdr", "soapysdr0.8-module-airspy",
-                                            "soapysdr0.8-module-hackrf"})
-                for word in ("cargo install", "rustup", "rustc ", "build-essential", "gcc"):
-                    self.assertNotIn(word, body.replace("command -v rustc", ""))
+        for name, job, row in self.each_job():
+            _, body = self.runtime_body(name, job, row)
+            artifact = row["artifact"]
+            missing = body.index(f"check-soapy-release.py --expect-missing-soapy-library /release/{artifact}.tar.gz")
+            install = body.index("libsoapysdr0.8 ")
+            guard = body.index("command -v cargo || command -v rustc")
+            dev_guard = body.index("dpkg-query")
+            final = body.index(f"check-soapy-release.py /release/{artifact}.tar.gz")
+            self.assertLess(missing, install, "the missing-library check must run before the install")
+            self.assertLess(install, guard)
+            self.assertLess(guard, final)
+            self.assertLess(dev_guard, final)
+            installs = re.findall(r"apt-get install ([^\n]*)", body)
+            self.assertEqual(len(installs), 2)
+            packages = set()
+            for line in installs:
+                self.assertIn("--no-install-recommends", line)
+                packages |= {w for w in line.split() if not w.startswith("-")}
+            self.assertEqual(packages, {"python3", row["alsa"], "libsoapysdr0.8",
+                                        "soapysdr0.8-module-rtlsdr", "soapysdr0.8-module-airspy",
+                                        "soapysdr0.8-module-hackrf"})
+            for word in ("cargo install", "rustup", "rustc ", "build-essential", "gcc"):
+                self.assertNotIn(word, body.replace("command -v rustc", ""))
 
     def test_real_library_soapy_tests_run_with_the_release_features(self):
         for name in RELEASE_WORKFLOWS:
-            with self.subTest(workflow=name):
+            with self.subTest(workflow=name, job="build-soapy"):
                 bodies = [executable(wf.run_body(s)) for s in build_soapy_steps(name)]
-                self.assertIn("cargo test --release --locked -p manta-input --features soapy "
-                              "--lib soapy::tests", [b.strip() for b in bodies])
+                self.assertIn(SOAPY_TEST, [b.strip() for b in bodies])
+            with self.subTest(workflow=name, job="build-soapy-arm64"):
+                # MAN-539: inside the Debian bookworm build container, against bookworm's library.
+                bodies = [executable(wf.run_body(s)) for s in build_soapy_steps(name, "build-soapy-arm64")]
+                builds = [b for b in bodies if "rust:1-slim-bookworm" in b]
+                self.assertEqual(len(builds), 1, "build-soapy-arm64 has one bookworm build container")
+                self.assertIn(SOAPY_TEST, [line.strip() for line in builds[0].splitlines()])
 
     def test_verifier_runs_the_extracted_archive_not_the_build_tree(self):
         with open(VERIFIER, encoding="utf-8") as f:
@@ -363,6 +543,52 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertNotIn("target/", code)
         self.assertNotIn("cargo", code.replace("Cargo", ""))
         self.assertIn("tempfile.TemporaryDirectory", code)
+
+
+def is_build_push(step):
+    return (wf.field(step, "uses") or "").startswith("docker/build-push-action@")
+
+
+def with_field(step, key):
+    block = wf.sub(step, "with")
+    return wf.field(block, key) if block else None
+
+
+class ImageCheckWiringTests(unittest.TestCase):
+    """MAN-539: each Docker job builds and checks the arm64 image before the multi-platform push."""
+
+    def test_each_docker_job_checks_the_arm64_image_before_the_push(self):
+        for name in RELEASE_WORKFLOWS:
+            for job in IMAGE_JOBS:
+                with self.subTest(workflow=name, job=job):
+                    steps = wf.steps(wf.job_block(wf.read(name), job))
+                    self.assertTrue(steps, f"{name} has no {job} job")
+                    smoke = index_of(steps, lambda s: is_build_push(s)
+                                     and with_field(s, "platforms") == CHECK_PLATFORM, "arm64 image build", job)
+                    check = index_of(steps, lambda s: executable(wf.run_body(s)).strip() == IMAGE_VERIFY,
+                                     "image check", job)
+                    push = index_of(steps, lambda s: is_build_push(s)
+                                    and with_field(s, "platforms") == THREE_PLATFORMS, "multi-platform build", job)
+                    self.assertLess(smoke, check)
+                    self.assertLess(check, push, "the image must be checked before anything is pushed")
+                    self.assertEqual(with_field(steps[smoke], "load"), "true")
+                    self.assertEqual(with_field(steps[smoke], "tags"), CHECK_IMAGE)
+                    self.assertIsNone(with_field(steps[smoke], "push"))
+                    self.assertEqual(wf.field(steps[smoke], "uses"), wf.field(steps[push], "uses"),
+                                     "the check build pins the same action as the push")
+                    for i in (smoke, check):
+                        # A publish=false dispatch still checks the image.
+                        self.assertIsNone(wf.field(steps[i], "if"))
+                        self.assertIsNone(wf.field(steps[i], "continue-on-error"))
+                    self.assertEqual(len([s for s in steps if is_build_push(s)]), 2)
+
+    def test_image_jobs_still_do_not_wait_for_the_archive_jobs(self):
+        # MAN-298, MAN-82 D5: the image jobs need only validate-tag and build.
+        for name in RELEASE_WORKFLOWS:
+            text = wf.read(name)
+            for job in IMAGE_JOBS:
+                with self.subTest(workflow=name, job=job):
+                    self.assertEqual(wf.field(wf.job_block(text, job), "needs"), "[validate-tag, build]")
 
 
 class CiWiringTests(unittest.TestCase):

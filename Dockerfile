@@ -5,9 +5,13 @@
 # lib in a slim runtime image.
 #
 # HPSDR is included in every build (pure UDP/std, no native radio library).
-# This uses the default features, matching the native release binaries
-# (.github/workflows/release-publish.yml).
-# `soapy` is deliberately excluded -- see that workflow's comment for why.
+# The image also has SoapySDR (MAN-539): the builder links Debian's
+# `libsoapysdr-dev`, and the runtime installs `libsoapysdr0.8` and the
+# RTL-SDR, Airspy and HackRF modules, so the binary starts and those
+# receivers open. The native release archives keep default features;
+# SoapySDR has its own archives (.github/workflows/release-publish.yml,
+# `build-soapy` and `build-soapy-arm64`). Both Docker jobs there check the
+# arm64 image's SoapySDR input before the multi-platform push.
 #
 # Built for linux/amd64, linux/arm64 and linux/arm/v7 (32-bit Raspberry Pi
 # OS) via `docker buildx build --platform
@@ -33,21 +37,31 @@ FROM rust:1-slim-bookworm AS builder
 # 'git fetch ...' (never executed) / No such file or directory (os error 2)`,
 # and `cargo build` exits 101 before compiling a single crate (PR #65
 # docker-build failure, MAN-48).
+# `libsoapysdr-dev` is the link-time SoapySDR library for `--features soapy`
+# (MAN-539); device modules are runtime packages, installed below.
 RUN apt-get update && apt-get install --no-install-recommends -y \
     libasound2-dev \
     pkg-config \
     git \
+    libsoapysdr-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 COPY . .
-RUN cargo build --release -p manta-cli
+RUN cargo build --release -p manta-cli --features soapy
 
 FROM debian:bookworm-slim
 
+# MAN-539: the binary links libSoapySDR, so it cannot start without
+# `libsoapysdr0.8`. The modules open RTL-SDR, Airspy R2/Mini and HackRF
+# receivers; SDRplay needs the vendor's API, which Debian does not package.
 RUN apt-get update && apt-get install --no-install-recommends -y \
     libasound2 \
     ca-certificates \
+    libsoapysdr0.8 \
+    soapysdr0.8-module-rtlsdr \
+    soapysdr0.8-module-airspy \
+    soapysdr0.8-module-hackrf \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --home-dir /home/manta manta
 

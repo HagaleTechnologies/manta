@@ -87,8 +87,8 @@ manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp, copp
         │            │        ├──▶ manta-decode
         │            │        └──▶ manta-spot ──────▶ manta-decode
         ├──────────────────▶ manta-server ──▶ manta-spot
-        └──────────────────▶ manta-decode, manta-input, manta-spot,
-                             manta-testkit, coppa-audio
+        └──────────────────▶ manta-decode, manta-dsp, manta-input,
+                             manta-spot, manta-testkit, coppa-audio
 manta-testkit ──▶ manta-dsp, manta-decode, manta-input, coppa-channel
 manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
@@ -99,8 +99,29 @@ and `manta-testkit → coppa-channel` (Watterson fading, see the M1
 pinned-decisions doc).
 
 The graph shows `[dependencies]` only; dev-only edges (for example
-`manta-cli → manta-dsp` and `manta-engine → manta-testkit`) are test
+`manta-cli → coppa-channel` and `manta-engine → manta-testkit`) are test
 fixtures and left out.
+
+Inside `manta-cli`, `src/main.rs` holds the clap tree (`Cli`, `enum Command`)
+and the dispatch in `run_command`. MAN-548 moved each piece of the daemon's
+wiring into its own module
+([decision record](docs/DECISIONS/2026-11-08-man548-main-rs-split.md)):
+
+- `run_cmd.rs`: `RunArgs` (the `run`/`listen` flags) and `run`, the daemon.
+- `source_spec.rs`: `LiveSourceSpec`, source opening and the source warnings.
+- `recording.rs`: `--record-iq` checks, start, finish and report.
+- `cli_parse.rs`: the clap `value_parser` functions and their ranges.
+- `session_epoch.rs`: the session epoch and spot-id nonce for replays.
+- `resolve.rs`: `CliOverrides`, `Resolved`, `resolve` and `spec_from_file`.
+- `daemon_client.rs`: `manta status`'s client and the `http_get` that
+  `manta health` shares.
+- `spot_server.rs`: `start_spot_server` and its `SpotServerParams`.
+
+Unit tests do not sit inline in these files. Each module's tests are in
+`src/<module>/tests.rs`, the tests of what stays in `main.rs` are in
+`src/tests.rs`, and fixtures that two or more of them share are in
+`src/test_support.rs`. `crates/manta-cli/tests/module_layout.rs` checks this
+layout.
 
 ### Reused from coppa vs. new
 
@@ -135,7 +156,10 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
-  native SoapySDR library (CI, contributors without hardware).
+  native SoapySDR library (CI, contributors without hardware). In `manta-cli`,
+  `soapy_opts` is the one module that names the feature: its `SoapyArgs` flags
+  exist only in a `soapy` build, and the `SoapyOpts` settings exist in every
+  build (MAN-550).
 - **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
   (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
@@ -403,7 +427,10 @@ Per track, operating on the ~375 Hz complex channel stream:
    the classification/likelihood consumers that want it), tracked with EMA.
    Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
    inter-element and inter-word gap
-   thresholds (dit's speed-detector lesson).
+   thresholds (dit's speed-detector lesson). An optional bank of up to three
+   speed hypotheses (MAN-544, `timing::bank`, off by default) can replace
+   the tracker after a speed step or a mis-locked opening (legacy and
+   edge-legacy engines).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
    the Morse code tree** — small-Viterbi rather than hard thresholding, so a
@@ -502,7 +529,11 @@ transmission may never produce again).
    The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
    `+` means at least two calls share that pattern; a plain entry means one.
    `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
-   does not change the pattern table. CW operators repeat their calls;
+   does not change the pattern table. With `[spot].pattern_url` set and
+   `refresh_lists` on, `run` from a live receiver downloads a replacement
+   (manta's format or RBN's `Patt3Ch.lst`) every 7 days and swaps it in
+   through the third `ReferenceLists` cell (MAN-542,
+   `docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md`). CW operators repeat their calls;
    single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
@@ -1261,7 +1292,8 @@ non-blocking send plus shared atomics and short locks between them.
   the KiwiSDR connect, the list refresher's DNS lookup); and two background
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
-  `ReferenceLists`). The decode thread picks those up before it feeds the
+  `ReferenceLists`, whose three cells hold `cty.dat`, `MASTER.SCP` and the
+  callsign-pattern list). The decode thread picks those up before it feeds the
   validator its next event. `manta-lookup` (`[callsign_lookup]`, MAN-318)
   does QRZ.com's HTTPS requests and hands answers back through a channel
   the decode thread polls once per batch, never waiting on it; only after
@@ -1328,6 +1360,9 @@ beside the one validator (`SharedRefine`). The pass's clock is its owner's
 stream position, never a batch event's timestamp. Input gaps clear retention
 (only the gapped input's tracks on the multi-input path); closed tracks lose
 their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
+The ceiling evicts the oldest ring front from an ordered index and keeps a
+running count, so recording costs O(log tracks), not a scan of every ring
+([MAN-525](docs/DECISIONS/2026-11-08-man525-refine-bookkeeping-cost.md)).
 
 `validator → refinement candidates → retained hops → scratch TrackDecoder →
 Validator::apply_refinement → spot sink` is a feedback path over preserved

@@ -273,9 +273,111 @@ pub fn key_text_loop(
     Ok((env, keyed.trim().to_string()))
 }
 
+/// MAN-544: a keyed transmission whose sender changes speed between
+/// segments. `steps[i]` is the first sample of segment `i + 1` (its first
+/// nonzero sample); `texts[i]` is segment `i`'s keyed text.
+#[derive(Debug, Clone)]
+pub struct KeyedSteps {
+    pub env: Vec<f32>,
+    pub steps: Vec<usize>,
+    pub texts: Vec<String>,
+}
+
+/// MAN-544: keyed speed steps. Each segment is `key_text_loop(text, spec,
+/// fs, secs)`. A join trims the previous segment's trailing exact-zero
+/// samples (the raised-cosine fall sits inside the element, so no edge is
+/// cut) and the next segment's leading exact-zero samples, then inserts one
+/// character gap of the NEXT segment's own timing (`char_gap_units` x its
+/// gap unit, Farnsworth included), so no word gap hides the step.
+pub fn key_text_steps(text: &str, segments: &[(KeyerSpec, f64)], fs: f64) -> Result<KeyedSteps> {
+    if segments.is_empty() {
+        bail!("key_text_steps needs at least one segment");
+    }
+    let mut env: Vec<f32> = Vec::new();
+    let mut steps = Vec::with_capacity(segments.len() - 1);
+    let mut texts = Vec::with_capacity(segments.len());
+    for (i, (spec, secs)) in segments.iter().enumerate() {
+        let (seg, keyed) = key_text_loop(text, spec, fs, *secs)?;
+        if i == 0 {
+            env.extend_from_slice(&seg);
+        } else {
+            let last = env.iter().rposition(|&v| v != 0.0).map_or(0, |p| p + 1);
+            env.truncate(last);
+            let (_, gap_unit) = units_ms(spec.wpm, spec.char_wpm);
+            let join = (spec.char_gap_units as f64 * gap_unit * fs / 1000.0).round() as usize;
+            env.resize(env.len() + join, 0.0);
+            let first = seg.iter().position(|&v| v != 0.0).unwrap_or(seg.len());
+            steps.push(env.len());
+            env.extend_from_slice(&seg[first..]);
+        }
+        texts.push(keyed);
+    }
+    Ok(KeyedSteps { env, steps, texts })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn last_nonzero(env: &[f32]) -> usize {
+        env.iter().rposition(|&v| v != 0.0).expect("a mark")
+    }
+
+    #[test]
+    fn key_text_steps_joins_with_the_next_segments_char_gap() {
+        let a = KeyerSpec::new(20.0);
+        let b = KeyerSpec::new(32.0);
+        let k = key_text_steps("CQ TEST W1AW", &[(a, 16.0), (b, 60.0)], 96_000.0).unwrap();
+        assert_eq!(k.steps.len(), 1);
+        // The samples before the step end in silence one 32 WPM char gap
+        // long (within one sample of rounding): exact zeros after the last
+        // nonzero sample.
+        let gap = k.steps[0] - last_nonzero(&k.env[..k.steps[0]]) - 1;
+        assert!(
+            gap.abs_diff((3.0 * 37.5e-3 * 96_000.0f64).round() as usize) <= 1,
+            "{gap}"
+        );
+        assert!(k.env[k.steps[0]] > 0.0, "segment 2 starts with a mark");
+        assert_eq!(k.texts.len(), 2);
+        assert!(k.texts[1].starts_with("CQ TEST W1AW"), "{}", k.texts[1]);
+    }
+
+    #[test]
+    fn key_text_steps_is_deterministic_and_matches_key_text_loop_per_segment() {
+        let a = KeyerSpec::new(25.0);
+        let b = KeyerSpec::new(40.0);
+        let segs = [(a, 6.0), (b, 8.0)];
+        let k1 = key_text_steps("CQ K", &segs, FS).unwrap();
+        let k2 = key_text_steps("CQ K", &segs, FS).unwrap();
+        assert_eq!(k1.env, k2.env);
+        assert_eq!(k1.steps, k2.steps);
+        let (seg2, text2) = key_text_loop("CQ K", &b, FS, 8.0).unwrap();
+        let first = seg2.iter().position(|&v| v != 0.0).unwrap();
+        assert_eq!(&k1.env[k1.steps[0]..], &seg2[first..]);
+        assert_eq!(k1.texts[1], text2);
+        let (seg1, _) = key_text_loop("CQ K", &a, FS, 6.0).unwrap();
+        let end1 = last_nonzero(&seg1) + 1;
+        assert_eq!(&k1.env[..end1], &seg1[..end1]);
+    }
+
+    #[test]
+    fn key_text_steps_uses_the_farnsworth_gap_unit_at_the_join() {
+        // Ticket scene: content at 32 WPM (37.5 ms), gap unit 40 ms.
+        let wpm = (60_000.0 / (31.0 * 37.5 + 19.0 * 40.0)) as f32;
+        let b = KeyerSpec {
+            char_wpm: Some(32.0),
+            ..KeyerSpec::new(wpm)
+        };
+        let (_, gap_unit) = units_ms(b.wpm, b.char_wpm);
+        assert!((gap_unit - 40.0).abs() < 1e-3, "{gap_unit}");
+        let k =
+            key_text_steps("CQ TEST W1AW", &[(KeyerSpec::new(20.0), 6.0), (b, 6.0)], FS).unwrap();
+        let gap = k.steps[0] - last_nonzero(&k.env[..k.steps[0]]) - 1;
+        assert!(
+            gap.abs_diff((0.120 * FS).round() as usize) <= 1,
+            "join {gap} samples, expected 120 ms"
+        );
+    }
 
     const FS: f64 = 96_000.0;
 

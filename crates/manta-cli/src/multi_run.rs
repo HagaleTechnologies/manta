@@ -12,8 +12,8 @@
 use crate::reconnect::{InputHealthTotals, ReconnectingSource};
 use crate::stdio::errln;
 use crate::{
-    fmt, logging, text_lines, wrap_file_replay, LiveSourceSpec, ReplayMode, ResolvedInput,
-    RunLists, SpotResolved,
+    fmt, logging, resolve::wrap_file_replay, resolve::ReplayMode, resolve::ResolvedInput,
+    resolve::SpotResolved, source_spec::LiveSourceSpec, text_lines, RunLists,
 };
 use anyhow::{bail, Result};
 use manta_engine::{InputSpec, PipelineConfig, RttyObserver, SessionClock, SharedObservers};
@@ -53,9 +53,9 @@ impl Drop for UnwindRecordings {
         if handles.is_empty() {
             return;
         }
-        let deadline = crate::close_recordings(&handles);
+        let deadline = crate::recording::close_recordings(&handles);
         for handle in handles {
-            crate::discard_empty_recording(handle, deadline);
+            crate::recording::discard_empty_recording(handle, deadline);
         }
     }
 }
@@ -90,7 +90,7 @@ pub(crate) struct MultiRun<'a> {
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct ReloadSetup {
     pub config_path: Option<std::path::PathBuf>,
-    pub cli: crate::CliOverrides,
+    pub cli: crate::resolve::CliOverrides,
     pub cli_engine: Option<manta_decode::decoder::Engine>,
     pub vars: Vec<(std::ffi::OsString, std::ffi::OsString)>,
     pub startup_raw: toml::Table,
@@ -102,7 +102,7 @@ pub(crate) struct ServerSetup {
     pub rbn_uplink: Vec<manta_server::config::RbnUplinkConfig>,
     pub rbn_compare: Option<manta_server::config::RbnCompareConfig>,
     /// MAN-320: the relay blocks, run like the single-input path's.
-    pub relays: crate::RelayConfigs,
+    pub relays: crate::spot_server::RelayConfigs,
     /// MAN-142: `[pskreporter]` and `[[wsjtx_output]]`, run like the
     /// single-input path's.
     pub outputs: crate::spot_outputs::SpotOutputs,
@@ -114,7 +114,7 @@ pub(crate) struct ServerSetup {
 fn replay_nonce(paths: &[&std::path::Path]) -> Result<u128> {
     let mut nonce: u128 = 0;
     for path in paths {
-        nonce = nonce.rotate_left(1) ^ crate::session_nonce_for_replay_path(path)?;
+        nonce = nonce.rotate_left(1) ^ crate::session_epoch::session_nonce_for_replay_path(path)?;
     }
     Ok(nonce)
 }
@@ -652,10 +652,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     let ftx_epoch = if digital_modes.is_empty() {
                         None
                     } else {
-                        Some(crate::resolve_ftx_epoch(&ftx_spec, replay_epoch, acquired_at)?)
+                        Some(crate::session_epoch::resolve_ftx_epoch(&ftx_spec, replay_epoch, acquired_at)?)
                     };
                     let start = if record_iq.is_some() {
-                        Some(crate::resolve_epoch(session_file.as_deref(), replay_epoch)?)
+                        Some(crate::session_epoch::resolve_epoch(session_file.as_deref(), replay_epoch)?)
                     } else {
                         None
                     };
@@ -667,7 +667,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                 path.display()
                             );
                         };
-                        let (src, handle) = crate::start_input_recording(
+                        let (src, handle) = crate::recording::start_input_recording(
                             src,
                             path,
                             start.expect("recording epoch"),
@@ -715,7 +715,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         if let Some((lo, hi)) = input.trusted_band_hz.map(|_| input.rf_passband_hz) {
             tracing::info!(
                 "{}",
-                crate::trusted_band_notice(input.sample_rate_hz, lo, hi)
+                crate::source_spec::trusted_band_notice(input.sample_rate_hz, lo, hi)
             );
         }
         // MAN-310: a split band plan's stream starts tracks only on its
@@ -769,7 +769,10 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 (epoch, nonce)
             } else {
                 (
-                    crate::resolve_epoch(files.first().copied(), setup.replay_epoch)?,
+                    crate::session_epoch::resolve_epoch(
+                        files.first().copied(),
+                        setup.replay_epoch,
+                    )?,
                     replay_nonce(&files)?,
                 )
             };
@@ -788,26 +791,27 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             let factor = manta_spot::calibration_factor_from_ppm(m.inputs[0].freq_correction_ppm)
                 .map_err(|e| anyhow::anyhow!(e))?;
             let silent_window = setup.cfg.silent_input_window();
-            let (rt, server) = crate::start_spot_server(
-                setup.cfg,
-                setup.rbn_uplink,
-                setup.rbn_compare,
-                crate::SourceInfo {
-                    name: &label,
-                    sample_rate_hz: opened.common_rate_hz(),
-                    dial_freq_hz: first.center_freq_hz,
-                    rf_passband_hz: first.rf_passband_hz,
-                    freq_calibration: factor,
-                    coverage: &coverage,
-                    inputs: Some(&names),
-                },
-                epoch,
-                nonce,
-                lists.clone(),
-                m.cfg,
-                setup.relays,
-                setup.outputs,
-            )?;
+            let (rt, server) =
+                crate::spot_server::start_spot_server(crate::spot_server::SpotServerParams {
+                    cfg: setup.cfg,
+                    rbn_uplink_cfgs: setup.rbn_uplink,
+                    rbn_compare_cfg: setup.rbn_compare,
+                    source: crate::spot_server::SourceInfo {
+                        name: &label,
+                        sample_rate_hz: opened.common_rate_hz(),
+                        dial_freq_hz: first.center_freq_hz,
+                        rf_passband_hz: first.rf_passband_hz,
+                        freq_calibration: factor,
+                        coverage: &coverage,
+                        inputs: Some(&names),
+                    },
+                    epoch,
+                    session_nonce: nonce,
+                    lists: lists.clone(),
+                    pipeline: m.cfg,
+                    relays: setup.relays,
+                    outputs: setup.outputs,
+                })?;
             // MAN-324: one `bandState` per input per stream second, each
             // naming its input; track and decision records as with one.
             if server.live_addr.is_some() {
@@ -888,7 +892,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 // MAN-234: every input's bad-sample series exists from the
                 // first scrape, as the one-input path publishes it.
                 server.metrics.set_input_bad_samples(name, 0);
-                crate::publish_conditioned(
+                crate::run_cmd::publish_conditioned(
                     &server.metrics,
                     name,
                     &m.inputs[index].conditioning,
@@ -1046,8 +1050,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 server.metrics.record_spot(spot);
                 hearing.record(&server.metrics, &names, spot);
                 let cty = server.lists.cty.load();
-                if crate::geography_is_unresolved(&cty, &spot.callsign)
-                    || crate::station_geography_unresolved(&cty, &server.station_callsign)
+                if manta_server::spot_message::geography_is_unresolved(&cty, &spot.callsign)
+                    || manta_server::spot_message::station_geography_unresolved(
+                        &cty,
+                        &server.station_callsign,
+                    )
                 {
                     server.metrics.record_unresolved_geography();
                 }
@@ -1086,7 +1093,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             if let Some((_, server)) = &server {
                 server.metrics.set_input_bad_samples(&names[input], n_bad);
-                crate::publish_conditioned(
+                crate::run_cmd::publish_conditioned(
                     &server.metrics,
                     &names[input],
                     &m.inputs[input].conditioning,
@@ -1148,7 +1155,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     // finalize during the drain and are collected after it, by one shared
     // deadline (one failing does not stop the others).
     let handles = take_recordings(&recordings);
-    let recording_deadline = crate::close_recordings(&handles);
+    let recording_deadline = crate::recording::close_recordings(&handles);
     for thread in spectrum_threads {
         let _ = thread.join();
     }
@@ -1171,7 +1178,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         crate::signal_spot_server_shutdown(&rt, &server);
         crate::shutdown_runtime_after_drain(rt, &server.tasks);
     }
-    let recording_result = crate::finish_recordings(handles, recording_deadline);
+    let recording_result = crate::recording::finish_recordings(handles, recording_deadline);
     if let Some(failed) = ends.iter().find(|e| e.result.is_err()) {
         let e = failed.result.as_ref().err().map(|e| format!("{e:#}"));
         bail!(
@@ -1246,7 +1253,7 @@ mod tests {
         let b = dir.path().join("b.wav");
         std::fs::write(&a, b"first recording").unwrap();
         std::fs::write(&b, b"second recording").unwrap();
-        let one = crate::session_nonce_for_replay_path(&a).unwrap();
+        let one = crate::session_epoch::session_nonce_for_replay_path(&a).unwrap();
         assert_eq!(replay_nonce(&[&a]).unwrap(), one);
         let ab = replay_nonce(&[&a, &b]).unwrap();
         assert_eq!(ab, replay_nonce(&[&a, &b]).unwrap());

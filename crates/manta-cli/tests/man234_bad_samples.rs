@@ -14,11 +14,15 @@
 //! report `NO_SIGNAL`. Clean: `decode` exit 0, `run --json` 75 lines,
 //! `doctor` `WEAK_NO_DECODE`.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::free_ports;
+
 use manta_testkit::vectors::{self, VectorSpec};
 use num_complex::Complex32;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
@@ -84,7 +88,7 @@ fn write_fixtures(dir: &Path) -> Vec<(&'static str, PathBuf)> {
 }
 
 fn manta(args: &[&str], wav: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_manta"))
+    launch::manta()
         .args(args)
         .arg(wav)
         .output()
@@ -275,14 +279,6 @@ fn check_still_rejects_nonfinite_input() {
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(1), "stderr:\n{stderr}");
     assert!(stderr.contains("nonfinite input sample"), "{stderr}");
-}
-
-/// `N` distinct ports nothing listens on right now. All `N` listeners are
-/// held until every port is read (MAN-371), as `node_health_acceptance.rs`
-/// does.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// Kills and reaps the daemon child on drop, including on a failing assert.

@@ -5,6 +5,8 @@
 //!   Scenario: A week-old cty.dat is refreshed without a restart
 //!   Scenario: An unreachable SCP server keeps the last good copy
 //!   Scenario: A fresh install without network runs on the bundled lists
+//!   MAN-542 Scenario: The pattern list refreshes with the others
+//!   MAN-542 Scenario: No URL means no download
 //!
 //! plus file-replay determinism (a replay never downloads or reads the
 //! cache) and `--cty-sha256`/`cty_sha256` pins.
@@ -61,6 +63,28 @@ fn bundled_cty() -> &'static [u8] {
 
 fn bundled_scp() -> &'static [u8] {
     manta_spot::MASTER_SCP.as_bytes()
+}
+
+/// MAN-542.
+fn bundled_patterns() -> &'static [u8] {
+    manta_spot::PATTERNS_LST.as_bytes()
+}
+
+/// MAN-542: the bundled pattern list in RBN's Skimmer style (CRLF,
+/// `+ PATTERN` or two spaces and `PATTERN`), plus `+ QQ9@@@` and two lines
+/// no admitted call can match: 6,037 patterns, 2 skipped.
+fn skimmer_patterns_with_qq9() -> Vec<u8> {
+    let mut out: String = manta_spot::PATTERNS_LST
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| match line.strip_prefix('+') {
+            Some(pattern) => format!("+ {pattern}\r\n"),
+            None => format!("  {line}\r\n"),
+        })
+        .collect();
+    out.push_str("+ QQ9@@@\r\n  3E5##@@@\r\n  A2#@\r\n");
+    out.into_bytes()
 }
 
 /// The bundled cty.dat plus the QQ9 entity: a valid, newer download.
@@ -158,6 +182,7 @@ fn vendored_retrieved_at(list: &str) -> Option<SystemTime> {
     match list {
         "cty" => manta_spot::vintage::cty_dat_retrieved_at(),
         "scp" => manta_spot::vintage::master_scp_retrieved_at(),
+        "patterns" => manta_spot::vintage::patterns_lst_generated_at(),
         other => panic!("no list {other:?}"),
     }
 }
@@ -203,19 +228,34 @@ fn seed_cache(
     path
 }
 
-/// A plain-HTTP list server on an ephemeral port: `/cty.dat` and
-/// `/MASTER.SCP` with `Content-Length`, `Last-Modified` and
-/// `Connection: close`, 404 for anything else. Counts every connection and
-/// every request per list.
+/// A plain-HTTP list server on an ephemeral port: `/cty.dat`,
+/// `/MASTER.SCP` and (MAN-542) `/Patt3Ch.lst` with `Content-Length`,
+/// `Last-Modified` and `Connection: close`, 404 for anything else. Counts
+/// every connection and every request per list.
 struct ListServer {
     port: u16,
     connections: Arc<AtomicUsize>,
     cty_hits: Arc<AtomicUsize>,
     scp_hits: Arc<AtomicUsize>,
+    pattern_hits: Arc<AtomicUsize>,
+}
+
+/// The bodies a [`ListServer`] serves, and its per-list request counters.
+struct Served {
+    cty: Vec<u8>,
+    scp: Vec<u8>,
+    patterns: Vec<u8>,
+    cty_hits: Arc<AtomicUsize>,
+    scp_hits: Arc<AtomicUsize>,
+    pattern_hits: Arc<AtomicUsize>,
 }
 
 impl ListServer {
     fn start(cty: Vec<u8>, scp: Vec<u8>) -> ListServer {
+        ListServer::start_with_patterns(cty, scp, bundled_patterns().to_vec())
+    }
+
+    fn start_with_patterns(cty: Vec<u8>, scp: Vec<u8>, patterns: Vec<u8>) -> ListServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server = ListServer {
@@ -223,22 +263,25 @@ impl ListServer {
             connections: Arc::default(),
             cty_hits: Arc::default(),
             scp_hits: Arc::default(),
+            pattern_hits: Arc::default(),
         };
-        let (connections, cty_hits, scp_hits) = (
-            server.connections.clone(),
-            server.cty_hits.clone(),
-            server.scp_hits.clone(),
-        );
-        let lists = Arc::new((cty, scp));
+        let connections = server.connections.clone();
+        let served = Arc::new(Served {
+            cty,
+            scp,
+            patterns,
+            cty_hits: server.cty_hits.clone(),
+            scp_hits: server.scp_hits.clone(),
+            pattern_hits: server.pattern_hits.clone(),
+        });
         // Never joined: it blocks in `accept` until the test binary exits.
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 connections.fetch_add(1, Ordering::SeqCst);
-                let (lists, cty_hits, scp_hits) =
-                    (lists.clone(), cty_hits.clone(), scp_hits.clone());
+                let served = served.clone();
                 std::thread::spawn(move || {
-                    let _ = serve_one(stream, &lists, &cty_hits, &scp_hits);
+                    let _ = serve_one(stream, &served);
                 });
             }
         });
@@ -250,12 +293,7 @@ impl ListServer {
     }
 }
 
-fn serve_one(
-    mut stream: TcpStream,
-    lists: &(Vec<u8>, Vec<u8>),
-    cty_hits: &AtomicUsize,
-    scp_hits: &AtomicUsize,
-) -> std::io::Result<()> {
+fn serve_one(mut stream: TcpStream, served: &Served) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
@@ -269,12 +307,16 @@ fn serve_one(
     let path = head.split_whitespace().nth(1).unwrap_or("");
     let body = match path {
         "/cty.dat" => {
-            cty_hits.fetch_add(1, Ordering::SeqCst);
-            Some(&lists.0)
+            served.cty_hits.fetch_add(1, Ordering::SeqCst);
+            Some(&served.cty)
         }
         "/MASTER.SCP" => {
-            scp_hits.fetch_add(1, Ordering::SeqCst);
-            Some(&lists.1)
+            served.scp_hits.fetch_add(1, Ordering::SeqCst);
+            Some(&served.scp)
+        }
+        "/Patt3Ch.lst" => {
+            served.pattern_hits.fetch_add(1, Ordering::SeqCst);
+            Some(&served.patterns)
         }
         _ => None,
     };
@@ -593,9 +635,13 @@ fn scenario_1_a_week_old_cty_is_refreshed_without_a_restart() {
     let mut daemon = Live::start(dir.path(), &refresh_spot_toml(&cache, &cty_url, &scp_url));
     let pid = daemon.child.0.id();
     daemon.log.wait_for(
-        &[&format!(
-            "lists: cty from the cache (sha256 {bundled_cty_sha}, downloaded "
-        )],
+        &[
+            &format!("lists: cty from the cache (sha256 {bundled_cty_sha}, downloaded "),
+            &format!(
+                "; patterns built in (sha256 {})",
+                sha256_hex(bundled_patterns())
+            ),
+        ],
         WAIT,
     );
     daemon.log.wait_for(
@@ -721,6 +767,7 @@ fn scenario_3a_a_fresh_install_without_network_runs_on_the_bundled_lists() {
     let cache = dir.path().join("cache");
     std::fs::create_dir_all(&cache).unwrap();
     let (cty_sha, scp_sha) = (sha256_hex(bundled_cty()), sha256_hex(bundled_scp()));
+    let patterns_sha = sha256_hex(bundled_patterns());
     let (_cty_socket, cty_port) = refused_source();
     let (_scp_socket, scp_port) = refused_source();
     let cty_url = format!("http://127.0.0.1:{cty_port}/cty.dat");
@@ -729,7 +776,8 @@ fn scenario_3a_a_fresh_install_without_network_runs_on_the_bundled_lists() {
     let mut daemon = Live::start(dir.path(), &refresh_spot_toml(&cache, &cty_url, &scp_url));
     daemon.log.wait_for(
         &[&format!(
-            "lists: cty built in (sha256 {cty_sha}); scp built in (sha256 {scp_sha})"
+            "lists: cty built in (sha256 {cty_sha}); scp built in (sha256 {scp_sha}); \
+             patterns built in (sha256 {patterns_sha})"
         )],
         WAIT,
     );
@@ -755,6 +803,17 @@ fn scenario_3a_a_fresh_install_without_network_runs_on_the_bundled_lists() {
     assert_eq!(
         metric_value(&body, &list_info("scp", &scp_sha, "bundled")),
         Some(1.0),
+        "{body}"
+    );
+    // MAN-542: every daemon names its pattern list; without `pattern_url`
+    // it has no refresh series.
+    assert_eq!(
+        metric_value(&body, &list_info("patterns", &patterns_sha, "bundled")),
+        Some(1.0),
+        "{body}"
+    );
+    assert!(
+        !body.contains("manta_list_refresh_total{list=\"patterns\""),
         "{body}"
     );
     daemon.assert_still_running("without a network");
@@ -843,10 +902,11 @@ fn file_replay_never_downloads_or_reads_the_cache() {
     let with_refresh = replay(Some(&config));
 
     let stderr = String::from_utf8_lossy(&with_refresh.stderr);
+    let patterns_sha = sha256_hex(bundled_patterns());
     let note = format!(
         "note: list refresh is off for file replay, so the run is repeatable; using cty built \
-         in (sha256 {cty_sha}) and scp built in (sha256 {scp_sha}); pin a downloaded copy with \
-         --cty-sha256 or --scp-sha256"
+         in (sha256 {cty_sha}), scp built in (sha256 {scp_sha}) and patterns built in (sha256 \
+         {patterns_sha}); pin a downloaded copy with --cty-sha256 or --scp-sha256"
     );
     assert!(stderr.contains(&note), "no {note:?} in stderr:\n{stderr}");
     assert!(
@@ -978,4 +1038,158 @@ fn run_with_refresh_on_and_a_pin_never_refreshes_the_pinned_list() {
         "the pinned cty.dat has refresh samples:\n{body}"
     );
     daemon.assert_still_running("with a pinned cty.dat");
+}
+
+/// MAN-542 Scenario: The pattern list refreshes with the others.
+#[test]
+fn pattern_scenario_1_the_pattern_list_refreshes_with_the_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let patterns = skimmer_patterns_with_qq9();
+    let sha = sha256_hex(&patterns);
+    let bundled_sha = sha256_hex(bundled_patterns());
+    let server = ListServer::start_with_patterns(
+        bundled_cty().to_vec(),
+        bundled_scp().to_vec(),
+        patterns.clone(),
+    );
+    let (cty_url, scp_url, pattern_url) = (
+        server.url("/cty.dat"),
+        server.url("/MASTER.SCP"),
+        server.url("/Patt3Ch.lst"),
+    );
+    // Given refresh on, `pattern_url` set and an empty cache.
+    let spot = format!(
+        "{}pattern_url = \"{pattern_url}\"\n",
+        refresh_spot_toml(&cache, &cty_url, &scp_url)
+    );
+
+    let mut daemon = Live::start(dir.path(), &spot);
+    daemon.log.wait_for(
+        &[&format!("; patterns built in (sha256 {bundled_sha})")],
+        WAIT,
+    );
+    daemon.log.wait_for(
+        &[&format!(
+            "list refresh: on; cty every 7 days from {cty_url}, scp every day from {scp_url}, \
+             patterns every 7 days from {pattern_url}; cache {}",
+            cache.display()
+        )],
+        WAIT,
+    );
+    // When the refresh runs, then the pattern list is downloaded and swapped in.
+    daemon.log.wait_for(
+        &[&format!(
+            "list refresh: patterns updated to sha256 {sha} (6037 patterns, 2 unmatchable lines \
+             skipped, Last-Modified {LAST_MODIFIED}); new spots use it now"
+        )],
+        WAIT,
+    );
+    // And `manta_list_refresh_total{list="patterns"}` counts the outcome.
+    let updated = refresh_total("patterns", "updated");
+    let info = list_info("patterns", &sha, "download");
+    let body = daemon.wait_for_metrics("the pattern update", |b| {
+        metric_value(b, &updated) == Some(1.0) && metric_value(b, &info) == Some(1.0)
+    });
+    assert_eq!(
+        metric_value(&body, &refresh_total("patterns", "failed")),
+        Some(0.0),
+        "{body}"
+    );
+    assert!(
+        body.lines()
+            .any(|l| l.starts_with("manta_list_last_success_timestamp_seconds{list=\"patterns\"}")),
+        "{body}"
+    );
+    let version = cache.join("patterns").join(format!("{sha}.lst"));
+    assert_eq!(
+        std::fs::read(&version).unwrap_or_else(|e| panic!("{}: {e}", version.display())),
+        patterns
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(cache.join("patterns/state.json")).unwrap()).unwrap();
+    assert_eq!(state["sha256"], sha.as_str(), "{state}");
+    assert_eq!(state["url"], pattern_url.as_str(), "{state}");
+    assert_eq!(server.pattern_hits.load(Ordering::SeqCst), 1);
+    daemon.assert_still_running("after the pattern refresh");
+    drop(daemon);
+
+    // A second daemon on the same cache starts from the download and does
+    // not fetch it again: the list is not due for 7 days.
+    let mut second = Live::start(dir.path(), &spot);
+    second.log.wait_for(
+        &[&format!(
+            "; patterns from the cache (sha256 {sha}, downloaded "
+        )],
+        WAIT,
+    );
+    let info = list_info("patterns", &sha, "cache");
+    second.wait_for_metrics("the cached pattern list", |b| {
+        metric_value(b, &info) == Some(1.0)
+    });
+    second.wait_for_healthy();
+    assert_eq!(server.pattern_hits.load(Ordering::SeqCst), 1);
+    second.assert_still_running("on the cached pattern list");
+}
+
+/// MAN-542 Scenario: No URL means no download.
+#[test]
+fn pattern_scenario_2_no_url_means_no_download() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let bundled_sha = sha256_hex(bundled_patterns());
+    let server = ListServer::start_with_patterns(
+        bundled_cty().to_vec(),
+        bundled_scp().to_vec(),
+        skimmer_patterns_with_qq9(),
+    );
+    let (cty_url, scp_url) = (server.url("/cty.dat"), server.url("/MASTER.SCP"));
+    // A cache holding a pattern version from a past run that had a URL.
+    let state_path = seed_cache(
+        &cache,
+        "patterns",
+        "lst",
+        &skimmer_patterns_with_qq9(),
+        &server.url("/Patt3Ch.lst"),
+        60,
+        60,
+    );
+    let seeded_state = std::fs::read(&state_path).unwrap();
+
+    let mut daemon = Live::start(dir.path(), &refresh_spot_toml(&cache, &cty_url, &scp_url));
+    daemon.log.wait_for(
+        &[&format!("; patterns built in (sha256 {bundled_sha})")],
+        WAIT,
+    );
+    let on = daemon.log.wait_for(&["list refresh: on;"], WAIT);
+    assert!(!on.contains("patterns"), "{on}");
+    // A full refresher pass: cty and scp both had no state, so both were due.
+    let body = daemon.wait_for_metrics("a cty and an scp attempt", |b| {
+        ["cty", "scp"].iter().all(|list| {
+            ["updated", "unchanged", "failed"]
+                .iter()
+                .map(|o| metric_value(b, &refresh_total(list, o)).unwrap_or(0.0))
+                .sum::<f64>()
+                >= 1.0
+        })
+    });
+    assert_eq!(server.pattern_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        server.connections.load(Ordering::SeqCst),
+        server.cty_hits.load(Ordering::SeqCst) + server.scp_hits.load(Ordering::SeqCst)
+    );
+    assert_eq!(
+        metric_value(&body, &list_info("patterns", &bundled_sha, "bundled")),
+        Some(1.0),
+        "{body}"
+    );
+    assert!(
+        !body.lines().any(
+            |l| l.starts_with("manta_list_refresh_total{list=\"patterns\"")
+                || l.starts_with("manta_list_last_success_timestamp_seconds{list=\"patterns\"")
+        ),
+        "{body}"
+    );
+    assert_eq!(std::fs::read(&state_path).unwrap(), seeded_state);
+    daemon.assert_still_running("with no pattern_url");
 }

@@ -106,7 +106,8 @@ pub struct ListenObservers {
     /// refresh replaces. The running `Validator` takes their current tables
     /// at the start (so the caller builds this from the same
     /// `PipelineConfig`, `ReferenceLists::new(cfg.cty_table(),
-    /// cfg.scp_set())`) and again before the next decoder event after a
+    /// cfg.scp_set(), cfg.pattern_table())`; MAN-542 added the pattern
+    /// list) and again before the next decoder event after a
     /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
     /// existing callers pay nothing.
     pub reference_lists: Option<Arc<ReferenceLists>>,
@@ -354,12 +355,14 @@ impl OperatorListsUpdate {
 
 /// MAN-316: the decode loop's view of `ListenObservers::reference_lists`:
 /// the generation of each list its validator already holds, so a `store`
-/// costs one table swap and an unchanged list costs two atomic loads per
+/// costs one table swap and an unchanged list costs three atomic loads per
 /// event.
 struct ReferenceWatch {
     lists: Arc<ReferenceLists>,
     seen_cty: u64,
     seen_scp: u64,
+    /// MAN-542: the callsign-pattern list's generation.
+    seen_patterns: u64,
 }
 
 impl ReferenceWatch {
@@ -370,16 +373,18 @@ impl ReferenceWatch {
             lists,
             seen_cty: 0,
             seen_scp: 0,
+            seen_patterns: 0,
         };
         watch.apply(validator);
         watch
     }
 
-    /// Hands `validator` the current tables if either list moved since the
+    /// Hands `validator` the current tables if any list moved since the
     /// last call.
     fn sync(&mut self, validator: &mut Validator) {
         if self.lists.cty.generation() != self.seen_cty
             || self.lists.scp.generation() != self.seen_scp
+            || self.lists.patterns.generation() != self.seen_patterns
         {
             self.apply(validator);
         }
@@ -389,10 +394,16 @@ impl ReferenceWatch {
         // Generations before values: a `store` landing in between leaves a
         // generation behind its value, so the next `sync` swaps again rather
         // than recording the new generation against the old table.
-        let (cty_gen, scp_gen) = (self.lists.cty.generation(), self.lists.scp.generation());
+        let (cty_gen, scp_gen, patterns_gen) = (
+            self.lists.cty.generation(),
+            self.lists.scp.generation(),
+            self.lists.patterns.generation(),
+        );
         validator.replace_reference_tables(self.lists.cty.load(), Some(self.lists.scp.load()));
+        validator.replace_patterns(self.lists.patterns.load());
         self.seen_cty = cty_gen;
         self.seen_scp = scp_gen;
+        self.seen_patterns = patterns_gen;
     }
 }
 
@@ -5173,19 +5184,30 @@ mod tests {
         )))
     }
 
-    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+    /// MAN-542: the lists a caller builds from `cfg`, all three of its
+    /// tables, as `ListenObservers::reference_lists` requires.
+    fn reference_lists_for(cfg: &PipelineConfig) -> Arc<ReferenceLists> {
         Arc::new(ReferenceLists::new(
-            Arc::new(manta_spot::cty::Table::bundled()),
-            Arc::new(manta_spot::scp::Set::bundled()),
+            cfg.cty_table(),
+            cfg.scp_set(),
+            cfg.pattern_table(),
         ))
     }
 
-    /// Stores `cty_with_qq9()` from inside a read, including the EOF read:
+    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+        reference_lists_for(&PipelineConfig::default())
+    }
+
+    /// What `StoringSource` does to the lists at its store read.
+    type Store = Box<dyn Fn(&ReferenceLists) + Send>;
+
+    /// Runs `store` from inside a read, including the EOF read:
     /// `OfferingSource` for a list refresh.
     struct StoringSource {
         inner: FixedFreqSource,
         lists: Arc<ReferenceLists>,
         store_at: Option<u64>,
+        store: Store,
         reads: Arc<AtomicU64>,
     }
 
@@ -5201,7 +5223,7 @@ mod tests {
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             let k = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
             if self.store_at == Some(k) {
-                self.lists.cty.store(cty_with_qq9());
+                (self.store)(&self.lists);
             }
             self.inner.read(buf)
         }
@@ -5221,13 +5243,34 @@ mod tests {
         loop_text: bool,
         store_at: Option<u64>,
     ) -> (Vec<(String, u64)>, u64) {
+        // MAN-95: QQ9 calls' patterns are common, so the repetition gate
+        // needs two messages, as these scenes were timed for.
+        let cfg = PipelineConfig {
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n+QQ9@\n").unwrap(),
+            )),
+            ..Default::default()
+        };
+        let lists = reference_lists_for(&cfg);
+        let store: Store = Box::new(|lists| lists.cty.store(cty_with_qq9()));
+        scene_spots((seconds, wpm, text, loop_text), cfg, lists, store_at, store)
+    }
+
+    /// `qq9_spots`' scene (`(seconds, wpm, text, loop_text)`) with the
+    /// caller's `cfg`, starting lists and store.
+    fn scene_spots(
+        (seconds, wpm, text, loop_text): (f64, f32, &str, bool),
+        mut cfg: PipelineConfig,
+        lists: Arc<ReferenceLists>,
+        store_at: Option<u64>,
+        store: Store,
+    ) -> (Vec<(String, u64)>, u64) {
         let mut spec = manta_testkit::vectors::v1();
         spec.duration_s = seconds;
         spec.signals[0].wpm = wpm;
         spec.signals[0].text = text.into();
         spec.signals[0].loop_text = loop_text;
         let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
-        let lists = bundled_reference_lists();
         let reads = Arc::new(AtomicU64::new(0));
         let src = StoringSource {
             inner: FixedFreqSource {
@@ -5238,15 +5281,10 @@ mod tests {
             },
             lists: lists.clone(),
             store_at,
+            store,
             reads: reads.clone(),
         };
-        let mut cfg = PipelineConfig::default();
         cfg.detector.warmup_hops = 0;
-        // MAN-95: QQ9 calls' patterns are common, so the repetition gate
-        // needs two messages, as these scenes were timed for.
-        cfg.patterns = Some(Arc::new(
-            manta_spot::pattern::Table::parse("+QQ9@@@\n+QQ9@\n").unwrap(),
-        ));
         let mut spots = Vec::new();
         listen_with_observers(
             Box::new(src),
@@ -5290,6 +5328,65 @@ mod tests {
                 "no spot may come out before the store at read {k}: {spots:?}"
             );
         }
+    }
+
+    /// MAN-542: the looped QQ9ZZZ scene with `cty_with_qq9()` from the
+    /// start and the lists' pattern table `patterns`; at read `store_at`, a
+    /// `+QQ9@@@` pattern table is stored.
+    fn looped_qq9_patterns(
+        patterns: Arc<manta_spot::pattern::Table>,
+        store_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
+        let cfg = PipelineConfig::default();
+        let lists = Arc::new(ReferenceLists::new(cty_with_qq9(), cfg.scp_set(), patterns));
+        let store: Store = Box::new(|lists| {
+            lists.patterns.store(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            ))
+        });
+        scene_spots(
+            (10.0, 60.0, "CQ CQ DE QQ9ZZZ QQ9ZZZ K", true),
+            cfg,
+            lists,
+            store_at,
+            store,
+        )
+    }
+
+    #[test]
+    fn pattern_list_swapped_mid_stream_lowers_the_bar_from_the_next_event() {
+        let bundled = || Arc::new(manta_spot::pattern::Table::bundled());
+        let (control, _) = looped_qq9_patterns(bundled(), None);
+        assert!(
+            control.is_empty(),
+            "QQ9@@@ is unlisted in the bundled patterns, so two transmissions are not enough: {control:?}"
+        );
+        for k in [2, 40] {
+            let (spots, _) = looped_qq9_patterns(bundled(), Some(k));
+            assert!(
+                spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+                "a pattern store at read {k} must let QQ9ZZZ spot, got {spots:?}"
+            );
+            assert!(
+                spots.iter().all(|(_, read)| *read >= k),
+                "no spot may come out before the store at read {k}: {spots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_pattern_table_is_what_the_watch_starts_with() {
+        // The lists carry `cfg`'s `+QQ9@@@` table, so the watch keeps it.
+        let configured = Arc::new(manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap());
+        let (spots, _) = looped_qq9_patterns(configured, None);
+        assert!(
+            spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+            "got {spots:?}"
+        );
+        // Lists carrying the bundled patterns are the validator's source of
+        // truth even when `cfg` set none: no spot.
+        let (spots, _) = looped_qq9_patterns(Arc::new(manta_spot::pattern::Table::bundled()), None);
+        assert!(spots.is_empty(), "got {spots:?}");
     }
 
     /// MAN-78 remediate-9 timing, for a list refresh: "V DE QQ9E K DE QQ9E

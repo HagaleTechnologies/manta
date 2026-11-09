@@ -282,7 +282,8 @@ class WindowsVisibilityTests(unittest.TestCase):
                     self.assertEqual([w for w in written if w.endswith("=")], [], "no empty check-run id")
 
     def test_relay_reports_the_windows_leg(self):
-        relay = wf.job_block(self.text, "relay-check-runs")
+        # MAN-516: the Windows check-run has its own relay, waiting only on the Windows job.
+        relay = wf.job_block(self.text, "relay-windows-check-run")
         step = wf.steps(relay)[-1]
         self.assertEqual(wf.field(wf.sub(step, "env"), "WINDOWS_CHECK_ID"),
                          "${{ needs.create-ci-check.outputs.windows_check_id }}")
@@ -1050,7 +1051,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         for platform in ('ubuntu', 'macos'):
             aggregate = wf.job_block(text, f'{platform}-aggregate')
             self.assertEqual(wf.field(aggregate, 'name'), f'test ({platform}-latest)')
-            self.assertEqual(wf.field(aggregate, 'needs'), f'[{platform}-support, {platform}-shards]')
+            self.assertEqual(wf.field(aggregate, 'needs'), f'[{platform}-support, {platform}-build, {platform}-shards]')
             self.assertIn('always() &&', wf.field(aggregate, 'if'))
             self.assertIn('github.event.pull_request.head.repo.full_name != github.repository', wf.field(aggregate, 'if'))
             shards = wf.job_block(text, f'{platform}-shards')
@@ -1058,57 +1059,198 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertIn('fail-fast: false', '\n'.join(shards))
             self.assertNotIn('max-parallel', '\n'.join(shards))
             self.assertEqual(wf.field(shards, 'timeout-minutes'), '35')
-            self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '') for s in wf.steps(shards)))
+            self.assertEqual(wf.field(shards, 'needs'), f'{platform}-build')
+            self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')
+                                and '--from-bundle' in (wf.run_body(s) or '') for s in wf.steps(shards)))
+            # MAN-518: one build job per OS compiles every test executable once.
+            build = wf.job_block(text, f'{platform}-build')
+            self.assertEqual(wf.field(build, 'timeout-minutes'), '35')
+            self.assertIn('fail-fast: false', '\n'.join(build))
+            self.assertIn(f'os: [{platform}-latest]', '\n'.join(build))
+            builds = [s for s in wf.steps(build) if 'scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')]
+            self.assertEqual(len(builds), 1)
+            self.assertIn('--build-bundles test-bundles', wf.run_body(builds[0]))
             upload = next(s for s in wf.steps(shards) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or ''))
             self.assertEqual(wf.field(upload, 'if'), 'always()')
             support = wf.job_block(text, f'{platform}-support')
             self.assertEqual(len(steps_running(support, 'cargo test --workspace --doc --locked')), 1)
             self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_ci_shards -v')), 1)
-        relay = wf.job_block(text, 'relay-check-runs')
-        self.assertEqual(wf.field(relay, 'needs'), '[create-ci-check, test, ubuntu-aggregate, macos-aggregate]')
+        # MAN-516: Unix check-runs are relayed from the aggregates alone; Windows has its own relay.
+        self.assertNotIn('relay-check-runs', wf.job_ids(text))
+        unix = wf.job_block(text, 'relay-unix-check-runs')
+        self.assertEqual(wf.field(unix, 'needs'), '[create-ci-check, ubuntu-aggregate, macos-aggregate]')
+        windows = wf.job_block(text, 'relay-windows-check-run')
+        self.assertEqual(wf.field(windows, 'needs'), '[create-ci-check, test]')
+        for relay in (unix, windows):
+            self.assertEqual(wf.field(relay, 'if'), "always() && github.event_name == 'workflow_dispatch'")
+            self.assertEqual(wf.field(wf.sub(relay, 'environment'), 'name'), 'codex-review')
 
     def test_aggregate_verdict_fails_closed(self):
         text = wf.read('ci-full.yml')
         for platform in ('ubuntu', 'macos'):
             aggregate = wf.job_block(text, f'{platform}-aggregate')
             body = wf.run_body(wf.steps(aggregate)[0])
-            for shard, support, expected in [('success', 'success', 0), ('failure', 'success', 1),
-                                             ('cancelled', 'success', 1), ('skipped', 'success', 1),
-                                             ('success', 'failure', 1), (None, 'success', 1)]:
+            # (build, shards, support, expected); None leaves the key out. A failed build skips
+            # the shards, and the old two-key shape (no build) must not pass either.
+            for build, shard, support, expected in [
+                    ('success', 'success', 'success', 0),
+                    ('success', 'failure', 'success', 1), ('success', 'cancelled', 'success', 1),
+                    ('success', 'skipped', 'success', 1), ('success', 'success', 'failure', 1),
+                    ('success', None, 'success', 1),
+                    ('failure', 'skipped', 'success', 1), ('cancelled', 'skipped', 'success', 1),
+                    ('skipped', 'skipped', 'success', 1), ('failure', 'success', 'success', 1),
+                    ('cancelled', 'success', 'success', 1), ('skipped', 'success', 'success', 1),
+                    (None, 'success', 'success', 1)]:
                 results = {f'{platform}-support': {'result': support}}
+                if build:
+                    results[f'{platform}-build'] = {'result': build}
                 if shard:
                     results[f'{platform}-shards'] = {'result': shard}
                 proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
-                self.assertEqual(proc.returncode, expected, proc.stderr)
+                self.assertEqual(proc.returncode, expected, (build, shard, support, proc.stderr))
+
+    def test_build_job_uploads_one_bundle_per_shard(self):
+        # MAN-518: the build job cuts one slice per shard; every shard index has its own upload.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            shards = wf.job_block(text, f'{platform}-shards')
+            m = re.search(r'^\s*shard: \[([0-9, ]+)\]$', '\n'.join(shards), re.M)
+            self.assertIsNotNone(m, f'{platform}-shards: no shard matrix list')
+            indices = [int(x) for x in m.group(1).split(',')]
+            self.assertEqual(indices, list(range(len(indices))))
+            build = wf.job_block(text, f'{platform}-build')
+            for job in (shards, build):
+                counts = {int(c) for s in wf.steps(job)
+                          for c in re.findall(r'scripts/ci-shards\.py --count (\d+)', wf.run_body(s) or '')}
+                self.assertEqual(counts, {len(indices)})
+            uploads = [s for s in wf.steps(build) if (wf.field(s, 'uses') or '').startswith('actions/upload-artifact@')]
+            bundles = {}
+            for step in uploads:
+                with_block = wf.sub(step, 'with')
+                self.assertIsNotNone(with_block)
+                name = wf.field(with_block, 'name')
+                if name == 'build-${{ matrix.os }}':
+                    self.assertEqual(wf.field(step, 'if'), 'always()')
+                    self.assertEqual(wf.field(with_block, 'path'), 'build-evidence/*.json')
+                    self.assertEqual(wf.field(with_block, 'if-no-files-found'), 'error')
+                    bundles.setdefault('evidence', []).append(step)
+                    continue
+                m = re.fullmatch(r'test-bundle-\$\{\{ matrix\.os \}\}-(\d+)', name or '')
+                self.assertIsNotNone(m, f'{platform}-build: unexpected upload {name}')
+                i = int(m.group(1))
+                self.assertNotIn(i, bundles, f'{platform}-build: two uploads for slice {i}')
+                bundles[i] = step
+                self.assertEqual(wf.field(with_block, 'path'), f'test-bundles/slice-{i}.tar.gz')
+                self.assertEqual(wf.field(with_block, 'compression-level'), '0')
+                self.assertEqual(wf.field(with_block, 'retention-days'), '1')
+                self.assertEqual(wf.field(with_block, 'if-no-files-found'), 'error')
+            self.assertEqual(len(bundles.pop('evidence', [])), 1, f'{platform}-build: one evidence upload')
+            self.assertEqual(sorted(bundles), indices)
+
+    def test_shards_run_their_bundle_without_a_compiler(self):
+        # MAN-518: a shard downloads its slice and runs it; nothing in the job compiles.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            job_steps = wf.steps(wf.job_block(text, f'{platform}-shards'))
+            downloads = [i for i, s in enumerate(job_steps)
+                         if (wf.field(s, 'uses') or '').startswith('actions/download-artifact@')]
+            self.assertEqual(len(downloads), 1, f'{platform}-shards: expected one download step')
+            with_block = wf.sub(job_steps[downloads[0]], 'with')
+            self.assertIsNotNone(with_block)
+            self.assertEqual(wf.field(with_block, 'name'), 'test-bundle-${{ matrix.os }}-${{ matrix.shard }}')
+            self.assertEqual(wf.field(with_block, 'path'), 'test-bundle')
+            runs = [i for i, s in enumerate(job_steps) if 'scripts/ci-shards.py' in (wf.run_body(s) or '')]
+            self.assertEqual(len(runs), 1, f'{platform}-shards: expected one ci-shards.py step')
+            self.assertLess(downloads[0], runs[0])
+            self.assertIn('--from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz', wf.run_body(job_steps[runs[0]]))
+            for step in job_steps:
+                uses = wf.field(step, 'uses') or ''
+                self.assertFalse(uses.startswith(('dtolnay/rust-toolchain@', 'Swatinem/rust-cache@')), uses)
+                body = wf.run_body(step) or ''
+                self.assertNotIn('check-rust-toolchain-pin', body)
+                self.assertIsNone(re.search(r'\b(cargo|rustc|rustup)\b', body), body)
+            apt = [s for s in job_steps if 'apt-get install -y libasound2-dev' in (wf.run_body(s) or '')]
+            self.assertEqual(len(apt), 1, f'{platform}-shards: the Linux apt step is gone')
+            self.assertEqual(wf.field(apt[0], 'if'), "runner.os == 'Linux'")
+
+    def run_relay(self, job, results, ids):
+        """PATCH calls (one string each) of a relay job's real step body, against stub gh."""
+        relay = wf.job_block(wf.read('ci-full.yml'), job)
+        body = wf.run_body(wf.steps(relay)[-1]).replace('${{ github.run_id }}', '123')
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = os.path.join(tmp, 'gh')
+            with open(stub, 'w') as f:
+                f.write('#!/usr/bin/env python3\nimport os,sys\n'
+                        'if "--paginate" in sys.argv: print(os.environ["JOBS"])\n'
+                        'else:\n with open(os.environ["CALLS"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
+            os.chmod(stub, 0o755)
+            calls = os.path.join(tmp, 'calls')
+            env = {**os.environ, 'PATH': tmp+os.pathsep+os.environ['PATH'], 'CALLS': calls,
+                   'JOBS': json.dumps({'jobs': results}), 'REPO': 'o/r', 'APP_TOKEN': 'stub', **ids}
+            proc = subprocess.run(['bash', '-e', '-c', body], env=env, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            if not os.path.exists(calls):
+                return []
+            with open(calls) as f:
+                return f.read().splitlines()
 
     def test_relay_uses_independent_actual_job_results(self):
-        relay = wf.job_block(wf.read('ci-full.yml'), 'relay-check-runs')
-        body = wf.run_body(wf.steps(relay)[-1]).replace('${{ github.run_id }}', '123')
+        unix_ids = {'UBUNTU_CHECK_ID': '11', 'MACOS_CHECK_ID': '12'}
         for mac in ('failure', 'cancelled', 'skipped', None):
-            with tempfile.TemporaryDirectory() as tmp:
-                stub = os.path.join(tmp, 'gh')
-                with open(stub, 'w') as f:
-                    f.write('#!/usr/bin/env python3\nimport os,sys\n'
-                            'if "--paginate" in sys.argv: print(os.environ["JOBS"])\n'
-                            'else:\n with open(os.environ["CALLS"],"a") as f: f.write(" ".join(sys.argv[1:])+"\\n")\n')
-                os.chmod(stub, 0o755)
-                results = [{'name': CHECKS[0], 'conclusion': 'success'},
-                           {'name': CHECKS[2], 'conclusion': 'success'}]
-                if mac is not None:
-                    results.append({'name': CHECKS[1], 'conclusion': mac})
-                calls = os.path.join(tmp, 'calls')
-                env = {**os.environ, 'PATH': tmp+os.pathsep+os.environ['PATH'], 'CALLS': calls,
-                       'JOBS': json.dumps({'jobs': results}), 'REPO': 'o/r', 'APP_TOKEN': 'stub',
-                       'UBUNTU_CHECK_ID': '11', 'MACOS_CHECK_ID': '12', 'WINDOWS_CHECK_ID': '13'}
-                proc = subprocess.run(['bash', '-e', '-c', body], env=env, capture_output=True, text=True)
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                with open(calls) as f:
-                    written = f.read().splitlines()
+            results = [{'name': CHECKS[0], 'conclusion': 'success'},
+                       # MAN-516: Windows is still running when the Unix relay fires.
+                       {'name': CHECKS[2], 'conclusion': None, 'status': 'in_progress'}]
+            if mac is not None:
+                results.append({'name': CHECKS[1], 'conclusion': mac})
+            with self.subTest(mac=mac):
+                written = self.run_relay('relay-unix-check-runs', results, unix_ids)
+                self.assertEqual(len(written), 2, written)
                 self.assertIn('conclusion=success', written[0])
                 self.assertIn('check-runs/11', written[0])
                 self.assertIn(f'conclusion={mac or "failure"}', written[1])
                 self.assertIn('check-runs/12', written[1])
-                self.assertIn('conclusion=success', written[2])
+
+    def test_windows_relay_marks_only_the_windows_check_run(self):
+        # The Unix legs were relayed green; the Windows job then fails (or is missing).
+        for windows, expected in (('success', 'success'), ('failure', 'failure'),
+                                  ('cancelled', 'cancelled'), (None, 'failure')):
+            results = [{'name': CHECKS[0], 'conclusion': 'success'},
+                       {'name': CHECKS[1], 'conclusion': 'success'}]
+            if windows is not None:
+                results.append({'name': CHECKS[2], 'conclusion': windows})
+            with self.subTest(windows=windows):
+                written = self.run_relay('relay-windows-check-run', results, {'WINDOWS_CHECK_ID': '13'})
+                self.assertEqual(len(written), 1, written)
+                self.assertIn('check-runs/13', written[0])
+                self.assertIn(f'conclusion={expected}', written[0])
+
+    def test_each_relay_reads_only_jobs_it_waits_for(self):
+        # relay() marks a job with no conclusion failed, so a relay naming a job outside its
+        # `needs` would fail that check-run while the job is still running.
+        text = wf.read('ci-full.yml')
+        owner = {CHECKS[0]: 'ubuntu-aggregate', CHECKS[1]: 'macos-aggregate', CHECKS[2]: 'test'}
+        for job, expected in (('relay-unix-check-runs', {CHECKS[0], CHECKS[1]}),
+                              ('relay-windows-check-run', {CHECKS[2]})):
+            block = wf.job_block(text, job)
+            body = wf.run_body(wf.steps(block)[-1])
+            # Any mention of a test job, not just one call form, counts as a lookup.
+            named = set(re.findall(r'test \([a-z]+-latest\)', body))
+            self.assertEqual(named, expected, job)
+            needs = {n.strip() for n in wf.field(block, 'needs').strip('[]').split(',')}
+            self.assertTrue({owner[n] for n in named} <= needs, job)
+
+    def test_relays_share_one_fail_closed_relay_function(self):
+        # MAN-516: the two relay jobs carry the same relay() so neither drifts from the
+        # fail-closed rule (no conclusion found -> the check-run is marked failed).
+        text = wf.read('ci-full.yml')
+        defs = []
+        for job in ('relay-unix-check-runs', 'relay-windows-check-run'):
+            body = wf.run_body(wf.steps(wf.job_block(text, job))[-1])
+            m = re.search(r'^relay\(\) \{\n.*?^\}$', body, re.M | re.S)
+            self.assertIsNotNone(m, job)
+            defs.append(m.group(0))
+        self.assertEqual(defs[0], defs[1])
+        self.assertIn('conclusion="failure"', defs[0])
 
     def test_every_unix_command_has_a_required_home(self):
         text = wf.read('ci-full.yml')
