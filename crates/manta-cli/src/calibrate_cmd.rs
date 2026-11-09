@@ -37,6 +37,11 @@ pub(crate) struct CalibrateArgs {
     pub cli: CliOverrides,
     /// MAN-13: `--input NAME`, the `[[input]]` entry to measure.
     pub input: Option<String>,
+    /// MAN-541: take the correction from a running daemon's RBN
+    /// comparison instead of measuring a carrier.
+    pub from_rbn: bool,
+    /// MAN-541: with `--from-rbn`, the daemon's metrics listener.
+    pub addr: Option<String>,
 }
 
 /// What happens to a measured value.
@@ -97,15 +102,9 @@ pub(crate) fn confirm(out: &mut impl Write, input: &mut impl BufRead, prompt: &s
     }
 }
 
-/// The value that is saved: rounded to 0.01 ppm, never `-0.0`.
-pub(crate) fn round_ppm(ppm: f64) -> f64 {
-    let r = (ppm * 100.0).round() / 100.0;
-    if r == 0.0 {
-        0.0
-    } else {
-        r
-    }
-}
+/// The value that is saved: rounded to 0.01 ppm, never `-0.0`. One copy,
+/// shared with the daemon's RBN skew suggestion (MAN-541).
+pub(crate) use manta_spot::round_ppm;
 
 /// Whole dB, half away from zero, never `-0`.
 fn db(v: f64) -> String {
@@ -425,6 +424,9 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
 }
 
 pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
+    if args.from_rbn {
+        return run_from_rbn(args);
+    }
     let duration = Duration::from_secs(args.duration_secs);
     check_duration(duration)?;
     let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
@@ -556,83 +558,21 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
                 );
             }
         }
-        let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-        let decision = save_decision(
-            config_path.is_some(),
-            &overrides,
-            file_value == Some(value),
-            args.write,
-            args.json,
-            interactive,
-        );
-        // The TOML literal, as saved: `2.0`, never `2`.
-        let value_lit = config_edit::literal(value);
-        let run_hint = format!("pass --freq-correction-ppm {value_lit} to manta run");
-        // MAN-13: `[input]`, or the `[[input]]` entry `--input` named.
-        let entry = Entry {
-            name: input_name.as_deref(),
-            section: config_text.map_or_else(
-                || "[input]".to_string(),
-                |text| config_edit::input_section(text, input_name.as_deref()),
-            ),
-        };
-        let outcome = match (decision, config_path.as_deref()) {
-            (SaveDecision::Save, Some(path)) => Some(save(
-                path,
+        let outcome = offer_save(
+            &SaveContext {
                 value,
-                read_before.as_ref(),
-                &entry,
-                &mut written,
-                &mut save_error,
-            )),
-            (SaveDecision::Ask, Some(path)) => {
-                let streams = entry_stream_count(path, input_name.as_deref());
-                let prompt = format!(
-                    "Save freq_correction_ppm = {value_lit} to {} in {}{}?",
-                    entry.section,
-                    path.display(),
-                    match streams {
-                        n if n > 1 => format!(" (all {n} streams of this receiver)"),
-                        _ => String::new(),
-                    }
-                );
-                if confirm(
-                    &mut std::io::stderr(),
-                    &mut std::io::stdin().lock(),
-                    &prompt,
-                ) {
-                    Some(save(
-                        path,
-                        value,
-                        read_before.as_ref(),
-                        &entry,
-                        &mut written,
-                        &mut save_error,
-                    ))
-                } else {
-                    Some("not saved: answered no".to_string())
-                }
-            }
-            (SaveDecision::Skip, _) => None,
-            (SaveDecision::AlreadySet, Some(path)) => Some(format!(
-                "not saved: {} already has freq_correction_ppm = {value_lit}",
-                path.display()
-            )),
-            (SaveDecision::Overridden(list), Some(path)) => Some(format!(
-                "not saved: input overrides were in effect ({list}); persist them in [input] of \
-                 {} and re-run calibrate without them, or {run_hint} with the same flags and \
-                 environment",
-                path.display()
-            )),
-            (SaveDecision::NotInteractive, _) => Some(format!(
-                "not saved: no terminal to confirm on; re-run with --write to save it, or \
-                 {run_hint}"
-            )),
-            _ => Some(format!(
-                "not saved: no config file; pass --config or set MANTA_CONFIG to save it, or \
-                 {run_hint}"
-            )),
-        };
+                config_path: config_path.as_deref(),
+                config_text,
+                read_before: read_before.as_ref(),
+                file_value,
+                overrides: &overrides,
+                input_name: input_name.as_deref(),
+                write: args.write,
+                json: args.json,
+            },
+            &mut written,
+            &mut save_error,
+        );
         if let (Some(line), false) = (outcome, args.json) {
             println!("{line}");
         }
@@ -653,6 +593,420 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// What [`offer_save`] needs to save a value the way `calibrate` saves it.
+struct SaveContext<'a> {
+    value: f64,
+    config_path: Option<&'a Path>,
+    config_text: Option<&'a str>,
+    read_before: Option<&'a config_edit::ReadBefore>,
+    file_value: Option<f64>,
+    overrides: &'a [String],
+    input_name: Option<&'a str>,
+    write: bool,
+    json: bool,
+}
+
+/// The save tail both sources share (the WWV measurement and, MAN-541,
+/// the daemon's RBN reading): the decision, the prompt, the save and the
+/// outcome line to print (`None`: nothing to say).
+fn offer_save(
+    ctx: &SaveContext<'_>,
+    written: &mut bool,
+    save_error: &mut Option<anyhow::Error>,
+) -> Option<String> {
+    let value = ctx.value;
+    let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    let decision = save_decision(
+        ctx.config_path.is_some(),
+        ctx.overrides,
+        ctx.file_value == Some(value),
+        ctx.write,
+        ctx.json,
+        interactive,
+    );
+    // The TOML literal, as saved: `2.0`, never `2`.
+    let value_lit = config_edit::literal(value);
+    let run_hint = format!("pass --freq-correction-ppm {value_lit} to manta run");
+    // MAN-13: `[input]`, or the `[[input]]` entry `--input` named.
+    let entry = Entry {
+        name: ctx.input_name,
+        section: ctx.config_text.map_or_else(
+            || "[input]".to_string(),
+            |text| config_edit::input_section(text, ctx.input_name),
+        ),
+    };
+    match (decision, ctx.config_path) {
+        (SaveDecision::Save, Some(path)) => Some(save(
+            path,
+            value,
+            ctx.read_before,
+            &entry,
+            written,
+            save_error,
+        )),
+        (SaveDecision::Ask, Some(path)) => {
+            let streams = entry_stream_count(path, ctx.input_name);
+            let prompt = format!(
+                "Save freq_correction_ppm = {value_lit} to {} in {}{}?",
+                entry.section,
+                path.display(),
+                match streams {
+                    n if n > 1 => format!(" (all {n} streams of this receiver)"),
+                    _ => String::new(),
+                }
+            );
+            if confirm(
+                &mut std::io::stderr(),
+                &mut std::io::stdin().lock(),
+                &prompt,
+            ) {
+                Some(save(
+                    path,
+                    value,
+                    ctx.read_before,
+                    &entry,
+                    written,
+                    save_error,
+                ))
+            } else {
+                Some("not saved: answered no".to_string())
+            }
+        }
+        (SaveDecision::Skip, _) => None,
+        (SaveDecision::AlreadySet, Some(path)) => Some(format!(
+            "not saved: {} already has freq_correction_ppm = {value_lit}",
+            path.display()
+        )),
+        (SaveDecision::Overridden(list), Some(path)) => Some(format!(
+            "not saved: input overrides were in effect ({list}); persist them in [input] of \
+             {} and re-run calibrate without them, or {run_hint} with the same flags and \
+             environment",
+            path.display()
+        )),
+        (SaveDecision::NotInteractive, _) => Some(format!(
+            "not saved: no terminal to confirm on; re-run with --write to save it, or \
+             {run_hint}"
+        )),
+        _ => Some(format!(
+            "not saved: no config file; pass --config or set MANTA_CONFIG to save it, or \
+             {run_hint}"
+        )),
+    }
+}
+
+// ---- MAN-541: `calibrate --from-rbn` ----
+
+/// How the report names a daemon row's config entry.
+fn entry_label(entry: Option<&str>) -> String {
+    match entry {
+        None => "[input]".to_string(),
+        Some(name) => format!("the [[input]] entry {}", crate::fmt::quoted(name)),
+    }
+}
+
+/// The daemon's row for the config entry being calibrated. With a config,
+/// `config_entry` is the entry `save_entry_name` chose (`None`: the
+/// `[input]` table). Without one, `--input` is matched against the entry
+/// or its stream names, and a lone row needs no `--input`.
+pub(crate) fn pick_entry<'a>(
+    rows: &'a [manta_server::status_doc::RbnSkewEntry],
+    config_entry: Option<Option<&str>>,
+    input: Option<&str>,
+    daemon: &str,
+    config_path: Option<&Path>,
+) -> Result<&'a manta_server::status_doc::RbnSkewEntry> {
+    let reported = || {
+        rows.iter()
+            .map(|r| entry_label(r.entry.as_deref()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if rows.is_empty() {
+        bail!(
+            "the daemon at {daemon} has not registered its inputs yet; wait a moment and run \
+             calibrate --from-rbn again"
+        );
+    }
+    let found = match (config_entry, input) {
+        (Some(entry), _) => rows.iter().find(|r| r.entry.as_deref() == entry),
+        (None, Some(name)) => rows
+            .iter()
+            .find(|r| r.entry.as_deref() == Some(name) || r.names.iter().any(|n| n == name)),
+        (None, None) if rows.len() == 1 => rows.first(),
+        (None, None) => bail!(
+            "the daemon at {daemon} reports several inputs ({}); pass --input NAME",
+            reported()
+        ),
+    };
+    found.ok_or_else(|| {
+        let wanted = match (config_entry, input) {
+            (Some(entry), _) => entry_label(entry),
+            (None, name) => entry_label(name),
+        };
+        let hint = match config_path {
+            Some(path) => format!("point --addr at the daemon that runs {}", path.display()),
+            None => "point --addr at the daemon that runs it".to_string(),
+        };
+        anyhow::anyhow!(
+            "the daemon at {daemon} reports no RBN reading for {wanted}; it reports {}; {hint}",
+            reported()
+        )
+    })
+}
+
+/// The `--from-rbn` report through the `correction:` line.
+pub(crate) fn render_rbn_human(
+    daemon: &str,
+    window_seconds: u64,
+    min_samples: usize,
+    row: &manta_server::status_doc::RbnSkewEntry,
+    section: &str,
+) -> String {
+    use manta_server::rbn_compare::skew::{offset_text, skew_text};
+    let mut out = format!(
+        "source: RBN comparison of the daemon at {daemon} over the last {window_seconds} s, for \
+         {section}\n"
+    );
+    for b in &row.bands {
+        let band = manta_server::status_doc::escape_for_terminal(&b.band);
+        match (b.median_ppm, b.ppm_error) {
+            (Some(ppm), Some(err)) => out.push_str(&format!(
+                "evidence: {band}: {}, median {} over {} spots\n",
+                skew_text(ppm, err),
+                offset_text(b.median_offset_hz),
+                b.samples
+            )),
+            _ => out.push_str(&format!(
+                "evidence: {band}: median {} over {} spots, needs {min_samples}\n",
+                offset_text(b.median_offset_hz),
+                b.samples
+            )),
+        }
+    }
+    if let (Some(observed), Some(err), Some(set)) =
+        (row.observed_ppm, row.ppm_error, row.suggested_ppm)
+    {
+        out.push_str(&format!(
+            "measured: the receiver reads {:.2} ppm {} against the RBN, with {:.2} ppm applied\n",
+            observed.abs(),
+            if observed < 0.0 { "low" } else { "high" },
+            row.applied_ppm
+        ));
+        out.push_str(&format!(
+            "correction: freq_correction_ppm = {} (±{err:.2} ppm)\n",
+            config_edit::literal(set)
+        ));
+    }
+    out
+}
+
+/// The `--from-rbn --json` object.
+fn render_rbn_json(
+    daemon: &str,
+    window_seconds: u64,
+    row: &manta_server::status_doc::RbnSkewEntry,
+    saveable: Option<f64>,
+    configured_ppm: f64,
+    config_path: Option<&Path>,
+    written: bool,
+) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "source": "rbn",
+        "daemon": daemon,
+        "window_seconds": window_seconds,
+        "input": row.entry,
+        "applied_ppm": row.applied_ppm,
+        "bands": row.bands,
+        "observed_ppm": row.observed_ppm,
+        "ppm_error": row.ppm_error,
+        "result": saveable.map(|v| serde_json::json!({ "freq_correction_ppm": v })),
+        "configured_ppm": configured_ppm,
+        "config_path": config_path.map(|p| p.display().to_string()),
+        "written": written,
+    }))?)
+}
+
+/// `calibrate --from-rbn`: reads the daemon's `GET /status`, opens no
+/// receiver, and saves its suggestion through the WWV path's save tail.
+fn run_from_rbn(args: CalibrateArgs) -> Result<()> {
+    use manta_server::rbn_compare::skew::MAX_SAVE_ERROR_PPM;
+    let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+    let config_path = args
+        .config
+        .clone()
+        .or_else(|| config::config_path_from_env(&vars));
+    if args.write && config_path.is_none() {
+        bail!("--write needs a config file: pass --config or set MANTA_CONFIG");
+    }
+    // The config entry to save into, its text and its own value.
+    let mut read_before = None;
+    let mut file_value = None;
+    let mut input_name = None;
+    // The entry the daemon reports the selected input under: `None` for
+    // the `[input]` table, else its `[[input]]` entry (`NamedInput::entry`,
+    // as `run` registers it), which a lone `[[input]]` entry has even
+    // without `--input`.
+    let mut daemon_entry: Option<String> = None;
+    let mut env_vars: Vec<String> = Vec::new();
+    let mut configured_ppm = 0.0;
+    if let Some(path) = config_path.as_deref() {
+        let before = config_edit::ReadBefore::read(path)?;
+        let mut loaded = config::load(Some(path), config::Env::Read(&vars))?;
+        crate::resolve::select_input(&mut loaded, args.input.as_deref(), "calibrate")?;
+        input_name = save_entry_name(&loaded.inputs, args.input.as_deref());
+        daemon_entry = loaded.inputs.first().and_then(|n| n.entry.clone());
+        file_value =
+            config_edit::set_freq_correction_ppm(&before.text, 0.0, input_name.as_deref())?.1;
+        configured_ppm = loaded
+            .inputs
+            .first()
+            .and_then(|n| n.input.shared.freq_correction_ppm)
+            .unwrap_or(0.0);
+        env_vars = loaded.env_vars.clone();
+        read_before = Some(before);
+    }
+    let server = if args.addr.is_some() {
+        None
+    } else {
+        crate::daemon_client::daemon_server_config(config_path.as_deref())?.1
+    };
+    let daemon = crate::daemon_client::format_addrs(&crate::daemon_client::resolve_status_addr(
+        args.addr.as_deref(),
+        server.as_ref(),
+    )?);
+    let reply = crate::daemon_client::run_status(config_path.as_deref(), args.addr.as_deref(), 5)?;
+    let Some(rc) = reply.doc.rbn_compare.as_ref() else {
+        bail!(
+            "the daemon at {daemon} is not comparing its spots with the RBN; enable \
+             [rbn_compare] (or run it with --rbn-compare), let it grade spots for an hour, then \
+             run calibrate --from-rbn again"
+        );
+    };
+    let row = pick_entry(
+        &rc.inputs,
+        config_path.as_ref().map(|_| daemon_entry.as_deref()),
+        args.input.as_deref(),
+        &daemon,
+        config_path.as_deref(),
+    )?;
+    let config_text = read_before.as_ref().map(|r| r.text.as_str());
+    let section = config_text.map_or_else(
+        || entry_label(row.entry.as_deref()),
+        |text| config_edit::input_section(text, input_name.as_deref()),
+    );
+    if args.write && row.replaced_by_flag {
+        bail!(
+            "--write refuses to save the RBN reading of a daemon whose receiver a command-line \
+             source flag chose: the saved value would apply to the receiver {section} of {} \
+             describes, not the one the daemon measured; run the daemon from the config, then \
+             re-run calibrate --from-rbn",
+            config_path
+                .as_deref()
+                .map_or_else(String::new, |p| p.display().to_string())
+        );
+    }
+    // The value comes from a peer: never save one `run` would refuse.
+    if let Some(v) = row.suggested_ppm {
+        ensure!(
+            v.is_finite() && v.abs() <= manta_spot::MAX_ABS_PPM,
+            "the daemon at {daemon} suggests freq_correction_ppm = {v}, outside the supported \
+             range [-{max}, {max}]; nothing saved",
+            max = manta_spot::MAX_ABS_PPM
+        );
+    }
+    let saveable = match (row.suggested_ppm, row.ppm_error) {
+        (Some(v), Some(err)) if err <= MAX_SAVE_ERROR_PPM => Some(v),
+        _ => None,
+    };
+    if !args.json {
+        print!(
+            "{}",
+            render_rbn_human(&daemon, rc.window_seconds, rc.min_samples, row, &section)
+        );
+    }
+    let mut written = false;
+    let mut save_error = None;
+    if let Some(value) = saveable {
+        let origin = if env_vars.iter().any(|v| v == PPM_ENV_VAR) {
+            format!("from {PPM_ENV_VAR}")
+        } else if let (Some(path), Some(_)) = (config_path.as_deref(), file_value) {
+            format!("from {}", path.display())
+        } else {
+            "nothing set".to_string()
+        };
+        if !args.json {
+            println!("configured: {configured_ppm:.2} ppm, {origin}");
+        }
+        if let Some(path) = config_path.as_deref() {
+            if env_vars.iter().any(|v| v == PPM_ENV_VAR) {
+                eprintln!(
+                    "warning: {PPM_ENV_VAR} is set and overrides freq_correction_ppm from {} for \
+                     run, soak and doctor; unset it to use the saved value",
+                    path.display()
+                );
+            }
+        }
+        let outcome = if row.replaced_by_flag {
+            Some(format!(
+                "not saved: the daemon's receiver came from a command-line source flag, not \
+                 from {}",
+                config_path
+                    .as_deref()
+                    .map_or_else(|| "a config file".to_string(), |p| p.display().to_string())
+            ))
+        } else {
+            offer_save(
+                &SaveContext {
+                    value,
+                    config_path: config_path.as_deref(),
+                    config_text,
+                    read_before: read_before.as_ref(),
+                    file_value,
+                    overrides: &[],
+                    input_name: input_name.as_deref(),
+                    write: args.write,
+                    json: args.json,
+                },
+                &mut written,
+                &mut save_error,
+            )
+        };
+        if let (Some(line), false) = (outcome, args.json) {
+            println!("{line}");
+        }
+    }
+    if args.json {
+        println!(
+            "{}",
+            render_rbn_json(
+                &daemon,
+                rc.window_seconds,
+                row,
+                saveable,
+                configured_ppm,
+                config_path.as_deref(),
+                written
+            )?
+        );
+    }
+    if let Some(e) = save_error {
+        return Err(e);
+    }
+    match (row.suggested_ppm, row.ppm_error) {
+        (Some(_), Some(err)) if err > MAX_SAVE_ERROR_PPM => bail!(
+            "the RBN reading for {section} is ±{err:.2} ppm, too coarse to save (needs \
+             ±{MAX_SAVE_ERROR_PPM:.2} or better); wait for more spots, ideally on 20m or higher \
+             bands, or run manta calibrate against WWV"
+        ),
+        (Some(_), Some(_)) => Ok(()),
+        _ => bail!(
+            "no RBN reading for {section} yet: a band needs {} graded spots in the last hour; \
+             wait for more spots, or run manta calibrate against WWV",
+            rc.min_samples
+        ),
+    }
 }
 
 /// The table a save writes into: `--input`'s name and how the lines
@@ -779,17 +1133,6 @@ mod tests {
             let mut out = Vec::new();
             assert!(!confirm(&mut out, &mut no.as_bytes(), "Save?"), "{no:?}");
         }
-    }
-
-    #[test]
-    fn round_ppm_rounds_to_hundredths_and_normalises_negative_zero() {
-        assert_eq!(round_ppm(-1.41999), -1.42);
-        assert_eq!(round_ppm(2.4987), 2.5);
-        assert_eq!(round_ppm(1.005_1), 1.01);
-        let z = round_ppm(-0.001);
-        assert_eq!(z, 0.0);
-        assert!(z.is_sign_positive());
-        assert_eq!(format!("{:?}", round_ppm(-0.004)), "0.0");
     }
 
     fn result(
@@ -1214,6 +1557,100 @@ mod tests {
         assert_eq!(
             planned_err(r),
             "TCP connect to 127.0.0.1:1: Connection refused"
+        );
+    }
+
+    // ---- MAN-541: --from-rbn ----
+
+    fn rbn_row(entry: Option<&str>, names: &[&str]) -> manta_server::status_doc::RbnSkewEntry {
+        use manta_server::status_doc::{RbnSkewEntry, RbnSkewReading};
+        let reading = |band: &str, hz: f64, n: usize, r: Option<(f64, f64)>| RbnSkewReading {
+            band: band.to_string(),
+            median_offset_hz: hz,
+            samples: n,
+            median_ppm: r.map(|r| r.0),
+            ppm_error: r.map(|r| r.1),
+        };
+        RbnSkewEntry {
+            entry: entry.map(str::to_string),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            applied_ppm: 0.0,
+            replaced_by_flag: false,
+            bands: vec![
+                reading("80m", 13.5, 41, Some((3.803, 2.2))),
+                reading("40m", 21.0, 8, None),
+                reading("20m", 42.0, 40, Some((2.995, 0.564))),
+                reading("15m", 63.0, 24, Some((2.996, 0.485))),
+            ],
+            observed_ppm: Some(3.017),
+            ppm_error: Some(0.363),
+            suggested_ppm: Some(-3.02),
+        }
+    }
+
+    #[test]
+    fn pick_entry() {
+        let d = "127.0.0.1:7302";
+        let one = [rbn_row(None, &["kiwi"])];
+        assert_eq!(
+            super::pick_entry(&one, None, None, d, None).unwrap().entry,
+            None
+        );
+        assert_eq!(
+            super::pick_entry(&one, Some(None), None, d, None)
+                .unwrap()
+                .entry,
+            None
+        );
+        let two = [
+            rbn_row(Some("kiwi"), &["kiwi-20m", "kiwi-15m"]),
+            rbn_row(Some("hl2"), &["hl2"]),
+        ];
+        let err = super::pick_entry(&two, None, None, d, None).unwrap_err();
+        assert!(format!("{err}").contains("pass --input NAME"), "{err}");
+        for name in ["kiwi", "kiwi-15m"] {
+            assert_eq!(
+                super::pick_entry(&two, None, Some(name), d, None)
+                    .unwrap()
+                    .entry
+                    .as_deref(),
+                Some("kiwi")
+            );
+        }
+        assert_eq!(
+            super::pick_entry(&two, Some(Some("hl2")), Some("hl2"), d, None)
+                .unwrap()
+                .entry
+                .as_deref(),
+            Some("hl2")
+        );
+        let err = super::pick_entry(&one, Some(Some("hl2")), Some("hl2"), d, None).unwrap_err();
+        assert_eq!(
+            format!("{err}"),
+            "the daemon at 127.0.0.1:7302 reports no RBN reading for the [[input]] entry \"hl2\"; \
+             it reports [input]; point --addr at the daemon that runs it"
+        );
+        assert!(super::pick_entry(&[], None, None, d, None).is_err());
+    }
+
+    #[test]
+    fn render_rbn_human() {
+        assert_eq!(
+            super::render_rbn_human(
+                "127.0.0.1:7302",
+                3600,
+                20,
+                &rbn_row(None, &["kiwi"]),
+                "[input]"
+            ),
+            "source: RBN comparison of the daemon at 127.0.0.1:7302 over the last 3600 s, for \
+             [input]\n\
+             evidence: 80m: +3.8 ±2.2 ppm, median +14 Hz over 41 spots\n\
+             evidence: 40m: median +21 Hz over 8 spots, needs 20\n\
+             evidence: 20m: +3.0 ±0.6 ppm, median +42 Hz over 40 spots\n\
+             evidence: 15m: +3.0 ±0.5 ppm, median +63 Hz over 24 spots\n\
+             measured: the receiver reads 3.02 ppm high against the RBN, with 0.00 ppm applied\n\
+             correction: freq_correction_ppm = -3.02 (±0.36 ppm)\n"
         );
     }
 }

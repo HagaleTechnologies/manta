@@ -967,6 +967,16 @@ enum Command {
         /// Print the report as one JSON object. Never asks before saving.
         #[arg(long, help_heading = "Output")]
         json: bool,
+        /// Take the correction from a running daemon's RBN comparison instead
+        /// of measuring a carrier. Reads the daemon's GET /status (its metrics
+        /// listener, from --config or --addr) and opens no receiver; the
+        /// daemon needs [rbn_compare] and about an hour of graded spots
+        #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["duration", "reference_hz", "search_ppm", "tune_hz", "device", "source", "source_iq", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz", "ka9q_group", "capture_rate_hz", "dial_freq_hz"]))]
+        from_rbn: bool,
+        /// With --from-rbn: the daemon's metrics listener (default: from
+        /// --config's [server], else 127.0.0.1:7302)
+        #[arg(long, requires = "from_rbn", value_name = "HOST:PORT")]
+        addr: Option<String>,
     },
     /// Check or create a config file, without starting anything.
     #[command(subcommand)]
@@ -3882,7 +3892,11 @@ fn run_command() -> Result<std::process::ExitCode> {
             config,
             write,
             json,
+            from_rbn,
+            addr,
         } => calibrate_cmd::run(calibrate_cmd::CalibrateArgs {
+            from_rbn,
+            addr,
             input,
             duration_secs: duration,
             reference_hz,

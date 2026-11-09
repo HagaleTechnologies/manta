@@ -2309,6 +2309,10 @@ const CLI_ONLY: &[&str] = &[
     "log_format",
     // `--input NAME` (MAN-13): picks one `[[input]]` entry by name.
     "input",
+    // `calibrate --from-rbn`/`--addr` (MAN-541): where the correction
+    // comes from (a running daemon), not a property of the receiver.
+    "from_rbn",
+    "addr",
 ];
 
 /// MAN-124: `run`'s `Logging` flags, parsed (or refused) by clap.

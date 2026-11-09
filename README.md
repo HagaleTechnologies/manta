@@ -615,6 +615,18 @@ evidence for it, then asks before it saves `freq_correction_ppm` to
 asking. A measurement takes 60 seconds; NCDXF beacons share each frequency
 in turns, so give them `--duration 180`.
 
+A node that runs `[rbn_compare]` can skip the carrier. After about an hour of
+graded spots, `manta status` shows each band's skew from the RBN in ppm and
+the `freq_correction_ppm` to set, and this saves it without opening the
+receiver, so `manta run` keeps running:
+
+```sh
+manta calibrate --from-rbn --config manta.toml
+```
+
+The suggestion replaces the value already applied rather than adding to it.
+See [docs/RUNBOOKS/rbn-comparison.md](docs/RUNBOOKS/rbn-comparison.md#the-skew-reading-and-a-suggested-correction).
+
 ## Running unattended
 
 To run a node as a service that starts at boot and restarts after a

@@ -294,6 +294,9 @@ pub(crate) struct ResolvedInput {
     pub(crate) cw_policy: manta_engine::cw_segments::Policy,
     pub(crate) conditioning: manta_dsp::condition::ConditioningConfig,
     pub(crate) name: String,
+    /// MAN-541: the config entry (`NamedInput::entry`) this input came
+    /// from, so the RBN skew suggestion pools a band plan's streams.
+    pub(crate) entry: Option<String>,
     pub(crate) digital_modes: Vec<manta_engine::ftx::FtxMode>,
     pub(crate) spec: LiveSourceSpec,
     pub(crate) freq_correction_ppm: f64,
@@ -503,6 +506,7 @@ pub(crate) fn resolve(cli: CliOverrides, loaded: &config::Loaded) -> Result<Reso
                 Ok(ResolvedInput {
                     cw_policy: n.input.shared.cw_policy.clone(),
                     name: n.name.clone(),
+                    entry: n.entry.clone(),
                     digital_modes: n.input.shared.digital_modes.clone(),
                     spec: spec_from_file(source, cli.source_iq)?,
                     freq_correction_ppm: n.input.shared.freq_correction_ppm.unwrap_or(0.0),

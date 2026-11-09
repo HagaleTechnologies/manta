@@ -24,6 +24,19 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-541: a node running `[rbn_compare]` reads its frequency skew from the
+  RBN in ppm. `manta status` (and `GET /status`'s new `rbn_compare` object)
+  shows each band's median offset in Hz and skew in ppm with its precision,
+  and the `freq_correction_ppm` each config entry should set, which replaces
+  the applied value rather than adding to it. A band whose skew stays beyond
+  the new `[rbn_compare].skew_warn_ppm` (default 2 ppm, on by default; 0
+  turns it off) for 30 minutes adds a `WARN rbn skew` line to `/healthz`;
+  the verdict, status code and `manta_healthy` are unchanged. New metrics
+  `manta_rbn_compare_freq_offset_median_ppm` and
+  `manta_rbn_compare_skew_warning`, and a shipped `MantaRbnSkew` alert.
+  `manta calibrate --from-rbn [--write]` saves the suggestion the way the
+  WWV path does, reading the daemon and opening no receiver. See
+  [docs/DECISIONS/2026-11-09-man541-rbn-skew.md](docs/DECISIONS/2026-11-09-man541-rbn-skew.md).
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when

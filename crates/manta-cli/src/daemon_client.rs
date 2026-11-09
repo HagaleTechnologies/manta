@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 /// first, reporting a healthy daemon as unreachable whenever that guess
 /// was wrong. `fetch_status` tries every returned address in turn (same
 /// precedent as `uplink::connect_first_reachable`).
-fn resolve_status_addr(
+pub(crate) fn resolve_status_addr(
     addr: Option<&str>,
     server: Option<&manta_server::config::ServerConfig>,
 ) -> Result<Vec<std::net::SocketAddr>> {

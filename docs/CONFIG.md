@@ -134,8 +134,11 @@ and that `station_callsign` is not the example `N0CALL`. `status` reads
 `--config` or `MANTA_CONFIG` names plus any `MANTA_SERVER_*` overrides; with
 neither it dials `127.0.0.1:7302`. `health` reads the same two keys the same
 way to probe `/healthz`, but exits 1 when the named file plus overrides resolve
-to no `[server]` table, since `run` then serves no `/healthz`. `--addr` skips
-the config for both. The table needs `station_callsign`.
+to no `[server]` table, since `run` then serves no `/healthz`.
+`calibrate --from-rbn` reads `metrics_bind_addr` and `metrics_port` the same
+way as `status`, to fetch the daemon's RBN skew reading from `/status`
+(MAN-541). `--addr` skips the config for all three. The table needs
+`station_callsign`.
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -204,6 +207,7 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 | `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
 | `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
 | `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+| `skew_warn_ppm` | `2.0` | live: `run` with `[server]` | 0 to 1000; 0 turns the warning off. A band warns after 30 minutes past it (see RUNBOOKS/rbn-comparison.md). |
 
 ## [[skimmer_relay]]
 

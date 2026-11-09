@@ -1503,6 +1503,7 @@ fn publish_grade(bus: &SpotBus) {
             freq_offset_hz: Some(100),
             rbn_bands: vec!["20m"],
             spotter_filter: vec![],
+            track_id: None,
         })
         .unwrap()
         .into()

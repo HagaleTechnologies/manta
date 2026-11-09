@@ -62,6 +62,67 @@ pub struct StatusDoc {
     /// stays 1 and a one-input document is unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputHearingSnapshot>,
+    /// MAN-541: the RBN skew reading. Present only with `[rbn_compare]`
+    /// enabled (additive, so `schema_version` stays 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbn_compare: Option<RbnCompareStatus>,
+}
+
+/// MAN-541: `GET /status`'s `rbn_compare` object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RbnCompareStatus {
+    pub window_seconds: u64,
+    pub min_samples: usize,
+    pub skew_warn_ppm: f64,
+    pub skew_hold_seconds: u64,
+    /// Node-wide, one row per band with a `match`/`disagree` grade in the
+    /// window, lowest frequency first.
+    pub bands: Vec<RbnSkewBand>,
+    /// One row per config entry, empty until the daemon registers its
+    /// inputs.
+    pub inputs: Vec<RbnSkewEntry>,
+}
+
+/// MAN-541: one band's node-wide skew and its warning state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RbnSkewBand {
+    pub band: String,
+    pub median_offset_hz: f64,
+    pub samples: usize,
+    /// `null` under `min_samples`.
+    pub median_ppm: Option<f64>,
+    pub ppm_error: Option<f64>,
+    /// Seconds the band has been over the limit; `null` when it is not.
+    pub over_limit_seconds: Option<u64>,
+    pub warning: bool,
+}
+
+/// MAN-541: one band's skew over one config entry's spots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RbnSkewReading {
+    pub band: String,
+    pub median_offset_hz: f64,
+    pub samples: usize,
+    pub median_ppm: Option<f64>,
+    pub ppm_error: Option<f64>,
+}
+
+/// MAN-541: one config entry's pooled skew and suggested
+/// `freq_correction_ppm`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RbnSkewEntry {
+    /// The `[[input]]` entry name; `null` for the `[input]` table.
+    pub entry: Option<String>,
+    /// The daemon's input (stream) names for the entry.
+    pub names: Vec<String>,
+    pub applied_ppm: f64,
+    pub replaced_by_flag: bool,
+    pub bands: Vec<RbnSkewReading>,
+    pub observed_ppm: Option<f64>,
+    pub ppm_error: Option<f64>,
+    /// The value to put in `freq_correction_ppm`: it replaces
+    /// `applied_ppm`, it is not added to it.
+    pub suggested_ppm: Option<f64>,
 }
 
 /// MAN-14: one input's row in `GET /status`'s `inputs`.
@@ -166,6 +227,7 @@ impl StatusDoc {
                 targets,
             },
             inputs: InputHearingSnapshot::rows(metrics, now),
+            rbn_compare: metrics.rbn_skew_snapshot_at(now),
         }
     }
 
@@ -296,6 +358,11 @@ pub fn render_human(doc: &StatusDoc) -> String {
         out.push('\n');
     }
 
+    // MAN-541: before the uplink section, which returns early.
+    if let Some(rc) = &doc.rbn_compare {
+        render_rbn_skew(&mut out, rc);
+    }
+
     if doc.uplink.targets.is_empty() {
         out.push_str("RBN uplink: not configured\n");
         return out;
@@ -323,6 +390,102 @@ pub fn render_human(doc: &StatusDoc) -> String {
         ));
     }
     out
+}
+
+/// MAN-541: the `manta status` RBN skew block, then a blank line.
+fn render_rbn_skew(out: &mut String, rc: &RbnCompareStatus) {
+    use crate::rbn_compare::skew::{offset_text, skew_text, MAX_SAVE_ERROR_PPM};
+    let mut lines: Vec<String> = Vec::new();
+    let minutes = rc.window_seconds / 60;
+    let window = if minutes == 60 {
+        "last hour".to_string()
+    } else {
+        format!("last {minutes} min")
+    };
+    if rc.bands.is_empty() {
+        lines.push(format!("RBN skew, {window}: no spots graded yet"));
+    } else {
+        let limit = rc.skew_warn_ppm;
+        let warn_on = limit > 0.0;
+        lines.push(if warn_on {
+            format!(
+                "RBN skew, {window} (+ means manta reads high; warns past {limit} ppm for {} min)",
+                rc.skew_hold_seconds / 60
+            )
+        } else {
+            format!("RBN skew, {window} (+ means manta reads high; warning off)")
+        });
+        lines.push(format!(
+            "  {:<6} {:>7} {:>6}  {:<15} {}",
+            "BAND", "OFFSET", "SPOTS", "SKEW", "STATE"
+        ));
+        let needs = format!("needs {} spots", rc.min_samples);
+        for b in &rc.bands {
+            let (skew, state) = match (b.median_ppm, b.ppm_error) {
+                (Some(ppm), Some(err)) => {
+                    let state = if !warn_on {
+                        String::new()
+                    } else if b.warning {
+                        format!("WARN for {} min", b.over_limit_seconds.unwrap_or(0) / 60)
+                    } else if let Some(secs) = b.over_limit_seconds {
+                        format!("over {limit} ppm for {} min", secs / 60)
+                    } else if ppm.abs() > limit {
+                        "too few spots to warn".to_string()
+                    } else {
+                        "ok".to_string()
+                    };
+                    (skew_text(ppm, err), state)
+                }
+                _ => ("-".to_string(), needs.clone()),
+            };
+            lines.push(format!(
+                "  {:<6} {:>7} {:>6}  {:<15} {}",
+                escape_for_terminal(&b.band),
+                offset_text(b.median_offset_hz),
+                b.samples,
+                skew,
+                state
+            ));
+        }
+        if !rc.inputs.is_empty() {
+            lines.push(
+                "Suggested freq_correction_ppm (replaces the current value; restart to apply)"
+                    .to_string(),
+            );
+            lines.push(format!(
+                "  {:<32} {:>6} {:>7} {:>5}  {}",
+                "INPUT", "NOW", "SET", "±PPM", "NOTE"
+            ));
+            for e in &rc.inputs {
+                let name = match &e.entry {
+                    Some(name) => escape_for_terminal(name),
+                    None => "[input]".to_string(),
+                };
+                let (set, err, note) = match (e.suggested_ppm, e.ppm_error) {
+                    (Some(set), Some(err)) => {
+                        let note = if e.replaced_by_flag {
+                            "source set by a flag"
+                        } else if err > MAX_SAVE_ERROR_PPM {
+                            "too coarse to save"
+                        } else {
+                            ""
+                        };
+                        (format!("{set:+.2}"), format!("{err:.2}"), note.to_string())
+                    }
+                    _ => ("-".to_string(), "-".to_string(), needs.clone()),
+                };
+                lines.push(format!(
+                    "  {:<32} {:>6.2} {:>7} {:>5}  {}",
+                    name, e.applied_ppm, set, err, note
+                ));
+            }
+        }
+    }
+    for line in lines {
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push('\n');
 }
 
 #[cfg(test)]
@@ -393,6 +556,240 @@ mod tests {
             .unwrap();
         assert!(deaf.contains("never") && deaf.ends_with("yes"), "{deaf}");
         assert!(human.lines().all(|l| l.chars().count() <= 80), "{human}");
+    }
+
+    // ---- MAN-541: the RBN skew block ----
+
+    fn band(
+        band: &str,
+        hz: f64,
+        n: usize,
+        reading: Option<(f64, f64)>,
+        over: Option<u64>,
+        warning: bool,
+    ) -> RbnSkewBand {
+        RbnSkewBand {
+            band: band.to_string(),
+            median_offset_hz: hz,
+            samples: n,
+            median_ppm: reading.map(|r| r.0),
+            ppm_error: reading.map(|r| r.1),
+            over_limit_seconds: over,
+            warning,
+        }
+    }
+
+    fn reading(b: &RbnSkewBand) -> RbnSkewReading {
+        RbnSkewReading {
+            band: b.band.clone(),
+            median_offset_hz: b.median_offset_hz,
+            samples: b.samples,
+            median_ppm: b.median_ppm,
+            ppm_error: b.ppm_error,
+        }
+    }
+
+    /// The plan's design fixture: 80m, 40m, 20m and 15m, nothing applied.
+    fn design_rbn() -> RbnCompareStatus {
+        let bands = vec![
+            band("80m", 13.5, 41, Some((3.803, 2.2)), None, false),
+            band("40m", 21.0, 8, None, None, false),
+            band("20m", 42.0, 40, Some((2.995, 0.564)), Some(2100), true),
+            band("15m", 63.0, 24, Some((2.996, 0.485)), Some(720), false),
+        ];
+        RbnCompareStatus {
+            window_seconds: 3600,
+            min_samples: 20,
+            skew_warn_ppm: 2.0,
+            skew_hold_seconds: 1800,
+            inputs: vec![RbnSkewEntry {
+                entry: None,
+                names: vec!["kiwi".to_string()],
+                applied_ppm: 0.0,
+                replaced_by_flag: false,
+                bands: bands.iter().map(reading).collect(),
+                observed_ppm: Some(3.017),
+                ppm_error: Some(0.363),
+                suggested_ppm: Some(-3.02),
+            }],
+            bands,
+        }
+    }
+
+    fn doc_with_rbn(rbn: Option<RbnCompareStatus>) -> StatusDoc {
+        let mut doc = StatusDoc::from_metrics(&Metrics::new());
+        doc.uptime_seconds = 2 * 3600 + 14 * 60;
+        doc.rbn_compare = rbn;
+        doc
+    }
+
+    fn rbn_block(doc: &StatusDoc) -> Vec<String> {
+        render_human(doc)
+            .lines()
+            .skip_while(|l| !l.starts_with("RBN skew"))
+            .take_while(|l| !l.starts_with("RBN uplink"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_node_without_rbn_compare_has_no_rbn_compare_key() {
+        let doc = StatusDoc::from_metrics(&metrics_fixture());
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(json.starts_with("{\"schema_version\":1,"), "{json}");
+        assert!(!json.contains("\"rbn_compare\""), "{json}");
+        assert!(!render_human(&doc).contains("RBN skew"));
+    }
+
+    #[test]
+    fn the_status_doc_carries_rbn_skew_bands_and_suggestion() {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        let doc = StatusDoc::from_metrics(&m);
+        let v = serde_json::to_value(&doc).unwrap();
+        assert_eq!(v["rbn_compare"]["window_seconds"], 3600);
+        assert_eq!(v["rbn_compare"]["min_samples"], 20);
+        assert_eq!(v["rbn_compare"]["skew_warn_ppm"], 2.0);
+        assert_eq!(v["rbn_compare"]["skew_hold_seconds"], 1800);
+
+        let v = serde_json::to_value(doc_with_rbn(Some(design_rbn()))).unwrap();
+        let rc = &v["rbn_compare"];
+        assert_eq!(rc["inputs"][0]["suggested_ppm"], -3.02);
+        assert_eq!(rc["inputs"][0]["observed_ppm"], 3.017);
+        assert_eq!(rc["inputs"][0]["entry"], serde_json::Value::Null);
+        assert_eq!(rc["bands"][1]["band"], "40m");
+        assert_eq!(rc["bands"][1]["median_ppm"], serde_json::Value::Null);
+        assert_eq!(rc["bands"][2]["over_limit_seconds"], 2100);
+        assert_eq!(rc["bands"][2]["warning"], true);
+    }
+
+    #[test]
+    fn render_human_prints_the_rbn_skew_block() {
+        let out = render_human(&doc_with_rbn(Some(design_rbn())));
+        let want = "\
+RBN skew, last hour (+ means manta reads high; warns past 2 ppm for 30 min)
+  BAND    OFFSET  SPOTS  SKEW            STATE
+  80m     +14 Hz     41  +3.8 ±2.2 ppm   too few spots to warn
+  40m     +21 Hz      8  -               needs 20 spots
+  20m     +42 Hz     40  +3.0 ±0.6 ppm   WARN for 35 min
+  15m     +63 Hz     24  +3.0 ±0.5 ppm   over 2 ppm for 12 min
+Suggested freq_correction_ppm (replaces the current value; restart to apply)
+  INPUT                               NOW     SET  ±PPM  NOTE
+  [input]                            0.00   -3.02  0.36
+
+RBN uplink: not configured
+";
+        assert!(out.ends_with(want), "{out}");
+    }
+
+    #[test]
+    fn render_human_rbn_states() {
+        // Nothing graded yet.
+        let mut rc = design_rbn();
+        rc.bands.clear();
+        rc.inputs.clear();
+        assert_eq!(
+            rbn_block(&doc_with_rbn(Some(rc))),
+            vec!["RBN skew, last hour: no spots graded yet", ""]
+        );
+
+        // Warning off.
+        let mut rc = design_rbn();
+        rc.skew_warn_ppm = 0.0;
+        let block = rbn_block(&doc_with_rbn(Some(rc)));
+        assert_eq!(
+            block[0],
+            "RBN skew, last hour (+ means manta reads high; warning off)"
+        );
+        assert_eq!(block[2], "  80m     +14 Hz     41  +3.8 ±2.2 ppm");
+        assert!(block[3].ends_with("needs 20 spots"));
+
+        // No band at 20 spots.
+        let mut rc = design_rbn();
+        rc.bands = vec![band("40m", 21.0, 8, None, None, false)];
+        rc.inputs[0].bands = rc.bands.iter().map(reading).collect();
+        rc.inputs[0].observed_ppm = None;
+        rc.inputs[0].ppm_error = None;
+        rc.inputs[0].suggested_ppm = None;
+        let block = rbn_block(&doc_with_rbn(Some(rc)));
+        assert_eq!(
+            block[5],
+            "  [input]                            0.00       -     -  needs 20 spots"
+        );
+
+        // Two entries: one too coarse, one from a source flag.
+        let mut rc = design_rbn();
+        let mut hl2 = rc.inputs[0].clone();
+        hl2.entry = Some("hl2".to_string());
+        hl2.applied_ppm = 1.5;
+        hl2.ppm_error = Some(1.3);
+        hl2.suggested_ppm = Some(-0.4);
+        let mut kiwi = rc.inputs[0].clone();
+        kiwi.entry = Some("kiwi".to_string());
+        kiwi.replaced_by_flag = true;
+        rc.inputs = vec![kiwi, hl2];
+        let block = rbn_block(&doc_with_rbn(Some(rc)));
+        assert_eq!(
+            block[8],
+            "  kiwi                               0.00   -3.02  0.36  source set by a flag"
+        );
+        assert_eq!(
+            block[9],
+            "  hl2                                1.50   -0.40  1.30  too coarse to save"
+        );
+    }
+
+    #[test]
+    fn the_rbn_block_fits_80_columns() {
+        let mut rc = design_rbn();
+        rc.skew_warn_ppm = 1000.0;
+        rc.bands = vec![
+            band(
+                "160m",
+                -99_999.0,
+                99_999,
+                Some((-999.9, 0.1)),
+                Some(3599),
+                false,
+            ),
+            band(
+                "2200m",
+                -9_999.0,
+                99_999,
+                Some((-999.9, 0.1)),
+                Some(3599),
+                true,
+            ),
+        ];
+        rc.inputs[0].entry = Some("x".repeat(32));
+        rc.inputs[0].applied_ppm = -999.99;
+        rc.inputs[0].suggested_ppm = Some(-999.99);
+        rc.inputs[0].replaced_by_flag = true;
+        let block = rbn_block(&doc_with_rbn(Some(rc)));
+        assert!(block.iter().any(|l| l.contains("over 1000 ppm for 59 min")));
+        for line in &block {
+            assert!(
+                line.chars().count() <= 80,
+                "{} > 80: {line}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn the_status_doc_round_trips_with_rbn_compare() {
+        let doc = doc_with_rbn(Some(design_rbn()));
+        let back: StatusDoc = serde_json::from_str(&doc.to_json()).unwrap();
+        assert_eq!(back, doc);
+    }
+
+    #[test]
+    fn terminal_escaping_covers_entry_names() {
+        let mut rc = design_rbn();
+        rc.inputs[0].entry = Some("evil\x1b[31m".to_string());
+        let out = render_human(&doc_with_rbn(Some(rc)));
+        assert!(!out.contains('\x1b'), "{out:?}");
+        assert!(out.contains("evil\\u{1b}[31m"), "{out}");
     }
 
     #[test]

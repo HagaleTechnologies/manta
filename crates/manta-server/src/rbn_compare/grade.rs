@@ -71,6 +71,11 @@ pub struct GradeInput {
     pub time: i64,
     pub freq_hz: i64,
     pub wpm: Option<i32>,
+    /// MAN-541: the decoder track the spot came from, so the live
+    /// comparator can attribute its offset to the input that owns the
+    /// track (MAN-13 D3). Never on the wire; offline inputs carry `None`.
+    #[serde(skip)]
+    pub track_id: Option<u32>,
 }
 
 /// One CW report from RBN: live (arrival time) or archive (`date` column).
@@ -126,6 +131,10 @@ pub struct SpotGrade {
     pub freq_offset_hz: Option<i64>,
     pub rbn_bands: Vec<&'static str>,
     pub spotter_filter: Vec<String>,
+    /// MAN-541: the graded spot's decoder track ([`GradeInput::track_id`]).
+    /// Skipped on the wire, so `spotGrade` records are byte-identical.
+    #[serde(skip)]
+    pub track_id: Option<u32>,
 }
 
 /// `kind` of every grade record; spot lines have no `kind` key.
@@ -297,7 +306,7 @@ impl Coverage {
 
 /// Index of `band` in the band table (`band::allocations` order); unknown
 /// bands sort last.
-fn band_rank(band: &str) -> usize {
+pub(crate) fn band_rank(band: &str) -> usize {
     let table = crate::band::allocations();
     table
         .iter()
@@ -312,12 +321,17 @@ fn band_at_rank(rank: usize) -> &'static str {
         .unwrap_or("unknown")
 }
 
+/// RBN reports frequencies to 100 Hz; the modal frequency is rounded to it.
+pub const RBN_RESOLUTION_HZ: f64 = 100.0;
+
 /// Most common report frequency after rounding to RBN's 100 Hz resolution.
 /// Ties go to the value nearest manta's frequency, then the lower one.
 fn modal_freq_hz(freqs: &[f64], manta_hz: i64) -> Option<i64> {
     let mut counts: BTreeMap<i64, u32> = BTreeMap::new();
     for f in freqs {
-        *counts.entry((f / 100.0).round() as i64 * 100).or_default() += 1;
+        *counts
+            .entry((f / RBN_RESOLUTION_HZ).round() as i64 * RBN_RESOLUTION_HZ as i64)
+            .or_default() += 1;
     }
     // BTreeMap iterates ascending, and `min_by_key` keeps the first of
     // equal keys, so an exact tie on count and distance goes to the lower.
@@ -421,6 +435,7 @@ fn grade_with(
         freq_offset_hz: None,
         rbn_bands: bands.into_iter().map(band_at_rank).collect(),
         spotter_filter: filter.only.iter().cloned().collect(),
+        track_id: spot.track_id,
     };
 
     if same.is_empty() {
@@ -755,6 +770,7 @@ impl GradeInput {
             time: bus.unix_ts_for(spot.sample_ts),
             freq_hz: crate::spot_message::wire_frequency_hz(spot),
             wpm: crate::spot_message::wire_wpm(spot),
+            track_id: Some(spot.track_id),
         }
     }
 }
@@ -779,6 +795,7 @@ impl From<SpotWire> for GradeInput {
             time: w.timestamp,
             freq_hz: w.frequency,
             wpm: w.wpm,
+            track_id: None,
         }
     }
 }
@@ -827,6 +844,7 @@ mod tests {
             time,
             freq_hz,
             wpm,
+            track_id: None,
         }
     }
 
@@ -901,6 +919,52 @@ mod tests {
         cfg: &GradeConfig,
     ) -> SpotGrade {
         grade_spot(&s, &refs(&reports), covered, cfg)
+    }
+
+    /// MAN-541: the track id is for attribution only; `spotGrade` bytes
+    /// are the same with or without it.
+    #[test]
+    fn a_spot_grade_never_serialises_its_track_id() {
+        let none = graded(scenario1(), true, &cfg());
+        let some = SpotGrade {
+            track_id: Some(7),
+            ..none.clone()
+        };
+        let json = serde_json::to_string(&some).unwrap();
+        assert!(
+            !json.contains("trackId") && !json.contains("track_id"),
+            "{json}"
+        );
+        assert_eq!(json, serde_json::to_string(&none).unwrap());
+    }
+
+    #[test]
+    fn from_bus_spot_keeps_the_track_id() {
+        let spot = manta_spot::Spot {
+            callsign: "W1AW".to_string(),
+            freq_hz: 14_025_000.0,
+            snr_db: 20.0,
+            wpm: 25.0,
+            spot_type: manta_spot::SpotType::Cq,
+            confidence: 0.9,
+            emission_state: manta_spot::EmissionState::Confirmed,
+            track_id: 7,
+            sample_ts: 12_345,
+            rst: None,
+            qrl_query: false,
+            mode: manta_spot::SpotMode::Cw,
+            baud: None,
+        };
+        let bus = crate::bus::SpotBus::new(48_000.0, std::time::SystemTime::UNIX_EPOCH, 0);
+        let input = GradeInput::from_bus_spot(&spot, &bus, "W3XYZ");
+        assert_eq!(input.track_id, Some(7));
+        let mut s = scenario1();
+        s.0.track_id = input.track_id;
+        assert_eq!(
+            graded(s, true, &cfg()).track_id,
+            Some(7),
+            "grading copies it"
+        );
     }
 
     #[test]
@@ -1372,6 +1436,7 @@ mod tests {
                 time,
                 freq_hz: (base(call, rng.below(3) == 0) + rng.below(1_400) as f64 - 700.0) as i64,
                 wpm: (rng.below(6) != 0).then(|| 15 + rng.below(20) as i32),
+                track_id: None,
             });
         }
 

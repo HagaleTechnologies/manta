@@ -540,6 +540,8 @@ fn calibrate_help_names_every_flag() {
         "--source",
         "--kiwi-host",
         "--dial-freq-hz",
+        "--from-rbn",
+        "--addr",
     ] {
         assert!(help.contains(flag), "no {flag} in {help}");
     }
@@ -735,4 +737,453 @@ fn calibrate_gives_a_sound_card_the_dial_hint_without_opening_it() {
     );
     assert!(stderr.contains("--dial-freq-hz 9998350"), "{stderr}");
     assert!(!stderr.contains("no audio input"), "{stderr}");
+}
+
+// ---- MAN-541: `calibrate --from-rbn` ----
+
+/// One band row of a daemon's `rbn_compare` reading.
+fn rbn_band(band: &str, hz: f64, n: u64, reading: Option<(f64, f64)>) -> serde_json::Value {
+    serde_json::json!({
+        "band": band, "median_offset_hz": hz, "samples": n,
+        "median_ppm": reading.map(|r| r.0), "ppm_error": reading.map(|r| r.1),
+    })
+}
+
+/// The design's four bands, nothing applied, suggestion -3.02 ±0.36.
+fn design_entry(entry: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "entry": entry,
+        "names": [entry.unwrap_or("file")],
+        "applied_ppm": 0.0,
+        "replaced_by_flag": false,
+        "bands": [
+            rbn_band("80m", 13.5, 41, Some((3.803, 2.2))),
+            rbn_band("40m", 21.0, 8, None),
+            rbn_band("20m", 42.0, 40, Some((2.995, 0.564))),
+            rbn_band("15m", 63.0, 24, Some((2.996, 0.485))),
+        ],
+        "observed_ppm": 3.017,
+        "ppm_error": 0.363,
+        "suggested_ppm": -3.02
+    })
+}
+
+/// A `/status` body; `rbn_inputs: None` is a daemon without comparison.
+fn status_with(rbn_inputs: Option<Vec<serde_json::Value>>) -> String {
+    let mut doc = serde_json::json!({
+        "schema_version": 1, "version": "test", "uptime_seconds": 3600, "spots_total": 1,
+        "telnet_clients": 0, "json_clients": 0, "ws_clients": 0, "active_tracks": 0,
+        "uplink": {
+            "health": "ok", "connected_targets": 0, "enabled_targets": 0, "sent_total": 0,
+            "suppressed_total": 0, "reconnects_total": 0, "reconnect_window_seconds": 300,
+            "flapping_threshold": 3, "targets": []
+        }
+    });
+    if let Some(inputs) = rbn_inputs {
+        doc["rbn_compare"] = serde_json::json!({
+            "window_seconds": 3600, "min_samples": 20, "skew_warn_ppm": 2.0,
+            "skew_hold_seconds": 1800, "bands": [], "inputs": inputs
+        });
+    }
+    doc.to_string()
+}
+
+/// Runs `calibrate --from-rbn --addr <fake daemon>` plus `extra`, returning
+/// the output and the daemon address.
+fn from_rbn(
+    body: &str,
+    cfg: Option<&Path>,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> (Output, String) {
+    let (addr, requests) = common::fake_server(common::http_reply("200 OK", body), 1);
+    let mut cmd = manta();
+    cmd.args(["calibrate", "--from-rbn", "--addr", &addr.to_string()]);
+    if let Some(cfg) = cfg {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.args(extra);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    if let Ok(request) = requests.recv_timeout(Duration::from_secs(5)) {
+        assert!(request.starts_with("GET /status HTTP/1.1"), "{request:?}");
+    }
+    (out, addr.to_string())
+}
+
+#[test]
+fn calibrate_from_rbn_write_saves_the_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let (out, addr) = from_rbn(
+        &status_with(Some(vec![design_entry(None)])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&out.stderr)
+    );
+    let want = format!(
+        "source: RBN comparison of the daemon at {addr} over the last 3600 s, for [input]\n\
+         evidence: 80m: +3.8 ±2.2 ppm, median +14 Hz over 41 spots\n\
+         evidence: 40m: median +21 Hz over 8 spots, needs 20\n\
+         evidence: 20m: +3.0 ±0.6 ppm, median +42 Hz over 40 spots\n\
+         evidence: 15m: +3.0 ±0.5 ppm, median +63 Hz over 24 spots\n\
+         measured: the receiver reads 3.02 ppm high against the RBN, with 0.00 ppm applied\n\
+         correction: freq_correction_ppm = -3.02 (±0.36 ppm)\n\
+         configured: 0.00 ppm, nothing set\n\
+         saved: freq_correction_ppm = -3.02 in [input] of {} (was not set); restart manta to \
+         apply it\n",
+        cfg.display()
+    );
+    assert_eq!(stdout, want);
+    let saved = std::fs::read_to_string(&cfg).unwrap();
+    assert!(saved.contains("freq_correction_ppm = -3.02"), "{saved}");
+    for line in FILE_INPUT.lines() {
+        assert!(saved.lines().any(|l| l == line), "{line} lost: {saved}");
+    }
+}
+
+#[test]
+fn calibrate_from_rbn_replaces_the_applied_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        &format!("{FILE_INPUT}freq_correction_ppm = -2.0\n"),
+    );
+    let mut entry = design_entry(None);
+    entry["applied_ppm"] = serde_json::json!(-2.0);
+    entry["bands"] = serde_json::json!([rbn_band("20m", 14.0, 40, Some((1.0, 0.564)))]);
+    entry["observed_ppm"] = serde_json::json!(1.0);
+    entry["ppm_error"] = serde_json::json!(0.564);
+    entry["suggested_ppm"] = serde_json::json!(-3.0);
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![entry])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{stdout}\n{}",
+        text(&out.stderr)
+    );
+    assert!(
+        stdout.ends_with("(was -2.0); restart manta to apply it\n"),
+        "{stdout}"
+    );
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("freq_correction_ppm = -3.0\n"));
+}
+
+#[test]
+fn calibrate_from_rbn_reports_already_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(
+        dir.path(),
+        &format!("{FILE_INPUT}freq_correction_ppm = -3.02\n"),
+    );
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![design_entry(None)])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(
+        stdout.ends_with(&format!(
+            "not saved: {} already has freq_correction_ppm = -3.02\n",
+            cfg.display()
+        )),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_refuses_a_daemon_without_rbn_compare() {
+    let (out, addr) = from_rbn(&status_with(None), None, &[], &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "the daemon at {addr} is not comparing its spots with the RBN; enable [rbn_compare]"
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_refuses_without_a_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let mut entry = design_entry(None);
+    entry["bands"] = serde_json::json!([rbn_band("40m", 21.0, 8, None)]);
+    entry["observed_ppm"] = serde_json::Value::Null;
+    entry["ppm_error"] = serde_json::Value::Null;
+    entry["suggested_ppm"] = serde_json::Value::Null;
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![entry])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(text(&out.stdout).contains("evidence: 40m: median +21 Hz over 8 spots, needs 20"));
+    assert!(
+        text(&out.stderr).contains("no RBN reading for [input] yet"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), FILE_INPUT);
+}
+
+#[test]
+fn calibrate_from_rbn_refuses_a_coarse_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let mut entry = design_entry(None);
+    entry["ppm_error"] = serde_json::json!(1.3);
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![entry])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(text(&out.stdout).contains("correction: freq_correction_ppm = -3.02 (±1.30 ppm)"));
+    assert!(
+        text(&out.stderr).contains("too coarse to save (needs ±1.00 or better)"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), FILE_INPUT);
+}
+
+#[test]
+fn calibrate_from_rbn_write_refuses_a_daemon_source_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let mut entry = design_entry(None);
+    entry["replaced_by_flag"] = serde_json::json!(true);
+    let body = status_with(Some(vec![entry]));
+    let (out, _) = from_rbn(&body, Some(&cfg), &["--write"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("--write refuses to save the RBN reading of a daemon"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), FILE_INPUT);
+    // Without --write: the report, then why it is not saved.
+    let (out, _) = from_rbn(&body, Some(&cfg), &[], &[]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(text(&out.stdout).ends_with(&format!(
+        "not saved: the daemon's receiver came from a command-line source flag, not from {}\n",
+        cfg.display()
+    )));
+}
+
+const TWO_ENTRIES: &str = "[[input]]\nname = \"kiwi\"\ntype = \"file\"\npath = \"ref.wav\"\n\
+                           iq = true\n\n[[input]]\nname = \"hl2\"\ntype = \"file\"\n\
+                           path = \"ref.wav\"\niq = true\nfreq_correction_ppm = 1.5\n";
+
+#[test]
+fn calibrate_from_rbn_saves_into_the_named_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), TWO_ENTRIES);
+    let mut hl2 = design_entry(Some("hl2"));
+    hl2["applied_ppm"] = serde_json::json!(1.5);
+    hl2["suggested_ppm"] = serde_json::json!(-0.4);
+    let body = status_with(Some(vec![design_entry(Some("kiwi")), hl2]));
+    let (out, _) = from_rbn(&body, Some(&cfg), &["--input", "hl2", "--write"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        std::fs::read_to_string(&cfg).unwrap(),
+        TWO_ENTRIES.replace("freq_correction_ppm = 1.5", "freq_correction_ppm = -0.4")
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_needs_input_with_several_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), TWO_ENTRIES);
+    let mut cmd = manta();
+    let out = cmd
+        .args([
+            "calibrate",
+            "--from-rbn",
+            "--addr",
+            "127.0.0.1:1",
+            "--config",
+        ])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("--input"), "{stderr}");
+}
+
+#[test]
+fn calibrate_from_rbn_refuses_an_entry_the_daemon_does_not_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), TWO_ENTRIES);
+    let body = status_with(Some(vec![design_entry(None)]));
+    let (out, addr) = from_rbn(&body, Some(&cfg), &["--input", "hl2"], &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "the daemon at {addr} reports no RBN reading for the [[input]] entry \"hl2\"; it \
+             reports [input]; point --addr at the daemon that runs {}",
+            cfg.display()
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_json_reports_the_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let (out, addr) = from_rbn(
+        &status_with(Some(vec![design_entry(None)])),
+        Some(&cfg),
+        &["--json"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["source"], "rbn");
+    assert_eq!(v["daemon"], addr.as_str());
+    assert_eq!(v["window_seconds"], 3600);
+    assert_eq!(v["input"], serde_json::Value::Null);
+    assert_eq!(v["observed_ppm"], 3.017);
+    assert_eq!(v["result"]["freq_correction_ppm"], -3.02);
+    assert_eq!(v["bands"].as_array().unwrap().len(), 4);
+    assert_eq!(v["written"], false);
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), FILE_INPUT);
+}
+
+#[test]
+fn calibrate_from_rbn_opens_no_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let kiwi = TcpListener::bind("127.0.0.1:0").unwrap();
+    kiwi.set_nonblocking(true).unwrap();
+    let port = kiwi.local_addr().unwrap().port();
+    let cfg = write_cfg(dir.path(), &kiwi_input(port, 9_998_500.0));
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![design_entry(None)])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        matches!(kiwi.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "calibrate --from-rbn connected to the receiver"
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_conflicts_with_measurement_flags() {
+    for extra in [
+        &["--duration", "60"][..],
+        &["--source", "x.wav"],
+        &["--tune-hz", "9998500"],
+    ] {
+        let out = manta()
+            .args(["calibrate", "--from-rbn"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {out:?}");
+        assert!(
+            text(&out.stderr).contains("cannot be used with"),
+            "{extra:?}: {}",
+            text(&out.stderr)
+        );
+    }
+    let out = manta()
+        .args(["calibrate", "--addr", "127.0.0.1:7302"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--addr needs --from-rbn: {out:?}"
+    );
+}
+
+#[test]
+fn calibrate_from_rbn_warns_when_the_environment_overrides_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![design_entry(None)])),
+        Some(&cfg),
+        &["--write"],
+        &[("MANTA_INPUT_FREQ_CORRECTION_PPM", "1.0")],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains(&format!(
+            "warning: MANTA_INPUT_FREQ_CORRECTION_PPM is set and overrides freq_correction_ppm \
+             from {} for run, soak and doctor; unset it to use the saved value",
+            cfg.display()
+        )),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// MAN-541 review: a lone `[[input]]` entry needs no `--input`. The loader
+/// folds it into `[input]` (MAN-393), so the daemon reports it with
+/// `entry: null`, and calibrate matches it the same way.
+#[test]
+fn calibrate_from_rbn_saves_a_lone_input_entry_without_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let original = "[[input]]\nname = \"kiwi\"\ntype = \"file\"\npath = \"ref.wav\"\niq = true\n";
+    let cfg = write_cfg(dir.path(), original);
+    let body = status_with(Some(vec![design_entry(None)]));
+    let (out, _) = from_rbn(&body, Some(&cfg), &["--write"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert!(std::fs::read_to_string(&cfg)
+        .unwrap()
+        .contains("freq_correction_ppm = -3.02"));
+}
+
+/// MAN-541 review: a peer's out-of-range suggestion is never saved.
+#[test]
+fn calibrate_from_rbn_refuses_an_out_of_range_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = write_cfg(dir.path(), FILE_INPUT);
+    let mut entry = design_entry(None);
+    entry["suggested_ppm"] = serde_json::json!(1e300);
+    let (out, _) = from_rbn(
+        &status_with(Some(vec![entry])),
+        Some(&cfg),
+        &["--write"],
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("outside the supported range"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(std::fs::read_to_string(&cfg).unwrap(), FILE_INPUT);
 }

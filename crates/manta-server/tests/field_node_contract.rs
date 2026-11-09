@@ -109,6 +109,7 @@ fn grade_records_never_look_like_spots_to_field_node() {
         time: 1_791_720_000,
         freq_hz: 14_025_100,
         wpm: Some(25),
+        track_id: None,
     };
     let rbn = |spotter: &str, freq_hz: f64, wpm: f64| RbnReport {
         spotter: spotter.to_string(),

@@ -320,6 +320,10 @@ sudo systemctl start manta-field.service
 ```
 
 If it finds no carrier, try another time of day, or `--duration 180` for a beacon.
+With `[rbn_compare]` enabled on the node, `sudo manta calibrate --from-rbn --config
+/etc/manta/manta-field.toml` is the no-WWV fallback: after about an hour of graded spots it saves
+the correction the RBN comparison suggests, without stopping the service or opening the SDR
+(MAN-541; see [rbn-comparison.md](rbn-comparison.md#the-skew-reading-and-a-suggested-correction)).
 `shadow-compare` cross-checks the result against the primary, and is the fallback when no
 reference is audible: in its `## Calibration` table, the `Freq delta (Hz)` row's `Median` column
 is the signed median Δf, node minus primary. If its magnitude is over 20 Hz, set

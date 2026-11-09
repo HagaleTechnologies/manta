@@ -5805,6 +5805,19 @@ mod tests {
         );
     }
 
+    /// MAN-541: the new key reads `MANTA_RBN_COMPARE_SKEW_WARN_PPM` through
+    /// the generic `[rbn_compare]` overlay.
+    #[test]
+    fn rbn_compare_skew_warn_ppm_reads_its_environment_variable() {
+        let body = format!("{SERVER}[rbn_compare]\nenabled = true\n");
+        let loaded = load_env(Some(&body), &[("MANTA_RBN_COMPARE_SKEW_WARN_PPM", "3.5")]).unwrap();
+        assert_eq!(loaded.rbn_compare.unwrap().skew_warn_ppm, 3.5);
+        assert_eq!(
+            loaded.env_vars,
+            vec!["MANTA_RBN_COMPARE_SKEW_WARN_PPM".to_string()]
+        );
+    }
+
     #[test]
     fn rbn_compare_env_overlay() {
         let body = format!("{SERVER}[rbn_compare]\nenabled = true\nwindow_secs = 120\n");

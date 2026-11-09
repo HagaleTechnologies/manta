@@ -204,6 +204,25 @@ recovers after a short burst does not fire it. A disabled target never fires.
 explains each target state and what to do about it. The direct uplink is
 experimental (MAN-90).
 
+### MantaRbnSkew
+
+**Fires when** the node's `manta_rbn_compare_skew_warning{band}` is 1.
+Severity `warning`. The daemon sets it, not the rule: a band with at least 20
+spots in the last hour, a reading precise to a third of the limit, and a
+median skew beyond `[rbn_compare].skew_warn_ppm` (default 2 ppm) for 30
+minutes without a break. The rule has no `for` because the daemon has already
+waited the 30 minutes. The notification quotes the band's skew in ppm.
+
+**Means** the receiver's frequency reference has drifted relative to the RBN
+skimmers that heard the same stations: manta reads every band high (positive)
+or low (negative) by about the same ppm.
+
+**Check** `manta status` on the node: its RBN skew block shows each band's
+reading and the `freq_correction_ppm` to save. Save it with
+`manta calibrate --from-rbn --config manta.toml --write`, or calibrate against
+WWV, then restart manta. [rbn-comparison.md](rbn-comparison.md#the-skew-reading-and-a-suggested-correction)
+explains the reading.
+
 ## Changing thresholds
 
 Edit your copy of `manta-alerts.yml`, add or adjust a case in
@@ -222,6 +241,9 @@ To change the 30 minutes, change the `offset` and the uptime term together:
 the uptime term keeps a restart inside the window from comparing two
 processes' counts. The tests in `crates/manta-cli/tests/monitoring_kit.rs`
 pin the shipped values; your own copy is yours to change.
+
+MantaRbnSkew's threshold is not in the rule: it is each node's
+`[rbn_compare].skew_warn_ppm` config key, so change it there.
 
 ## Notifications
 
