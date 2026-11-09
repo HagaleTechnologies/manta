@@ -2,7 +2,10 @@
 //! CI-sized grid (one AWGN series, two SNRs, 30 s). Harness correctness only:
 //! the command is a measuring instrument, not a decoder gate.
 
-use std::process::{Command, Output};
+#[path = "common/launch.rs"]
+mod launch;
+
+use std::process::Output;
 
 const SMALL: &[&str] = &[
     "bench",
@@ -18,13 +21,7 @@ const SMALL: &[&str] = &[
 ];
 
 fn manta(args: &[&str]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd.args(args).output().unwrap()
+    launch::manta().args(args).output().unwrap()
 }
 
 /// The `recall` column's numerator, e.g. 10 from "10/10".

@@ -7,6 +7,7 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
+use common::{free_ports, manta};
 
 use common::ka9q::*;
 use std::io::{BufRead, BufReader, Read, Write};

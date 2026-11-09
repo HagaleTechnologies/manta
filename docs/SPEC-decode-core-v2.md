@@ -487,7 +487,8 @@ keyed text decides which keyed spaces the decode reproduced; every other
 decoded space is spurious, so a word gap read as a character gap and a
 character gap read as a word gap cost the same. A whole first word lost to
 the warm-up floor (v1 §2.1) is not a miss. `word_boundary_fraction` in
-`crates/manta-cli/tests/golden_vr.rs` implements it (MAN-173).
+`crates/manta-testkit/src/cer.rs` implements it (MAN-173);
+`crates/manta-cli/tests/golden_vr.rs` applies it.
 
 `manta-testkit::keyer` gains `rise_ms` per scene (exists), `weight`
 (dah/dit ratio), and `gap_units` (character/word gap multipliers) to

@@ -9,12 +9,16 @@
 //! datagrams from `base+11`, paced at real time. A real `manta` child
 //! is pointed at `--hpsdr-port <base>`, with no `--hpsdr-protocol`.
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::{free_ports, manta};
+
 use manta_input::IqSource;
 use num_complex::Complex32;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -38,24 +42,6 @@ const SAMPLE_TS_TOLERANCE: i64 = 512;
 /// container, where the kernel itself dropped 10-213 datagrams at
 /// startup); a quarter of RBN's 100 Hz reporting step.
 const FREQ_TOLERANCE_HZ: f64 = 25.0;
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
-
-/// `N` distinct ports nothing listens on right now. All `N` listeners are
-/// held until every port is read: releasing each before binding the next
-/// lets the OS hand the same port out twice.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
-}
 
 /// V1 at 192 kHz, shortened to 30 s (centre 14 MHz).
 fn v1_fixture(dir: &Path) -> PathBuf {
