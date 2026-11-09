@@ -51,6 +51,7 @@ async fn spawn_listener(
                 lists: Arc::new(manta_spot::reference::ReferenceLists::new(
                     Arc::new(Table::parse(CTY_FIXTURE)),
                     Arc::new(manta_spot::scp::Set::bundled()),
+                    std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
                 )),
                 station_call: "W3XYZ".to_string(),
                 station_location: None,

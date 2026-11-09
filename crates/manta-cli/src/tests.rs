@@ -195,9 +195,184 @@ fn pinned_spot(
     };
     resolve_spot_pinned(vec![], None, None, cty, None, pins, None, &spot)
 }
-fn pinned(spot: &SpotResolved) -> Result<(PipelineConfig, [list_refresh::InUse; 2])> {
+fn pinned(spot: &SpotResolved) -> Result<(PipelineConfig, [list_refresh::InUse; 3])> {
     build_pipeline_config(0.0, spot, Default::default(), Engine::Legacy)
 }
+// ---- MAN-542: the pattern list in use
+
+/// A `[spot]` with refresh on and `list_cache_dir`, and the given
+/// `pattern_url` and `pattern_path`, resolved as `run` does.
+fn pattern_spot(
+    cache: &std::path::Path,
+    pattern_url: Option<&str>,
+    pattern_path: Option<PathBuf>,
+) -> SpotResolved {
+    let spot = config::SpotFile {
+        refresh_lists: true,
+        list_cache_dir: Some(cache.to_path_buf()),
+        pattern_url: pattern_url.map(str::to_string),
+        pattern_path,
+        ..Default::default()
+    };
+    resolve_spot(vec![], None, None, None, None, None, &spot)
+}
+
+/// Seeds `cache` with a current pattern version holding `+QQ9@@@`;
+/// returns its SHA-256.
+fn cache_pattern_version(cache: &std::path::Path) -> String {
+    let text = format!("{}+QQ9@@@\n", manta_spot::PATTERNS_LST);
+    let sha = list_cache::sha256_hex(text.as_bytes());
+    let now = list_cache::unix_secs(SystemTime::now());
+    list_cache::Cache::new(cache.to_path_buf())
+        .store(
+            ListKind::Patterns,
+            text.as_bytes(),
+            &list_cache::State {
+                sha256: sha.clone(),
+                url: "http://mirror.lan/Patt3Ch.lst".into(),
+                downloaded_at: now,
+                checked_at: now,
+                last_modified: None,
+            },
+        )
+        .unwrap();
+    sha
+}
+
+#[test]
+fn build_pipeline_config_reports_the_pattern_list_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let spot = pattern_spot(dir.path(), None, None);
+    let (_, in_use) = pinned(&spot).unwrap();
+    assert_eq!(in_use[2], list_refresh::InUse::bundled(ListKind::Patterns));
+    let path = dir.path().join("patterns.lst");
+    let bytes = "\u{feff}+QQ9@@@\n".as_bytes();
+    std::fs::write(&path, bytes).unwrap();
+    let spot = pattern_spot(dir.path(), None, Some(path.clone()));
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    assert_eq!(
+        in_use[2],
+        list_refresh::InUse::new(
+            ListKind::Patterns,
+            list_cache::sha256_hex(bytes),
+            list_refresh::Origin::File(path),
+        )
+    );
+    assert_eq!(
+        cfg.pattern_table().tier("QQ9ZZZ"),
+        manta_spot::PatternTier::Common
+    );
+}
+
+#[test]
+fn prepare_run_lists_shares_the_configured_pattern_table() {
+    let dir = tempfile::tempdir().unwrap();
+    cache_pattern_version(dir.path());
+    let path = dir.path().join("patterns.lst");
+    std::fs::write(&path, "+K5@@@\n").unwrap();
+    let url = Some("http://mirror.lan/Patt3Ch.lst");
+    let spot = pattern_spot(dir.path(), url, Some(path));
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    // Refresh off (a file source): the very table `cfg` holds.
+    let off = prepare_run_lists(false, &spot, in_use.clone(), &cfg).unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &off.lists.patterns.load(),
+        &cfg.pattern_table()
+    ));
+    // Refresh on with a cached version: `pattern_path` still wins.
+    let on = prepare_run_lists(true, &spot, in_use, &cfg).unwrap();
+    let table = on.lists.patterns.load();
+    assert_eq!(
+        (table.len(), table.tier("QQ9ZZZ")),
+        (1, manta_spot::PatternTier::Unlisted)
+    );
+    assert!(matches!(on.in_use[2].origin, list_refresh::Origin::File(_)));
+}
+
+#[test]
+fn prepare_run_lists_manages_patterns_only_with_a_url() {
+    let managed_kinds = |run_lists: &RunLists| -> Vec<ListKind> {
+        run_lists
+            .refresh
+            .as_ref()
+            .unwrap()
+            .lists
+            .iter()
+            .map(|l| l.in_use.kind)
+            .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cached_sha = cache_pattern_version(dir.path());
+    // `pattern_url` set: three lists, the cache's pattern table.
+    let spot = pattern_spot(dir.path(), Some("http://mirror.lan/Patt3Ch.lst"), None);
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    let run_lists = prepare_run_lists(true, &spot, in_use, &cfg).unwrap();
+    assert_eq!(managed_kinds(&run_lists), ListKind::ALL.to_vec());
+    assert_eq!(run_lists.in_use[2].sha256, cached_sha);
+    assert_eq!(
+        run_lists.lists.patterns.load().tier("QQ9ZZZ"),
+        manta_spot::PatternTier::Common
+    );
+    // Unset: two lists and the built-in table, cache or not (D11).
+    let spot = pattern_spot(dir.path(), None, None);
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    let run_lists = prepare_run_lists(true, &spot, in_use, &cfg).unwrap();
+    assert_eq!(
+        managed_kinds(&run_lists),
+        vec![ListKind::Cty, ListKind::Scp]
+    );
+    assert_eq!(
+        run_lists.in_use[2],
+        list_refresh::InUse::bundled(ListKind::Patterns)
+    );
+    assert_eq!(
+        run_lists.lists.patterns.load().tier("QQ9ZZZ"),
+        manta_spot::PatternTier::Unlisted
+    );
+    // `pattern_path` set: two lists.
+    let path = dir.path().join("patterns.lst");
+    std::fs::write(&path, "+K5@@@\n").unwrap();
+    let spot = pattern_spot(
+        dir.path(),
+        Some("http://mirror.lan/Patt3Ch.lst"),
+        Some(path),
+    );
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    let run_lists = prepare_run_lists(true, &spot, in_use, &cfg).unwrap();
+    assert_eq!(
+        managed_kinds(&run_lists),
+        vec![ListKind::Cty, ListKind::Scp]
+    );
+}
+
+#[test]
+fn adopt_run_lists_copies_all_three_tables() {
+    let dir = tempfile::tempdir().unwrap();
+    cache_pattern_version(dir.path());
+    let spot = pattern_spot(dir.path(), Some("http://mirror.lan/Patt3Ch.lst"), None);
+    let (cfg, in_use) = pinned(&spot).unwrap();
+    let run_lists = prepare_run_lists(true, &spot, in_use.clone(), &cfg).unwrap();
+    let mut adopted = cfg.clone();
+    adopt_run_lists(&mut adopted, &run_lists);
+    assert!(std::sync::Arc::ptr_eq(
+        &adopted.pattern_table(),
+        &run_lists.lists.patterns.load()
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &adopted.cty_table(),
+        &run_lists.lists.cty.load()
+    ));
+    assert!(std::sync::Arc::ptr_eq(
+        &adopted.scp_set(),
+        &run_lists.lists.scp.load()
+    ));
+    // Refresh off: `cfg` is untouched.
+    let off = prepare_run_lists(false, &spot, in_use, &cfg).unwrap();
+    let mut untouched = cfg.clone();
+    adopt_run_lists(&mut untouched, &off);
+    assert!(untouched.patterns.is_none() && untouched.cty.is_none() && untouched.scp.is_none());
+}
+
 /// Writes `bytes` as `dir`'s cty version file; returns its SHA-256.
 fn cache_cty_version(dir: &std::path::Path, bytes: &[u8]) -> String {
     let sha = list_cache::sha256_hex(bytes);

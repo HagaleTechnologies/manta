@@ -20,6 +20,7 @@ use crate::decode_quality_of;
 use crate::fmt;
 use crate::ftx_run;
 
+use crate::adopt_run_lists;
 use crate::latency_histogram_of;
 use crate::live_state;
 use crate::logging;
@@ -522,10 +523,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
         let run_lists = prepare_run_lists(live, &resolved.spot, lists_in_use, &cfg)?;
         let mut cfg = cfg;
         attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
-        if run_lists.refresh.is_some() {
-            cfg.cty = Some(run_lists.lists.cty.load());
-            cfg.scp = Some(run_lists.lists.scp.load());
-        }
+        adopt_run_lists(&mut cfg, &run_lists);
         let server = match loaded.server.clone() {
             None => None,
             Some(server_cfg) => Some(multi_run::ServerSetup {
@@ -723,10 +721,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
     let run_lists = prepare_run_lists(spec.is_reconnectable(), &resolved.spot, lists_in_use, &cfg)?;
     let mut cfg = cfg;
     attach_language_prior(&mut cfg, &resolved.spot, Some(run_lists.lists.clone()))?;
-    if run_lists.refresh.is_some() {
-        cfg.cty = Some(run_lists.lists.cty.load());
-        cfg.scp = Some(run_lists.lists.scp.load());
-    }
+    adopt_run_lists(&mut cfg, &run_lists);
     let lists = run_lists.lists.clone();
 
     // Kept alive for the process lifetime: dropping it would stop

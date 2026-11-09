@@ -60,8 +60,13 @@ the git history and `docs/DECISIONS/`.
   between callsigns (in the repetition gate and the rival ledger) without adding
   repetitions, and spots retain the later supporting RF timestamp. A speed
   change triggers a replay only once it has held across two words.
-  `[decode.refine]` controls the budget; five `manta_refine_*` counters report
+  `[decode.refine]` controls the budget; eight `manta_refine_*` counters report
   activity. RF recall remains unmeasured.
+- MAN-515: Refinement no longer flips a legacy or edge-legacy base to HSMM,
+  replays a seeded timing hypothesis once per speed, and never moves a
+  callsign's support to a reading that cannot be spotted.
+  `manta_refine_replays_total`, `manta_refine_changed_total` and
+  `manta_refine_rejected_total` report how many replays changed a word.
 - MAN-494: optional per-input IQ correction uses a controlled-tone calibration
   to remove receiver images. It defaults to off. Observe and a centre mismatch
   preserve samples; mirror evidence never enables correction by itself.
