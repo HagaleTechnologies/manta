@@ -402,12 +402,16 @@
 #calls_heard_path = "calls-heard.txt"
 
 # Download current copies of cty.dat and MASTER.SCP while `manta run`
-# runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day.
+# runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day
+# and, with pattern_url set, the callsign-pattern list every 7 days.
 # A download is used only if it parses and looks complete; a failed one is
 # logged, counted in manta_list_refresh_total and retried in an hour, and
 # the copy already in use stays. File replay never downloads. Downloads are
-# plain HTTP (port 80) from the two URLs below. Not used for a list that
-# cty_path/scp_path or cty_sha256/scp_sha256 sets.
+# HTTPS (TCP port 443) from cty_url and scp_url by default, checked
+# against the certificate authorities built into manta. pattern_url has
+# no default; http:// mirrors use TCP port 80 unless another port is set.
+# Not used for a list that cty_path/scp_path/pattern_path or
+# cty_sha256/scp_sha256 sets.
 #refresh_lists = false
 
 # Directory for downloaded lists, so a restart starts from the last good
@@ -415,12 +419,13 @@
 # directory. Unset: downloads are kept in memory only.
 #list_cache_dir = "/var/cache/manta"
 
-# Where to download cty.dat. Only http:// URLs: manta has no TLS
-# support. Point it at a local mirror to share one download.
-#cty_url = "http://www.country-files.com/cty/cty.dat"
+# Where to download cty.dat: an https:// URL, or an http:// URL for a
+# local mirror (plain HTTP). Redirects are not followed, and HTTPS_PROXY
+# and HTTP_PROXY are not used. Point it at a mirror to share one download.
+#cty_url = "https://www.country-files.com/cty/cty.dat"
 
 # Where to download MASTER.SCP, under the same rules as cty_url.
-#scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+#scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 
 # Use exactly this version of cty.dat, by the SHA-256 of its bytes (64 hex
 # digits, as printed in manta's `lists:` log line). If cty_path is set,
@@ -456,6 +461,16 @@
 # starts a comment: "+K5@@@". Relative to this file's directory. Unset: the
 # built-in copy. --patterns overrides it. Changes need a restart.
 #pattern_path = "patterns.lst"
+
+# Where list refresh downloads the callsign-pattern list (see
+# refresh_lists). Unset: the pattern list is never downloaded. Accepts
+# manta's own [+]PATTERN files and RBN's Patt3Ch.lst, for example
+# "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst". Checked
+# every 7 days. Lines no call manta accepts can match (longer than 7
+# characters, or a shape manta's pattern rule never produces) are skipped.
+# Only http:// URLs. Not used when pattern_path is set. Changes need a
+# restart.
+#pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
 
 
 # --- Signal detection --------------------------------------------------------
@@ -541,7 +556,7 @@
 # documented defaults):
 #    enabled = true                   # false: no retention, no replay
 #    lookback_secs = 10.0             # per-track retained hops; 0 (off) or 4.0..=10.0 s
-#    max_refinements_per_episode = 2  # hypothesis cap per episode, 1 through 4
+#    max_refinements_per_episode = 2  # attempt cap per episode, 1 through 4
 #    replay_hops_per_batch = 1500     # re-decode work per input batch, in hops
 #    backlog = 16                     # queued episodes, 1 through 256
 #refine = { enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }

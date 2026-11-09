@@ -32,6 +32,7 @@ fn fixture_lists() -> Arc<ReferenceLists> {
     Arc::new(ReferenceLists::new(
         Arc::new(Table::parse(CTY_FIXTURE)),
         Arc::new(scp::Set::bundled()),
+        std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
     ))
 }
 

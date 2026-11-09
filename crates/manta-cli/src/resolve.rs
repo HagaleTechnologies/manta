@@ -164,6 +164,9 @@ pub(crate) struct SpotResolved {
     pub(crate) list_cache_dir: Option<PathBuf>,
     pub(crate) cty_url: String,
     pub(crate) scp_url: String,
+    /// MAN-542: `[spot] pattern_url`; `None` means the pattern list is never
+    /// downloaded.
+    pub(crate) pattern_url: Option<String>,
     pub(crate) patterns: Option<PathBuf>,
     /// MAN-200: `[spot] repetition_fusion`; no flag, so straight from the
     /// file/env layer.
@@ -232,6 +235,7 @@ pub(crate) fn resolve_spot_pinned(
         list_cache_dir: spot.list_cache_dir.clone(),
         cty_url: spot.cty_url().to_string(),
         scp_url: spot.scp_url().to_string(),
+        pattern_url: spot.pattern_url.clone(),
         patterns: cli_patterns.or_else(|| spot.pattern_path.clone()),
         validation_level: spot.validation_level,
         repetition_fusion: spot.repetition_fusion,

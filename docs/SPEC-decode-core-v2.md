@@ -589,10 +589,13 @@ attempts accept 1–4, hop budgets 1–15000, and backlog 1–256.
 Admission follows track id and word sequence. Unresolved alternatives or a rival
 admit an initial attempt. A stable changed speed -- at least 3 WPM, held across
 two words since the track's last speed update -- or a neighbour moving
-from within 93.75 Hz to outside that distance can trigger another attempt. A later
-word also permits a second attempt. Attempts remain capped. Replay first flips
-legacy/HSMM and then seeds the causal engine with the current speed estimate.
-The causal engine default remains legacy.
+from within 93.75 Hz to outside that distance can trigger another attempt. From an
+HSMM base, a later word also permits a second attempt. Attempts remain capped.
+From an HSMM base, replay first flips to legacy and then seeds HSMM with the
+current speed estimate; from a legacy or edge-legacy base it replays the base
+engine with the speed seeded, once per stable speed (MAN-515). A refinement
+never moves a spottable callsign's support to a reading that cannot be
+spotted. The causal engine default remains legacy.
 
 Retained decoder inputs are bounded per track at 375 hops per retained second
 and globally at 8 MiB of estimated entries. Gaps clear retention; missing spans

@@ -116,9 +116,9 @@ missing series as "no loss" or "no traffic".
 | `manta_input_distinct_calls_total` | counter | `source` | Distinct callsigns this input decoded spots for since the daemon started. Kept as a set of 64-bit FNV-1a hashes, at most 20,000 per input: past that, new calls are not counted (a one-time warning says so), so the value is then a floor. | As `manta_input_spots_total`. |
 | `manta_input_cross_input_dupes_total` | counter | `source` | Candidate spots this input had withheld because another input had already spotted the same signal (MAN-13's cross-input dedupe: within 600 s, in the same 300 Hz bucket or within one channel across a bucket edge). `source` is the withheld input, the one that lost: each count shows that it heard the station too. | As `manta_input_spots_total`. |
 | `manta_input_silent` | gauge | `source` | 1 when a healthy input published no spots and lost no cross-input dedupes over the last `[server].silent_input_warning_secs` window while another input published at least one spot, else 0. Evaluated once per window; an input whose sample delivery was unhealthy during the window is not flagged, nor is any input when every input was quiet. Back to 0 promptly when the input publishes a spot, loses a cross-input dedupe, or becomes unhealthy. Not part of `/healthz`: a silent input that still delivers samples reads `manta_source_health` 1. | As `manta_input_spots_total`. Stays 0 with `silent_input_warning_secs = 0`. |
-| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty` or `scp`; `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list. |
-| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. |
-| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400`. | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. |
+| `manta_list_info` | gauge | `list`, `sha256`, `origin` | Always 1. Names the reference list each consumer uses now: `list` is `cty`, `scp` or `patterns` (the callsign-pattern list, MAN-542); `sha256` is the SHA-256 of its bytes; `origin` is `bundled`, `file`, `cache` or `download`. A swap replaces the series. | Always with `[server]`; one series per list, so every daemon has a `patterns` series. |
+| `manta_list_refresh_total` | counter | `list`, `outcome` | Download attempts by outcome: `updated` (a new version passed the checks and is in use), `unchanged` (304, or the same bytes), `failed` (network or HTTP error, or rejected by the checks). | With `refresh_lists` on, for each list the refresher manages; all three outcomes start at 0. No samples otherwise. `list="patterns"` series exist only with `[spot] pattern_url` set and `pattern_path` unset. |
+| `manta_list_last_success_timestamp_seconds` | gauge | `list` | Unix time manta last confirmed the list in use is current with its URL (an `updated` or `unchanged` attempt, or the cache's `checked_at` at startup). Alert on `time() - manta_list_last_success_timestamp_seconds{list="cty"} > 8*86400` (likewise `{list="patterns"}`, also checked every 7 days). | With `refresh_lists` on, once the list has been confirmed at least once. Absent means never confirmed. For `list="patterns"`, only with `[spot] pattern_url` set and `pattern_path` unset. |
 | `manta_uplink_sent_total` | counter | — | Spots forwarded to RBN uplink targets; the sum over every configured target. Includes relayed spots (MAN-320). | Always, one series. Stays 0 with no `[[rbn_uplink]]` configured. |
 | `manta_callsign_lookups_total` | counter | `outcome` | Callsign lookups (MAN-318), one per callsign request the `manta-lookup` thread takes off its queue (concurrent spots of one call share one request): `found` and `not_found` are QRZ.com's answers; `failed` is no answer (none within 10 s, a network or HTTP error, a refused login, or skipped while lookups pause after one of those). | With `[callsign_lookup]` enabled on a live `run` with `[server]`; all series start at 0. No samples otherwise. |
 | `manta_callsign_lookup_withheld_total` | counter | — | Spots not published because QRZ.com does not list the callsign, from a fresh or a cached answer. Counts spots, not requests. | With `[callsign_lookup]` enabled on a live `run` with `[server]`; all series start at 0. No samples otherwise. |
@@ -445,7 +445,7 @@ For what each uplink state means and what to do about it, see
 
 ### Delayed refinement
 
-The decode-quality observer exports five counters without labels:
+The decode-quality observer exports eight counters without labels:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -454,7 +454,13 @@ The decode-quality observer exports five counters without labels:
 | `manta_refine_rescues_total` | counter | Spots emitted by refinement. |
 | `manta_refine_budget_exhausted_total` | counter | Batches that paused an unfinished replay. |
 | `manta_refine_orphaned_revisions_total` | counter | Revisions whose observation expired. |
+| `manta_refine_replays_total` | counter | Replays that ran to the end of their preserved inputs, with or without a reading. |
+| `manta_refine_changed_total` | counter | Replays whose reading replaced the word's decoded text. `changed / replays` is the share of replays that change a word. |
+| `manta_refine_rejected_total` | counter | Replays whose reading would have turned a spottable callsign into a string that can never be spotted; the decoded word was kept. |
 
 Counters accumulate deltas across input segments, including reconnects. The
 scheduler also counts backlog overflow, buffer misses and replays without a
 reading internally. A rescue counter is an emission count, not a truth score.
+The share of replays that change a word is
+`rate(manta_refine_changed_total[1h]) / rate(manta_refine_replays_total[1h])`
+([MAN-515](DECISIONS/2026-11-09-man515-refine-replay-gate.md)).

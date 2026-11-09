@@ -336,6 +336,7 @@ impl DecodeConfigToml {
             },
             refine_bw_hz: self.refine_bw_hz,
             steered_frontend: false,
+            legacy_alternatives: false,
             refine: self.refine.into_refine_config(),
             // MAN-544: not a TOML option; a config file keeps the runtime
             // default, never a literal off value.
@@ -426,6 +427,22 @@ pub struct DecodeConfigFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAN-545: the legacy runner-up switch is a Rust-only research knob;
+    /// `deny_unknown_fields` keeps a config file from reaching it.
+    #[test]
+    fn legacy_alternatives_is_not_a_toml_key() {
+        let err = toml::from_str::<DecodeConfigFile>("[decode]\nlegacy_alternatives = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("legacy_alternatives"), "{err}");
+    }
+
+    #[test]
+    fn toml_decode_config_keeps_legacy_alternatives_off() {
+        let file: DecodeConfigFile = toml::from_str("").unwrap();
+        assert!(!file.decode.into_decode_config().legacy_alternatives);
+    }
 
     #[test]
     fn absent_decode_table_parses_to_all_defaults() {

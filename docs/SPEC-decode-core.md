@@ -2393,19 +2393,21 @@ allowlist = []
 # Same path rule. Unset: bundled. --scp overrides it.
 # scp_path = "MASTER.SCP"
 # Scheduled list refresh (MAN-316). Opt-in; only `run` from a live
-# receiver downloads. cty.dat is checked every 7 days and MASTER.SCP every
-# day (If-Modified-Since); a download replaces the table in use only after
+# receiver downloads. cty.dat is checked every 7 days, MASTER.SCP every
+# day and, with pattern_url set (MAN-542), the pattern list every 7 days
+# (If-Modified-Since); a download replaces the table in use only after
 # it parses and passes the acceptance checks, and a failure keeps the
 # current table and retries in 1 hour. File replay never downloads and
 # never reads the cache's latest copy. Skipped for a list that a path or
 # a SHA-256 pin below sets.
 # refresh_lists = false
 # Accepted downloads, content-addressed (cty/<sha256>.dat,
-# scp/<sha256>.scp, state.json). Same path rule. Unset: memory only.
+# scp/<sha256>.scp, patterns/<sha256>.lst, state.json). Same path rule.
+# Unset: memory only.
 # list_cache_dir = "/var/cache/manta"
-# http:// only (no TLS); https:// is refused at load.
-# cty_url = "http://www.country-files.com/cty/cty.dat"
-# scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+# https:// (checked against built-in CA roots) or http:// for a local mirror.
+# cty_url = "https://www.country-files.com/cty/cty.dat"
+# scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 # Pin a list by the SHA-256 of its bytes (64 hex digits), for every
 # validating command: a set cty_path/scp_path must match it; otherwise it
 # is looked up in the bundled copy, then list_cache_dir. No match stops
@@ -2422,6 +2424,10 @@ repetition_fusion = false
 # Leading # comments; @ for later letters, # for later digits. Same path rule.
 # Unset: bundled. --patterns overrides it.
 # pattern_path = "patterns.lst"
+# MAN-542: where refresh_lists downloads the pattern list ([+]PATTERN or
+# RBN's Patt3Ch.lst). No default: unset, nothing is fetched. http:// only;
+# not used when pattern_path is set.
+# pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders

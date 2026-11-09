@@ -93,6 +93,7 @@ mod tests {
             Arc::new(ReferenceLists::new(
                 Arc::new(cty::Table::parse("")),
                 Arc::new(scp::Set::parse(scp)),
+                Arc::new(crate::pattern::Table::bundled()),
             )),
             CallsHeard::parse(heard),
             2.0,
@@ -116,6 +117,7 @@ mod tests {
             Arc::new(ReferenceLists::new(
                 Arc::new(cty::Table::bundled()),
                 Arc::new(scp::Set::parse("")),
+                Arc::new(crate::pattern::Table::bundled()),
             )),
             CallsHeard::default(),
             2.0,
@@ -153,6 +155,7 @@ mod tests {
         let lists = Arc::new(ReferenceLists::new(
             Arc::new(cty::Table::parse("")),
             Arc::new(scp::Set::parse("")),
+            Arc::new(crate::pattern::Table::bundled()),
         ));
         let p = LanguagePrior::new(lists.clone(), CallsHeard::default(), 2.0);
         assert_eq!(p.reading_bonus("W1AW"), 0.0);

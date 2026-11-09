@@ -35,8 +35,13 @@ pub use observation::{Detail, Observation, ObservationId, ObservationLog, Observ
 pub use pattern::{PatternTier, ValidationLevel};
 pub use support::Support;
 pub use validator::{
+<<<<<<< HEAD
     calibration_factor_from_ppm, round_ppm, EmissionState, InvalidCalibration, RefineCandidate,
     RefinedWord, Spot, SpotMode, SuppressionCounts, Validator, MAX_ABS_PPM, STABLE_SPEED_WORDS,
+=======
+    calibration_factor_from_ppm, EmissionState, InvalidCalibration, RefineCandidate, RefinedWord,
+    RefinementOutcome, Spot, SpotMode, SuppressionCounts, Validator, STABLE_SPEED_WORDS,
+>>>>>>> 58406a20d7cb57fa2a21ae10a1dbe2a1012b050d
 };
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see
