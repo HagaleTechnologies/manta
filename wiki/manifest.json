@@ -66,11 +66,7 @@
       "visibility": "public"
     },
     {
-<<<<<<< HEAD
-      "hash": "sha256:4d8f9b11086b8ea462c75094ae9ffbb6a2fd0e99db2c7469727f92b69f04e2bf",
-=======
-      "hash": "sha256:d47cbfbada9012ef5cef9ae283ec47ef70a0f65e51b48f2f6bd27cf4391d481b",
->>>>>>> 6328bd0e46f249188aa35b4a48ab0794414fa68f
+      "hash": "sha256:53dae587af74c9bc2b757b03f8dd1c8fa8a437e11bf3e1098066c5df51d76697",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [

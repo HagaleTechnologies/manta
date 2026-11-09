@@ -115,14 +115,12 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   cross these windows need an explicit opt-out. See the
   [decision record](../../docs/DECISIONS/2026-10-19-man311-digital-window-exclusions.md)
   and [config table](../../docs/CONFIG.md#digital-mode-windows).
-<<<<<<< HEAD
 - MAN-526: `FloorBank::update` and `Gate::update` take the same hop in
   dB and linear units (`&hop.power`); the linear EMA and the gate windows
   never undo `power_db`. `F_rise` and the gate's linear threshold are
   cached at the decimated push, so any new write to floor state outside
   the decimated branch must refresh `rise_floor_db`. See the
   [decision record](../../docs/DECISIONS/2026-11-08-man526-linear-channel-power.md).
-=======
 
 - MAN-524: ownership, spawn admission and merge read track centres through
   a per-pass `CenterIndex` (`track/neighbours.rs`), never cached. A test
@@ -131,4 +129,3 @@ Order statistics rather than a mean floor is the load-bearing choice: CW is burs
   exact negation (`short_of(d, r)`, which is `!(d >= r)`, not `d < r`),
   or NaN centres decide differently. See the
   [decision record](../../docs/DECISIONS/2026-11-08-man524-linear-track-neighbour-queries.md).
->>>>>>> 6328bd0e46f249188aa35b4a48ab0794414fa68f
