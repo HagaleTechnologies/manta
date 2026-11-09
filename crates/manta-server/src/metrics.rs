@@ -2792,7 +2792,7 @@ impl Metrics {
         // lists whose setter has run (see `ListMetrics`).
         let lists = self.list_metrics();
         out.push_str(
-            "# HELP manta_list_info The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.\n",
+            "# HELP manta_list_info The reference list in use: list (cty, scp or patterns), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.\n",
         );
         out.push_str("# TYPE manta_list_info gauge\n");
         for (list, m) in lists.iter() {
@@ -5511,7 +5511,7 @@ mod tests {
             (
                 "manta_list_info",
                 "gauge",
-                "The reference list in use: list (cty or scp), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.",
+                "The reference list in use: list (cty, scp or patterns), the SHA-256 of its bytes, and its origin (bundled, file, cache or download). Always 1.",
             ),
             (
                 "manta_list_refresh_total",

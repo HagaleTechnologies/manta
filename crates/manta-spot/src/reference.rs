@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::{cty, scp};
+use crate::{cty, pattern, scp};
 
 /// One reference list that a scheduled refresh may replace while readers
 /// hold snapshots of the old one.
@@ -51,20 +51,24 @@ impl<T> Live<T> {
     }
 }
 
-/// The two reference lists a refresh can replace: AD1C's `cty.dat` and
-/// `MASTER.SCP`. Shared as an `Arc` between the refresher, the decode
-/// thread's validator and the daemon's spot servers.
+/// The three reference lists a refresh can replace: AD1C's `cty.dat`,
+/// `MASTER.SCP` and the callsign-pattern list (MAN-542). Shared as an `Arc`
+/// between the refresher, the decode thread's validator and the daemon's
+/// spot servers. The decode thread applies all three at start, so each
+/// caller passes the pattern table it actually uses.
 #[derive(Debug)]
 pub struct ReferenceLists {
     pub cty: Live<cty::Table>,
     pub scp: Live<scp::Set>,
+    pub patterns: Live<pattern::Table>,
 }
 
 impl ReferenceLists {
-    pub fn new(cty: Arc<cty::Table>, scp: Arc<scp::Set>) -> Self {
+    pub fn new(cty: Arc<cty::Table>, scp: Arc<scp::Set>, patterns: Arc<pattern::Table>) -> Self {
         Self {
             cty: Live::new(cty),
             scp: Live::new(scp),
+            patterns: Live::new(patterns),
         }
     }
 }
@@ -143,19 +147,10 @@ pub fn accept_scp(text: &str, bundled: &scp::Set) -> Result<scp::Set, String> {
             .bytes()
             .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'/');
         if !is_call {
-            // Control characters (an escape sequence's ESC, say) become `?`:
-            // the reason reaches the log, and the download is untrusted.
-            let mut quoted: String = line
-                .chars()
-                .take(QUOTED_LINE_CHARS)
-                .map(|c| if c.is_control() { '?' } else { c })
-                .collect();
-            if line.chars().count() > QUOTED_LINE_CHARS {
-                quoted.push('…');
-            }
             return Err(format!(
-                "line {} is \"{quoted}\", not a callsign",
-                index + 1
+                "line {} is \"{}\", not a callsign",
+                index + 1,
+                quoted_line(line)
             ));
         }
     }
@@ -168,6 +163,62 @@ pub fn accept_scp(text: &str, bundled: &scp::Set) -> Result<scp::Set, String> {
         ));
     }
     Ok(set)
+}
+
+/// A download's line as a rejection quotes it: cut at
+/// [`QUOTED_LINE_CHARS`] with `…`, and control characters (an escape
+/// sequence's ESC, say) shown as `?`, because the reason reaches the log and
+/// the download is untrusted.
+fn quoted_line(line: &str) -> String {
+    let mut quoted: String = line
+        .chars()
+        .take(QUOTED_LINE_CHARS)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    if line.chars().count() > QUOTED_LINE_CHARS {
+        quoted.push('…');
+    }
+    quoted
+}
+
+/// MAN-542 D6: parses a downloaded callsign-pattern list (manta's
+/// `[+]PATTERN` format or RBN's Skimmer-format `Patt3Ch.lst`) and returns it
+/// only if every line is pattern-shaped, it lists every [`CTY_CANARIES`]
+/// call's pattern, and it lists at least half as many patterns as the
+/// built-in copy `bundled`.
+pub fn accept_patterns(
+    text: &str,
+    bundled: &pattern::Table,
+) -> Result<pattern::Downloaded, String> {
+    let text = strip_bom(text);
+    let downloaded = match pattern::Table::parse_download(text) {
+        Ok(downloaded) => downloaded,
+        Err(pattern::ParseError::InvalidLine { line, text }) => {
+            return Err(format!(
+                "line {line} is \"{}\", not a pattern",
+                quoted_line(&text)
+            ));
+        }
+        Err(pattern::ParseError::Empty) => return Err("it lists no patterns".into()),
+    };
+    let table = &downloaded.table;
+    if let Some((call, entity)) = CTY_CANARIES
+        .iter()
+        .find(|(call, _)| table.tier(call) == pattern::PatternTier::Unlisted)
+    {
+        return Err(format!(
+            "it does not list {call}'s pattern {} ({entity}), so it is truncated or not a callsign-pattern list",
+            pattern::pattern_of(call)
+        ));
+    }
+    if table.len() * 2 < bundled.len() {
+        return Err(format!(
+            "it lists {} patterns, under half the built-in copy's {}",
+            table.len(),
+            bundled.len()
+        ));
+    }
+    Ok(downloaded)
 }
 
 #[cfg(test)]
@@ -215,14 +266,147 @@ mod tests {
         let lists = ReferenceLists::new(
             Arc::new(cty::Table::parse(QQ9_ENTITY)),
             Arc::new(scp::Set::parse("K1ABC\n")),
+            Arc::new(pattern::Table::bundled()),
         );
+        let generations = |l: &ReferenceLists| {
+            (
+                l.cty.generation(),
+                l.scp.generation(),
+                l.patterns.generation(),
+            )
+        };
         lists.cty.store(Arc::new(cty::Table::parse(crate::CTY_DAT)));
-        assert_eq!((lists.cty.generation(), lists.scp.generation()), (1, 0));
+        assert_eq!(generations(&lists), (1, 0, 0));
         assert!(lists.cty.load().is_allocated("K1ABC"));
         assert!(lists.scp.load().contains("K1ABC"));
         lists.scp.store(Arc::new(scp::Set::parse("W1AW\n")));
-        assert_eq!((lists.cty.generation(), lists.scp.generation()), (1, 1));
+        assert_eq!(generations(&lists), (1, 1, 0));
         assert!(lists.scp.load().contains("W1AW"));
+        lists
+            .patterns
+            .store(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
+        assert_eq!(generations(&lists), (1, 1, 1));
+        assert_eq!(
+            lists.patterns.load().tier("QQ9ZZZ"),
+            pattern::PatternTier::Common
+        );
+    }
+
+    /// MAN-542: `text` (a `[+]PATTERN` list) as RBN's `Patt3Ch.lst` writes
+    /// it: `+ PATTERN` or two spaces and `PATTERN`, CRLF, no comments.
+    fn skimmer(text: &str) -> String {
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| match line.strip_prefix('+') {
+                Some(pattern) => format!("+ {pattern}\r\n"),
+                None => format!("  {line}\r\n"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn accept_patterns_takes_the_bundled_list() {
+        let bundled = pattern::Table::bundled();
+        let dl = accept_patterns(crate::PATTERNS_LST, &bundled).unwrap();
+        assert_eq!((dl.table.len(), dl.skipped_lines), (6036, 0));
+    }
+
+    #[test]
+    fn accept_patterns_takes_the_bundled_list_in_skimmer_style() {
+        let bundled = pattern::Table::bundled();
+        let text = format!("{}  3E5##@@@\r\n", skimmer(crate::PATTERNS_LST));
+        let dl = accept_patterns(&text, &bundled).unwrap();
+        assert_eq!((dl.table.len(), dl.skipped_lines), (6036, 1));
+        assert_eq!(dl.table.common_len(), bundled.common_len());
+    }
+
+    #[test]
+    fn accept_patterns_strips_a_bom() {
+        let bundled = pattern::Table::bundled();
+        let dl = accept_patterns(&format!("\u{feff}{}", crate::PATTERNS_LST), &bundled).unwrap();
+        assert_eq!(dl.table.len(), bundled.len());
+    }
+
+    #[test]
+    fn accept_patterns_rejects_a_web_page() {
+        let bundled = pattern::Table::bundled();
+        let err = accept_patterns(WEB_PAGE, &bundled).unwrap_err();
+        assert_eq!(
+            err,
+            "line 1 is \"<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\", not a pattern"
+        );
+        let long = format!("+K5@@@\n{}\n", "x-".repeat(100));
+        let err = accept_patterns(&long, &bundled).unwrap_err();
+        assert_eq!(
+            err,
+            format!("line 2 is \"{}…\", not a pattern", "x-".repeat(30))
+        );
+        let err = accept_patterns("+K5@@@\n\u{1b}[2J\n", &bundled).unwrap_err();
+        assert_eq!(err, "line 2 is \"?[2J\", not a pattern");
+    }
+
+    #[test]
+    fn accept_patterns_rejects_an_scp_or_cty_file() {
+        let bundled = pattern::Table::bundled();
+        for text in [crate::MASTER_SCP, crate::CTY_DAT] {
+            let err = accept_patterns(text, &bundled).unwrap_err();
+            assert!(
+                err.starts_with("line ") && err.ends_with("\", not a pattern"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_patterns_rejects_a_list_cut_before_its_tail() {
+        let bundled = pattern::Table::bundled();
+        let zs = crate::PATTERNS_LST.find("\n+ZS6@@@\n").unwrap() + 1;
+        let cut = &crate::PATTERNS_LST[..zs];
+        assert!(
+            pattern::Table::parse(cut).unwrap().len() * 2 >= bundled.len(),
+            "the cut keeps over half the patterns, so only a canary notices"
+        );
+        let err = accept_patterns(cut, &bundled).unwrap_err();
+        assert_eq!(
+            err,
+            "it does not list ZS6ABC's pattern ZS6@@@ (South Africa), so it is truncated or not a callsign-pattern list"
+        );
+    }
+
+    #[test]
+    fn accept_patterns_rejects_under_half_the_bundled_size() {
+        let bundled = pattern::Table::bundled();
+        let canaries: Vec<String> = CTY_CANARIES
+            .iter()
+            .map(|(call, _)| pattern::pattern_of(call))
+            .collect();
+        let mut lines: Vec<String> = canaries.iter().map(|p| format!("+{p}")).collect();
+        for line in crate::PATTERNS_LST.lines().map(str::trim) {
+            if lines.len() == 2999 {
+                break;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let pattern = line.trim_start_matches('+');
+            if !canaries.iter().any(|c| c == pattern) {
+                lines.push(line.to_owned());
+            }
+        }
+        let text = lines.join("\n");
+        assert_eq!(pattern::Table::parse(&text).unwrap().len(), 2999);
+        let err = accept_patterns(&text, &bundled).unwrap_err();
+        assert_eq!(
+            err,
+            "it lists 2999 patterns, under half the built-in copy's 6036"
+        );
+    }
+
+    #[test]
+    fn accept_patterns_rejects_an_empty_list() {
+        let err = accept_patterns("# only comments\n", &pattern::Table::bundled()).unwrap_err();
+        assert_eq!(err, "it lists no patterns");
     }
 
     #[test]

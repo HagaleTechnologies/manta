@@ -1029,7 +1029,8 @@ blocklist_path = \"bl.txt\"
             "[spot]\nrefresh_lists = true\nallowlist = [\"B\"]\n\
              list_cache_dir = \"/var/cache/manta\"\ncty_url = \"http://mirror.lan/cty.dat\"\n\
              scp_url = \"http://mirror.lan/MASTER.SCP\"\ncty_sha256 = \"{pin}\"\n\
-             scp_sha256 = \"{pin}\"\n"
+             scp_sha256 = \"{pin}\"\n\
+             pattern_url = \"http://mirror.lan/Patt3Ch.lst\"\n"
         ));
         assert_eq!(
             restart_only_changes(&old, &new),
@@ -1037,6 +1038,7 @@ blocklist_path = \"bl.txt\"
                 "spot.cty_sha256",
                 "spot.cty_url",
                 "spot.list_cache_dir",
+                "spot.pattern_url",
                 "spot.refresh_lists",
                 "spot.scp_sha256",
                 "spot.scp_url",
@@ -1047,6 +1049,7 @@ blocklist_path = \"bl.txt\"
             "list_cache_dir",
             "cty_url",
             "scp_url",
+            "pattern_url",
             "cty_sha256",
             "scp_sha256",
         ] {

@@ -658,6 +658,13 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             line.push_str(&format!(" calls_heard_path={}", path.display()));
         }
     }
+    // MAN-542 D12: shown only when set, so a config without it prints
+    // what it always did.
+    if let Some(url) = &spot.pattern_url {
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" pattern_url={url}"));
+        }
+    }
 
     let detector = set_keys(loaded, "detector", &[]);
     lines.push(if detector.is_empty() {
@@ -928,7 +935,8 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
     if !spot.refresh_lists {
         return notes;
     }
-    let lists = [
+    let no_pin = None;
+    let mut lists = vec![
         (
             "cty",
             "cty.dat",
@@ -944,6 +952,17 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
             spot.scp_url(),
         ),
     ];
+    // MAN-542 D13: the pattern list joins only with `pattern_url` set; it
+    // has no pin.
+    if let Some(url) = &spot.pattern_url {
+        lists.push((
+            "pattern",
+            "the pattern list",
+            &spot.pattern_path,
+            &no_pin,
+            url.as_str(),
+        ));
+    }
     // `load` already parsed every URL, so a failure here cannot happen.
     let refreshed: Vec<crate::list_http::HttpUrl> = lists
         .iter()
@@ -981,6 +1000,7 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
 
 /// `www.country-files.com and www.supercheckpartial.com (TCP port 80)`: each
 /// distinct host once, then the port; `host:port` forms when the ports differ.
+/// Three or more hosts read `A, B and C` (MAN-542).
 fn download_endpoints(urls: &[crate::list_http::HttpUrl]) -> String {
     let ports: BTreeSet<u16> = urls.iter().map(|u| u.port).collect();
     let mut names: Vec<String> = Vec::new();
@@ -994,7 +1014,10 @@ fn download_endpoints(urls: &[crate::list_http::HttpUrl]) -> String {
             names.push(name);
         }
     }
-    let names = names.join(" and ");
+    let names = match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    };
     match ports.iter().next() {
         Some(port) if ports.len() == 1 => format!("{names} (TCP port {port})"),
         _ => names,
@@ -1933,6 +1956,98 @@ mod tests {
         );
     }
 
+    /// MAN-542: `pattern_url` joins the host list and the summary only when
+    /// set; `pattern_path` keeps it out and draws its own note.
+    #[test]
+    fn pattern_url_joins_the_refresh_notes_and_the_summary() {
+        const URL: &str = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+        let on = "[spot]\nrefresh_lists = true\nlist_cache_dir = \"/var/cache/manta\"\n";
+        let without: Vec<String> = notes_of(on);
+        assert!(
+            has(
+                &without,
+                "note: list refresh downloads over plain HTTP from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 80) while"
+            ),
+            "{without:?}"
+        );
+        assert!(
+            !without.iter().any(|n| n.contains("pattern")),
+            "{without:?}"
+        );
+        let spot_line = |body: &str| line(&lines_of(body), "spot:").to_string();
+        assert!(!spot_line(on).contains("pattern_url"));
+
+        let with_url = format!("{on}pattern_url = \"{URL}\"\n");
+        let n = notes_of(&with_url);
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from www.country-files.com, \
+                 www.supercheckpartial.com and data.reversebeacon.net (TCP port 80) while"
+            ),
+            "{n:?}"
+        );
+        assert!(!n.iter().any(|n| n.ends_with(" alone")), "{n:?}");
+        assert!(
+            spot_line(&with_url).ends_with(&format!(" repetition_fusion=off pattern_url={URL}")),
+            "{}",
+            spot_line(&with_url)
+        );
+        // After `calls_heard_path` when both are set.
+        let both = format!("{with_url}calls_heard_path = \"/tmp/heard.txt\"\n");
+        let l = spot_line(&both);
+        let heard = l.find(" calls_heard_path=").unwrap();
+        let url = l.find(" pattern_url=").unwrap();
+        assert!(heard < url && l.ends_with(URL), "{l}");
+
+        let with_path = format!("{with_url}pattern_path = \"/etc/manta/patterns.lst\"\n");
+        let n = notes_of(&with_path);
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 80) while"
+            ),
+            "{n:?}"
+        );
+        assert!(
+            has(
+                &n,
+                "note: pattern_path is set, so list refresh leaves the pattern list alone"
+            ),
+            "{n:?}"
+        );
+        // A path with no URL: nothing to leave alone.
+        let n = notes_of(&format!("{on}pattern_path = \"/etc/manta/patterns.lst\"\n"));
+        assert!(!n.iter().any(|n| n.contains("pattern")), "{n:?}");
+    }
+
+    #[test]
+    fn download_endpoints_join_two_and_three_hosts() {
+        let urls = |list: &[&str]| -> Vec<crate::list_http::HttpUrl> {
+            list.iter()
+                .map(|u| crate::list_http::HttpUrl::parse(u).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            download_endpoints(&urls(&["http://a.lan/x", "http://b.lan/y"])),
+            "a.lan and b.lan (TCP port 80)"
+        );
+        assert_eq!(
+            download_endpoints(&urls(&[
+                "http://a.lan/x",
+                "http://b.lan/y",
+                "http://c.lan/z"
+            ])),
+            "a.lan, b.lan and c.lan (TCP port 80)"
+        );
+        assert_eq!(
+            download_endpoints(&urls(&["http://a.lan/x"])),
+            "a.lan (TCP port 80)"
+        );
+    }
+
     #[test]
     fn refresh_on_with_cty_path_notes_cty_is_left_alone() {
         let n = notes_of("[spot]\nrefresh_lists = true\ncty_path = \"/etc/manta/cty.dat\"\n");
@@ -2165,6 +2280,7 @@ mod tests {
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),
         ("spot", "pattern_path"),
+        ("spot", "pattern_url"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
