@@ -6,6 +6,7 @@
 //! checks the learned timing a track reports in its `TimingUpdate` events.
 //! See docs/DECISIONS/2026-10-11-man315-sender-timing.md.
 
+use manta_testkit::cer::word_boundary_fraction;
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -100,89 +101,6 @@ fn primary_track(report: &serde_json::Value) -> u64 {
         .find(|(_, (t, _))| !t.is_empty())
         .expect("no decoded track")
         .0
-}
-
-/// What a cheapest character-level alignment did with one position in `a`.
-/// Copied from golden_vr.rs (see its doc comments for the derivation).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AlignOp {
-    Match,
-    Sub,
-    Del,
-}
-
-fn char_alignment_ops(a: &[char], b: &[char]) -> Vec<AlignOp> {
-    let (n, m) = (a.len(), b.len());
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for (i, row) in dp.iter_mut().enumerate() {
-        row[0] = i;
-    }
-    for (j, cell) in dp[0].iter_mut().enumerate() {
-        *cell = j;
-    }
-    for i in 1..=n {
-        for j in 1..=m {
-            let sub = dp[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]);
-            dp[i][j] = sub.min(dp[i - 1][j] + 1).min(dp[i][j - 1] + 1);
-        }
-    }
-    let mut ops = vec![AlignOp::Del; n];
-    let (mut i, mut j) = (n, m);
-    while i > 0 || j > 0 {
-        if i > 0 && j > 0 && a[i - 1] == b[j - 1] && dp[i - 1][j - 1] == dp[i][j] {
-            ops[i - 1] = AlignOp::Match;
-            i -= 1;
-            j -= 1;
-        } else if i > 0 && j > 0 && dp[i - 1][j - 1] + 1 == dp[i][j] {
-            ops[i - 1] = AlignOp::Sub;
-            i -= 1;
-            j -= 1;
-        } else if i > 0 && dp[i - 1][j] + 1 == dp[i][j] {
-            ops[i - 1] = AlignOp::Del;
-            i -= 1;
-        } else {
-            j -= 1;
-        }
-    }
-    ops
-}
-
-/// 1 minus the share of `expected`'s word boundaries `decoded` misses or
-/// adds (a decoded space no expected space matches is spurious), floored
-/// at 0; the first boundary is forgiven when the whole first word is
-/// genuinely absent (SPEC §2.1 warm-up). Copied from golden_vr.rs, whose
-/// doc comment derives it (MAN-173); keep the two bodies identical.
-fn word_boundary_fraction(expected: &str, decoded: &str) -> f64 {
-    let normalize = |s: &str| -> Vec<char> {
-        s.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .collect()
-    };
-    let e = normalize(expected);
-    let d = normalize(decoded);
-    let boundaries: Vec<usize> = e
-        .iter()
-        .enumerate()
-        .filter(|&(_, &c)| c == ' ')
-        .map(|(i, _)| i)
-        .collect();
-    let decoded_boundaries = d.iter().filter(|&&c| c == ' ').count();
-    if boundaries.is_empty() {
-        return if decoded_boundaries == 0 { 1.0 } else { 0.0 };
-    }
-    let ops = char_alignment_ops(&e, &d);
-    let boundary0_genuinely_dropped = ops[..=boundaries[0]].iter().all(|&op| op == AlignOp::Del);
-    let matched = boundaries
-        .iter()
-        .filter(|&&p| ops[p] == AlignOp::Match)
-        .count();
-    let credited = matched + usize::from(boundary0_genuinely_dropped);
-    // A `Match` pairs one expected space with one decoded space, so every
-    // other decoded space is a word break `expected` does not have.
-    let spurious = decoded_boundaries - matched;
-    credited.saturating_sub(spurious) as f64 / boundaries.len() as f64
 }
 
 /// Decode a single-signal VW vector; returns `(report, keyed, decoded,

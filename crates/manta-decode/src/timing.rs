@@ -2,6 +2,9 @@
 
 use std::collections::VecDeque;
 
+mod bank;
+pub use bank::{SpeedBankConfig, SwitchRecord, TimingBank, TimingHypothesis};
+
 const CLUSTER_ALPHA: f32 = 0.15; // SPEC §9 decode.cluster_alpha
 const RATIO_MIN: f32 = 2.2; // SPEC §9 decode.mu_ratio_bounds
                             // SPEC §9 decode.mu_ratio_bounds upper end, **[DEVIATION]** (MAN-315 D5):
@@ -1082,8 +1085,9 @@ impl TimingEstimates {
 ///
 /// Values are stored in dits of the dit period at observation time (the
 /// caller passes `SpeedTracker::dit_estimate_ms`), so ratios survive slow
-/// speed drift. MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses)
-/// read `estimates()`; this model itself uses only the means.
+/// speed drift. MAN-111 (scored boundaries) reads `estimates()`; this
+/// model itself uses only the means. The MAN-544 speed hypothesis bank
+/// (`timing::bank`) reads neither and resets it on a switch.
 #[derive(Debug, Clone, Default)]
 pub struct SenderTiming {
     stats: [ClassStats; 5],

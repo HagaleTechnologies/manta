@@ -119,19 +119,56 @@ fn a_span_without_preroll_still_replays_whole() {
     );
 }
 
-fn candidate(rival: Option<&str>, alternatives: usize) -> RefineCandidate {
+#[test]
+fn the_global_bound_keeps_the_newest_entries_across_300_tracks() {
+    // MAN-525: recording is (sample_ts, track_id) order, so oldest-front
+    // eviction is FIFO over the record stream: the last 174_762 records
+    // survive.
+    let mut b = RefineBuffers::new(&cfg(10.0));
+    for hop in 0..3800u64 {
+        for id in 0..300u32 {
+            b.record(id, entry(hop * 256));
+        }
+    }
+    assert_eq!(b.len(), 174_762);
+    assert_eq!(b.evicted_entries(), 300 * 3800 - 174_762);
+    for id in 0..300u32 {
+        assert!(b.replay_slice(id, (3218 * 256, 3799 * 256)).is_some());
+        assert_eq!(
+            b.replay_slice(id, (3217 * 256, 3799 * 256)).is_some(),
+            id >= 138
+        );
+    }
+}
+
+#[test]
+fn equal_front_timestamps_evict_the_smallest_track_id_first() {
+    let mut b = RefineBuffers::new(&cfg(10.0)).with_entry_budget(3);
+    for id in [5, 2, 9] {
+        b.record(id, entry(100));
+    }
+    b.record(7, entry(200)); // evicts (100, 2)
+    b.record(3, entry(300)); // evicts (100, 5)
+    assert_eq!(b.evicted_entries(), 2);
+    assert!(b.replay_slice(2, (100, 100)).is_none());
+    assert!(b.replay_slice(5, (100, 100)).is_none());
+    assert!(b.replay_slice(9, (100, 100)).is_some());
+    assert!(b.replay_slice(7, (200, 200)).is_some());
+    assert!(b.replay_slice(3, (300, 300)).is_some());
+}
+
+fn candidate(rival: Option<&str>, alternatives: usize) -> RefineCandidate<'_> {
     RefineCandidate {
         episode_wpm: 20.0,
         neighbor_gap_hz: f64::INFINITY,
         latest_word_seq: 1,
         track_id: 1,
         word_seq: 0,
-        call: "K3ABC".to_string(),
+        call: "K3ABC",
         span: (0, 100),
         reps: 1,
-        required_reps: 2,
         wpm: 20.0,
-        rival: rival.map(String::from),
+        rival,
         alternatives,
         wpm_stable: true,
     }
@@ -150,7 +187,6 @@ fn ambiguity_trigger_ignores_decided_episodes() {
     // repetition requirement met.
     let decided = RefineCandidate {
         reps: 2,
-        required_reps: 2,
         ..candidate(None, 0)
     };
     assert!(!ambiguity_trigger(&decided));

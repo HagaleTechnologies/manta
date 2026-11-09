@@ -321,12 +321,7 @@ mod run {
     fn manta_command(dir: &Path, config: &str) -> Command {
         let path = dir.join("manta.toml");
         std::fs::write(&path, config).unwrap();
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-        for (key, _) in std::env::vars() {
-            if key.starts_with("MANTA_") {
-                cmd.env_remove(key);
-            }
-        }
+        let mut cmd = super::common::manta();
         cmd.args(["run", "--config"]).arg(&path);
         cmd
     }

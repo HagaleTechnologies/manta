@@ -3,7 +3,7 @@ mod common;
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -89,12 +89,7 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(&cfg, format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n")).unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            command.env_remove(key);
-        }
-    }
+    let mut command = common::manta();
     let mut child = command
         .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())

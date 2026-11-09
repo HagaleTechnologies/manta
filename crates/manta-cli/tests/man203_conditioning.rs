@@ -9,17 +9,20 @@
 //!   Scenario: A bad mode value is refused by `manta config check` with the
 //!             exact key error.
 
+#[path = "common/launch.rs"]
+mod launch;
 #[path = "../../manta-engine/tests/support/man203.rs"]
 mod support;
 
 use manta_testkit::sensitivity::{CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+use launch::free_ports;
 use support::near_centre_scene;
 
 /// The scene MAN-203 measured (docs/DECISIONS/2026-11-03): one 6 dB
@@ -30,10 +33,7 @@ const SNR_DB: f64 = 6.0;
 const DC: f32 = 0.01;
 
 fn manta(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_manta"))
-        .args(args)
-        .output()
-        .expect("spawn manta")
+    launch::manta().args(args).output().expect("spawn manta")
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -178,14 +178,6 @@ fn bad_conditioning_mode_is_refused_by_config_check() {
         stderr.contains("[input] dc_block must be \"off\", \"observe\" or \"apply\", not \"on\""),
         "stderr:\n{stderr}"
     );
-}
-
-/// `N` distinct ports nothing listens on right now. All `N` listeners are
-/// held until every port is read (MAN-371), as `node_health_acceptance.rs`
-/// does.
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 /// Kills and reaps the daemon child on drop, including on a failing assert.

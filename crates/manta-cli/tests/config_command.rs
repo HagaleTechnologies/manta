@@ -1327,11 +1327,11 @@ fn tuning_range_needs_bands_and_a_low_below_high() {
 
 #[test]
 fn an_unknown_band_lists_the_vocabulary() {
-    let err = fails(&check_body(&format!("{KIWI}bands = [\"6m\"]\n")));
+    let err = fails(&check_body(&format!("{KIWI}bands = [\"4m\"]\n")));
     assert!(
         err.ends_with(
-            "[input]: input.bands: \"6m\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
-             20m, 17m, 15m, 12m or 10m) or a centre frequency in kHz such as \"7030\"\n"
+            "[input]: input.bands: \"4m\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
+             20m, 17m, 15m, 12m, 10m or 6m) or a centre frequency in kHz such as \"7030\"\n"
         ),
         "{err}"
     );
@@ -1340,6 +1340,41 @@ fn an_unknown_band_lists_the_vocabulary() {
         err.ends_with(
             "[input]: input.bands must be \"all\", a band such as \"40m\", a centre frequency \
              in kHz such as \"7030\", or a list of them; got true\n"
+        ),
+        "{err}"
+    );
+}
+
+// MAN-543: 6m is a named band, skimmed when the tuning range reaches it.
+
+const HPSDR_192K_6M: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\n\
+                           rate_hz = 192000.0\nbands = [\"6m\"]\n";
+
+/// Scenario 1: `bands = ["6m"]` on a receiver that tunes 50 MHz lists the
+/// 6 m CW segment as one stream at its centre.
+#[test]
+fn six_metres_on_a_192k_hpsdr_radio_is_one_stream_at_50050_khz() {
+    let o = check_body(&format!(
+        "{HPSDR_192K_6M}tuning_range_hz = [0.0, 61440000.0]\n"
+    ));
+    assert_eq!(
+        input_lines(&succeeds(&o)),
+        ["input: type=hpsdr host=192.168.1.40 port=1024 protocol=auto freq_hz=50050000 rate_hz=192000"]
+    );
+    assert!(
+        stderr(&o).contains("note: [input]: bands = [\"6m\"] plans 1 stream: 6m\n"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn six_metres_needs_a_tuning_range_that_reaches_it() {
+    let err = fails(&check_body(HPSDR_192K_6M));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands leaves nothing to skim inside the receiver's tuning range, 0 \
+             to 30000 kHz: 6m (50000 to 50100 kHz) is outside it\n"
         ),
         "{err}"
     );

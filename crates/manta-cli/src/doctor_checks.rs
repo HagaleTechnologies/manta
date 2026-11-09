@@ -760,7 +760,6 @@ pub(crate) enum ReceiverKind {
     SoundCard,
     File,
     Kiwi,
-    #[cfg(feature = "soapy")]
     Soapy,
     Hpsdr,
     Ka9q,
@@ -773,7 +772,6 @@ impl ReceiverKind {
             ReceiverKind::SoundCard => "sound-card",
             ReceiverKind::File => "WAV file",
             ReceiverKind::Kiwi => "KiwiSDR",
-            #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => "SoapySDR",
             ReceiverKind::Hpsdr => "HPSDR",
             ReceiverKind::Ka9q => "ka9q-radio",
@@ -793,7 +791,6 @@ impl ReceiverKind {
                 "check --kiwi-host/input.host and --kiwi-port/input.port, and that the KiwiSDR \
                  has a free channel (open it in a web browser)"
             }
-            #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => {
                 "check --soapy-driver/input.driver, and that SoapySDRUtil --find lists the \
                  radio; install its SoapySDR module if it does not"
@@ -1099,8 +1096,8 @@ mod tests {
         let (_dir, path, l) = loaded(
             "[server]\nstation_callsign = \"W1AW\"\n[input]\ntype = \"file\"\npath = \"x.wav\"\n",
         );
-        let resolved = crate::resolve(crate::CliOverrides::none(), &l).unwrap();
-        let needs = crate::needs_dial_freq(
+        let resolved = crate::resolve::resolve(crate::resolve::CliOverrides::none(), &l).unwrap();
+        let needs = crate::resolve::needs_dial_freq(
             l.server.is_some(),
             resolved.spec.is_rf_aware(),
             resolved.dial_freq_hz,
@@ -1125,8 +1122,8 @@ mod tests {
             "[server]\nstation_callsign = \"W1AW\"\n[input]\ntype = \"file\"\npath = \
              \"x.wav\"\ncenter_freq_hz = 7030000.0\n",
         );
-        let resolved = crate::resolve(crate::CliOverrides::none(), &l).unwrap();
-        let needs = crate::needs_dial_freq(
+        let resolved = crate::resolve::resolve(crate::resolve::CliOverrides::none(), &l).unwrap();
+        let needs = crate::resolve::needs_dial_freq(
             l.server.is_some(),
             resolved.spec.is_rf_aware(),
             resolved.dial_freq_hz,
@@ -1592,12 +1589,12 @@ mod tests {
 
     // --- receiver and signal -------------------------------------------
 
-    fn desc(spec: crate::LiveSourceSpec) -> ReceiverDesc {
+    fn desc(spec: crate::source_spec::LiveSourceSpec) -> ReceiverDesc {
         crate::receiver_desc(&spec)
     }
 
-    fn kiwi(password: &str) -> crate::LiveSourceSpec {
-        crate::LiveSourceSpec::Kiwi(crate::KiwiOpts {
+    fn kiwi(password: &str) -> crate::source_spec::LiveSourceSpec {
+        crate::source_spec::LiveSourceSpec::Kiwi(crate::source_spec::KiwiOpts {
             host: Some("kiwi.example.net".into()),
             port: 8073,
             freq: Some(7_030_000.0),
@@ -1607,7 +1604,7 @@ mod tests {
 
     #[test]
     fn receiver_pass_names_the_source_and_rate() {
-        let file = desc(crate::LiveSourceSpec::File {
+        let file = desc(crate::source_spec::LiveSourceSpec::File {
             path: "/x.wav".into(),
             source_iq: false,
             raw: None,
@@ -1621,19 +1618,19 @@ mod tests {
     #[test]
     fn receiver_fail_has_a_per_kind_fix() {
         let err = anyhow::anyhow!("inner").context("outer");
-        let mut cases: Vec<(crate::LiveSourceSpec, &str, &[&str])> = vec![
+        let mut cases: Vec<(crate::source_spec::LiveSourceSpec, &str, &[&str])> = vec![
             (
-                crate::LiveSourceSpec::AudioDevice(None),
+                crate::source_spec::LiveSourceSpec::AudioDevice(None),
                 "could not open the system default sound-card input: outer: inner",
                 &["--device", "input.device"],
             ),
             (
-                crate::LiveSourceSpec::AudioDevice(Some("USB".into())),
+                crate::source_spec::LiveSourceSpec::AudioDevice(Some("USB".into())),
                 "could not open the sound-card input matching \"USB\": outer: inner",
                 &["--device", "input.device"],
             ),
             (
-                crate::LiveSourceSpec::File {
+                crate::source_spec::LiveSourceSpec::File {
                     path: "/x.wav".into(),
                     source_iq: true,
                     raw: None,
@@ -1647,9 +1644,8 @@ mod tests {
                 &["--kiwi-host", "--kiwi-port", "free channel"],
             ),
         ];
-        #[cfg(feature = "soapy")]
         cases.push((
-            crate::LiveSourceSpec::Soapy(crate::SoapyOpts {
+            crate::source_spec::LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
                 driver: Some("driver=rtlsdr".into()),
                 freq: Some(7e6),
                 rate: Some(48_000.0),
@@ -1659,7 +1655,7 @@ mod tests {
             &["--soapy-driver", "SoapySDRUtil --find"],
         ));
         cases.push((
-            crate::LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
+            crate::source_spec::LiveSourceSpec::Hpsdr(crate::source_spec::HpsdrOpts {
                 host: Some("10.0.0.5".into()),
                 mac: None,
                 port: Some(1024),
@@ -1687,12 +1683,12 @@ mod tests {
     #[test]
     fn ka9q_receiver_label_and_fix() {
         let ka9q = |ssrc| {
-            crate::LiveSourceSpec::Ka9q(crate::Ka9qOpts {
+            crate::source_spec::LiveSourceSpec::Ka9q(crate::source_spec::Ka9qOpts {
                 group: Some("239.101.6.1".into()),
                 port: 5004,
                 ssrc,
                 interface: None,
-                ..crate::Ka9qOpts::unset()
+                ..crate::source_spec::Ka9qOpts::unset()
             })
         };
         let d = desc(ka9q(None));
