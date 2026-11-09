@@ -331,6 +331,16 @@ fn get_with(
     if content_length.is_some_and(|want| want > limits.max_body) {
         return Err(too_large());
     }
+    // ureq ends a close-delimited body at a reset or at a TLS close without
+    // close_notify as if it were whole, so over HTTPS a cut body could not
+    // be told from a complete one.
+    if content_length.is_none() && url.scheme == Scheme::Https {
+        return Err(FetchError(
+            "the server sent no Content-Length, which manta needs over HTTPS to tell a whole \
+             body from a cut one"
+                .to_string(),
+        ));
+    }
 
     let host_port = url.host_port();
     let mut reader = response.body_mut().as_reader();
@@ -890,7 +900,10 @@ mod tests {
         );
         let err = fetch_err(&url, &quick());
         assert!(!err.chars().any(char::is_control), "{err:?}");
-        assert!(err.starts_with("HTTP 302 Found"), "{err:?}");
+        assert!(
+            err.starts_with("HTTP 302 Found (Location: http://m/a?b); "),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -1317,6 +1330,23 @@ mod tests {
             "it is larger than 8 MiB"
         );
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_https_body_without_content_length_is_refused() {
+        let (url, _server) = tls_serve(
+            LOCALHOST,
+            "/cty.dat",
+            Then::Close,
+            canned("HTTP/1.1 200 OK\r\n\r\nW1"),
+        );
+        assert_eq!(
+            get_with(&agent(&quick(), trusting_test_ca()), &url, None, &quick())
+                .unwrap_err()
+                .to_string(),
+            "the server sent no Content-Length, which manta needs over HTTPS to tell a whole \
+             body from a cut one"
+        );
     }
 
     #[test]

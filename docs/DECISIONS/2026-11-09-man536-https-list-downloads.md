@@ -156,6 +156,15 @@ manta connects to the list host directly.
   are echoed.
 - The `Connection: close` header is no longer sent. `ureq` also sends
   `accept: */*`, and header names go out in lower case.
+- `ureq` ends a body that has no `Content-Length` at a connection reset,
+  or at a TLS close without `close_notify`, as if the body were whole. The
+  old client reported a reset as a failure. Over HTTPS, manta therefore
+  refuses a 200 that has no `Content-Length`, so a cut body cannot pass as
+  a whole one. Both default hosts send `Content-Length`. Over plain HTTP a
+  close-delimited body is still accepted. A reset in the middle of it now
+  reads as the end of the body, and the parse and completeness checks are
+  what catch a cut list. Plain HTTP has no integrity anyway (the MAN-316
+  threat note).
 
 ## One re-download after the upgrade
 
