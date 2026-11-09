@@ -1,5 +1,6 @@
-//! Age of the built-in cty.dat for the startup warning, and the retrieval
-//! date of the built-in MASTER.SCP (MAN-316).
+//! Age of the built-in cty.dat for the startup warning, the retrieval date
+//! of the built-in MASTER.SCP (MAN-316), and the generation date of the
+//! built-in callsign-pattern list (MAN-542).
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// UTC retrieval date of data/cty.dat, pinned to data/SOURCES.md by a test.
@@ -7,6 +8,9 @@ pub const CTY_DAT_RETRIEVED: &str = "2026-07-25";
 /// UTC retrieval date of data/master.scp, pinned to data/SOURCES.md by a
 /// test (MAN-316).
 pub const MASTER_SCP_RETRIEVED: &str = "2026-07-25";
+/// UTC generation date of data/patterns.lst, pinned to data/SOURCES.md by a
+/// test (MAN-542 D10).
+pub const PATTERNS_LST_GENERATED: &str = "2026-10-14";
 /// Startup warns after this many whole days.
 pub const CTY_DAT_STALE_AFTER_DAYS: u64 = 180;
 
@@ -18,6 +22,11 @@ pub fn cty_dat_retrieved_at() -> Option<SystemTime> {
 /// constant.
 pub fn master_scp_retrieved_at() -> Option<SystemTime> {
     date_at_midnight_utc(MASTER_SCP_RETRIEVED)
+}
+/// patterns.lst's generation midnight in UTC; None only for a malformed
+/// constant (MAN-542).
+pub fn patterns_lst_generated_at() -> Option<SystemTime> {
+    date_at_midnight_utc(PATTERNS_LST_GENERATED)
 }
 /// Whole days since retrieval, or None for a clock before retrieval.
 pub fn cty_dat_age_days(now: SystemTime) -> Option<u64> {
@@ -141,6 +150,30 @@ mod tests {
         assert!(
             master_scp_retrieved_at().is_some(),
             "{MASTER_SCP_RETRIEVED} must be YYYY-MM-DD"
+        );
+    }
+
+    #[test]
+    fn patterns_lst_generated_matches_sources_md() {
+        // The `- Retrieved: generated YYYY-MM-DD` line under `## patterns.lst`.
+        let sources = include_str!("../data/SOURCES.md");
+        let section = sources
+            .split("## ")
+            .find(|s| s.starts_with("patterns.lst"))
+            .unwrap();
+        let line = section
+            .lines()
+            .find(|l| l.starts_with("- Retrieved: generated "))
+            .unwrap();
+        let date = line
+            .trim_start_matches("- Retrieved: generated ")
+            .split(|c: char| c == ';' || c.is_whitespace())
+            .next()
+            .unwrap();
+        assert_eq!(date, PATTERNS_LST_GENERATED);
+        assert!(
+            patterns_lst_generated_at().is_some(),
+            "{PATTERNS_LST_GENERATED} must be YYYY-MM-DD"
         );
     }
 

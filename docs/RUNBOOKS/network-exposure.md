@@ -23,10 +23,16 @@ the `[rbn_compare]` telnet feed, each `[[skimmer_relay]]` (MAN-320: a
 plaintext telnet login to the operator's own skimmer at `host:port`; manta
 writes only its `callsign` login line and a blank keepalive line every
 300 s, and never echoes received text back), the MAN-316 cty.dat/MASTER.SCP
+<<<<<<< HEAD
 refresh (MAN-536: HTTPS to `www.country-files.com:443` and
 `www.supercheckpartial.com:443` by default, or plain HTTP to an
 operator-chosen `http://` mirror; it does not use the proxy variables; see
 `docs/CONFIG.md`'s `refresh_lists`), the
+=======
+refresh (plain `http://`, see `docs/CONFIG.md`'s `refresh_lists`) and, with
+`[spot] pattern_url` set, the MAN-542 pattern-list download from that URL's
+host, the
+>>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
 `[callsign_lookup]` QRZ.com client (MAN-318: HTTPS to `xmldata.qrz.com:443`,
 honouring `HTTPS_PROXY`; allow that egress when the table is enabled),
 the `[input] spectrum_udp` feed (MAN-141: plaintext UDP to the N1MM+
