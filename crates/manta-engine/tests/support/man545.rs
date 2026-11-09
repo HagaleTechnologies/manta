@@ -9,8 +9,10 @@
 //! Item 16's invariants hold for every policy (ceilings included):
 //! (a) fusing a branch with a byte-identical copy of itself changes nothing
 //! (`oracle-legacy-alts` reads no second branch, so it has none to copy);
-//! (b) a legacy `?` (an unknown glyph) is never replaced, and `?` never
-//! replaces a real glyph.
+//! (b) alignment never erases an unknown span: a legacy `?` is never
+//! deleted (the substitution policies never change it; a span policy
+//! replaces a region holding one only by an HSMM side with the same number
+//! of non-space characters), and `?` never replaces a real glyph.
 #![allow(dead_code)]
 
 use manta_decode::events::DecoderEvent;
@@ -519,8 +521,16 @@ pub fn fuse(
         let mut edits: Vec<SpanEdit> = Vec::new();
         for st in stations {
             for e in station_span_edits(policy, st, cal) {
-                let taken = |x: &SpanEdit| x.remove.iter().any(|r| e.remove.contains(r));
-                if !edits.iter().any(|x| x.at == e.at || taken(x)) {
+                // Two edits conflict when they remove a shared event, when
+                // one anchors to an event the other removes, or when both
+                // insert on the same side of one anchor.
+                let conflicts = |x: &SpanEdit| {
+                    x.remove.iter().any(|r| e.remove.contains(r))
+                        || x.remove.contains(&e.at)
+                        || e.remove.contains(&x.at)
+                        || (x.at == e.at && x.before == e.before)
+                };
+                if !edits.iter().any(conflicts) {
                     edits.push(e);
                 }
             }

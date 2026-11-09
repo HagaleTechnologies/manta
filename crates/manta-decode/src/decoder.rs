@@ -78,6 +78,11 @@ pub struct DecodeConfig {
     /// `CharDecoded::alternatives` (glyph, softmax mass times `q`), on the
     /// prior-off path only. Rust-only and default off: no TOML key or CLI
     /// flag reaches it, and off is byte-identical to the historical stream.
+    /// On, winners, confidences and timestamps are unchanged, but every
+    /// consumer of `alternatives` sees the runner-ups (MAN-208's refinement
+    /// trigger, MAN-200 repetition fusion, the observation trace), so spots
+    /// match the switch-off run only with refinement and repetition fusion
+    /// off, as the MAN-545 measurement runs them.
     pub legacy_alternatives: bool,
     /// MAN-208: the `[decode.refine]` table -- the deterministic,
     /// budget-bounded delayed-refinement scheduler's tunables. Carried on

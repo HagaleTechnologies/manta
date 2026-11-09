@@ -537,3 +537,37 @@ fn oracle_span_prefers_the_closer_side_and_ties_to_legacy() {
         "W1AW K"
     );
 }
+
+#[test]
+fn span_edits_apply_at_their_anchor() {
+    let edit = |remove: Vec<usize>, at: usize, before: bool| SpanEdit {
+        remove,
+        at,
+        before,
+        track: 1,
+        insert: vec![('X', 0.5, 0)],
+    };
+    let events = track(1, F_HZ, "ABCD", 0.5, &[]);
+    // Event 2 ('B') removed by one edit; another inserts after it.
+    let out = apply_spans(&events, &[edit(vec![2], 2, true)]);
+    assert_eq!(text(&items(&out)), "AXCD");
+    // Opposite sides of one anchor are both applied.
+    let out = apply_spans(&events, &[edit(vec![], 2, true), edit(vec![], 2, false)]);
+    assert_eq!(text(&items(&out)), "AXBXCD");
+}
+
+#[test]
+fn span_policy_replaces_a_question_mark_only_one_for_one() {
+    let cal = tables(0.1, 0.9);
+    let legacy = track(1, F_HZ, "W?AW", 0.1, &[]);
+    let hsmm = track(1, F_HZ, "W1AW", 0.9, &[]);
+    assert_eq!(
+        fused_with(Policy::CalSpan, &legacy, &hsmm, "W1AW", Some(&cal)),
+        "W1AW"
+    );
+    let hsmm = track(1, F_HZ, "W12AW", 0.9, &[]);
+    assert_eq!(
+        fused_with(Policy::CalSpan, &legacy, &hsmm, "W12AW", Some(&cal)),
+        "W?AW"
+    );
+}

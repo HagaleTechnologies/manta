@@ -757,6 +757,7 @@ class FusionTests(Base):
         # Gap held equals A's share of the gap: A holds its A-only identity.
         self.assertEqual(ident["gap_held"], 0.5)
         self.assertIn("recovered of headroom below 25%", js["gate"]["failed"])
+        self.assertIn("net gain below 0.25 pp or its interval not above 0", js["gate"]["failed"])
         self.assertIn("Reading: below the adoption bar: recovered of headroom below 25%", out)
 
     def test_fusion_counts_gains_and_losses_by_origin(self):
