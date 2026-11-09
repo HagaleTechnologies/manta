@@ -28,7 +28,9 @@ pub enum DecoderEvent {
         glyph: Glyph,
         confidence: f32,
         /// v2 §4.9: up to two competing glyphs at this position with their
-        /// posterior mass. Empty for the legacy engine.
+        /// posterior mass. Empty for the legacy engine unless the Rust-only
+        /// `DecodeConfig::legacy_alternatives` research switch (MAN-545) is
+        /// on; then up to `beam.width - 1` beam runner-ups.
         #[serde(default)]
         alternatives: Vec<(Glyph, f32)>,
     },

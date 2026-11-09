@@ -472,8 +472,29 @@ is logged as a `warning: list refresh:` line, counted in
 copy already in use stays. Without network access manta runs on the
 built-in copies. File replay never downloads. Refresh is off by default.
 
+The callsign-pattern list (which calls need 2, 3 or 5 repetitions) is
+downloaded too only if you also name a source for it:
+
+```toml
+[spot]
+refresh_lists = true
+pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
+```
+
+It is then checked every 7 days under the same rules. manta accepts its
+own `[+]PATTERN` files and RBN's `Patt3Ch.lst`, and skips the lines no
+call it accepts can match. `pattern_url` has no default: the URL above is
+an example, not a recommendation. RBN's list is a different policy from
+the built-in one, not just a newer copy. It lists about 10,190 patterns
+against the built-in 6,036, but leaves about 3% of MASTER.SCP's calls
+unlisted (5 repetitions) where the built-in list leaves 0.34%. See
+`docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md` in the source
+repository.
+
 - **Firewall.** Downloads are plain HTTP: allow outbound TCP port 80 to
-  `www.country-files.com` and `www.supercheckpartial.com`. To keep the
+  `www.country-files.com` and `www.supercheckpartial.com`, and to the
+  `pattern_url` host if you set one (`data.reversebeacon.net` for RBN's
+  list). To keep the
   node off the internet, or to share one download between nodes, serve
   the two files from a local web server and set `cty_url` and `scp_url`
   in `[spot]` to its `http://` URLs. manta has no TLS support and refuses
@@ -493,19 +514,21 @@ built-in copies. File replay never downloads. Refresh is off by default.
   `manta_list_last_success_timestamp_seconds` (`docs/METRICS.md` in the
   source repository). Alert when
   `time() - manta_list_last_success_timestamp_seconds{list="cty"}` passes
-  8 days.
+  8 days, and likewise for `{list="patterns"}` when `pattern_url` is set.
 - **Replaying a recording with the list the daemon used.** Copy the hash
   from the `lists:` line and pass it to `decode`, `run`, `soak` or
   `doctor` as `--cty-sha256` or `--scp-sha256`, with a config whose
   `list_cache_dir` holds that version (or `--cty`/`--scp` naming the
   file). manta stops before reading the recording if no copy has that
   hash.
-- **Choosing a list yourself.** A list that `cty_path`/`scp_path` or
-  `cty_sha256`/`scp_sha256` sets is never downloaded.
+- **Choosing a list yourself.** A list that `cty_path`/`scp_path`/
+  `pattern_path` or `cty_sha256`/`scp_sha256` sets is never downloaded.
+  `pattern_path` takes manta's `[+]PATTERN` format only.
 
 Every `[spot]` key is described in `manta.example.toml` and in
 [SPEC-decode-core.md](../docs/SPEC-decode-core.md) §9; the design is in
-`docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md` in the source
+`docs/DECISIONS/2026-10-12-man316-reference-list-refresh.md` and
+`docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md` in the source
 repository.
 
 ## Network exposure

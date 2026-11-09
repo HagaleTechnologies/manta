@@ -50,6 +50,7 @@ fn decode_envelope(env: &[f32], enabled: bool) -> Vec<DecoderEvent> {
                 Arc::new(manta_spot::reference::ReferenceLists::new(
                     Arc::new(manta_spot::cty::Table::bundled()),
                     Arc::new(manta_spot::scp::Set::bundled()),
+                    std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
                 )),
                 manta_spot::prior::CallsHeard::parse("W1AW 1000"),
                 2.0,

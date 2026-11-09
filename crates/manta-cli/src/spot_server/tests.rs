@@ -35,6 +35,7 @@ fn start_spot_server_uses_the_cty_table_it_is_given() {
         lists: std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
             table.clone(),
             std::sync::Arc::new(manta_spot::scp::Set::bundled()),
+            std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
         )),
         pipeline: &PipelineConfig {
             cty: Some(table.clone()),

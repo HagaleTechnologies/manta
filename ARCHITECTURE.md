@@ -529,7 +529,11 @@ transmission may never produce again).
    The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
    `+` means at least two calls share that pattern; a plain entry means one.
    `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
-   does not change the pattern table. CW operators repeat their calls;
+   does not change the pattern table. With `[spot].pattern_url` set and
+   `refresh_lists` on, `run` from a live receiver downloads a replacement
+   (manta's format or RBN's `Patt3Ch.lst`) every 7 days and swaps it in
+   through the third `ReferenceLists` cell (MAN-542,
+   `docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md`). CW operators repeat their calls;
    single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
@@ -1290,7 +1294,8 @@ non-blocking send plus shared atomics and short locks between them.
   the KiwiSDR connect, the list refresher's DNS lookup); and two background
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
-  `ReferenceLists`). The decode thread picks those up before it feeds the
+  `ReferenceLists`, whose three cells hold `cty.dat`, `MASTER.SCP` and the
+  callsign-pattern list). The decode thread picks those up before it feeds the
   validator its next event. `manta-lookup` (`[callsign_lookup]`, MAN-318)
   does QRZ.com's HTTPS requests and hands answers back through a channel
   the decode thread polls once per batch, never waiting on it; only after
