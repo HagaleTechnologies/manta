@@ -410,7 +410,8 @@ station_callsign = "N0CALL"
 # A download is used only if it parses and looks complete; a failed one is
 # logged, counted in manta_list_refresh_total and retried in an hour, and
 # the copy already in use stays. File replay never downloads. Downloads are
-# plain HTTP (port 80) from the two URLs below. Not used for a list that
+# HTTPS (TCP port 443) from the two URLs below, checked against the
+# certificate authorities built into manta. Not used for a list that
 # cty_path/scp_path or cty_sha256/scp_sha256 sets.
 #refresh_lists = false
 
@@ -419,12 +420,13 @@ station_callsign = "N0CALL"
 # directory. Unset: downloads are kept in memory only.
 #list_cache_dir = "/var/cache/manta"
 
-# Where to download cty.dat. Only http:// URLs: manta has no TLS
-# support. Point it at a local mirror to share one download.
-#cty_url = "http://www.country-files.com/cty/cty.dat"
+# Where to download cty.dat: an https:// URL, or an http:// URL for a
+# local mirror (plain HTTP). Redirects are not followed, and HTTPS_PROXY
+# and HTTP_PROXY are not used. Point it at a mirror to share one download.
+#cty_url = "https://www.country-files.com/cty/cty.dat"
 
 # Where to download MASTER.SCP, under the same rules as cty_url.
-#scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+#scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 
 # Use exactly this version of cty.dat, by the SHA-256 of its bytes (64 hex
 # digits, as printed in manta's `lists:` log line). If cty_path is set,

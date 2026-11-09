@@ -2403,9 +2403,9 @@ allowlist = []
 # Accepted downloads, content-addressed (cty/<sha256>.dat,
 # scp/<sha256>.scp, state.json). Same path rule. Unset: memory only.
 # list_cache_dir = "/var/cache/manta"
-# http:// only (no TLS); https:// is refused at load.
-# cty_url = "http://www.country-files.com/cty/cty.dat"
-# scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+# https:// (checked against built-in CA roots) or http:// for a local mirror.
+# cty_url = "https://www.country-files.com/cty/cty.dat"
+# scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 # Pin a list by the SHA-256 of its bytes (64 hex digits), for every
 # validating command: a set cty_path/scp_path must match it; otherwise it
 # is looked up in the bundled copy, then list_cache_dir. No match stops

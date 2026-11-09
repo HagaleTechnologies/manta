@@ -468,12 +468,13 @@ is logged as a `warning: list refresh:` line, counted in
 copy already in use stays. Without network access manta runs on the
 built-in copies. File replay never downloads. Refresh is off by default.
 
-- **Firewall.** Downloads are plain HTTP: allow outbound TCP port 80 to
-  `www.country-files.com` and `www.supercheckpartial.com`. To keep the
-  node off the internet, or to share one download between nodes, serve
-  the two files from a local web server and set `cty_url` and `scp_url`
-  in `[spot]` to its `http://` URLs. manta has no TLS support and refuses
-  `https://`.
+- **Firewall.** Downloads are HTTPS: allow outbound TCP port 443 to
+  `www.country-files.com` and `www.supercheckpartial.com`. manta connects
+  directly and does not use `HTTPS_PROXY`. To keep the node off the
+  internet, or to share one download between nodes, serve the two files
+  from a local web server and set `cty_url` and `scp_url` in `[spot]` to
+  its URLs: `http://`, or `https://` with a certificate from a public CA,
+  because manta trusts only the Mozilla roots built into it.
 - **Where downloads are kept.** Each accepted version is stored under
   `[spot].list_cache_dir`, so a restart starts from the last good
   download. The systemd unit sets it with

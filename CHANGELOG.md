@@ -411,6 +411,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-536: `[spot].refresh_lists` downloads cty.dat and MASTER.SCP over
+  HTTPS by default. `cty_url` and `scp_url` default to `https://` URLs,
+  verified against the CA roots built into manta. `http://` stays accepted
+  for local mirrors. Allow outbound TCP port 443 instead of 80. See
+  [docs/DECISIONS/2026-11-09-man536-https-list-downloads.md](docs/DECISIONS/2026-11-09-man536-https-list-downloads.md).
 - MAN-539: the Docker image is built with `--features soapy`, so its
   `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
   three device modules.

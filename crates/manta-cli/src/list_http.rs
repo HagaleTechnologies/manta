@@ -1,22 +1,60 @@
-//! MAN-316: the blocking HTTP/1.1 GET that downloads cty.dat and
-//! MASTER.SCP. std only, so the `manta-lists` thread needs no tokio runtime
-//! and the crate no new dependency: plain `http://`, no TLS, no redirects,
-//! no chunked or compressed bodies. Every failure is a sentence an operator
-//! can act on. See the MAN-316 plan, D7.
+//! MAN-316, MAN-536: the blocking GET that downloads cty.dat and
+//! MASTER.SCP, over `https://` or plain `http://`. It runs `ureq` (rustls,
+//! the Mozilla roots built into manta) on the `manta-lists` thread, so no
+//! tokio runtime is needed. The rules: 200 is the only success, a 304 only
+//! answers an `If-Modified-Since`, no redirects are followed, no chunked or
+//! compressed bodies, an 8 MiB body cap checked before the body is read, a
+//! 16 KiB header cap, one deadline for the whole fetch with name resolution
+//! and the TLS handshake inside it, and no proxy. Every failure is a
+//! sentence an operator can act on. See the MAN-316 plan, D7, and
+//! docs/DECISIONS/2026-11-09-man536-https-list-downloads.md.
 
 use std::fmt;
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::io::{self, ErrorKind, Read};
+use std::net::{Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const DEFAULT_PORT: u16 = 80;
+use ureq::http::{HeaderMap, Uri};
+use ureq::tls::TlsConfig;
+use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+
 const READ_CHUNK: usize = 16 * 1024;
+/// The most addresses one name resolves to that a fetch tries.
+const MAX_ADDRS: usize = 16;
 
-/// An `http://` URL: the only kind `[spot].cty_url`/`scp_url` accept.
+/// The two schemes a list URL may have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scheme {
+    Http,
+    Https,
+}
+
+impl Scheme {
+    /// 80 or 443.
+    pub(crate) fn default_port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https => 443,
+        }
+    }
+
+    /// `http` or `https`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
+}
+
+/// An `https://` or `http://` URL: the kinds `[spot].cty_url`/`scp_url`
+/// accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HttpUrl {
+    pub(crate) scheme: Scheme,
     pub(crate) host: String,
     pub(crate) port: u16,
     /// The request target: the path plus any query, never empty.
@@ -25,21 +63,23 @@ pub(crate) struct HttpUrl {
 }
 
 impl HttpUrl {
-    /// Parses `http://HOST[:PORT][/PATH]`; HOST may be `[IPv6]`. The `Err`
-    /// is a short reason, phrased to follow the URL.
+    /// Parses `https://HOST[:PORT][/PATH]` or `http://...`; HOST may be
+    /// `[IPv6]`. The `Err` is a short reason, phrased to follow the URL.
     pub(crate) fn parse(s: &str) -> Result<HttpUrl, String> {
         if s.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err("it contains a space or control character".to_string());
         }
-        let rest = match s.split_once("://") {
-            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        let (scheme, rest) = match s.split_once("://") {
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => (Scheme::Https, rest),
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => (Scheme::Http, rest),
             Some((scheme, _)) => {
                 return Err(format!(
-                    "it is a {scheme}:// URL, and manta downloads over plain http:// only"
+                    "it is a {scheme}:// URL, and manta downloads over https:// or http:// only"
                 ))
             }
-            None => return Err("it does not start with http://".to_string()),
+            None => return Err("it does not start with https:// or http://".to_string()),
         };
+        let default_port = scheme.default_port();
         let (authority, target) = match rest.find(['/', '?', '#']) {
             Some(i) => rest.split_at(i),
             None => (rest, ""),
@@ -68,7 +108,7 @@ impl HttpUrl {
             host.parse::<Ipv6Addr>()
                 .map_err(|_| format!("\"{host}\" is not an IPv6 address"))?;
             let port = match after {
-                "" => DEFAULT_PORT,
+                "" => default_port,
                 _ => match after.strip_prefix(':') {
                     Some(p) => port_of(p)?,
                     None => return Err(format!("\"{after}\" follows its IPv6 address")),
@@ -81,17 +121,23 @@ impl HttpUrl {
             }
             (host, port_of(port)?)
         } else {
-            (authority, DEFAULT_PORT)
+            (authority, default_port)
         };
         if host.is_empty() {
             return Err("it has no host".to_string());
         }
-        Ok(HttpUrl {
+        let url = HttpUrl {
+            scheme,
             host: host.to_string(),
             port,
             path,
             original: s.to_string(),
-        })
+        };
+        // A URL the client would refuse fails here, at load, rather than
+        // at the first refresh days later.
+        Uri::try_from(url.request_uri())
+            .map_err(|e| format!("it contains a character a URL cannot carry ({e})"))?;
+        Ok(url)
     }
 
     /// `host:port`, with an IPv6 host in brackets: what a connect error
@@ -109,16 +155,20 @@ impl HttpUrl {
         &self.original
     }
 
-    /// The `Host:` header: the port only when it is not 80.
-    fn host_header(&self) -> String {
-        if self.port == DEFAULT_PORT {
-            if self.host.contains(':') {
-                format!("[{}]", self.host)
-            } else {
-                self.host.clone()
-            }
+    /// The URL the client requests: `scheme://host[:port]/path`, the port
+    /// only when it is not the scheme's default (so the `host` header is
+    /// the bare host then), the fragment dropped.
+    pub(crate) fn request_uri(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
         } else {
-            self.host_port()
+            self.host.clone()
+        };
+        let scheme = self.scheme.as_str();
+        if self.port == self.scheme.default_port() {
+            format!("{scheme}://{host}{}", self.path)
+        } else {
+            format!("{scheme}://{host}:{}{}", self.port, self.path)
         }
     }
 }
@@ -133,10 +183,10 @@ impl fmt::Display for HttpUrl {
 /// the times.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchLimits {
-    /// Per resolved address.
+    /// For connecting, shared across a name's addresses.
     pub(crate) connect_timeout: Duration,
-    /// For the whole fetch, name resolution and connect included; checked
-    /// between reads.
+    /// For the whole fetch, name resolution, connect and the TLS handshake
+    /// included.
     pub(crate) deadline: Duration,
     pub(crate) max_body: u64,
     pub(crate) max_head: usize,
@@ -176,33 +226,67 @@ impl fmt::Display for FetchError {
 }
 
 /// One `GET`, with `If-Modified-Since` when given. Blocks for at most
-/// `limits.deadline`, name resolution included.
+/// `limits.deadline`, name resolution and the TLS handshake included. An
+/// `https://` URL's certificate is checked against the Mozilla roots built
+/// into manta, and its host name against the certificate.
 pub(crate) fn get(
     url: &HttpUrl,
     if_modified_since: Option<&str>,
     limits: &FetchLimits,
 ) -> Result<Fetched, FetchError> {
-    // The value comes from an earlier response; a CR or LF in it would
-    // split the request, so it is dropped rather than sent.
-    let if_modified_since = if_modified_since.filter(|v| !v.chars().any(|c| c.is_control()));
-    let mut conn = Conn::open(url, limits)?;
-    conn.send(&request(url, if_modified_since))?;
+    get_with(
+        &agent(limits, TlsConfig::default()),
+        url,
+        if_modified_since,
+        limits,
+    )
+}
 
-    let (head, mut body) = conn.read_head(limits.max_head)?;
-    let response = parse_head(&head)?;
-    let header = |name: &str| {
-        response
-            .headers
-            .iter()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
+/// A fresh agent per fetch: nothing is pooled across attempts, and
+/// dropping it closes the connection.
+fn agent(limits: &FetchLimits, tls: TlsConfig) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(limits.deadline))
+        .timeout_connect(Some(limits.connect_timeout))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .https_only(false)
+        // No HTTPS_PROXY/HTTP_PROXY/ALL_PROXY: the egress rule stays "these
+        // two hosts", and a LAN mirror is never routed to a proxy.
+        .proxy(None)
+        .accept_encoding("identity")
+        .user_agent(format!("manta/{}", env!("CARGO_PKG_VERSION")).as_str())
+        .max_response_header_size(limits.max_head)
+        .tls_config(tls)
+        .build();
+    ureq::Agent::with_parts(config, DefaultConnector::new(), ListsResolver)
+}
 
-    let status = match response.reason.as_str() {
-        "" => format!("HTTP {}", response.code),
-        reason => format!("HTTP {} {reason}", response.code),
+fn get_with(
+    agent: &ureq::Agent,
+    url: &HttpUrl,
+    if_modified_since: Option<&str>,
+    limits: &FetchLimits,
+) -> Result<Fetched, FetchError> {
+    // The value comes from an earlier response. Only visible ASCII can be
+    // a header value, so anything else is dropped rather than sent.
+    let if_modified_since =
+        if_modified_since.filter(|v| v.bytes().all(|b| (0x20..0x7f).contains(&b)));
+    let mut request = agent.get(url.request_uri());
+    if let Some(ims) = if_modified_since {
+        request = request.header("If-Modified-Since", ims);
+    }
+    let mut response = request
+        .call()
+        .map_err(|e| transport_error(e, url, limits))?;
+
+    let code = response.status().as_u16();
+    let status = match response.status().canonical_reason() {
+        Some(reason) => format!("HTTP {code} {reason}"),
+        None => format!("HTTP {code}"),
     };
-    match response.code {
+    let headers = response.headers();
+    match code {
         200 => {}
         304 if if_modified_since.is_some() => return Ok(Fetched::NotModified),
         // Nothing was asked of it, so it vouches for no copy.
@@ -212,77 +296,77 @@ pub(crate) fn get(
             )))
         }
         300..=399 => {
-            return Err(FetchError(match header("location") {
-                Some(loc) if loc.to_ascii_lowercase().starts_with("http://") => format!(
+            return Err(FetchError(match header(headers, "location") {
+                Some(loc) => format!(
                     "{status} (Location: {loc}); manta does not follow redirects, so point the \
                      URL at the new location"
-                ),
-                Some(loc) => format!(
-                    "{status} (Location: {loc}); manta downloads over plain http:// only, so \
-                     point the URL at an http:// mirror"
                 ),
                 None => format!("{status}; manta does not follow redirects"),
             }))
         }
         _ => return Err(FetchError(status)),
     }
-    if let Some(te) = header("transfer-encoding") {
+    if let Some(te) = header(headers, "transfer-encoding") {
         if !te.eq_ignore_ascii_case("identity") {
             return Err(FetchError(format!(
                 "the server sent Transfer-Encoding: {te}, which manta does not support"
             )));
         }
     }
-    if let Some(ce) = header("content-encoding") {
+    if let Some(ce) = header(headers, "content-encoding") {
         if !ce.is_empty() && !ce.eq_ignore_ascii_case("identity") {
             return Err(FetchError(format!(
                 "the server sent Content-Encoding: {ce}, which manta does not support"
             )));
         }
     }
-    let too_large = || FetchError(format!("it is larger than {}", size(limits.max_body)));
-    let last_modified = header("last-modified")
+    let last_modified = headers
+        .get("last-modified")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(str::to_string);
+    let too_large = || FetchError(format!("it is larger than {}", size(limits.max_body)));
+    let content_length = response.body().content_length();
+    if content_length.is_some_and(|want| want > limits.max_body) {
+        return Err(too_large());
+    }
 
-    match header("content-length") {
-        Some(text) => {
-            let want: u64 = text.parse().map_err(|_| {
+    let host_port = url.host_port();
+    let mut reader = response.body_mut().as_reader();
+    let mut body = Vec::new();
+    let mut buf = vec![0u8; READ_CHUNK];
+    match content_length {
+        Some(want) => {
+            let short = |got: usize| {
                 FetchError(format!(
-                    "the server sent an invalid Content-Length: \"{text}\""
+                    "it is shorter than its Content-Length (got {got} of {want} bytes)"
                 ))
-            })?;
-            if want > limits.max_body {
-                return Err(too_large());
-            }
-            // `want` fits in memory: it is at most `max_body`.
-            body.truncate(want as usize);
-            let mut buf = vec![0u8; READ_CHUNK];
+            };
             while (body.len() as u64) < want {
                 let room = (want - body.len() as u64).min(READ_CHUNK as u64) as usize;
-                let n = conn.read(&mut buf[..room])?;
+                let n = match read_body(&mut reader, &mut buf[..room]) {
+                    Ok(n) => n,
+                    Err(BodyError::Eof) => 0,
+                    Err(e) => return Err(e.into_fetch_error(&host_port, limits)),
+                };
                 if n == 0 {
-                    return Err(FetchError(format!(
-                        "it is shorter than its Content-Length (got {} of {want} bytes)",
-                        body.len()
-                    )));
+                    return Err(short(body.len()));
                 }
                 body.extend_from_slice(&buf[..n]);
             }
         }
-        None => {
-            let mut buf = vec![0u8; READ_CHUNK];
-            loop {
-                if body.len() as u64 > limits.max_body {
-                    return Err(too_large());
-                }
-                let n = conn.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                body.extend_from_slice(&buf[..n]);
+        None => loop {
+            if body.len() as u64 > limits.max_body {
+                return Err(too_large());
             }
-        }
+            let n = read_body(&mut reader, &mut buf)
+                .map_err(|e| e.into_fetch_error(&host_port, limits))?;
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&buf[..n]);
+        },
     }
     Ok(Fetched::Ok {
         body,
@@ -290,200 +374,132 @@ pub(crate) fn get(
     })
 }
 
-fn request(url: &HttpUrl, if_modified_since: Option<&str>) -> Vec<u8> {
-    let mut req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: manta/{}\r\nAccept-Encoding: identity\r\n\
-         Connection: close\r\n",
-        url.path,
-        url.host_header(),
-        env!("CARGO_PKG_VERSION"),
-    );
-    // `get` has already dropped a value carrying a control character.
-    if let Some(ims) = if_modified_since {
-        req.push_str(&format!("If-Modified-Since: {ims}\r\n"));
-    }
-    req.push_str("\r\n");
-    req.into_bytes()
+/// A header's value, trimmed and made printable; a value that is not
+/// visible ASCII is read lossily.
+fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers.get(name).map(|v| {
+        let text = match v.to_str() {
+            Ok(text) => text.to_string(),
+            Err(_) => String::from_utf8_lossy(v.as_bytes()).into_owned(),
+        };
+        printable(text.trim())
+    })
 }
 
-/// A connected socket and the fetch's deadline.
-struct Conn {
-    stream: TcpStream,
-    deadline: Instant,
-    allowed: Duration,
-    host_port: String,
+/// Why reading the body stopped short.
+enum BodyError {
+    /// The server closed before the body was whole.
+    Eof,
+    Timeout,
+    Other(String),
 }
 
-impl Conn {
-    fn open(url: &HttpUrl, limits: &FetchLimits) -> Result<Conn, FetchError> {
-        let host_port = url.host_port();
-        let connect_err =
-            |e: &dyn fmt::Display| FetchError(format!("connecting to {host_port}: {e}"));
-        // The deadline starts before name resolution, so a slow resolver
-        // spends the fetch's time, not more of its own.
-        let deadline = Instant::now() + limits.deadline;
-        let (host, port) = (url.host.clone(), url.port);
-        let lookup = move || {
-            (host.as_str(), port)
-                .to_socket_addrs()
-                .map(Iterator::collect)
-        };
-        let addrs = match resolve_within(&host_port, lookup, limits.deadline) {
-            Some(result) => result.map_err(|e| connect_err(&e))?,
-            None => return Err(timed_out(limits.deadline)),
-        };
-        let mut last_err = None;
-        for addr in addrs {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(timed_out(limits.deadline));
-            }
-            match TcpStream::connect_timeout(&addr, limits.connect_timeout.min(left)) {
-                Ok(stream) => {
-                    return Ok(Conn {
-                        stream,
-                        deadline,
-                        allowed: limits.deadline,
-                        host_port,
-                    })
+impl BodyError {
+    fn into_fetch_error(self, host_port: &str, limits: &FetchLimits) -> FetchError {
+        match self {
+            BodyError::Eof => FetchError(format!(
+                "reading from {host_port}: the server closed the connection"
+            )),
+            BodyError::Timeout => timed_out(limits.deadline),
+            BodyError::Other(e) => FetchError(printable(&format!("reading from {host_port}: {e}"))),
+        }
+    }
+}
+
+/// One read of the body. `Ok(0)` is its end.
+fn read_body(reader: &mut impl Read, buf: &mut [u8]) -> Result<usize, BodyError> {
+    loop {
+        match reader.read(buf) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => {
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    return Err(BodyError::Eof);
                 }
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(match last_err {
-            Some(e) => connect_err(&e),
-            None => connect_err(&"the name has no addresses"),
-        })
-    }
-
-    /// Time left before the deadline, or the timeout failure.
-    fn left(&self) -> Result<Duration, FetchError> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            Err(timed_out(self.allowed))
-        } else {
-            Ok(left)
-        }
-    }
-
-    fn send(&mut self, bytes: &[u8]) -> Result<(), FetchError> {
-        let left = self.left()?;
-        let _ = self.stream.set_write_timeout(Some(left));
-        self.stream.write_all(bytes).map_err(|e| match e.kind() {
-            ErrorKind::WouldBlock | ErrorKind::TimedOut => timed_out(self.allowed),
-            _ => FetchError(format!("sending the request to {}: {e}", self.host_port)),
-        })
-    }
-
-    /// One read, bounded by the deadline. `Ok(0)` is the server closing.
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, FetchError> {
-        loop {
-            let left = self.left()?;
-            let _ = self.stream.set_read_timeout(Some(left));
-            match self.stream.read(buf) {
-                Ok(n) => return Ok(n),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
-                    ) => {}
-                Err(e) => return Err(FetchError(format!("reading from {}: {e}", self.host_port))),
+                return Err(match ureq::Error::from(e) {
+                    ureq::Error::Timeout(_) => BodyError::Timeout,
+                    ureq::Error::Io(e) if e.kind() == ErrorKind::UnexpectedEof => BodyError::Eof,
+                    e => BodyError::Other(e.to_string()),
+                });
             }
         }
     }
+}
 
-    /// Reads up to the blank line ending the response head. Returns the
-    /// head (without the blank line) and whatever body bytes followed it.
-    fn read_head(&mut self, max_head: usize) -> Result<(Vec<u8>, Vec<u8>), FetchError> {
-        let mut buf = Vec::new();
-        let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
-            if let Some((end, sep)) = find_head_end(&buf) {
-                if end > max_head {
-                    break;
-                }
-                let body = buf.split_off(end + sep);
-                buf.truncate(end);
-                return Ok((buf, body));
-            }
-            if buf.len() > max_head {
-                break;
-            }
-            let n = self.read(&mut chunk)?;
-            if n == 0 {
-                return Err(FetchError(if buf.is_empty() {
-                    "the server closed the connection without answering".to_string()
-                } else {
-                    "the server closed the connection in the middle of its response headers"
-                        .to_string()
-                }));
-            }
-            buf.extend_from_slice(&chunk[..n]);
+/// A failure before the response head was read, as the operator's
+/// sentence.
+fn transport_error(e: ureq::Error, url: &HttpUrl, limits: &FetchLimits) -> FetchError {
+    let host_port = url.host_port();
+    let text = match e {
+        ureq::Error::Timeout(ureq::Timeout::Connect) => {
+            format!("connecting to {host_port}: timed out")
         }
-        Err(FetchError(format!(
+        ureq::Error::Timeout(_) => return timed_out(limits.deadline),
+        ureq::Error::Io(e) if e.kind() == ErrorKind::UnexpectedEof => {
+            "the server closed the connection without answering".to_string()
+        }
+        // Refused, reset, unreachable, and every certificate failure
+        // ("invalid peer certificate: ...").
+        ureq::Error::Io(e) => format!("connecting to {host_port}: {e}"),
+        ureq::Error::HostNotFound => {
+            format!("connecting to {host_port}: the name has no addresses")
+        }
+        ureq::Error::ConnectionFailed => {
+            format!("connecting to {host_port}: the connection failed")
+        }
+        ureq::Error::LargeResponseHeader(..) => format!(
             "the server's response headers are larger than {}",
-            size(max_head as u64)
-        )))
-    }
-}
-
-/// The end of the head and the length of the blank line that ends it
-/// (`\r\n\r\n`, or a bare `\n\n` from a sloppy server).
-fn find_head_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let crlf = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| (i, 4));
-    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2));
-    match (crlf, lf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (a, b) => a.or(b),
-    }
-}
-
-struct Head {
-    code: u16,
-    reason: String,
-    /// In order, names as sent, values trimmed.
-    headers: Vec<(String, String)>,
+            size(limits.max_head as u64)
+        ),
+        ureq::Error::Protocol(p) => format!("the server did not answer with valid HTTP ({p})"),
+        other => other.to_string(),
+    };
+    FetchError(printable(&text))
 }
 
 /// `text` with every control character (an escape sequence's ESC, say)
-/// replaced by `?`. The status line and header values reach the log, and
-/// over plain HTTP anyone on the path can write them.
+/// replaced by `?`. Server text reaches the log, and over plain HTTP anyone
+/// on the path can write it.
 fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
 }
 
-fn parse_head(head: &[u8]) -> Result<Head, FetchError> {
-    let text = String::from_utf8_lossy(head);
-    let mut lines = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l));
-    let status_line = lines.next().unwrap_or_default();
-    let not_http = || {
-        FetchError(format!(
-            "the server did not answer with HTTP (it sent \"{}\")",
-            printable(&status_line.chars().take(80).collect::<String>())
-        ))
-    };
-    let mut parts = status_line.splitn(3, ' ');
-    let version = parts.next().unwrap_or_default();
-    let code = parts.next().unwrap_or_default();
-    if !version.starts_with("HTTP/") || code.len() != 3 {
-        return Err(not_http());
+/// Resolves through [`resolve_within`], so a resolver that never answers
+/// holds one thread per name and the lookup spends the fetch's deadline.
+#[derive(Debug)]
+struct ListsResolver;
+
+impl Resolver for ListsResolver {
+    fn resolve(
+        &self,
+        uri: &Uri,
+        _config: &ureq::config::Config,
+        timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let key = match (uri.scheme(), uri.authority()) {
+            (Some(scheme), Some(authority)) => DefaultResolver::host_and_port(scheme, authority),
+            _ => None,
+        }
+        .ok_or_else(|| ureq::Error::BadUri(uri.to_string()))?;
+        let name = key.clone();
+        let lookup = move || name.to_socket_addrs().map(Iterator::collect);
+        let addrs = match resolve_within(&key, lookup, *timeout.after) {
+            None => return Err(ureq::Error::Timeout(timeout.reason)),
+            Some(Err(e)) => return Err(ureq::Error::Io(e)),
+            Some(Ok(addrs)) => addrs,
+        };
+        let mut resolved = self.empty();
+        for addr in addrs.into_iter().take(MAX_ADDRS) {
+            resolved.push(addr);
+        }
+        if resolved.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(resolved)
+        }
     }
-    let code: u16 = code.parse().map_err(|_| not_http())?;
-    let reason = printable(parts.next().unwrap_or_default().trim());
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(n, v)| (printable(n.trim()), printable(v.trim())))
-        .collect();
-    Ok(Head {
-        code,
-        reason,
-        headers,
-    })
 }
 
 type Lookup = io::Result<Vec<SocketAddr>>;
@@ -571,8 +587,19 @@ fn size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+    use ureq::tls::{Certificate, RootCerts};
+
+    const CA: &[u8] = include_bytes!("../tests/fixtures/list_tls/ca.der");
+    const LOCALHOST: &[u8] = include_bytes!("../tests/fixtures/list_tls/localhost.der");
+    const LOCALHOST_KEY: &[u8] = include_bytes!("../tests/fixtures/list_tls/localhost.key.der");
+    const WRONG_NAME: &[u8] = include_bytes!("../tests/fixtures/list_tls/wrong-name.der");
+    /// What `tls_serve`'s server returns when no request came over TLS.
+    const NO_REQUEST: &str = "no request: ";
 
     /// How the fake server ends the exchange after writing its reply.
     #[derive(Clone, Copy)]
@@ -615,6 +642,69 @@ mod tests {
         (url, handle)
     }
 
+    /// As `serve`, over TLS with `cert` (signed by the test CA, with the
+    /// `localhost` key). The server returns [`NO_REQUEST`] and the reason
+    /// when the handshake or the request read failed.
+    fn tls_serve(
+        cert: &'static [u8],
+        path: &str,
+        then: Then,
+        reply: impl FnOnce(&str) -> Vec<u8> + Send + 'static,
+    ) -> (HttpUrl, JoinHandle<String>) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from(cert.to_vec())],
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(LOCALHOST_KEY.to_vec())),
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let mut req = Vec::new();
+            let mut byte = [0u8; 1];
+            while !req.ends_with(b"\r\n\r\n") {
+                match tls.read(&mut byte) {
+                    Ok(0) => return format!("{NO_REQUEST}closed after {} bytes", req.len()),
+                    Ok(_) => req.push(byte[0]),
+                    Err(e) => return format!("{NO_REQUEST}{e}"),
+                }
+            }
+            let req = String::from_utf8(req).unwrap();
+            tls.write_all(&reply(&req)).unwrap();
+            match then {
+                Then::WaitForClient => {
+                    let mut sink = Vec::new();
+                    let _ = tls.read_to_end(&mut sink);
+                }
+                Then::Close => {
+                    tls.conn.send_close_notify();
+                    let _ = tls.flush();
+                }
+            }
+            req
+        });
+        let url = HttpUrl::parse(&format!("https://127.0.0.1:{port}{path}")).unwrap();
+        (url, handle)
+    }
+
+    /// A client that trusts the test CA alone.
+    fn trusting_test_ca() -> TlsConfig {
+        TlsConfig::builder()
+            .root_certs(RootCerts::new_with_certs(&[
+                Certificate::from_der(CA).to_owned()
+            ]))
+            .build()
+    }
+
     fn canned(text: &'static str) -> impl FnOnce(&str) -> Vec<u8> + Send + 'static {
         move |_| text.as_bytes().to_vec()
     }
@@ -653,27 +743,31 @@ mod tests {
         let req = server.join().unwrap();
         let port = url.port;
         assert!(req.starts_with("GET /cty/cty.dat HTTP/1.1\r\n"), "{req}");
+        // Header names are case-insensitive, and ureq sends them lower case.
+        let lower = req.to_ascii_lowercase();
         assert!(
-            req.contains(&format!("\r\nHost: 127.0.0.1:{port}\r\n")),
+            lower.contains(&format!("\r\nhost: 127.0.0.1:{port}\r\n")),
             "{req}"
         );
         assert!(
-            req.contains(&format!(
-                "\r\nUser-Agent: manta/{}\r\n",
+            lower.contains(&format!(
+                "\r\nuser-agent: manta/{}\r\n",
                 env!("CARGO_PKG_VERSION")
             )),
             "{req}"
         );
-        assert!(req.contains("\r\nAccept-Encoding: identity\r\n"), "{req}");
-        assert!(req.contains("\r\nConnection: close\r\n"), "{req}");
-        assert!(!req.contains("If-Modified-Since"), "{req}");
+        assert!(lower.contains("\r\naccept-encoding: identity\r\n"), "{req}");
+        assert!(!lower.contains("if-modified-since"), "{req}");
     }
 
     #[test]
     fn sends_if_modified_since_and_reports_not_modified_on_304() {
         const LM: &str = "Tue, 15 Sep 2026 20:52:28 GMT";
         let (url, server) = serve("/MASTER.SCP", Then::Close, |req| {
-            if req.contains(&format!("\r\nIf-Modified-Since: {LM}\r\n")) {
+            if req
+                .to_ascii_lowercase()
+                .contains(&format!("\r\nif-modified-since: {LM}\r\n").to_ascii_lowercase())
+            {
                 b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec()
             } else {
                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nW1".to_vec()
@@ -682,7 +776,8 @@ mod tests {
         assert_eq!(get(&url, Some(LM), &quick()).unwrap(), Fetched::NotModified);
         let req = server.join().unwrap();
         assert!(
-            req.contains(&format!("\r\nIf-Modified-Since: {LM}\r\n")),
+            req.to_ascii_lowercase()
+                .contains(&format!("\r\nif-modified-since: {LM}\r\n").to_ascii_lowercase()),
             "{req}"
         );
     }
@@ -702,7 +797,10 @@ mod tests {
                 "HTTP 304 Not Modified to a request that sent no If-Modified-Since"
             );
             let req = server.join().unwrap();
-            assert!(!req.contains("If-Modified-Since"), "{req}");
+            assert!(
+                !req.to_ascii_lowercase().contains("if-modified-since"),
+                "{req}"
+            );
         }
     }
 
@@ -765,7 +863,9 @@ mod tests {
     }
 
     #[test]
-    fn server_text_in_a_failure_has_its_control_characters_replaced() {
+    fn server_text_with_control_characters_never_reaches_the_failure() {
+        // ESC and BEL in the status line: the parser refuses the line, so
+        // none of the server's bytes are echoed.
         let (url, _server) = serve(
             "/cty.dat",
             Then::Close,
@@ -774,28 +874,46 @@ mod tests {
                  Content-Length: 0\r\n\r\n",
             ),
         );
-        assert_eq!(
-            fetch_err(&url, &quick()),
-            "HTTP 302 Found?]0;x? (Location: http://m/?[2J); manta does not follow \
-             redirects, so point the URL at the new location"
+        let err = fetch_err(&url, &quick());
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(
+            err.starts_with("the server did not answer with valid HTTP ("),
+            "{err:?}"
         );
+
+        // A clean status line and a TAB inside a header value: the value
+        // reaches the failure with the TAB replaced.
+        let (url, _server) = serve(
+            "/cty.dat",
+            Then::Close,
+            canned("HTTP/1.1 302 Found\r\nLocation: http://m/a\tb\r\nContent-Length: 0\r\n\r\n"),
+        );
+        let err = fetch_err(&url, &quick());
+        assert!(!err.chars().any(char::is_control), "{err:?}");
+        assert!(err.starts_with("HTTP 302 Found"), "{err:?}");
     }
 
     #[test]
-    fn a_301_is_a_failure_naming_the_location_and_the_http_only_rule() {
-        let (url, _server) = serve(
-            "/cty/cty.dat",
-            Then::Close,
-            canned(
-                "HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.country-files.com/cty/cty.dat\r\n\
-                 Content-Length: 0\r\n\r\n",
-            ),
-        );
-        assert_eq!(
-            fetch_err(&url, &quick()),
-            "HTTP 301 Moved Permanently (Location: https://www.country-files.com/cty/cty.dat); \
-             manta downloads over plain http:// only, so point the URL at an http:// mirror"
-        );
+    fn a_301_is_a_failure_naming_the_location() {
+        for location in [
+            "https://www.country-files.com/cty/cty.dat",
+            "http://mirror.lan/cty/cty.dat",
+        ] {
+            let (url, _server) = serve("/cty/cty.dat", Then::Close, move |_| {
+                format!(
+                    "HTTP/1.1 301 Moved Permanently\r\nLocation: {location}\r\n\
+                     Content-Length: 0\r\n\r\n"
+                )
+                .into_bytes()
+            });
+            assert_eq!(
+                fetch_err(&url, &quick()),
+                format!(
+                    "HTTP 301 Moved Permanently (Location: {location}); manta does not follow \
+                     redirects, so point the URL at the new location"
+                )
+            );
+        }
     }
 
     #[test]
@@ -889,22 +1007,42 @@ mod tests {
     }
 
     #[test]
-    fn url_parsing_accepts_http_host_port_path_and_refuses_others() {
+    fn url_parsing_accepts_https_and_http_and_refuses_others() {
+        let u = HttpUrl::parse("https://www.country-files.com/cty/cty.dat").unwrap();
+        assert_eq!(
+            (u.scheme, u.host.as_str(), u.port, u.path.as_str()),
+            (Scheme::Https, "www.country-files.com", 443, "/cty/cty.dat")
+        );
+        assert_eq!(u.host_port(), "www.country-files.com:443");
+        assert_eq!(u.request_uri(), "https://www.country-files.com/cty/cty.dat");
+        assert_eq!(u.as_str(), "https://www.country-files.com/cty/cty.dat");
+        assert_eq!(u.to_string(), "https://www.country-files.com/cty/cty.dat");
+
+        let u = HttpUrl::parse("HTTPS://example.org").unwrap();
+        assert_eq!(
+            (u.scheme, u.host.as_str(), u.port, u.path.as_str()),
+            (Scheme::Https, "example.org", 443, "/")
+        );
+        let u = HttpUrl::parse("https://[::1]:8443/x").unwrap();
+        assert_eq!(u.request_uri(), "https://[::1]:8443/x");
+
         let u = HttpUrl::parse("http://www.country-files.com/cty/cty.dat").unwrap();
         assert_eq!(
-            (u.host.as_str(), u.port, u.path.as_str()),
-            ("www.country-files.com", 80, "/cty/cty.dat")
+            (u.scheme, u.host.as_str(), u.port, u.path.as_str()),
+            (Scheme::Http, "www.country-files.com", 80, "/cty/cty.dat")
         );
         assert_eq!(u.host_port(), "www.country-files.com:80");
-        assert_eq!(u.as_str(), "http://www.country-files.com/cty/cty.dat");
-        assert_eq!(u.to_string(), "http://www.country-files.com/cty/cty.dat");
+        assert_eq!(u.request_uri(), "http://www.country-files.com/cty/cty.dat");
 
         let u = HttpUrl::parse("http://mirror.lan:8080/lists/MASTER.SCP?v=1#top").unwrap();
         assert_eq!(
             (u.host.as_str(), u.port, u.path.as_str()),
             ("mirror.lan", 8080, "/lists/MASTER.SCP?v=1")
         );
-        assert_eq!(u.host_header(), "mirror.lan:8080");
+        assert_eq!(
+            u.request_uri(),
+            "http://mirror.lan:8080/lists/MASTER.SCP?v=1"
+        );
 
         let u = HttpUrl::parse("http://[::1]:80/cty.dat").unwrap();
         assert_eq!(
@@ -912,21 +1050,22 @@ mod tests {
             ("::1", 80, "/cty.dat")
         );
         assert_eq!(u.host_port(), "[::1]:80");
-        assert_eq!(u.host_header(), "[::1]");
+        assert_eq!(u.request_uri(), "http://[::1]/cty.dat");
 
         let u = HttpUrl::parse("HTTP://example.org").unwrap();
         assert_eq!(
-            (u.host.as_str(), u.port, u.path.as_str()),
-            ("example.org", 80, "/")
+            (u.scheme, u.host.as_str(), u.port, u.path.as_str()),
+            (Scheme::Http, "example.org", 80, "/")
         );
 
         for bad in [
-            "https://www.country-files.com/cty/cty.dat",
             "ftp://example.org/cty.dat",
             "http:///cty.dat",
             "http://",
+            "https://",
             "http://:8080/cty.dat",
             "http://h:0/p",
+            "https://h:0/p",
             "http://h:65536/p",
             "http://h:port/p",
             "http://h:/p",
@@ -934,16 +1073,270 @@ mod tests {
             "http://[nothex]/p",
             "http://::1/p",
             "http://user@h/p",
+            "https://user@h/p",
             "http://h/a b",
+            "http://mirror.lan/a<b",
+            "https://h/a>b",
             "www.country-files.com/cty/cty.dat",
             "",
         ] {
             assert!(HttpUrl::parse(bad).is_err(), "{bad} was accepted");
         }
         assert_eq!(
-            HttpUrl::parse("https://h/p").unwrap_err(),
-            "it is a https:// URL, and manta downloads over plain http:// only"
+            HttpUrl::parse("ftp://h/p").unwrap_err(),
+            "it is a ftp:// URL, and manta downloads over https:// or http:// only"
+        );
+        assert_eq!(
+            HttpUrl::parse("h/p").unwrap_err(),
+            "it does not start with https:// or http://"
         );
         assert_eq!(HttpUrl::parse("http:///p").unwrap_err(), "it has no host");
+        assert_eq!(HttpUrl::parse("https:///p").unwrap_err(), "it has no host");
+        let err = HttpUrl::parse("http://h/a<b").unwrap_err();
+        assert!(
+            err.starts_with("it contains a character a URL cannot carry ("),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_body_of_exactly_the_cap_is_accepted_with_or_without_content_length() {
+        let limits = FetchLimits {
+            max_body: 1024,
+            ..quick()
+        };
+        for with_length in [true, false] {
+            let (url, _server) = serve("/cty.dat", Then::Close, move |_| {
+                let mut reply = if with_length {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n".to_vec()
+                } else {
+                    b"HTTP/1.1 200 OK\r\n\r\n".to_vec()
+                };
+                reply.extend_from_slice(&[b'W'; 1024]);
+                reply
+            });
+            match get(&url, None, &limits).unwrap() {
+                Fetched::Ok { body, .. } => assert_eq!(body.len(), 1024, "{with_length}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_close_delimited_body_over_the_cap_is_refused() {
+        let limits = FetchLimits {
+            max_body: 1024,
+            ..quick()
+        };
+        let (url, _server) = serve("/cty.dat", Then::Close, |_| {
+            let mut reply = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+            reply.extend_from_slice(&[b'W'; 1025]);
+            reply
+        });
+        assert_eq!(fetch_err(&url, &limits), "it is larger than 1 KiB");
+    }
+
+    #[test]
+    fn an_if_modified_since_that_is_not_visible_ascii_is_not_sent() {
+        let (url, server) = serve(
+            "/MASTER.SCP",
+            Then::Close,
+            canned("HTTP/1.1 304 Not Modified\r\n\r\n"),
+        );
+        assert_eq!(
+            get(&url, Some("Tue, 15 Sep 2026 20:52:28 GMT\u{e9}"), &quick())
+                .unwrap_err()
+                .to_string(),
+            "HTTP 304 Not Modified to a request that sent no If-Modified-Since"
+        );
+        let req = server.join().unwrap();
+        assert!(
+            !req.to_ascii_lowercase().contains("if-modified-since"),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn a_localhost_url_resolves_through_the_lists_resolver() {
+        let (url, _server) = serve(
+            "/x",
+            Then::Close,
+            canned("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nW1"),
+        );
+        let url = HttpUrl::parse(&format!("http://localhost:{}/x", url.port)).unwrap();
+        assert_eq!(
+            get(&url, None, &quick()).unwrap(),
+            Fetched::Ok {
+                body: b"W1".to_vec(),
+                last_modified: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_agent_uses_no_proxy_and_follows_no_redirect() {
+        let a = agent(&FetchLimits::default(), TlsConfig::default());
+        assert!(a.config().proxy().is_none());
+        assert_eq!(a.config().max_redirects(), 0);
+        assert!(!a.config().http_status_as_error());
+        assert_eq!(a.config().max_response_header_size(), 16 * 1024);
+    }
+
+    #[test]
+    fn an_https_url_is_fetched_over_tls_with_its_last_modified() {
+        const LM: &str = "Tue, 15 Sep 2026 20:52:28 GMT";
+        let (url, server) = tls_serve(
+            LOCALHOST,
+            "/cty/cty.dat",
+            Then::Close,
+            canned(
+                "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\
+                 Last-Modified: Tue, 15 Sep 2026 20:52:28 GMT\r\n\r\nhello world",
+            ),
+        );
+        let got = get_with(&agent(&quick(), trusting_test_ca()), &url, None, &quick()).unwrap();
+        assert_eq!(
+            got,
+            Fetched::Ok {
+                body: b"hello world".to_vec(),
+                last_modified: Some(LM.to_string()),
+            }
+        );
+        let req = server.join().unwrap();
+        assert!(req.starts_with("GET /cty/cty.dat HTTP/1.1\r\n"), "{req}");
+        assert!(
+            req.to_ascii_lowercase()
+                .contains(&format!("\r\nhost: 127.0.0.1:{}\r\n", url.port)),
+            "{req}"
+        );
+    }
+
+    #[test]
+    fn an_https_304_answers_if_modified_since() {
+        const LM: &str = "Tue, 15 Sep 2026 20:52:28 GMT";
+        let (url, _server) = tls_serve(LOCALHOST, "/MASTER.SCP", Then::Close, |req| {
+            if req
+                .to_ascii_lowercase()
+                .contains(&format!("\r\nif-modified-since: {LM}\r\n").to_ascii_lowercase())
+            {
+                b"HTTP/1.1 304 Not Modified\r\n\r\n".to_vec()
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nW1".to_vec()
+            }
+        });
+        assert_eq!(
+            get_with(
+                &agent(&quick(), trusting_test_ca()),
+                &url,
+                Some(LM),
+                &quick()
+            )
+            .unwrap(),
+            Fetched::NotModified
+        );
+    }
+
+    #[test]
+    fn a_certificate_from_an_unknown_authority_is_refused_before_any_request() {
+        let (url, server) = tls_serve(
+            LOCALHOST,
+            "/cty.dat",
+            Then::Close,
+            canned("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nW1"),
+        );
+        // The roots `run` uses: nothing there signed the test CA.
+        let err = fetch_err(&url, &quick());
+        assert!(
+            err.starts_with(&format!(
+                "connecting to 127.0.0.1:{}: invalid peer certificate: ",
+                url.port
+            )),
+            "{err}"
+        );
+        assert!(err.contains("UnknownIssuer"), "{err}");
+        let req = server.join().unwrap();
+        assert!(req.starts_with(NO_REQUEST), "{req}");
+    }
+
+    #[test]
+    fn a_certificate_for_another_name_is_refused() {
+        let (url, server) = tls_serve(
+            WRONG_NAME,
+            "/cty.dat",
+            Then::Close,
+            canned("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nW1"),
+        );
+        let err = get_with(&agent(&quick(), trusting_test_ca()), &url, None, &quick())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with(&format!(
+                "connecting to 127.0.0.1:{}: invalid peer certificate: ",
+                url.port
+            )),
+            "{err}"
+        );
+        assert!(err.contains("not valid for name"), "{err}");
+        let req = server.join().unwrap();
+        assert!(req.starts_with(NO_REQUEST), "{req}");
+    }
+
+    #[test]
+    fn an_https_redirect_is_not_followed() {
+        let (url, _server) = tls_serve(
+            LOCALHOST,
+            "/cty/cty.dat",
+            Then::Close,
+            canned(
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: https://www.country-files.com/cty/cty.dat\r\n\
+                 Content-Length: 0\r\n\r\n",
+            ),
+        );
+        assert_eq!(
+            get_with(&agent(&quick(), trusting_test_ca()), &url, None, &quick())
+                .unwrap_err()
+                .to_string(),
+            "HTTP 301 Moved Permanently (Location: https://www.country-files.com/cty/cty.dat); \
+             manta does not follow redirects, so point the URL at the new location"
+        );
+    }
+
+    #[test]
+    fn an_https_content_length_over_the_cap_is_refused_before_reading() {
+        let (url, _server) = tls_serve(
+            LOCALHOST,
+            "/cty.dat",
+            Then::WaitForClient,
+            canned("HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n\r\n"),
+        );
+        let started = Instant::now();
+        assert_eq!(
+            get_with(&agent(&quick(), trusting_test_ca()), &url, None, &quick())
+                .unwrap_err()
+                .to_string(),
+            "it is larger than 8 MiB"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[ignore = "network: fetches the two real list hosts over HTTPS"]
+    fn live_https_list_hosts_answer_over_tls() {
+        for url in [
+            "https://www.country-files.com/cty/cty.dat",
+            "https://www.supercheckpartial.com/MASTER.SCP",
+        ] {
+            let url = HttpUrl::parse(url).unwrap();
+            match get(&url, None, &FetchLimits::default()).unwrap() {
+                Fetched::Ok {
+                    body,
+                    last_modified,
+                } => {
+                    assert!(!body.is_empty(), "{url}");
+                    assert!(last_modified.is_some(), "{url}");
+                }
+                other => panic!("{url}: {other:?}"),
+            }
+        }
     }
 }
