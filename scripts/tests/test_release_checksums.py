@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
@@ -43,7 +44,8 @@ ARCHIVES = (
     "manta-windows-x86_64.zip",
 )
 # MAN-540: build's two Linux legs also upload <artifact>.deb in the same artifact, so the release
-# job publishes, checksums and attests nine files; sorted under any collation.
+# job publishes, checksums and attests nine files. Sorted in byte order, which is not every locale's
+# collation order, so ChecksumStepExecutionTests.run_step runs the step under LC_ALL=C.
 DEBS = ("manta-linux-arm64.deb", "manta-linux-x86_64.deb")
 RELEASE_FILES = tuple(sorted(ARCHIVES + DEBS))
 DOWNLOADED = "manta-linux-x86_64.tar.gz"
@@ -159,8 +161,8 @@ def write_file(path, data):
         f.write(data)
 
 
-def run(cmd, cwd):
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+def run(cmd, cwd, env=None):
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
 
 
 class ReleaseJobTests(unittest.TestCase):
@@ -478,7 +480,9 @@ class ChecksumStepExecutionTests(unittest.TestCase):
         with open(script, "wb") as f:
             f.write(wf.run_body(self.step).encode("utf-8"))
         cwd = os.path.join(self.work, wf.field(self.step, "working-directory") or ".")
-        return run([shutil.which("bash"), "--noprofile", "--norc", "-eo", "pipefail", script], cwd)
+        # The glob's order follows the locale; C gives the byte order sorted() gives these names.
+        env = dict(os.environ, LC_ALL="C")
+        return run([shutil.which("bash"), "--noprofile", "--norc", "-eo", "pipefail", script], cwd, env)
 
     def read_sums(self):
         with open(os.path.join(self.work, "dist", "SHA256SUMS"), encoding="utf-8") as f:
@@ -492,6 +496,15 @@ class ChecksumStepExecutionTests(unittest.TestCase):
         self.assertEqual(proc.stdout, want, "the step log shows the published digests")
         check = run([gnu_sha256sum(), "-c", "--strict", "SHA256SUMS"], os.path.join(self.work, "dist"))
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    def test_bare_name_order_ignores_the_callers_locale(self):
+        """MAN-540: en_US.UTF-8 sorts manta-linux-arm64.deb before manta-linux-arm64-soapy.tar.gz
+        and byte order does the opposite, so run_step pins LC_ALL=C. This fails without the pin
+        only on a host that has an en_US.UTF-8 locale; elsewhere bash falls back to C."""
+        with mock.patch.dict(os.environ, {"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8"}):
+            proc = self.run_step(RELEASE_FILES)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.read_sums(), sums_text(sorted(RELEASE_FILES)))
 
     def test_operator_check_passes_for_a_download_and_fails_once_it_changes(self):
         proc = self.run_step(RELEASE_FILES)

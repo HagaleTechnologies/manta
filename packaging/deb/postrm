@@ -1,14 +1,21 @@
 #!/bin/sh
 # manta's postrm (MAN-540): debhelper 13.14 postrm-systemd-reload-only and
-# postrm-systemd, plus deleting the config the postinst created.
+# postrm-systemd, plus deleting the config the postinst created. Where debhelper
+# ignores a call's exit status, this prints what failed and carries on.
 set -e
 if [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
-	systemctl --system daemon-reload >/dev/null || true
+	systemctl --system daemon-reload >/dev/null ||
+		echo "manta: systemctl daemon-reload failed (exit $?); continuing." >&2
 fi
 if [ "$1" = "purge" ]; then
 	rm -f "${DPKG_ROOT:-}/etc/manta/manta.toml" "${DPKG_ROOT:-}/etc/manta/manta.toml.dpkg-tmp"
-	rmdir "${DPKG_ROOT:-}/etc/manta" 2>/dev/null || true
+	# Kept when it still holds the operator's own files, as dpkg keeps a non-empty directory.
+	if [ -d "${DPKG_ROOT:-}/etc/manta" ] && [ -z "$(ls -A "${DPKG_ROOT:-}/etc/manta")" ]; then
+		rmdir "${DPKG_ROOT:-}/etc/manta" ||
+			echo "manta: removing /etc/manta failed (exit $?); continuing." >&2
+	fi
 	if [ -x "/usr/bin/deb-systemd-helper" ]; then
-		deb-systemd-helper purge 'manta.service' >/dev/null || true
+		deb-systemd-helper purge 'manta.service' >/dev/null ||
+			echo "manta: purging manta.service's enable state failed (exit $?); continuing." >&2
 	fi
 fi

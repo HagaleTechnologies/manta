@@ -554,7 +554,8 @@ class SystemdRunningScriptTests(unittest.TestCase):
         os.makedirs(run_dir)
         self.bin = os.path.join(self.tmp, "bin")
         self.log = os.path.join(self.tmp, "calls.log")
-        stub = '#!/bin/sh\necho "$(basename "$0") $*" >> "$STUB_LOG"\nexit 0\n'
+        stub = ('#!/bin/sh\necho "$(basename "$0") $*" >> "$STUB_LOG"\n'
+                'if grep -qxF "$(basename "$0") $*" "$STUB_FAILING"; then exit 3; fi\nexit 0\n')
         for cmd in ("deb-systemd-helper", "deb-systemd-invoke", "systemctl"):
             write_file(os.path.join(self.bin, cmd), stub.encode(), 0o755)
         self.scripts = {}
@@ -567,14 +568,18 @@ class SystemdRunningScriptTests(unittest.TestCase):
             write_file(path, text.encode(), 0o755)
             self.scripts[name] = path
 
-    def run_script(self, name, *args):
+    def run_script(self, name, *args, failing=()):
+        """Run a script; each stub call named in `failing` exits 3, every other one exits 0."""
         env = {k: v for k, v in os.environ.items() if k != "DPKG_ROOT"}
-        env.update(PATH=self.bin + os.pathsep + env.get("PATH", ""), STUB_LOG=self.log)
+        failing_list = os.path.join(self.tmp, "failing")
+        write_file(failing_list, "".join(call + "\n" for call in failing).encode())
+        env.update(PATH=self.bin + os.pathsep + env.get("PATH", ""), STUB_LOG=self.log, STUB_FAILING=failing_list)
         if os.path.exists(self.log):
             os.remove(self.log)
         proc = subprocess.run(["sh", self.scripts[name], *args], env=env, capture_output=True, text=True,
                               stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.stderr = proc.stderr
         return Path(self.log).read_text().splitlines() if os.path.exists(self.log) else []
 
     def test_first_configure_enables_and_never_starts(self):
@@ -600,6 +605,44 @@ class SystemdRunningScriptTests(unittest.TestCase):
         calls = self.run_script("postrm", "purge")
         self.assertEqual(calls, ["deb-systemd-helper purge manta.service"])
         self.assertFalse(os.path.exists(os.path.join(self.prefix, "etc/manta")))
+
+    def test_a_failing_systemd_call_is_reported_and_never_fails_the_script(self):
+        """Where debhelper's snippets ignore a call's exit status, the scripts print what failed and carry on."""
+        unmask, was_enabled, enable, update_state = (f"deb-systemd-helper {a} manta.service" for a in
+                                                     ("unmask", "--quiet was-enabled", "enable", "update-state"))
+        reload, purge = "systemctl --system daemon-reload", "deb-systemd-helper purge manta.service"
+        cases = (("postinst", ("configure", "0.1.0-1"),
+                  (unmask, was_enabled, update_state, reload, "deb-systemd-invoke try-restart manta.service"),
+                  ("unmasking manta.service", "recording manta.service's enable state",
+                   "systemctl daemon-reload", "restarting manta.service")),
+                 ("postinst", ("configure",), (enable,), ("enabling manta.service",)),
+                 ("prerm", ("remove",), ("deb-systemd-invoke stop manta.service",), ("stopping manta.service",)),
+                 ("postrm", ("remove",), (reload,), ("systemctl daemon-reload",)),
+                 ("postrm", ("purge",), (purge,), ("purging manta.service's enable state",)))
+        for name, args, failing, failures in cases:
+            with self.subTest(script=name, args=args, failing=failing):
+                calls = self.run_script(name, *args, failing=failing)
+                self.assertTrue(set(failing) <= set(calls), calls)
+                reported = [line for line in self.stderr.splitlines() if line.startswith("manta: ")]
+                self.assertEqual(reported, [f"manta: {what} failed (exit 3); continuing." for what in failures])
+
+    def test_purge_keeps_a_non_empty_etc_manta_and_never_fails_on_rmdir(self):
+        conf_dir = os.path.join(self.prefix, "etc/manta")
+        purge = ["deb-systemd-helper purge manta.service"]
+        write_file(os.path.join(conf_dir, "operator-notes.txt"), b"mine\n")
+        self.assertEqual(self.run_script("postrm", "purge"), purge)
+        self.assertEqual(os.listdir(conf_dir), ["operator-notes.txt"])
+        self.assertEqual(self.stderr, "")
+        shutil.rmtree(conf_dir)
+        self.assertEqual(self.run_script("postrm", "purge"), purge, "a missing /etc/manta skips only the rmdir")
+        # A link to a directory passes the emptiness test, and rmdir refuses it: reported, not fatal.
+        os.makedirs(os.path.join(self.tmp, "elsewhere"))
+        os.symlink(os.path.join(self.tmp, "elsewhere"), conf_dir)
+        self.assertEqual(self.run_script("postrm", "purge"), purge)
+        self.assertTrue(os.path.islink(conf_dir))
+        reported = [line for line in self.stderr.splitlines() if line.startswith("manta: ")]
+        self.assertEqual(len(reported), 1, self.stderr)
+        self.assertRegex(reported[0], r"^manta: removing /etc/manta failed \(exit \d+\); continuing\.$")
 
 
 class ReleaseWorkflowTests(unittest.TestCase):

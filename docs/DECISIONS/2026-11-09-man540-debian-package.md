@@ -31,7 +31,7 @@ real packages, and the release path compiles no extra third-party tool.
 as a non-root user, so neither `fakeroot` nor root is needed. `-Zxz` keeps
 the package readable by Debian 11's dpkg: Ubuntu 24.04's `dpkg-deb` writes
 zstd members by default. The cost is the debhelper 13.14 systemd snippets
-copied by hand into `packaging/deb/` (about 30 lines). This reverses the
+written out by hand in `packaging/deb/` (about 30 lines). This reverses the
 research's D1.
 
 ### A2: build in `build`'s Linux legs from the archive's binary, with stable names (P2, P3)
@@ -88,10 +88,15 @@ and `Restart=always` would start it again every 10 seconds, so the package
 enables the service but never starts it. On upgrade the postinst runs
 `deb-systemd-invoke try-restart`, so a running service restarts on the new
 binary and a stopped one stays stopped. The prerm stops the service only on
-`remove`. The postinst's systemd blocks are debhelper 13.14's
+`remove`. The postinst's systemd blocks make the calls of debhelper 13.14's
 `postinst-systemd-enable` and `postinst-systemd-restartnostart`
-(`RESTART_ACTION=try-restart`); the prerm is `prerm-systemd-restart`; the
-postrm is `postrm-systemd-reload-only` and `postrm-systemd`. Every path the
+(`RESTART_ACTION=try-restart`) under the same conditions; the prerm follows
+`prerm-systemd-restart`; the postrm follows `postrm-systemd-reload-only` and
+`postrm-systemd`. One difference: where debhelper ignores a call's exit
+status, these scripts print `manta: <action> failed (exit N); continuing.`
+on stderr and carry on, so a failed systemd call is visible and does not
+fail the maintainer script. The purge removes `/etc/manta` only when it is
+empty, and reports a failed `rmdir` the same way. Every path the
 scripts write sits under `${DPKG_ROOT:-}`, so a scratch-root install in the
 tests touches only that root.
 
