@@ -391,8 +391,9 @@ pub struct ValueHistogram {
 /// opposed to whether the daemon is running at all.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeQuality {
-    /// MAN-208: admitted, replayed hops, rescues, budget exhaustion, orphans.
-    pub refine: [u64; 5],
+    /// MAN-208: admitted, replayed hops, rescues, budget exhaustion,
+    /// orphans; MAN-515: replays, changed words, guard rejections.
+    pub refine: [u64; 8],
     pub chars_total: u64,
     pub garbles_total: u64,
     pub rail_ratio: ValueHistogram,
@@ -3170,6 +3171,9 @@ impl Metrics {
                 ("# TYPE manta_refine_rescues_total counter\nmanta_refine_rescues_total ", q.refine[2]),
                 ("# TYPE manta_refine_budget_exhausted_total counter\nmanta_refine_budget_exhausted_total ", q.refine[3]),
                 ("# TYPE manta_refine_orphaned_revisions_total counter\nmanta_refine_orphaned_revisions_total ", q.refine[4]),
+                ("# TYPE manta_refine_replays_total counter\nmanta_refine_replays_total ", q.refine[5]),
+                ("# TYPE manta_refine_changed_total counter\nmanta_refine_changed_total ", q.refine[6]),
+                ("# TYPE manta_refine_rejected_total counter\nmanta_refine_rejected_total ", q.refine[7]),
             ] {
                 out.push_str(&format!("{header}{n}\n"));
             }
@@ -4415,7 +4419,7 @@ mod tests {
 
     fn sample_decode_quality() -> DecodeQuality {
         DecodeQuality {
-            refine: [0; 5],
+            refine: [0; 8],
             chars_total: 9690,
             garbles_total: 3,
             rail_ratio: ValueHistogram {
@@ -4446,7 +4450,7 @@ mod tests {
     fn refine_metrics_render() {
         let m = Metrics::new();
         let mut q = sample_decode_quality();
-        q.refine = [2, 1500, 1, 3, 0];
+        q.refine = [2, 1500, 1, 3, 0, 73, 12, 4];
         m.set_decode_quality(q);
         let text = m.render_prometheus_text();
         for (name, count) in [
@@ -4455,9 +4459,12 @@ mod tests {
             "rescues",
             "budget_exhausted",
             "orphaned_revisions",
+            "replays",
+            "changed",
+            "rejected",
         ]
         .iter()
-        .zip([2, 1500, 1, 3, 0])
+        .zip([2, 1500, 1, 3, 0, 73, 12, 4])
         {
             assert!(text.contains(&format!(
                 "# TYPE manta_refine_{name}_total counter\nmanta_refine_{name}_total {count}\n"

@@ -727,8 +727,27 @@ pub struct RefinedWord {
     /// The re-decode's whole-word confidence (geometric mean).
     pub word_confidence: f32,
     /// Which alternate configuration produced this reading (e.g.
-    /// `"engine:hsmm"`, `"wpm:25"`), for the scheduler's own bookkeeping.
+    /// `"engine:legacy"`, `"wpm-seed"`), for the scheduler's own
+    /// bookkeeping.
     pub hypothesis: &'static str,
+}
+
+/// MAN-515: what [`Validator::apply_refinement_with_outcome`] did with one
+/// refined reading, for the scheduler's outcome counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefinementOutcome {
+    /// The occurrence's word had left the window (or its track was gone):
+    /// the record was revised, nothing was re-evaluated.
+    Orphaned,
+    /// The reading equals the word's decoded text.
+    Unchanged,
+    /// The reading replaced the word's decoded text, and the occurrence's
+    /// repetition support moved to it.
+    Changed,
+    /// The reading would have turned a spottable callsign into a string
+    /// that can never be spotted, so it was refused: the decoded word,
+    /// its support and its ledger entry are untouched.
+    Rejected,
 }
 
 /// MAN-525: the nearest other track's frequency distance from `freq_hz`,
@@ -1200,7 +1219,90 @@ impl Validator {
     /// `decision_sample_ts` is the stream position at the re-decode: the
     /// earliest time the refined identity could have been known. It stamps
     /// the observation record, never the spot.
+    ///
+    /// MAN-515: a reading that would turn a spottable callsign (allowlisted,
+    /// or grammar-plausible with an allocated prefix) into a string that can
+    /// never be spotted is refused before anything moves: the word keeps its
+    /// text and support, and a `Refined` withheld decision records why
+    /// (`Grammar` or `Cty`). [`Validator::apply_refinement_with_outcome`]
+    /// reports which case applied.
     pub fn apply_refinement(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> Vec<Spot> {
+        self.apply_refinement_with_outcome(track_id, word_seq, refined, decision_sample_ts)
+            .0
+    }
+
+    /// MAN-515: whether `call` could ever be spotted by the permanent
+    /// checks: allowlisted, or grammar-plausible with an allocated prefix.
+    fn spottable(&self, call: &str) -> bool {
+        self.allowlist.contains(call)
+            || (grammar::is_plausible(call) && self.cty.is_allocated(call))
+    }
+
+    /// MAN-515: [`Validator::apply_refinement`], also reporting what it did
+    /// with the reading ([`RefinementOutcome`]) so the scheduler can count
+    /// the replays that changed a word and the ones the guard refused.
+    pub fn apply_refinement_with_outcome(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> (Vec<Spot>, RefinementOutcome) {
+        let current = self.tracks.get(&track_id).and_then(|t| {
+            t.words.iter().find(|w| w.seq == word_seq).map(|w| {
+                (
+                    w.text.clone(),
+                    w.last_spot_type.unwrap_or(SpotType::Unknown),
+                )
+            })
+        });
+        let outcome = match &current {
+            None => RefinementOutcome::Orphaned,
+            Some((old_call, _)) if *old_call == refined.call => RefinementOutcome::Unchanged,
+            Some((old_call, _)) if self.spottable(old_call) && !self.spottable(&refined.call) => {
+                RefinementOutcome::Rejected
+            }
+            Some(_) => RefinementOutcome::Changed,
+        };
+        if let (RefinementOutcome::Rejected, Some((_, spot_type))) = (outcome, current) {
+            // The guard returns before `move_occurrence`, the ledger
+            // revision and any write to the word: the causal reading keeps
+            // everything it had.
+            self.advance_clock(decision_sample_ts);
+            let reason = if grammar::is_plausible(&refined.call) {
+                Reason::Cty
+            } else {
+                Reason::Grammar
+            };
+            let freq_hz = self.tracks[&track_id].freq_hz * self.freq_calibration;
+            let at = At::new(track_id, word_seq, Cause::Refined);
+            self.decide(at, Some(reason), || {
+                Decision::withheld(
+                    track_id,
+                    decision_sample_ts,
+                    &refined.call,
+                    freq_hz,
+                    spot_type,
+                    reason,
+                )
+            });
+            return (Vec::new(), outcome);
+        }
+        (
+            self.apply_refinement_inner(track_id, word_seq, refined, decision_sample_ts),
+            outcome,
+        )
+    }
+
+    /// The MAN-208 refinement path behind [`Validator::apply_refinement`],
+    /// after the MAN-515 guard has let the reading through.
+    fn apply_refinement_inner(
         &mut self,
         track_id: u32,
         word_seq: u64,
@@ -6461,6 +6563,154 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             total,
             "repeated refinements conserve counted occurrences"
         );
+    }
+
+    // ---- MAN-515: the narrow refinement guard and its outcomes ----
+
+    /// The `N3NXI` -> `EEETT` loss in miniature: a refinement that would
+    /// turn a spottable call into garbage is refused, the word keeps its
+    /// text and support, and a later clean repetition still spots it.
+    #[test]
+    fn refinement_never_turns_a_spottable_call_into_garbage() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000);
+        assert!(
+            run(&events, &mut v).is_empty(),
+            "one repetition never spots"
+        );
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let counted = v.gate.counted_total();
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert!(spots.is_empty());
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq, "the word keeps its text");
+        assert_eq!(v.gate.counted_total(), counted, "nothing moved");
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABD", v.now_ts)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 1, "the occurrence still counts");
+        assert!(
+            v.gate
+                .support_snapshot(14_000_000.0, "EEETT", v.now_ts)
+                .is_none_or(|s| s.counted.is_empty()),
+            "no support moved to the garbage reading"
+        );
+        let later = transmission_events(1, &["DE", "K3ABD", "K"], 1_768_000);
+        let spots = run(&later, &mut v);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|s| s.callsign.as_str())
+                .collect::<Vec<_>>(),
+            ["K3ABD"],
+            "the kept occurrence plus a clean repetition spots"
+        );
+    }
+
+    /// The HSMM `AC3GYH` context case: a non-call word is not spottable,
+    /// so a refinement of it still applies (`NEE` -> `DE`).
+    #[test]
+    fn refinement_of_a_non_call_word_still_applies() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["NEE", "K3ABD", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "NEE");
+        let mut fix = refined("DE", span, "engine:legacy");
+        fix.confidences = vec![0.95; 2];
+        let (_, outcome) = v.apply_refinement_with_outcome(1, seq, fix, 1_100_000);
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(word_named(&v, 1, "DE").0, seq, "the word now reads DE");
+    }
+
+    #[test]
+    fn plausible_to_plausible_refinement_still_moves_support() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("K3ABD", span, "engine:legacy"),
+            1_800_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K3ABD");
+        assert_eq!(spots[0].sample_ts, 1_768_800);
+    }
+
+    #[test]
+    fn unchanged_and_orphaned_outcomes() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("K3ABC", span, "wpm-seed"), 1_050_000);
+        assert_eq!(outcome, RefinementOutcome::Unchanged);
+        for i in 0..17u64 {
+            run(
+                &transmission_events(1, &["QSL"], 1_100_000 + i * 100_000),
+                &mut v,
+            );
+        }
+        let (spots, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("EEETT", span, "wpm-seed"), 3_000_000);
+        assert!(spots.is_empty());
+        assert_eq!(
+            outcome,
+            RefinementOutcome::Orphaned,
+            "an evicted word is orphaned, never rejected"
+        );
+    }
+
+    /// The rejection is recorded once, as a withheld decision about the
+    /// refined reading, under the permanent check it failed.
+    #[test]
+    fn a_rejected_refinement_records_one_grammar_or_cty_decision() {
+        let mut v = recording(CTY_FIXTURE).with_observations(ObservationPolicy::records());
+        run(
+            &transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000),
+            &mut v,
+        );
+        v.take_decisions();
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let (_, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].call, "EEETT");
+        assert_eq!(log[0].reason, Some(Reason::Grammar));
+        let records: Vec<_> = v
+            .observations()
+            .iter()
+            .filter(|o| o.draft.cause == Cause::Refined)
+            .collect();
+        assert_eq!(records.len(), 1, "one Refined record");
+        assert_eq!(
+            records[0].draft.decision().and_then(|d| d.reason),
+            Some(Reason::Grammar)
+        );
+        // A plausible reading whose prefix the table does not allocate
+        // fails cty instead.
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("Z3ABD", span, "wpm-seed"), 1_150_000);
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].reason, Some(Reason::Cty));
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq);
     }
 
     /// A beacon-shaped transmission (`V V V` + call, twice) whose first
