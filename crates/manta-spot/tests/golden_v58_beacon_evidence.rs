@@ -10,6 +10,8 @@ const FS: f64 = 96_000.0;
 const CTY_FIXTURE: &str = "\
 United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     K,W,N,AA,AB,AC;
+Namibia: 38: 57: AF: -22.0: -17.0: -2.0: V5:
+    V5;
 ";
 
 fn word_events(track_id: u32, text: &str, start_ts: u64) -> (Vec<DecoderEvent>, u64) {
@@ -148,5 +150,22 @@ fn v58_a_trailing_t_alone_is_not_beacon_evidence() {
         run(&transmission_events(1, words, 0), &mut v);
         let log = v.take_decisions();
         assert!(no_evidence(&log).is_empty(), "{words:?}: {log:?}");
+    }
+}
+
+// MAN-532: listing the true scene call must never exempt a decoded garble.
+#[test]
+fn historical_garbles_do_not_inherit_the_true_calls_allowlist() {
+    for call in ["NE5ARH", "V5ARH"] {
+        let mut v = validator(&["K5ARH"]);
+        let mut spots = run(&transmission_events(1, &[call, "T"], 0), &mut v);
+        spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
+        assert!(spots.is_empty(), "{call}: {spots:?}");
+        let log = v.take_decisions();
+        let decisions = no_evidence(&log);
+        assert_eq!(decisions.len(), 1, "{call}: {log:?}");
+        assert_eq!(decisions[0].call, call);
+        assert_eq!(decisions[0].spot_type, SpotType::Beacon);
+        assert_eq!(v.suppression_counts().beacon_no_evidence, 1);
     }
 }
