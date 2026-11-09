@@ -22,13 +22,19 @@ default legacy engine:
 
 - 142 admissions, 108 replays, 120,378 replayed hops, 0 rescues.
 - The legacy-to-HSMM flip ran 73 times. It changed 40 words: 19 from a
-  correct callsign to garbage, 21 from wrong to wrong, none from wrong to
-  right. 33 flips read nothing.
+  correct callsign to a wrong reading (13 of them to strings that are not
+  callsigns), 21 from wrong to wrong, none from wrong to right. 33 flips read
+  nothing.
 - One real spot was lost against refinement off: `N3NXI` at
   `good/35wpm/t1/0dB`. The flip re-read it as `EEETT`, and the support move
   took the occurrence away from `N3NXI`.
-- Seeded second attempts read the same word as the first in 54 of 57 cases.
-  None had a new speed; 53 were re-admitted by a later word alone.
+- The seeded attempt that follows the flip ran 35 times: 24 read the same
+  word and 11 changed it, 6 of those to a callsign keyed in the scene.
+
+In the planning no-flip variant (main with the flip removed for a legacy
+base, so both attempts are seeded; 130 replays), the second attempt read the
+same word as the first in 54 of 57 cases. None of the 57 had a new speed; 53
+were re-admitted by a later word alone.
 
 With an HSMM base (21 AWGN recordings) the HSMM-to-legacy flip changed 67
 readings, 36 of them from wrong to right, for 7 rescues.
@@ -72,12 +78,14 @@ admitted an episode.
 ## Results
 
 Pre-change (main, figures above, from the planning measurement): on the
-legacy base 51 of 108 replays (47%) changed a word, and 19 of those changes
-damaged a correct call. With the flip removed and one seeded attempt per
-speed, the planning variant ran 73 replays, of which 12 (16%) changed a word,
-none from correct to wrong; replayed hops fell from 120,378 to 83,697 (-30%)
-and admissions from 142 to 100, with no spot lost in any of the 126
-recordings.
+legacy base 51 of 108 replays (47%) changed a word, and 19 of the 40 flip
+changes damaged a correct call. With the flip removed, a cap of one seeded
+attempt per episode and the broad guard (Decision 3), the planning variant
+ran 73 replays, of which 12 (16%) changed a word; replayed hops fell from
+120,378 to 83,697 (-30%) and admissions from 142 to 100, with no spot lost in
+any of the 126 recordings. The first attempts of the no-flip variant above
+give the same counts, 73 replays and 12 changes, and none of those 12 went
+from correct to wrong.
 
 Branch A/B against main `7020ede` on the same corpus, by `man515_refine_ab`
 (`crates/manta-engine/tests/man515_refine_ab.rs`; main's rows are committed in
@@ -97,17 +105,19 @@ gains a bogus one.
 - The HSMM run covers the 21 AWGN trial-0 recordings, the same set the
   pre-change HSMM measurement used. Both full HSMM runs were OOM-killed in the
   container's 9 GiB cgroup after those rows (`memory.events` `oom_kill`), so
-  the fading HSMM rows are unmeasured. The narrow guard did not lose a correct
-  call on either base, so the D4 fallback (remove the guard) did not fire.
+  the other 105 HSMM rows (AWGN trial 1 and every fading row) are unmeasured.
+  The narrow guard did not lose a correct call on either base, so the D4
+  fallback (remove the guard) did not fire.
 - The MAN-398 grid (288 cases, `MAN398_GRID_JOBS=4`) printed byte-identical
   `GRID` rows on main and on the branch: 288 identical at 14 s and 30 s, none
   better, none worse. The grid cannot see refinement, so this guards only the
   causal path.
 - The A/B harness prints spots, not scheduler counters. The share of
-  legacy-base replays that change a word is therefore the planning
-  measurement of this design: 12 of 73 replays (16%), against 51 of 108 (47%)
-  on main, with 19 of main's changes damaging a correct call and none of the
-  branch design's.
+  legacy-base replays that change a word is therefore estimated from those
+  planning variants, not measured on this branch (the planning run with the
+  narrow guard was not analysed): 12 of 73 replays (16%), against 51 of 108
+  (47%) on main, with 19 of main's 40 flip changes damaging a correct call and
+  none of the no-flip first attempts' 12 changes doing so.
 
 The integration tests pin the mechanism on synthetic scenes
 (`crates/manta-engine/tests/man515_refine_gate.rs`): a legacy or edge-legacy
