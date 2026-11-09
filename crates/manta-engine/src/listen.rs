@@ -5253,16 +5253,13 @@ mod tests {
         };
         let lists = reference_lists_for(&cfg);
         let store: Store = Box::new(|lists| lists.cty.store(cty_with_qq9()));
-        scene_spots(seconds, wpm, text, loop_text, cfg, lists, store_at, store)
+        scene_spots((seconds, wpm, text, loop_text), cfg, lists, store_at, store)
     }
 
-    /// `qq9_spots`' scene with the caller's `cfg`, starting lists and store.
-    #[allow(clippy::too_many_arguments)]
+    /// `qq9_spots`' scene (`(seconds, wpm, text, loop_text)`) with the
+    /// caller's `cfg`, starting lists and store.
     fn scene_spots(
-        seconds: f64,
-        wpm: f32,
-        text: &str,
-        loop_text: bool,
+        (seconds, wpm, text, loop_text): (f64, f32, &str, bool),
         mut cfg: PipelineConfig,
         lists: Arc<ReferenceLists>,
         store_at: Option<u64>,
@@ -5348,10 +5345,7 @@ mod tests {
             ))
         });
         scene_spots(
-            10.0,
-            60.0,
-            "CQ CQ DE QQ9ZZZ QQ9ZZZ K",
-            true,
+            (10.0, 60.0, "CQ CQ DE QQ9ZZZ QQ9ZZZ K", true),
             cfg,
             lists,
             store_at,
