@@ -1214,12 +1214,17 @@ mod tests {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut i = 0u32;
+            let mut next = Instant::now();
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if tx.send(op(i)).is_err() {
                     break;
                 }
                 i += 1;
-                std::thread::sleep(every);
+                // Keep the simulated sample rate independent of time spent
+                // sending and scheduler oversleep. A delayed wake catches up
+                // instead of adding its delay to every subsequent frame.
+                next += every;
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
             }
         })
     }
