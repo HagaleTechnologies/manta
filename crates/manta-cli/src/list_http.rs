@@ -274,7 +274,8 @@ fn get_with(
         if_modified_since.filter(|v| v.bytes().all(|b| (0x20..0x7f).contains(&b)));
     let mut request = agent.get(url.request_uri());
     if let Some(ims) = if_modified_since {
-        request = request.header("If-Modified-Since", ims);
+        // Preserve the socket client's wire spelling for existing mirrors.
+        request = request.header_raw("If-Modified-Since", ims.as_bytes());
     }
     let mut response = request
         .call()

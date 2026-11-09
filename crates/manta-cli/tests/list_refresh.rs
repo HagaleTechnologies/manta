@@ -5,12 +5,9 @@
 //!   Scenario: A week-old cty.dat is refreshed without a restart
 //!   Scenario: An unreachable SCP server keeps the last good copy
 //!   Scenario: A fresh install without network runs on the bundled lists
-<<<<<<< HEAD
 //!   Scenario: An https list URL is fetched with certificate checks (MAN-536)
-=======
 //!   MAN-542 Scenario: The pattern list refreshes with the others
 //!   MAN-542 Scenario: No URL means no download
->>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
 //!
 //! plus file-replay determinism (a replay never downloads or reads the
 //! cache) and `--cty-sha256`/`cty_sha256` pins.

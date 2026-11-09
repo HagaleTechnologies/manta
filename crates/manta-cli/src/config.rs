@@ -4442,21 +4442,6 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
-    fn the_default_list_urls_parse_as_https_on_port_443() {
-        for url in [DEFAULT_CTY_URL, DEFAULT_SCP_URL] {
-            let u = crate::list_http::HttpUrl::parse(url).unwrap();
-            assert_eq!(
-                (u.scheme, u.port),
-                (crate::list_http::Scheme::Https, 443),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn https_list_urls_load_from_the_file_and_the_environment() {
-=======
     fn pattern_url_has_no_default_and_parses_from_file_and_environment() {
         assert_eq!(load_file("[spot]\n").unwrap().spot.pattern_url, None);
         let dir = tempfile::tempdir().unwrap();
@@ -4481,14 +4466,14 @@ mod tests {
     }
 
     #[test]
-    fn pattern_url_must_be_http() {
-        let url = "https://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+    fn pattern_url_must_be_http_or_https() {
+        let url = "ftp://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
         let f = write_cfg(&format!("[spot]\npattern_url = \"{url}\"\n"));
         let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
         assert_eq!(
             err,
             format!(
-                "{}: [spot]: pattern_url must be an http:// URL (manta has no TLS support), got \
+                "{}: [spot]: pattern_url must be an https:// or http:// URL, got \
                  \"{url}\"",
                 f.path().display()
             )
@@ -4508,13 +4493,31 @@ mod tests {
     }
 
     #[test]
-    fn an_https_or_malformed_list_url_is_refused_before_io() {
->>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
+    fn the_default_list_urls_parse_as_https_on_port_443() {
+        for url in [DEFAULT_CTY_URL, DEFAULT_SCP_URL] {
+            let u = crate::list_http::HttpUrl::parse(url).unwrap();
+            assert_eq!(
+                (u.scheme, u.port),
+                (crate::list_http::Scheme::Https, 443),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn https_list_urls_load_from_the_file_and_the_environment() {
         let f = write_cfg("[spot]\ncty_url = \"https://www.country-files.com/cty/cty.dat\"\n");
-        let v = vars(&[("MANTA_SPOT_SCP_URL", "https://10.0.0.1:8443/MASTER.SCP")]);
+        let v = vars(&[
+            ("MANTA_SPOT_SCP_URL", "https://10.0.0.1:8443/MASTER.SCP"),
+            ("MANTA_SPOT_PATTERN_URL", "https://mirror.lan/patterns.lst"),
+        ]);
         let spot = load(Some(f.path()), Env::Read(&v)).unwrap().spot;
         assert_eq!(spot.cty_url(), "https://www.country-files.com/cty/cty.dat");
         assert_eq!(spot.scp_url(), "https://10.0.0.1:8443/MASTER.SCP");
+        assert_eq!(
+            spot.pattern_url.as_deref(),
+            Some("https://mirror.lan/patterns.lst")
+        );
     }
 
     #[test]

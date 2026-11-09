@@ -468,15 +468,6 @@ is logged as a `warning: list refresh:` line, counted in
 copy already in use stays. Without network access manta runs on the
 built-in copies. File replay never downloads. Refresh is off by default.
 
-<<<<<<< HEAD
-- **Firewall.** Downloads are HTTPS: allow outbound TCP port 443 to
-  `www.country-files.com` and `www.supercheckpartial.com`. manta connects
-  directly and does not use `HTTPS_PROXY`. To keep the node off the
-  internet, or to share one download between nodes, serve the two files
-  from a local web server and set `cty_url` and `scp_url` in `[spot]` to
-  its URLs: `http://`, or `https://` with a certificate from a public CA,
-  because manta trusts only the Mozilla roots built into it.
-=======
 The callsign-pattern list (which calls need 2, 3 or 5 repetitions) is
 downloaded too only if you also name a source for it:
 
@@ -496,15 +487,15 @@ unlisted (5 repetitions) where the built-in list leaves 0.34%. See
 `docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md` in the source
 repository.
 
-- **Firewall.** Downloads are plain HTTP: allow outbound TCP port 80 to
-  `www.country-files.com` and `www.supercheckpartial.com`, and to the
-  `pattern_url` host if you set one (`data.reversebeacon.net` for RBN's
-  list). To keep the
-  node off the internet, or to share one download between nodes, serve
-  the two files from a local web server and set `cty_url` and `scp_url`
-  in `[spot]` to its `http://` URLs. manta has no TLS support and refuses
-  `https://`.
->>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
+- **Firewall.** Downloads are HTTPS: allow outbound TCP port 443 to
+  `www.country-files.com` and `www.supercheckpartial.com`. Also allow
+  the `pattern_url` host and port if set (TCP port 80 for the RBN example
+  above). manta connects
+  directly and does not use `HTTPS_PROXY`. To keep the node off the
+  internet, or to share one download between nodes, serve the two files
+  from a local web server and set `cty_url` and `scp_url` in `[spot]` to
+  its URLs: `http://`, or `https://` with a certificate from a public CA,
+  because manta trusts only the Mozilla roots built into it.
 - **Where downloads are kept.** Each accepted version is stored under
   `[spot].list_cache_dir`, so a restart starts from the last good
   download. The systemd unit sets it with

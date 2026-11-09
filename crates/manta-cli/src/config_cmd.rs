@@ -952,9 +952,6 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
             spot.scp_url(),
         ),
     ];
-<<<<<<< HEAD
-    // `load` checked every set URL and the defaults parse (a test pins it).
-=======
     // MAN-542 D13: the pattern list joins only with `pattern_url` set; it
     // has no pin.
     if let Some(url) = &spot.pattern_url {
@@ -966,8 +963,7 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
             url.as_str(),
         ));
     }
-    // `load` already parsed every URL, so a failure here cannot happen.
->>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
+    // `load` checked every set URL and the defaults parse (a test pins it).
     let refreshed: Vec<crate::list_http::HttpUrl> = lists
         .iter()
         .filter(|(_, _, path, pin, _)| path.is_none() && pin.is_none())
@@ -2018,8 +2014,8 @@ mod tests {
         assert!(
             has(
                 &without,
-                "note: list refresh downloads over plain HTTP from www.country-files.com and \
-                 www.supercheckpartial.com (TCP port 80) while"
+                "note: list refresh downloads over HTTPS from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 443) while"
             ),
             "{without:?}"
         );
@@ -2035,8 +2031,9 @@ mod tests {
         assert!(
             has(
                 &n,
-                "note: list refresh downloads over plain HTTP from www.country-files.com, \
-                 www.supercheckpartial.com and data.reversebeacon.net (TCP port 80) while"
+                "note: list refresh downloads over HTTPS from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 443) and over plain HTTP from \
+                 data.reversebeacon.net (TCP port 80) while"
             ),
             "{n:?}"
         );
@@ -2058,8 +2055,8 @@ mod tests {
         assert!(
             has(
                 &n,
-                "note: list refresh downloads over plain HTTP from www.country-files.com and \
-                 www.supercheckpartial.com (TCP port 80) while"
+                "note: list refresh downloads over HTTPS from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 443) while"
             ),
             "{n:?}"
         );

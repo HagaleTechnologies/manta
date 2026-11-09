@@ -411,14 +411,11 @@ station_callsign = "N0CALL"
 # A download is used only if it parses and looks complete; a failed one is
 # logged, counted in manta_list_refresh_total and retried in an hour, and
 # the copy already in use stays. File replay never downloads. Downloads are
-<<<<<<< HEAD
-# HTTPS (TCP port 443) from the two URLs below, checked against the
-# certificate authorities built into manta. Not used for a list that
-# cty_path/scp_path or cty_sha256/scp_sha256 sets.
-=======
-# plain HTTP (port 80) from cty_url, scp_url and pattern_url. Not used for
-# a list that cty_path/scp_path/pattern_path or cty_sha256/scp_sha256 sets.
->>>>>>> 4d7ce700267d1a916d84829a3ed39d66f85a63ec
+# HTTPS (TCP port 443) from cty_url and scp_url by default, checked
+# against the certificate authorities built into manta. pattern_url has
+# no default; http:// mirrors use TCP port 80 unless another port is set.
+# Not used for a list that cty_path/scp_path/pattern_path or
+# cty_sha256/scp_sha256 sets.
 #refresh_lists = false
 
 # Directory for downloaded lists, so a restart starts from the last good
