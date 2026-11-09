@@ -23,7 +23,10 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "test-soapy")
+CI_TEST_JOBS = ("test", "ubuntu-support", "ubuntu-build", "ubuntu-shards", "macos-support", "macos-build",
+                "macos-shards", "test-soapy")
+# MAN-518: the shards run executables their OS's build job compiled, so they carry no build cache.
+PREBUILT_SHARD_JOBS = ("ubuntu-shards", "macos-shards")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 NATIVE_IF = ("github.event_name != 'pull_request' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
@@ -356,11 +359,24 @@ CACHE_MARKERS = ("actions/cache@", "cache-from:", "cache-to:", "sccache")
 class CiFullCacheTests(unittest.TestCase):
     def test_rust_cache_saves_only_on_push_to_main(self):
         found = rust_cache_steps(read("ci-full.yml"))
-        self.assertEqual(len(found), 2, "expected exactly two rust-cache steps in ci-full.yml")
+        self.assertEqual({job for job, _ in found}, set(CI_TEST_JOBS) - set(PREBUILT_SHARD_JOBS))
         for job, step in found:
             with self.subTest(job=job):
                 with_block = sub(step, "with")
                 self.assertIsNotNone(with_block, f"{job}: rust-cache step has no with: block")
+                self.assertEqual(field(with_block, "save-if"), SAVE_IF)
+
+    def test_build_jobs_restore_the_shard_cache_key(self):
+        # MAN-518: the build job reuses the key the shards wrote (`shared-key` replaces the job id
+        # in rust-cache's key), so its first runs after landing restore warm dependencies.
+        found = dict(rust_cache_steps(read("ci-full.yml")))
+        for platform in ("ubuntu", "macos"):
+            with self.subTest(platform=platform):
+                step = found.get(f"{platform}-build")
+                self.assertIsNotNone(step, f"{platform}-build: no rust-cache step")
+                with_block = sub(step, "with")
+                self.assertIsNotNone(with_block, f"{platform}-build: rust-cache step has no with: block")
+                self.assertEqual(field(with_block, "shared-key"), f"{platform}-shards")
                 self.assertEqual(field(with_block, "save-if"), SAVE_IF)
 
     def test_soapy_cache_is_keyed_to_the_installed_soapysdr(self):
@@ -397,7 +413,7 @@ class CiFullNativePathTests(unittest.TestCase):
         self.text = read("ci-full.yml")
 
     def test_hpsdr_coverage_moves_to_default_ci_and_catalyst_together(self):
-        self.assertEqual(tuple(j for j in job_ids(self.text) if j.startswith("test")), CI_TEST_JOBS)
+        self.assertEqual(tuple(j for j in job_ids(self.text) if j in CI_TEST_JOBS), CI_TEST_JOBS)
         # This suite also runs on macOS; do not require Python 3.11's tomllib.
         with open(os.path.join(ROOT, ".catalyst", "catalyst.toml"), encoding="utf-8") as f:
             config = f.read()
@@ -422,7 +438,7 @@ class CiFullNativePathTests(unittest.TestCase):
 
     def test_trust_boundary_test_runs_in_required_test_job(self):
         wanted = "python3 -m unittest scripts.tests.test_ci_trust_boundary -v"
-        matches = [s for s in steps(job_block(self.text, "test")) if field(s, "run") == wanted]
+        matches = [s for s in steps(job_block(self.text, "ubuntu-support")) if field(s, "run") == wanted]
         self.assertEqual(len(matches), 1, f"job test has no step running {wanted!r}")
         self.assertEqual(field(matches[0], "if"), "runner.os != 'Windows'")
 
@@ -525,8 +541,10 @@ class CiFullDispatchMergeWiringTests(unittest.TestCase):
             self.assertIsNotNone(step, f"{job}: no merge-main step")
             bodies[job] = run_body(step)
             self.assertTrue(bodies[job] and bodies[job].strip(), f"{job}: merge-main has no run: body")
-        self.assertEqual(bodies["test"], bodies["test-soapy"],
-                         "the two merge-main steps' run: bodies must be byte-identical")
+        # MAN-518: every job, not only test and test-soapy -- the shards run the build job's
+        # binaries, which embed the merge commit, so all jobs must create the same one.
+        self.assertEqual(len(set(bodies.values())), 1,
+                         "the merge-main steps' run: bodies must be byte-identical in every test job")
 
     def test_merge_step_holds_no_credentials(self):
         for job in CI_TEST_JOBS:
@@ -713,6 +731,30 @@ class CiFullDispatchMergeBehaviourTests(unittest.TestCase):
         proc = self.run_step(work, pr, "f" * 40)
         self.assertNotEqual(proc.returncode, 0, proc.stdout)
         self.assertIn("::error title=Default-branch commit missing::", proc.stdout)
+
+    def test_two_jobs_merging_the_same_commits_create_the_same_merge(self):
+        # MAN-518: the build job and each shard run this step on separate runners. The shards run
+        # the build job's binaries, and build_identity checks that the commit they embed is the
+        # shard's HEAD, so both runners must create the same merge commit whatever their clocks say.
+        work, _, pr, b = self._fixture()
+        self.git(self.tmp, "clone", "-q", "--no-checkout", os.path.join(self.tmp, "src"), "work2")
+        work2 = os.path.join(self.tmp, "work2")
+        self.git(work2, "checkout", "-q", "--detach", pr)
+        heads = []
+        for cwd, clock in ((work, "2030-01-01T00:00:00Z"), (work2, "2031-06-01T12:00:00Z")):
+            proc = subprocess.run(
+                ["bash", "--noprofile", "--norc", "-eo", "pipefail", self.script], cwd=cwd,
+                env=dict(self.env, HEAD_SHA=pr, BASE_SHA=b, GIT_AUTHOR_DATE=clock, GIT_COMMITTER_DATE=clock),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(self.rev(cwd, "HEAD^1"), pr)
+            self.assertEqual(self.rev(cwd, "HEAD^2"), b)
+            heads.append(self.rev(cwd, "HEAD"))
+        self.assertEqual(heads[0], heads[1], "two runners created different merge commits")
+        parent_times = [int(self.git(work, "show", "-s", "--format=%ct", c).stdout) for c in (pr, b)]
+        self.assertEqual(int(self.git(work, "show", "-s", "--format=%ct", "HEAD").stdout), max(parent_times))
+        self.assertEqual(int(self.git(work, "show", "-s", "--format=%at", "HEAD").stdout), max(parent_times))
 
 
 

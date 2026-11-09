@@ -1,15 +1,12 @@
 # MAN-323: FT8 and FT4 spots from the band streams manta already receives
 
-**Status:** in progress. The engine slice is implemented: the pinned
-decoder dependency behind the `ftx` feature, the coverage rule, the
-streaming USB demodulator, the UTC slot slicer and the IQ tap with its
-decode service. The JSON spot path in `manta-server` is implemented too:
-the `FtxSpot` record, `SpotBus::publish_ftx`, its rendering on the `:7301`
-stream and the four `manta_ftx_` metric families. Nothing calls them yet.
-The `[input].digital_modes` key, the CLI wiring and the operator docs
-follow in the next slice of this ticket.
-Blocked on pancetta PR #550: move the pin to the `pancetta-ft8` tag before
-merging.
+**Status:** implemented, including the MAN-485 wiring slice. An input's
+`digital_modes` key enables the engine tap, the Publisher sink, the
+JSON-only spot path and the `manta_ftx_` metrics in builds with `ftx`.
+Single-input and multi-input `manta run` sessions report coverage before
+listening. The decoder pin now follows PR #550's untagged merge commit.
+A five-minute live receiver run and the clock warning with network time
+off remain operator checks; neither has been verified in the cloud run.
 
 ## Context
 
@@ -27,16 +24,15 @@ and `v0.9.6`; no `pancetta-ft8-v*` tag existed.
 
 ## Decisions
 
-- **D1. Pin.** The workspace pins
-  `pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "390d786..." }`,
-  PR #550's head. The rule, in order: a `pancetta-ft8-v*` tag when one
-  exists; PR #550's merge commit when it has merged untagged; its head
-  otherwise. A head pin builds (GitHub keeps `refs/pull/550/head`) but is
-  not the stable surface, so the PR stays draft until the pin moves.
+- **D1. Pin.** MAN-485 pins
+  `pancetta-ft8` to PR #550's merge commit
+  `7f8078b19d759e24f50adb1efd0b3fd75371a39d`. PR #550 merged without a
+  `pancetta-ft8-v*` tag. The rule, in order: such a tag when one exists;
+  PR #550's merge commit when it has merged untagged; its head otherwise.
   `deny.toml` allows the pancetta URL; the crate also fetches the
   `kgoba/ft8_lib` submodule at build time, which cargo-deny does not see.
-  Rules out pancetta `main`, which has only the 12.64 s `decode_window`
-  family.
+  Rules out pancetta `main`, which had only the 12.64 s `decode_window`
+  family when the decoder work began.
 - **D2. Contract.** `docs/decoder-crate.md` at the pinned commit: default
   features, the `CycleDecoder` reuse form, 12 kHz mono `f32` with sample 0
   on the slot boundary (FT8 180 000 samples, FT4 90 000). "Don't build it
@@ -48,6 +44,12 @@ and `v0.9.6`; no `pancetta-ft8-v*` tag existed.
   tested without it. CI runs the feature's clippy, unit and band-stream
   tests on Linux and macOS; MSVC cannot compile ft8_lib, so Windows skips
   them.
+- **D4. Config.** `[input].digital_modes` defaults to `[]`, accepts exact
+  `"FT8"` and `"FT4"` spellings once each, and is restart-only. A nonempty
+  list needs a build with `ftx` and a `[server]` table. The shared loader
+  refuses unsupported or repeated modes and unmet requirements for config
+  check, run, doctor and reload. Band-plan expansion copies the key to
+  every stream; `MANTA_INPUT_DIGITAL_MODES='["FT8"]'` overrides it.
 - **D5. Coverage** (`manta_engine::ftx::coverage`). A window is the mode's
   dial from the MAN-311 table plus the audio span `[dial + 300, dial + 3000]`
   Hz. A stream attempts it only when the whole span lies inside
@@ -82,12 +84,21 @@ and `v0.9.6`; no `pancetta-ft8-v*` tag existed.
   process-wide one-thread rayon pool, so the decoder never competes with
   the CW decoder pool.
 
+- **D9. Replay order.** FTx results from several replayed inputs publish
+  in `(slot start, input index, mode, decode order)` order, independent of
+  worker interleaving. Each input's end releases its remaining results.
+  Their position among CW JSON records is not fixed.
+- **D10. Spot rule.** Only CQ callers become spots, using MAN-320's CQ
+  parsing rule. The grid comes from the CQ; `RR73` is not a grid. Repeats
+  are held for 600 s per callsign, mode and band. Every decoded message
+  still contributes to the decode counter. Frequency includes the input's
+  `freq_correction_ppm` calibration.
 - **D11. Wire.** An FT8/FT4 spot is its own JSON-only bus record,
   `JsonItem::Ftx`, holding `FtxSpot { mode, callsign, grid, freq_hz,
   snr_db, slot_start_ms }`. `SpotBus::publish_ftx` gives it the next `seq`
   and a place in the resume history, aged by its slot start, and sends it
   on the JSON channel only: telnet, the RBN uplink and `recent()` never see
-  it. `SpotMessage::from_ftx` renders the same 29 keys as a CW spot, with
+  it. `SpotMessage::from_ftx` renders the same 30 keys as a CW spot, with
   `mode` `"FT8"`/`"FT4"`, `dxGrid` from the `CQ`, `timestamp` the slot start
   rounded down to whole seconds, the decoder's SNR on the 2500 Hz
   reference, and `wpm`, `rst`, `decodeConfidence` and
@@ -101,10 +112,17 @@ and `v0.9.6`; no `pancetta-ft8-v*` tag existed.
   registered with `Metrics::register_ftx_window`, so a run without FT8/FT4
   shows no `manta_ftx_` line, not even a header.
 
-The next slice carries the remaining decisions of the plan: the config
-key and its load rules (D4), replay ordering across inputs (D9), the CQ
-spot rule and dedupe (D10), the clock check (D12), and the cost notes
-(D13).
+- **D12. Clock.** A live session attempting a window checks the kernel's
+  network-clock sync state once. An unsynchronised clock warns that UTC
+  slot decoding needs about 1 s accuracy and names network time/chrony;
+  an unreadable state asks the operator to check `manta doctor`. Replay
+  uses its own epoch and prints no clock warning. The slot in progress at
+  startup is skipped, so the first FT8 spot can take up to 30 s.
+- **D13. Cost.** The MAN-323 prototype measured roughly 4% of one core for
+  one FT8 window at 96 kS/s. FT4 doubles the decode rate (7.5 s slots),
+  costing about 2 s of a Ryzen 9 5950X core per slot; a Pi 4 may drop
+  slots. These are prototype measurements, not a new platform guarantee.
+  With the key unset, no tap, decode thread or FTx metric series is built.
 
 ## Evidence
 
@@ -119,7 +137,7 @@ spot rule and dedupe (D10), the clock check (D12), and the cost notes
   `manta_testkit::ftx`. No binary fixture is committed.
 - `cargo test -p manta-server --test json_stream_acceptance
   an_ft8_spot_reaches_the_json_stream_labelled_ft8`: a TCP and a WebSocket
-  client each receive the published FT8 spot as a 29-key line with
+  client each receive the published FT8 spot as a 30-key line with
   `"mode":"FT8"`, `"dxGrid":"FN31"` and `"wpm":null`, and the telnet
   channel receives nothing. The FT8 example in `docs/SPOT-SCHEMA.md` is
   pinned to `from_ftx`'s output by
@@ -138,19 +156,16 @@ spot rule and dedupe (D10), the clock check (D12), and the cost notes
 - The slicer anchors sample 0 to the session epoch once and then counts
   samples (D7, as planned). A live source whose sample clock runs off
   nominal drifts against UTC: 50 ppm is 2.5 s after about 14 h, past the
-  decoder's DT range. The decode-seconds and spot-rate metrics of the next
-  slice are where that shows; re-anchoring to the wall clock is a
-  follow-up.
+  decoder's DT range. The decode-seconds and spot-rate metrics can show
+  that drift; re-anchoring to the wall clock is a follow-up.
 - Decoders registered with the live decode service stay for the session:
   inputs are restart-only, so no input re-attaches with a new window set.
 
 ## Follow-ups
 
-- This ticket's next slice: `[input].digital_modes`, the startup coverage
-  lines, the CLI wiring of `attach` and of the sink that calls
-  `SpotBus::publish_ftx` and the `manta_ftx_` metrics, the daemon
-  acceptance tests and the operator docs.
-- Move the pin to the `pancetta-ft8` tag once PR #550 merges.
+- Move the pin to a `pancetta-ft8-v*` tag when one exists.
+- Operator verification: five-minute live 20 m receiver run and a clock
+  warning on a host with network time disabled.
 - Release builds with `ftx`, once ft8_lib builds on every release target.
 - A diff of dispensa Q-0085 against `docs/decoder-crate.md`.
 - Re-anchor live slot boundaries to the wall clock if sample-clock drift

@@ -266,7 +266,7 @@ per-signal CER gate, and V2's CER half (SPEC §2.1 warmup-floor dilution).
 - `docs/DECISIONS/2026-09-07-man103-keying-edge-placement.md` — D3 (kept), D5
   (superseded here), D9 (resolved here), status updates.
 - `docs/DECISIONS/2026-09-06-broad-review-decisions.md` D8 — MAN-107–113 scope.
-- `docs/superpowers/specs/2026-09-09-decode-core-real-hf-design.md` §0 item 2 —
+- `docs/archive/plans/specs/2026-09-09-decode-core-real-hf-design.md` §0 item 2 —
   independent support for D3's midpoint band.
 - `docs/SPEC-decode-core.md` §3.2, §3.3.
 - `crates/manta-decode/src/envelope.rs` — `decision_band`, `Demod::step`,

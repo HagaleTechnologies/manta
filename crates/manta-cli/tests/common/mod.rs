@@ -3,7 +3,9 @@
 //! a fake KiwiSDR for live-source daemons (`config_reload.rs`;
 //! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
 //! MAN-252), and a fake metrics listener (`health_command.rs` and
-//! `status_command.rs`, MAN-285).
+//! `status_command.rs`, MAN-285). The `manta()` launcher, its `MANTA_*`
+//! scrub and `free_ports()` live in the `std`-only leaf `launch.rs`
+//! (MAN-549), re-exported here.
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
@@ -11,6 +13,19 @@
 /// `ka9q_input.rs`.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod ka9q;
+
+/// MAN-142 (D16): fake-listener readers for `[pskreporter]` (IPFIX) and
+/// `[[wsjtx_output]]` (WSJT-X `NetworkMessage`), written from the published
+/// formats.
+pub mod ipfix;
+pub mod wsjtx;
+
+/// MAN-549: the shared launcher and port reservation, a `std`-only leaf
+/// that roots without `mod common;` include by path.
+mod launch;
+// Unused in the roots that include `common` for its other helpers only.
+#[allow(unused_imports)]
+pub use launch::{free_ports, manta, without_manta_env};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};

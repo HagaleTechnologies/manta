@@ -86,6 +86,50 @@ fn final_stage() -> Vec<Directive> {
     all[last_from + 1..].to_vec()
 }
 
+/// The instructions between the Dockerfile's first and second `FROM`: the
+/// builder stage.
+fn builder_stage() -> Vec<Directive> {
+    let all = directives(&doc(DOCKERFILE));
+    let froms: Vec<usize> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.keyword == "FROM")
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        froms.len() >= 2,
+        "the Dockerfile has a builder and a runtime stage"
+    );
+    all[froms[0] + 1..froms[1]].to_vec()
+}
+
+/// The package names an `apt-get install` in `stage` installs: the words
+/// after `install` up to the first `&&`, flags dropped.
+fn apt_packages(stage: &[Directive]) -> Vec<String> {
+    let installs: Vec<&Directive> = stage
+        .iter()
+        .filter(|d| d.keyword == "RUN" && d.args.contains("apt-get install"))
+        .collect();
+    assert_eq!(
+        installs.len(),
+        1,
+        "the stage must install its packages in one RUN: {installs:?}"
+    );
+    let after = installs[0]
+        .args
+        .split_once("apt-get install")
+        .map(|(_, rest)| rest)
+        .expect("apt-get install");
+    after
+        .split("&&")
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|w| !w.starts_with('-'))
+        .map(str::to_string)
+        .collect()
+}
+
 fn only(stage: &[Directive], keyword: &str) -> Directive {
     let found: Vec<_> = stage.iter().filter(|d| d.keyword == keyword).collect();
     assert_eq!(
@@ -278,22 +322,127 @@ fn dockerfile_healthcheck_probes_the_daemon_config() {
     assert_eq!(targets, [CONFIG_PATH, "/var/cache/manta"]);
 }
 
+/// MAN-539: the image is built with SoapySDR and ships its runtime library
+/// and the three Debian device modules, and no development package.
+#[test]
+fn dockerfile_builds_with_soapy_and_installs_its_runtime() {
+    let builder = builder_stage();
+    let build_packages = apt_packages(&builder);
+    assert!(
+        build_packages.iter().any(|p| p == "libsoapysdr-dev"),
+        "the builder stage must install libsoapysdr-dev: {build_packages:?}"
+    );
+    let builds: Vec<&Directive> = builder
+        .iter()
+        .filter(|d| d.keyword == "RUN" && d.args.contains("cargo build"))
+        .collect();
+    assert_eq!(builds.len(), 1, "one cargo build: {builds:?}");
+    assert!(
+        builds[0].args.contains("--features soapy"),
+        "the image's cargo build must enable soapy: {}",
+        builds[0].args
+    );
+
+    let runtime = apt_packages(&final_stage());
+    for package in [
+        "libsoapysdr0.8",
+        "soapysdr0.8-module-rtlsdr",
+        "soapysdr0.8-module-airspy",
+        "soapysdr0.8-module-hackrf",
+    ] {
+        assert!(
+            runtime.iter().any(|p| p == package),
+            "the runtime stage must install {package}: {runtime:?}"
+        );
+    }
+    let dev: Vec<&String> = runtime.iter().filter(|p| p.ends_with("-dev")).collect();
+    assert!(
+        dev.is_empty(),
+        "the runtime stage installs development packages: {dev:?}"
+    );
+}
+
+/// MAN-539: the header no longer says the image leaves SoapySDR out.
+#[test]
+fn dockerfile_header_no_longer_excludes_soapy() {
+    assert!(
+        !doc(DOCKERFILE).contains("`soapy` is deliberately excluded"),
+        "the Dockerfile header still says soapy is excluded"
+    );
+}
+
+/// The workflow step that holds line `at`: from the nearest `- ` step start
+/// above it, at the step indentation, to the next step or a dedent.
+fn step_around(lines: &[&str], at: usize) -> Vec<String> {
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    let start = (0..=at)
+        .rev()
+        .find(|&i| lines[i].trim_start().starts_with("- "))
+        .unwrap_or_else(|| panic!("no step starts above line {}", at + 1));
+    let step_indent = indent(lines[start]);
+    let mut out = vec![lines[start].trim().to_string()];
+    for line in &lines[start + 1..] {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if indent(line) <= step_indent {
+            break;
+        }
+        out.push(line.trim().to_string());
+    }
+    out
+}
+
+/// MAN-81, MAN-539: every image that is pushed is built for the same three
+/// platforms. The one other `platforms:` line per Docker job is the
+/// arm64-only build that is loaded and checked before the push, and pushes
+/// nothing itself.
 #[test]
 fn every_buildx_call_site_builds_the_same_three_platforms() {
     for workflow in [".github/workflows/release-publish.yml"] {
         let text = doc(workflow);
-        let lines: Vec<&str> = text
-            .lines()
-            .filter_map(|l| l.trim().strip_prefix("platforms:"))
+        let lines: Vec<&str> = text.lines().collect();
+        let sites: Vec<(usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.trim().strip_prefix("platforms:").map(|p| (i, p)))
             .collect();
-        assert!(!lines.is_empty(), "{workflow} has no `platforms:` line");
-        for line in lines {
+        assert!(!sites.is_empty(), "{workflow} has no `platforms:` line");
+        let mut want = PLATFORMS.to_vec();
+        want.sort_unstable();
+        let (mut pushed, mut checked) = (0, 0);
+        for (at, line) in sites {
             let mut got: Vec<&str> = line.split(',').map(str::trim).collect();
             got.sort_unstable();
-            let mut want = PLATFORMS.to_vec();
-            want.sort_unstable();
-            assert_eq!(got, want, "{workflow}: platforms:{line}");
+            if got == want {
+                pushed += 1;
+                continue;
+            }
+            assert_eq!(
+                got,
+                ["linux/arm64"],
+                "{workflow}: platforms:{line} is neither the three image platforms nor the \
+                 arm64 check build"
+            );
+            let step = step_around(&lines, at);
+            assert!(
+                step.iter().any(|l| l == "load: true"),
+                "{workflow}: the arm64-only build must load its image: {step:?}"
+            );
+            assert!(
+                !step.iter().any(|l| l.starts_with("push:")),
+                "{workflow}: the arm64-only build must not push: {step:?}"
+            );
+            checked += 1;
         }
+        assert_eq!(
+            pushed, 2,
+            "{workflow}: two three-platform build-push steps, one per Docker job"
+        );
+        assert_eq!(
+            checked, 2,
+            "{workflow}: one arm64 check build per Docker job"
+        );
     }
 }
 
@@ -356,13 +505,7 @@ mod script {
 
     /// A command with no inherited `MANTA_*` variable.
     pub(super) fn clean(program: &Path) -> Command {
-        let mut cmd = Command::new(program);
-        for (key, _) in std::env::vars_os() {
-            if key.as_encoded_bytes().starts_with(b"MANTA_") {
-                cmd.env_remove(key);
-            }
-        }
-        cmd
+        super::common::without_manta_env(Command::new(program))
     }
 
     /// Runs `make()`'s command to completion, retrying while the kernel

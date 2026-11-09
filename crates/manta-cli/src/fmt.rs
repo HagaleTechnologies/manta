@@ -118,6 +118,66 @@ fn bad_samples_report_line(n: u64) -> String {
     }
 }
 
+/// A DC offset below this over the channel noise is indistinguishable from
+/// the floor, so naming it would be noise itself (MAN-495 D4; MAN-203 set
+/// no number and its fixture case reports >= 12 dB).
+const DC_LINE_OVER_FLOOR_DB: f64 = 6.0;
+
+/// MAN-495: the `input:` conditioning diagnostic lines of a doctor
+/// report, MAN-203 Design §2's canonical texts. Empty when the chain
+/// found nothing worth naming, so a clean receiver's report stays
+/// byte-identical. The paused line replaces the impulse line: a stage
+/// that paused itself saw impulses it believes are signal, and telling
+/// the operator to suppress those would be wrong advice.
+fn conditioning_report_lines(
+    cond: &manta_engine::ConditioningReport,
+    sample_rate_hz: f64,
+) -> String {
+    let mut out = String::new();
+    if let Some(over) = cond
+        .dc
+        .over_channel_noise_db
+        .filter(|&over| over >= DC_LINE_OVER_FLOOR_DB)
+    {
+        out.push_str(&format!(
+            "input: DC offset at the centre frequency, {} dB above the channel noise. It can \
+             hide stations within about 200 Hz of the centre; [input] dc_block = \"apply\" \
+             removes it\n",
+            over.round() as i64
+        ));
+    }
+    let marked = cond.impulse.flagged_samples + cond.impulse.repaired_samples;
+    if cond.impulse.paused_samples > 0 {
+        let secs = (cond.impulse.paused_samples as f64 / sample_rate_hz).round() as i64;
+        out.push_str(&format!(
+            "input: impulse suppression paused for {secs} s: more than 0.1% of the samples in a \
+             second looked like impulses, so they are probably signal\n"
+        ));
+    } else if marked > 0 {
+        // Spans are bounded and cover only the final reconnect segment.
+        // Name a run total only when they account for every marked sample.
+        let (runs, retained_samples) = cond
+            .spans
+            .iter()
+            .filter(|s| s.stage == "impulse" && (s.mark == "flagged" || s.mark == "repaired"))
+            .fold((0u64, 0u64), |(runs, samples), s| {
+                (runs + 1, samples + s.samples)
+            });
+        let summary = if retained_samples != marked {
+            format!("short impulses affected {marked} samples")
+        } else {
+            let impulse_noun = if runs == 1 { "impulse" } else { "impulses" };
+            let sample_noun = if marked == 1 { "sample" } else { "samples" };
+            format!("{runs} short {impulse_noun} ({marked} {sample_noun})")
+        };
+        out.push_str(&format!(
+            "input: {summary}; [input] \
+             impulse_suppress = \"apply\" repairs impulses of up to 4 samples\n"
+        ));
+    }
+    out
+}
+
 pub fn soak_report(report: &manta_engine::SoakReport) -> String {
     format!(
         "soak: {}\nevents: {}\nRSS growth: {:.1} MiB\npanicked: {}\n{}",
@@ -148,7 +208,7 @@ pub fn doctor_report(report: &manta_engine::DoctorReport) -> String {
 tracks: {} promoted, {} TrackMeta updates, {} closed, {} detector confirmations\n\
 SNR (2500 Hz reference): {}\n\
 decode: {} chars ({} distinct), {} confirmed spots\n\
-{}verdict: {}\n",
+{}{}verdict: {}\n",
         report.sample_rate_hz,
         khz(report.center_freq_hz),
         report.duration.as_secs_f64(),
@@ -161,6 +221,11 @@ decode: {} chars ({} distinct), {} confirmed spots\n\
         report.distinct_chars,
         report.spots_confirmed,
         bad_samples_report_line(report.bad_samples),
+        report
+            .input_conditioning
+            .as_ref()
+            .map(|cond| conditioning_report_lines(cond, report.sample_rate_hz))
+            .unwrap_or_default(),
         report.verdict().summary()
     )
 }
@@ -203,6 +268,7 @@ mod tests {
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,
+            input_conditioning: None,
             sample_rate_hz: 48_000.0,
         };
         assert_eq!(
@@ -384,6 +450,7 @@ mod tests {
             distinct_chars: 15,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(doctor_report(&r), format!("source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\ntracks: 61 promoted, 64 TrackMeta updates, 36 closed, 70 detector confirmations\nSNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), 0 confirmed spots\nverdict: {}\n", r.verdict().summary()));
         r.snr_db_min = None;
@@ -415,6 +482,7 @@ mod tests {
             distinct_chars: 9,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert_eq!(r.verdict(), Verdict::WeakNoDecode);
         let hint = doctor_rerun_hint(&r, ten).expect("a 10 s WEAK_NO_DECODE run hints");
@@ -493,6 +561,7 @@ mod tests {
             distinct_chars: 9,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         assert!(!doctor_report(&r).contains("input:"));
         r.bad_samples = 1;
@@ -501,6 +570,224 @@ mod tests {
              magnitude) replaced with silence\nverdict: {}\n",
             r.verdict().summary()
         )));
+    }
+
+    /// MAN-495: a clean conditioning report (zero counts, nothing over the
+    /// floor) prints no `input:` line -- the whole report stays
+    /// byte-identical to a run with no conditioning at all.
+    #[test]
+    fn doctor_report_prints_no_conditioning_line_when_clean() {
+        let mut r = manta_engine::DoctorReport {
+            sample_rate_hz: 48000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: std::time::Duration::from_secs(10),
+            tracks_promoted: 61,
+            detector_confirmations: 70,
+            track_meta_count: 64,
+            tracks_closed: 36,
+            snr_db_min: Some(20.4),
+            snr_db_median: Some(58.9),
+            snr_db_max: Some(68.0),
+            chars_decoded: 42,
+            distinct_chars: 15,
+            spots_confirmed: 0,
+            bad_samples: 0,
+            input_conditioning: Some(observed_clean()),
+        };
+        assert_eq!(
+            doctor_report(&r),
+            format!(
+                "source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\n\
+tracks: 61 promoted, 64 TrackMeta updates, 36 closed, 70 detector confirmations\n\
+SNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), \
+0 confirmed spots\nverdict: {}\n",
+                r.verdict().summary()
+            )
+        );
+        // A report over the line threshold but under +6 dB stays quiet.
+        r.input_conditioning = Some(manta_engine::ConditioningReport {
+            dc: manta_engine::DcConditioning {
+                over_channel_noise_db: Some(5.9),
+                ..observed_clean().dc
+            },
+            ..observed_clean()
+        });
+        assert!(
+            !doctor_report(&r).contains("input:"),
+            "{}",
+            doctor_report(&r)
+        );
+    }
+
+    /// MAN-495: a DC offset over the channel noise is named with the
+    /// canonical line, before `verdict:`.
+    #[test]
+    fn doctor_report_names_a_dc_offset() {
+        let mut r = base_conditioning_report();
+        r.input_conditioning = Some(manta_engine::ConditioningReport {
+            dc: manta_engine::DcConditioning {
+                level_dbfs: Some(-40.1),
+                over_channel_noise_db: Some(18.4),
+                ..observed_clean().dc
+            },
+            ..observed_clean()
+        });
+        let out = doctor_report(&r);
+        let line = "input: DC offset at the centre frequency, 18 dB above the channel noise. It \
+can hide stations within about 200 Hz of the centre; [input] dc_block = \"apply\" removes it\n";
+        assert!(out.contains(line), "{out}");
+        assert!(
+            out.find(line).unwrap() < out.find("verdict:").unwrap(),
+            "{out}"
+        );
+        // Exactly one line: nothing else was found.
+        assert_eq!(out.matches("input:").count(), 1, "{out}");
+    }
+
+    /// MAN-495: impulses are named with the canonical singular (pinned
+    /// verbatim to MAN-203 Design §2) and the counted plural.
+    #[test]
+    fn doctor_report_names_an_impulse() {
+        let mut r = base_conditioning_report();
+        r.input_conditioning = Some(manta_engine::ConditioningReport {
+            impulse: manta_engine::ImpulseConditioning {
+                flagged_samples: 1,
+                ..observed_clean().impulse
+            },
+            spans: vec![manta_engine::ConditioningSpan {
+                stage: "impulse".into(),
+                mark: "flagged".into(),
+                start_sample: 96_000,
+                samples: 1,
+            }],
+            ..observed_clean()
+        });
+        let out = doctor_report(&r);
+        assert!(
+            out.contains(
+                "input: 1 short impulse (1 sample); [input] impulse_suppress = \"apply\" \
+repairs impulses of up to 4 samples\n"
+            ),
+            "{out}"
+        );
+        r.input_conditioning = Some(manta_engine::ConditioningReport {
+            impulse: manta_engine::ImpulseConditioning {
+                flagged_samples: 5,
+                ..observed_clean().impulse
+            },
+            spans: vec![
+                manta_engine::ConditioningSpan {
+                    stage: "impulse".into(),
+                    mark: "flagged".into(),
+                    start_sample: 96_000,
+                    samples: 2,
+                },
+                manta_engine::ConditioningSpan {
+                    stage: "impulse".into(),
+                    mark: "flagged".into(),
+                    start_sample: 192_000,
+                    samples: 3,
+                },
+            ],
+            ..observed_clean()
+        });
+        let out = doctor_report(&r);
+        assert!(
+            out.contains(
+                "input: 2 short impulses (5 samples); [input] impulse_suppress = \"apply\" \
+repairs impulses of up to 4 samples\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn doctor_does_not_count_incomplete_impulse_spans_as_run_totals() {
+        // A full ring after 300 isolated impulses, then a final reconnect
+        // segment containing only one of those impulses.
+        for retained in [256, 1, 0] {
+            let mut cond = observed_clean();
+            cond.impulse.flagged_samples = 300;
+            cond.spans_dropped = if retained == 256 { 44 } else { 0 };
+            cond.spans = (0..retained)
+                .map(|i| manta_engine::ConditioningSpan {
+                    stage: "impulse".into(),
+                    mark: "flagged".into(),
+                    start_sample: i * 1000,
+                    samples: 1,
+                })
+                .collect();
+            let out = conditioning_report_lines(&cond, 48_000.0);
+            assert!(
+                out.contains("input: short impulses affected 300 samples;"),
+                "{out}"
+            );
+        }
+    }
+
+    /// MAN-495: a stage that paused itself replaces the impulse line --
+    /// those impulses are probably signal, and suppressing them is the
+    /// wrong advice.
+    #[test]
+    fn doctor_report_names_a_paused_impulse_stage() {
+        let mut r = base_conditioning_report();
+        r.sample_rate_hz = 96_000.0;
+        r.input_conditioning = Some(manta_engine::ConditioningReport {
+            impulse: manta_engine::ImpulseConditioning {
+                flagged_samples: 40_000,
+                paused_samples: 3 * 96_000,
+                ..observed_clean().impulse
+            },
+            ..observed_clean()
+        });
+        let out = doctor_report(&r);
+        assert!(
+            out.contains(
+                "input: impulse suppression paused for 3 s: more than 0.1% of the samples in a \
+second looked like impulses, so they are probably signal\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            !out.contains("impulse_suppress"),
+            "the paused line replaces the impulse line: {out}"
+        );
+    }
+
+    /// A zero-count report of doctor's forced-observe run.
+    fn observed_clean() -> manta_engine::ConditioningReport {
+        manta_engine::ConditioningReport {
+            impulse: manta_engine::ImpulseConditioning {
+                mode: "observe".into(),
+                ..Default::default()
+            },
+            dc: manta_engine::DcConditioning {
+                mode: "observe".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The doctor report the conditioning-line tests print into.
+    fn base_conditioning_report() -> manta_engine::DoctorReport {
+        manta_engine::DoctorReport {
+            sample_rate_hz: 48000.0,
+            center_freq_hz: 14_000_000.0,
+            duration: std::time::Duration::from_secs(10),
+            tracks_promoted: 61,
+            detector_confirmations: 70,
+            track_meta_count: 64,
+            tracks_closed: 36,
+            snr_db_min: Some(20.4),
+            snr_db_median: Some(58.9),
+            snr_db_max: Some(68.0),
+            chars_decoded: 42,
+            distinct_chars: 15,
+            spots_confirmed: 0,
+            bad_samples: 0,
+            input_conditioning: None,
+        }
     }
 
     #[test]
@@ -538,6 +825,7 @@ mod tests {
             distinct_chars: 0,
             spots_confirmed: 0,
             bad_samples: 0,
+            input_conditioning: None,
         };
         let out = doctor_report(&r);
         assert!(

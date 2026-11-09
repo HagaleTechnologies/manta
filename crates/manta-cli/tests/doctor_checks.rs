@@ -4,24 +4,18 @@
 //! (TCP listener, SNTP responder, held or closed port), and every run
 //! passes `--ntp-server 127.0.0.1:<fake>`, so no test reaches the internet.
 //!
-//! Helpers are copied from `metrics_bind.rs`; the repo's test files are
-//! self-contained.
+//! `manta()` comes from `common/launch.rs` (MAN-549); the port band below
+//! is this file's own (MAN-333, MAN-410).
+
+#[path = "common/launch.rs"]
+mod launch;
+use launch::manta;
 
 use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 /// `seconds` of 48 kHz mono silence: enough for doctor's 3 s minimum.
 fn silent_48k_wav(dir: &Path, seconds: u32) -> PathBuf {
@@ -526,13 +520,15 @@ fn the_example_callsign_fails_the_config_check() {
 }
 
 /// The keys `manta doctor --json` printed before MAN-126, plus MAN-313's
-/// `detectorConfirmations`, under MAN-139's camelCase names, sorted.
+/// `detectorConfirmations` and MAN-495's `inputConditioning`, under
+/// MAN-139's camelCase names, sorted.
 const REPORT_KEYS: &[&str] = &[
     "centerFreqHz",
     "charsDecoded",
     "detectorConfirmations",
     "distinctChars",
     "durationS",
+    "inputConditioning",
     "sampleRateHz",
     "snrMax",
     "snrMedian",
@@ -566,6 +562,9 @@ fn json_adds_checks_and_keeps_every_existing_key() {
     for key in REPORT_KEYS {
         assert!(map.contains_key(*key), "no {key} in {stdout}");
     }
+    // MAN-495: a receiver ran, so the report carries `inputConditioning`
+    // on top of the pre-MAN-495 keys; `verdict` is in REPORT_KEYS, so the
+    // only additions beyond it remain `checks` and `checksStatus`.
     assert_eq!(map.len(), REPORT_KEYS.len() + 2, "{stdout}");
     let checks = map["checks"].as_array().unwrap();
     assert!(!checks.is_empty());

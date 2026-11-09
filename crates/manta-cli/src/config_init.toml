@@ -190,6 +190,37 @@
 #enabled = true                       # false keeps the block but does not listen
 
 
+# --- Report spots to PSKReporter ----------------------------------------------
+# Sends validated spots to PSKReporter (pskreporter.info), where anyone can
+# see them on the public map under [server].station_callsign at its
+# operator_grid. Each call is reported at most once per band every 5 minutes,
+# in at most one datagram every 5 minutes. Needs [server] with operator_grid
+# (or operator_lat/operator_lon). A file replay reports only to a loopback
+# host. Do not also report the same call from WSJT-X, JTDX or CW Skimmer.
+# Restart-only.
+
+#[pskreporter]
+
+#enabled = false                      # true reports spots publicly to PSKReporter
+#host = "report.pskreporter.info"     # PSKReporter's collector, or a local test listener's IPv4 address
+#port = 4739                          # 14739 is PSKReporter's packet-analysis test listener
+#antenna = ""                         # shown on PSKReporter's map, e.g. "Inverted V at 12 m"; at most 254 bytes
+#spot_types = "cq_beacon"             # cq_beacon or all, as for [[rbn_uplink]]
+
+
+# --- Send spots to LAN loggers as WSJT-X UDP ------------------------------------
+# Sends every validated spot as WSJT-X UDP messages (Status, Decode) for
+# loggers that listen for WSJT-X, such as GridTracker or JTAlert. Each band
+# appears as its own WSJT-X instance, "manta-20m" and so on. Anyone on the
+# network who can receive `destination` can read the spots. Needs [server].
+# Restart-only.
+
+#[[wsjtx_output]]
+
+#destination = "127.0.0.1:2237"       # no default: a logger's UDP port, a broadcast such as 192.168.1.255:2237, or a multicast group such as 224.0.0.1:2237
+#enabled = true                       # false keeps the block but sends nothing
+
+
 # --- Callsign lookup (QRZ.com) ------------------------------------------------
 # Spots only callsigns QRZ.com lists. A call QRZ reports as not found is not
 # spotted; a lookup QRZ does not answer within 10 s spots anyway. Answers are
@@ -265,8 +296,39 @@
 
 # The settings below apply to any receiver type, or none.
 
+# CW coverage uses calibrated RF Hz. No default: omission keeps full coverage.
+# An empty list pauses CW decoding. Daily entries and dated overrides replace
+# the base ranges. See docs/CONFIG.md for the complete scheduling example.
+#cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+#cw_schedule = []                   # no default: daily UTC entries that replace the base ranges
+#cw_overrides = []                  # no default: dated entries that replace the base and daily ranges
+
+# IQ correction uses a controlled tone calibration for this receiver. Restart required.
+# Observe only measures mirrors; Apply requires the complete triple below.
+#iq_correction = "off"
+
+# No default: controlled-tone gain ratio, finite and 0.5 through 2.0. Supply all three values together.
+#iq_gain_ratio = 1.05
+
+# No default: controlled-tone phase error, finite and -45 through 45 degrees. Remeasure after a gain change.
+#iq_phase_deg = 2.0
+
+# No default: positive receiver centre, Hz, when measured. Apply needs agreement within 1 Hz; bands refuses calibration.
+#iq_calibrated_center_hz = 14000000.0
+
 # Oscillator correction for this receiver, parts per million, -1000 to 1000. `manta calibrate` measures it.
 #freq_correction_ppm = 0.0
+
+# FT8/FT4 spots on the JSON stream from windows this input covers.
+# Needs a manta built with --features ftx and a [server] table. Restart required.
+#digital_modes = []
+
+# Input-conditioning stages, each off | observe | apply:
+# "observe" measures and annotates without changing a sample, "apply"
+# corrects. Restart-only. `decode --json` reports what ran as
+# `inputConditioning`.
+#dc_block = "off"          # DC removal: a 5 Hz first-order high-pass
+#impulse_suppress = "off"  # short-impulse suppression
 
 # Your radio's dial frequency, Hz, for a sound card or WAV recording that
 # carries no frequency of its own. No default: without it, frequencies are
@@ -339,12 +401,13 @@
 #calls_heard_path = "calls-heard.txt"
 
 # Download current copies of cty.dat and MASTER.SCP while `manta run`
-# runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day.
+# runs from a live receiver: cty.dat every 7 days, MASTER.SCP every day
+# and, with pattern_url set, the callsign-pattern list every 7 days.
 # A download is used only if it parses and looks complete; a failed one is
 # logged, counted in manta_list_refresh_total and retried in an hour, and
 # the copy already in use stays. File replay never downloads. Downloads are
-# plain HTTP (port 80) from the two URLs below. Not used for a list that
-# cty_path/scp_path or cty_sha256/scp_sha256 sets.
+# plain HTTP (port 80) from cty_url, scp_url and pattern_url. Not used for
+# a list that cty_path/scp_path/pattern_path or cty_sha256/scp_sha256 sets.
 #refresh_lists = false
 
 # Directory for downloaded lists, so a restart starts from the last good
@@ -393,6 +456,16 @@
 # starts a comment: "+K5@@@". Relative to this file's directory. Unset: the
 # built-in copy. --patterns overrides it. Changes need a restart.
 #pattern_path = "patterns.lst"
+
+# Where list refresh downloads the callsign-pattern list (see
+# refresh_lists). Unset: the pattern list is never downloaded. Accepts
+# manta's own [+]PATTERN files and RBN's Patt3Ch.lst, for example
+# "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst". Checked
+# every 7 days. Lines no call manta accepts can match (longer than 7
+# characters, or a shape manta's pattern rule never produces) are skipped.
+# Only http:// URLs. Not used when pattern_path is set. Changes need a
+# restart.
+#pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
 
 
 # --- Signal detection --------------------------------------------------------
@@ -470,3 +543,23 @@
 #speed_alpha = 0.2                   # how quickly the speed estimate follows the sender
 #seed_units_hops = [9.0, 13.0, 18.0, 26.0, 38.0]  # starting dot lengths tried
 #conf_kappa = 6.0                    # confidence scale
+
+# Delayed refinement of ambiguous decodes: re-running a track's
+# preserved decoder inputs under an alternate configuration, inside fixed
+# budgets. enabled = false restores the pure causal baseline. The keys
+# live in the [decode.refine] sub-table (an absent sub-table means the
+# documented defaults):
+#    enabled = true                   # false: no retention, no replay
+#    lookback_secs = 10.0             # per-track retained hops; 0 (off) or 4.0..=10.0 s
+#    max_refinements_per_episode = 2  # attempt cap per episode, 1 through 4
+#    replay_hops_per_batch = 1500     # re-decode work per input batch, in hops
+#    backlog = 16                     # queued episodes, 1 through 256
+#refine = { enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }
+
+# CW coverage example, under your input table:
+# [input]
+# cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+# [[input.cw_schedule]]
+# at_utc = "18:00"
+# segments_hz = [[14000000, 14030000]]
+# Full UTC daily/dated semantics: docs/CONFIG.md.

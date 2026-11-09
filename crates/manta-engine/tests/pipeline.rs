@@ -5,7 +5,7 @@ use manta_testkit::scene::{render_scene, SignalSpec};
 /// The 0.12 CER bound was pinned against the old 750-hop (2.0 s) warmup
 /// floor, which lost this 20 s scene's leading "CQ " before the detector
 /// promoted a track (Task 11 Step 0: CER 0.09375, fixed `noise_seed=1`;
-/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md). MAN-115's
+/// docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md). MAN-115's
 /// 25 ms warmup after the pre-roll (SPEC §2.2 "Startup") promotes within
 /// ~0.07 s, so only the first, mid-element character is still at risk; the
 /// bound is kept as an upper limit, not re-tightened. See

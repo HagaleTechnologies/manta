@@ -480,6 +480,8 @@ fn check_prints_one_summary_line_per_table() {
             "rbn_compare",
             "skimmer_relay",
             "wsjtx_relay",
+            "pskreporter",
+            "wsjtx_output",
             "callsign_lookup",
             "input",
             "spot",
@@ -1325,11 +1327,11 @@ fn tuning_range_needs_bands_and_a_low_below_high() {
 
 #[test]
 fn an_unknown_band_lists_the_vocabulary() {
-    let err = fails(&check_body(&format!("{KIWI}bands = [\"6m\"]\n")));
+    let err = fails(&check_body(&format!("{KIWI}bands = [\"4m\"]\n")));
     assert!(
         err.ends_with(
-            "[input]: input.bands: \"6m\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
-             20m, 17m, 15m, 12m or 10m) or a centre frequency in kHz such as \"7030\"\n"
+            "[input]: input.bands: \"4m\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
+             20m, 17m, 15m, 12m, 10m or 6m) or a centre frequency in kHz such as \"7030\"\n"
         ),
         "{err}"
     );
@@ -1338,6 +1340,41 @@ fn an_unknown_band_lists_the_vocabulary() {
         err.ends_with(
             "[input]: input.bands must be \"all\", a band such as \"40m\", a centre frequency \
              in kHz such as \"7030\", or a list of them; got true\n"
+        ),
+        "{err}"
+    );
+}
+
+// MAN-543: 6m is a named band, skimmed when the tuning range reaches it.
+
+const HPSDR_192K_6M: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.168.1.40\"\n\
+                           rate_hz = 192000.0\nbands = [\"6m\"]\n";
+
+/// Scenario 1: `bands = ["6m"]` on a receiver that tunes 50 MHz lists the
+/// 6 m CW segment as one stream at its centre.
+#[test]
+fn six_metres_on_a_192k_hpsdr_radio_is_one_stream_at_50050_khz() {
+    let o = check_body(&format!(
+        "{HPSDR_192K_6M}tuning_range_hz = [0.0, 61440000.0]\n"
+    ));
+    assert_eq!(
+        input_lines(&succeeds(&o)),
+        ["input: type=hpsdr host=192.168.1.40 port=1024 protocol=auto freq_hz=50050000 rate_hz=192000"]
+    );
+    assert!(
+        stderr(&o).contains("note: [input]: bands = [\"6m\"] plans 1 stream: 6m\n"),
+        "{}",
+        stderr(&o)
+    );
+}
+
+#[test]
+fn six_metres_needs_a_tuning_range_that_reaches_it() {
+    let err = fails(&check_body(HPSDR_192K_6M));
+    assert!(
+        err.ends_with(
+            "[input]: input.bands leaves nothing to skim inside the receiver's tuning range, 0 \
+             to 30000 kHz: 6m (50000 to 50100 kHz) is outside it\n"
         ),
         "{err}"
     );
@@ -1510,6 +1547,36 @@ const SKIMMER_TOML: &str =
     "[[skimmer_relay]]\nhost = \"192.168.1.20\"\nport = 7300\ncallsign = \"W1ABC-2\"\n";
 const WSJTX_TOML: &str = "[[wsjtx_relay]]\nlisten = \"127.0.0.1:2237\"\ncallsign = \"W1ABC\"\n";
 
+/// MAN-142: both spot-output tables print one summary line each, after
+/// the relays and before `callsign_lookup:`.
+#[test]
+fn check_prints_the_spot_output_summary_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[server]\nstation_callsign = \"W5AU\"\noperator_grid = \"EM10dh\"\n\
+         [pskreporter]\nenabled = true\nantenna = \"Inverted V at 12 m\"\n\
+         [[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n",
+    );
+    let out = succeeds(&check_file(&path));
+    let lines: Vec<&str> = out.lines().collect();
+    let at = |line: &str| {
+        lines
+            .iter()
+            .position(|l| *l == line)
+            .unwrap_or_else(|| panic!("no {line:?} in {out}"))
+    };
+    let psk = at(
+        "pskreporter: enabled=true host=report.pskreporter.info port=4739 \
+                  spot_types=cq_beacon antenna=\"Inverted V at 12 m\"",
+    );
+    let wsjtx = at("wsjtx_output: destination=192.168.1.255:2237 enabled=true");
+    assert_eq!(psk, at("wsjtx_relay: none") + 1, "{out}");
+    assert_eq!(wsjtx, psk + 1, "{out}");
+    assert_eq!(at("callsign_lookup: none"), wsjtx + 1, "{out}");
+}
+
 #[test]
 fn check_prints_the_relay_summary_lines() {
     let dir = tempfile::tempdir().unwrap();
@@ -1530,8 +1597,10 @@ fn check_prints_the_relay_summary_lines() {
     let skimmer = at("skimmer_relay: host=192.168.1.20 port=7300 callsign=W1ABC-2 enabled=true");
     let wsjtx = at("wsjtx_relay: listen=127.0.0.1:2237 callsign=W1ABC enabled=true");
     assert_eq!((skimmer, wsjtx), (compare + 1, compare + 2), "{out}");
-    assert_eq!(lines[wsjtx + 1], "callsign_lookup: none", "{out}");
-    assert!(lines[wsjtx + 2].starts_with("input: "), "{out}");
+    assert_eq!(lines[wsjtx + 1], "pskreporter: none", "{out}");
+    assert_eq!(lines[wsjtx + 2], "wsjtx_output: none", "{out}");
+    assert_eq!(lines[wsjtx + 3], "callsign_lookup: none", "{out}");
+    assert!(lines[wsjtx + 4].starts_with("input: "), "{out}");
 
     let path = write_cfg(dir.path(), "plain.toml", RELAY_BASE);
     let out = succeeds(&check_file(&path));
@@ -1613,8 +1682,69 @@ fn check_rejects_each_relay_error_with_its_message() {
     let err = fails(&check_file(&path));
     assert!(
         err.contains(
-            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+            "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], \
+                 [callsign_lookup], [input], "
         ),
         "{err}"
     );
+}
+
+#[test]
+fn cw_segments_config_and_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let valid="[input]\ncw_segments_hz = [[14000000,14030000],[14040000,14060000]]\n[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []\n[[input.cw_overrides]]\nstart_utc = 2026-11-28T00:00:00Z\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = [[14000000,14060000]]\n";
+    succeeds(&check_file(&write_cfg(dir.path(), "valid.toml", valid)));
+    for (body,error) in [
+        ("cw_segments_hz = [[2,1]]","cw_segments_hz[0] must contain two finite positive Hz values with lo < hi"),
+        ("cw_segments_hz = [[1]]","cw_segments_hz[0]"),
+        ("cw_segments_hz = [[1,inf]]","cw_segments_hz[0]"),
+        ("[[input.cw_schedule]]\nat_utc = \"6:00\"\nsegments_hz = []","cw_schedule[0].at_utc must be HH:MM UTC"),
+        ("[[input.cw_schedule]]\nat_utc = \"24:00\"\nsegments_hz = []","cw_schedule[0].at_utc"),
+        ("[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []\n[[input.cw_schedule]]\nat_utc = \"06:00\"\nsegments_hz = []","cw_schedule contains duplicate at_utc 06:00"),
+        ("[[input.cw_overrides]]\nstart_utc = 2026-11-28T00:00:00+01:00\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = []","cw_overrides[0] requires UTC start_utc < end_utc"),
+        ("[[input.cw_overrides]]\nstart_utc = 2026-11-30T00:00:00Z\nend_utc = 2026-11-28T00:00:00Z\nsegments_hz = []","cw_overrides[0]"),
+        ("cw_segmnts_hz = []","unknown field"),
+    ] {
+        let path=write_cfg(dir.path(),"invalid.toml",&format!("[input]\n{body}\n"));
+        let err=fails(&check_file(&path));
+        assert!(err.contains(error),"{err}");
+    }
+    let path=write_cfg(dir.path(),"named.toml","[[input]]\nname = \"20m\"\ntype = \"kiwi\"\nhost = \"kiwi.example.org\"\nfreq_hz = 14050000\ncw_segments_hz = [[2,1]]\n");
+    assert!(fails(&check_file(&path)).contains("input \"20m\": cw_segments_hz[0]"));
+}
+
+#[test]
+fn cw_segments_documented_example_parses() {
+    // A Windows checkout (core.autocrlf) gives CONFIG.md CRLF line endings;
+    // normalize so the "```toml\n" fence split finds the example.
+    let doc = include_str!("../../../docs/CONFIG.md").replace("\r\n", "\n");
+    let section = doc
+        .split("### CW sub-segments and UTC schedules")
+        .nth(1)
+        .unwrap();
+    let example = section
+        .split("```toml\n")
+        .nth(1)
+        .unwrap()
+        .split("```")
+        .next()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    succeeds(&check_file(&write_cfg(
+        dir.path(),
+        "documented.toml",
+        example,
+    )));
+}
+
+#[test]
+fn cw_segments_decode_rejects_ambiguous_input_policies() {
+    let dir = tempfile::tempdir().unwrap();
+    let config=write_cfg(dir.path(),"two.toml","[[input]]\nname = '20m'\ntype = 'file'\npath = '20m.wav'\ncw_segments_hz = [[14000000,14060000]]\n[[input]]\nname = '40m'\ntype = 'file'\npath = '40m.wav'\ncw_segments_hz = [[7000000,7060000]]\n");
+    let out = manta()
+        .args(["decode", "missing.wav", "--config"])
+        .arg(config)
+        .output()
+        .unwrap();
+    assert!(fails(&out).contains("different CW coverage"));
 }

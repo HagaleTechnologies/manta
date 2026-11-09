@@ -194,6 +194,8 @@ impl From<Spot> for SpotJson {
 
 #[derive(Default)]
 struct Word {
+    refine_hypothesis: Option<&'static str>,
+    decoded_wpm: f32,
     text: String,
     confidences: Vec<f32>,
     /// MAN-200: each character's alternatives, parallel to `confidences`.
@@ -285,6 +287,14 @@ struct Word {
     /// MAN-207 D10: this word's role-skip has been counted and recorded;
     /// each occurrence counts once.
     not_candidate_recorded: bool,
+    /// MAN-208: this occurrence was withheld on a genuinely ambiguous
+    /// candidate -- below its repetition requirement, or beaten by a
+    /// better-supported rival -- so `refine_candidates` offers it to the
+    /// refinement scheduler. Cleared by a refinement of the word.
+    refine_hint: bool,
+    /// MAN-208: the rival that withheld this occurrence (`Reason::Variant`),
+    /// latched with `refine_hint` so `refine_candidates` can report it.
+    rival: Option<String>,
 }
 
 impl Word {
@@ -364,6 +374,10 @@ struct TrackState {
     /// have been at the 60 WPM noise ceiling (Codex review on PR #154,
     /// round 10).
     wpm_confirmed: bool,
+    /// MAN-208: `next_word_seq` when the latest `SpeedUpdate` arrived --
+    /// how many words the current speed has held across
+    /// (`RefineCandidate::wpm_stable`).
+    wpm_since_word_seq: u64,
     /// Set once a real `TrackMeta` event has been received. `freq_hz`/
     /// `snr_db` hold bogus `0.0` defaults until then (decoder.rs emits
     /// `TrackMeta` only every 375 hops -- a fast decode can complete
@@ -697,6 +711,105 @@ fn evidence_links(counted: &[GateOccurrence]) -> Vec<EvidenceLink> {
 /// a reasoned choice, not yet measured against real long-run data.
 const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
 
+/// MAN-208: one externally computed refinement of a retained occurrence --
+/// the result of re-decoding that occurrence's preserved samples under an
+/// alternate frontend/timing configuration. Same occurrence, same span;
+/// only the reading may change.
+#[derive(Debug, Clone)]
+pub struct RefinedWord {
+    /// The call the re-decode read. May equal the causal decode's.
+    pub call: String,
+    /// Per-character confidences of the re-decoded reading.
+    pub confidences: Vec<f32>,
+    /// The occurrence's original sample span `(start, end)` -- the span the
+    /// refinement must attach to, never a new one.
+    pub span: (u64, u64),
+    /// The re-decode's whole-word confidence (geometric mean).
+    pub word_confidence: f32,
+    /// Which alternate configuration produced this reading (e.g.
+    /// `"engine:legacy"`, `"wpm-seed"`), for the scheduler's own
+    /// bookkeeping.
+    pub hypothesis: &'static str,
+}
+
+/// MAN-515: what [`Validator::apply_refinement_with_outcome`] did with one
+/// refined reading, for the scheduler's outcome counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefinementOutcome {
+    /// The occurrence's word had left the window (or its track was gone):
+    /// the record was revised, nothing was re-evaluated.
+    Orphaned,
+    /// The reading equals the word's decoded text.
+    Unchanged,
+    /// The reading replaced the word's decoded text, and the occurrence's
+    /// repetition support moved to it.
+    Changed,
+    /// The reading would have turned a spottable callsign into a string
+    /// that can never be spotted, so it was refused: the decoded word,
+    /// its support and its ledger entry are untouched.
+    Rejected,
+}
+
+/// MAN-525: the nearest other track's frequency distance from `freq_hz`,
+/// read from `sorted` (finite frequencies, ascending by `(frequency,
+/// track_id)`) by binary search: the closest entry below `freq_hz`, and the
+/// first entry at or above it that is not `track_id` itself. Exact against
+/// the fold over every track because rounding is monotone (for
+/// `a <= b <= f`, `fl(f - b) <= fl(f - a)`). `None` for a non-finite
+/// `freq_hz`, which the caller answers with the fold.
+fn nearest_gap_hz(sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> Option<f64> {
+    if !freq_hz.is_finite() {
+        return None;
+    }
+    let p = sorted.partition_point(|&(f, _)| f < freq_hz);
+    let mut gap = f64::INFINITY;
+    if p > 0 {
+        gap = gap.min((sorted[p - 1].0 - freq_hz).abs());
+    }
+    if let Some(&(f, _)) = sorted[p..].iter().find(|&&(_, id)| id != track_id) {
+        gap = gap.min((f - freq_hz).abs());
+    }
+    Some(gap)
+}
+
+/// MAN-208: one retained occurrence the refinement scheduler may re-decode
+/// (`Validator::refine_candidates`). A read-only view borrowing the
+/// validator; a caller that keeps a candidate across a mutation copies the
+/// plain fields it needs (MAN-525). Deciding anything stays with the
+/// validator.
+#[derive(Debug, Clone, Copy)]
+pub struct RefineCandidate<'a> {
+    pub episode_wpm: f32,
+    pub neighbor_gap_hz: f64,
+    pub latest_word_seq: u64,
+    pub track_id: u32,
+    pub word_seq: u64,
+    /// The occurrence's currently decoded call.
+    pub call: &'a str,
+    /// `(start_ts, end_ts)` of the occurrence, for replay range selection
+    /// and span-matching the refined words back to occurrences.
+    pub span: (u64, u64),
+    /// The repetition count the occurrence's evaluation last saw.
+    pub reps: u32,
+    /// The track's latest speed, used by a seeded replay.
+    pub wpm: f32,
+    /// The better-supported rival that withheld it, if any.
+    pub rival: Option<&'a str>,
+    /// How many of its characters carried unresolved decoder alternatives.
+    pub alternatives: usize,
+    /// Whether `wpm` is a reliable estimate: the track has decoded at
+    /// least [`STABLE_SPEED_WORDS`] words since its last `SpeedUpdate`, so
+    /// the speed held rather than just jumped. The speed trigger requires
+    /// it.
+    pub wpm_stable: bool,
+}
+
+/// MAN-208: words a track must decode after its latest `SpeedUpdate`
+/// before that speed counts as a stable new estimate for the refinement
+/// speed trigger. `SpeedUpdate` fires only on a >= 1 WPM change (SPEC
+/// §5), so "no update across two whole words" means the estimate held.
+pub const STABLE_SPEED_WORDS: u64 = 2;
+
 impl Validator {
     /// Parses the supplied country and known-callsign tables.
     pub fn new(fs: f64, cty_dat: &str, master_scp: Option<&str>) -> Self {
@@ -986,6 +1099,468 @@ impl Validator {
         &self.observations
     }
 
+    /// MAN-208: marks one retained word as a refinement candidate (see
+    /// `Word::refine_hint`). Private: only the validator's own ambiguity
+    /// decisions set it, and only `apply_refinement` clears it.
+    fn note_refine_hint(&mut self, track_id: u32, word_seq: u64, rival: Option<String>) {
+        if let Some(track) = self.tracks.get_mut(&track_id) {
+            if let Some(word) = track.words.iter_mut().find(|w| w.seq == word_seq) {
+                word.refine_hint = true;
+                word.rival = word.rival.take().or(rival);
+            }
+        }
+    }
+
+    /// MAN-208: retained occurrences worth re-decoding under an alternate
+    /// frontend/timing configuration, read-only. An occurrence qualifies
+    /// when its word was withheld below its repetition requirement or
+    /// beaten by a better-supported rival (`refine_hint`), or when the
+    /// decoder offered per-character alternatives it never resolved, and
+    /// its span ends inside the last `lookback_samples` before `now_ts`.
+    /// Ordered by `(track_id, word_seq)` so the caller's admission order is
+    /// stable. Decides nothing and records nothing.
+    ///
+    /// MAN-525: neighbour gaps come from one frequency-sorted pass per
+    /// call, built on the first candidate, and each track's gap is computed
+    /// once, on its first candidate; the text is borrowed, not cloned.
+    pub fn refine_candidates(
+        &self,
+        now_ts: u64,
+        lookback_samples: u64,
+    ) -> Vec<RefineCandidate<'_>> {
+        let mut out = Vec::new();
+        let cutoff = now_ts.saturating_sub(lookback_samples);
+        let mut sorted: Option<Vec<(f64, u32)>> = None;
+        for (&track_id, track) in &self.tracks {
+            let mut gap: Option<f64> = None;
+            for word in &track.words {
+                if !word.attempted {
+                    continue;
+                }
+                if word.end_ts < cutoff {
+                    continue;
+                }
+                let alternatives = word
+                    .char_alternatives
+                    .iter()
+                    .filter(|a| !a.is_empty())
+                    .count();
+                if !word.refine_hint && alternatives == 0 {
+                    continue;
+                }
+                let neighbor_gap_hz = *gap.get_or_insert_with(|| {
+                    let s = sorted.get_or_insert_with(|| self.sorted_track_freqs());
+                    self.neighbor_gap_hz(s, track_id, track.freq_hz)
+                });
+                out.push(RefineCandidate {
+                    episode_wpm: word.decoded_wpm,
+                    latest_word_seq: track.next_word_seq,
+                    neighbor_gap_hz,
+                    track_id,
+                    word_seq: word.seq,
+                    call: &word.text,
+                    span: (word.start_ts, word.end_ts),
+                    reps: word.last_reps,
+                    wpm: track.wpm,
+                    rival: word.rival.as_deref(),
+                    alternatives,
+                    wpm_stable: track.wpm_confirmed
+                        && track.next_word_seq - track.wpm_since_word_seq >= STABLE_SPEED_WORDS,
+                });
+            }
+        }
+        out
+    }
+
+    /// MAN-525: every track's finite frequency with its id, sorted by
+    /// `(frequency, track_id)`: the one pass `refine_candidates` reads
+    /// neighbour gaps from. Non-finite frequencies are left out; against a
+    /// finite own frequency they only ever contribute NaN or infinity,
+    /// which the gap's `f64::min` from `INFINITY` ignores.
+    fn sorted_track_freqs(&self) -> Vec<(f64, u32)> {
+        let mut sorted: Vec<(f64, u32)> = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.freq_hz.is_finite())
+            .map(|(&id, t)| (t.freq_hz, id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        sorted
+    }
+
+    /// MAN-208's neighbour gap: the distance to the nearest OTHER track's
+    /// frequency, `INFINITY` with no other track. Reads `sorted`
+    /// ([`Self::sorted_track_freqs`]) by binary search (MAN-525); a
+    /// non-finite own frequency falls back to the original fold over every
+    /// track, so the value is bit-identical either way.
+    fn neighbor_gap_hz(&self, sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> f64 {
+        nearest_gap_hz(sorted, track_id, freq_hz).unwrap_or_else(|| {
+            self.tracks
+                .iter()
+                .filter(|(id, _)| **id != track_id)
+                .map(|(_, other)| (other.freq_hz - freq_hz).abs())
+                .fold(f64::INFINITY, f64::min)
+        })
+    }
+
+    /// MAN-208: applies one externally computed refinement of a retained
+    /// occurrence -- the result of re-decoding the occurrence's preserved
+    /// samples under an alternate configuration. The refinement is recorded
+    /// as a `Refined` observation about the SAME occurrence (never a new
+    /// repetition); if the call changed, the occurrence's repetition
+    /// support MOVES to the refined call (`RepetitionGate::move_occurrence`)
+    /// rather than being re-recorded; the refined candidate is then
+    /// re-evaluated through the normal candidate checks at the newest
+    /// supporting occurrence's RF time -- which is what makes a rescued
+    /// spot's timestamp the later repetition's, never the refined span's
+    /// older one, and what keeps a refinement alone (no later repetition)
+    /// from emitting anything.
+    ///
+    /// `decision_sample_ts` is the stream position at the re-decode: the
+    /// earliest time the refined identity could have been known. It stamps
+    /// the observation record, never the spot.
+    ///
+    /// MAN-515: a reading that would turn a spottable callsign (allowlisted,
+    /// or grammar-plausible with an allocated prefix) into a string that can
+    /// never be spotted is refused before anything moves: the word keeps its
+    /// text and support, and a `Refined` withheld decision records why
+    /// (`Grammar` or `Cty`). [`Validator::apply_refinement_with_outcome`]
+    /// reports which case applied.
+    pub fn apply_refinement(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> Vec<Spot> {
+        self.apply_refinement_with_outcome(track_id, word_seq, refined, decision_sample_ts)
+            .0
+    }
+
+    /// MAN-515: whether `call` could ever be spotted by the permanent
+    /// checks: allowlisted, or grammar-plausible with an allocated prefix.
+    fn spottable(&self, call: &str) -> bool {
+        self.allowlist.contains(call)
+            || (grammar::is_plausible(call) && self.cty.is_allocated(call))
+    }
+
+    /// MAN-515: [`Validator::apply_refinement`], also reporting what it did
+    /// with the reading ([`RefinementOutcome`]) so the scheduler can count
+    /// the replays that changed a word and the ones the guard refused.
+    pub fn apply_refinement_with_outcome(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> (Vec<Spot>, RefinementOutcome) {
+        let current = self.tracks.get(&track_id).and_then(|t| {
+            t.words.iter().find(|w| w.seq == word_seq).map(|w| {
+                (
+                    w.text.clone(),
+                    w.last_spot_type.unwrap_or(SpotType::Unknown),
+                )
+            })
+        });
+        let outcome = match &current {
+            None => RefinementOutcome::Orphaned,
+            Some((old_call, _)) if *old_call == refined.call => RefinementOutcome::Unchanged,
+            Some((old_call, _)) if self.spottable(old_call) && !self.spottable(&refined.call) => {
+                RefinementOutcome::Rejected
+            }
+            Some(_) => RefinementOutcome::Changed,
+        };
+        if let (RefinementOutcome::Rejected, Some((_, spot_type))) = (outcome, current) {
+            // The guard returns before `move_occurrence`, the ledger
+            // revision and any write to the word: the causal reading keeps
+            // everything it had.
+            self.advance_clock(decision_sample_ts);
+            let reason = if grammar::is_plausible(&refined.call) {
+                Reason::Cty
+            } else {
+                Reason::Grammar
+            };
+            let freq_hz = self.tracks[&track_id].freq_hz * self.freq_calibration;
+            let at = At::new(track_id, word_seq, Cause::Refined);
+            self.decide(at, Some(reason), || {
+                Decision::withheld(
+                    track_id,
+                    decision_sample_ts,
+                    &refined.call,
+                    freq_hz,
+                    spot_type,
+                    reason,
+                )
+            });
+            return (Vec::new(), outcome);
+        }
+        (
+            self.apply_refinement_inner(track_id, word_seq, refined, decision_sample_ts),
+            outcome,
+        )
+    }
+
+    /// The MAN-208 refinement path behind [`Validator::apply_refinement`],
+    /// after the MAN-515 guard has let the reading through.
+    fn apply_refinement_inner(
+        &mut self,
+        track_id: u32,
+        word_seq: u64,
+        refined: RefinedWord,
+        decision_sample_ts: u64,
+    ) -> Vec<Spot> {
+        self.advance_clock(decision_sample_ts);
+        let id = ObservationId { track_id, word_seq };
+        // An occurrence whose word has left the bounded window (or whose
+        // track is gone) can be revised in the record but never
+        // re-evaluated or re-counted: an orphaned revision, not a spot.
+        let Some((old_call, span, end_ts, spot_type)) = self.tracks.get(&track_id).and_then(|t| {
+            t.words.iter().find(|w| w.seq == word_seq).map(|w| {
+                (
+                    w.text.clone(),
+                    (w.start_ts.min(w.end_ts), w.end_ts),
+                    w.end_ts,
+                    w.last_spot_type.unwrap_or(SpotType::Unknown),
+                )
+            })
+        }) else {
+            let finding = Finding::Decided(Decision::withheld(
+                track_id,
+                decision_sample_ts,
+                &refined.call,
+                0.0,
+                SpotType::Unknown,
+                Reason::Repetition,
+            ));
+            let draft =
+                self.observation_draft(At::new(track_id, word_seq, Cause::Refined), finding);
+            self.observations.revise(id, draft, decision_sample_ts).ok();
+            return Vec::new();
+        };
+        if refined.call != old_call {
+            // A non-allowlisted Beacon word's occurrence was never
+            // recorded in the gate (`capture_pending_beacon` defers to
+            // close-time), so there is no repetition support to move --
+            // see the Beacon branch below.
+            let deferred_beacon =
+                spot_type == SpotType::Beacon && !self.allowlist.contains(&old_call);
+            if !deferred_beacon {
+                let is_active =
+                    |tid| self.tracks.contains_key(&tid) || self.merged_into.contains_key(&tid);
+                self.gate
+                    .move_occurrence(&old_call, &refined.call, track_id, span, is_active);
+            }
+            // The variant-arbitration ledger holds the same occurrence:
+            // revise it there too, or the rival check below compares the
+            // refined call against the reading it just superseded
+            // (validate round 2, PR #520). Moved, never added.
+            let plausible =
+                grammar::is_plausible(&refined.call) && self.cty.is_allocated(&refined.call);
+            self.ledger.revise_occurrence(
+                track_id,
+                word_seq,
+                &old_call,
+                span,
+                plausible.then(|| {
+                    (
+                        refined.call.as_str(),
+                        confidence::geo_mean(&refined.confidences),
+                    )
+                }),
+            );
+        }
+        // The word now carries the refined reading: its text, confidences
+        // and ambiguity signals are the re-decode's, so the window's later
+        // context rescans see the resolved call.
+        {
+            let track = self.tracks.get_mut(&track_id).expect("track present above");
+            if let Some(word) = track.words.iter_mut().find(|w| w.seq == word_seq) {
+                word.refine_hypothesis = Some(refined.hypothesis);
+                word.text = refined.call.clone();
+                word.confidences = refined.confidences.clone();
+                word.char_alternatives = Vec::new();
+                word.refine_hint = false;
+            }
+        }
+        let call = refined.call.clone();
+        let candidate = call.clone();
+        let (freq_hz, snr_db, wpm) = {
+            let track = &self.tracks[&track_id];
+            (
+                track.freq_hz * self.freq_calibration,
+                track.snr_db,
+                track.wpm,
+            )
+        };
+        let snapshot = self
+            .gate
+            .support_snapshot(freq_hz, &candidate, self.now_ts)
+            .unwrap_or_default();
+        let reps = snapshot.counted.len() as u32;
+        // The emission timestamp is the newest supporting occurrence's RF
+        // time -- the later repetition's, never the refined span's older
+        // one (dedupe rejects older timestamps, and backdating would be
+        // wrong even where it passed).
+        let sample_ts = snapshot
+            .accepted
+            .iter()
+            .map(|o| o.sample_ts)
+            .max()
+            .unwrap_or(end_ts);
+        let withheld = |reason: Reason| {
+            Decision::withheld(
+                track_id,
+                decision_sample_ts,
+                &candidate,
+                freq_hz,
+                spot_type,
+                reason,
+            )
+            .with_reps(reps)
+        };
+        let mut at = At::new(track_id, word_seq, Cause::Refined);
+        at.evidence = evidence_links(&snapshot.accepted);
+        if self.blocklist.contains(&candidate) {
+            self.suppression_counts.blocklist += 1;
+            self.decide(at, Some(Reason::Blocklist), || withheld(Reason::Blocklist));
+            return Vec::new();
+        }
+        if self.notch.contains(freq_hz) {
+            self.suppression_counts.notch += 1;
+            self.decide(at, Some(Reason::Notch), || withheld(Reason::Notch));
+            return Vec::new();
+        }
+        let is_allowlisted = self.allowlist.contains(&candidate);
+        if !is_allowlisted {
+            if !grammar::is_plausible(&candidate) {
+                self.decide(at, Some(Reason::Grammar), || withheld(Reason::Grammar));
+                return Vec::new();
+            }
+            if !self.cty.is_allocated(&candidate) {
+                self.decide(at, Some(Reason::Cty), || withheld(Reason::Cty));
+                return Vec::new();
+            }
+        }
+        // A non-allowlisted Beacon candidate is never evaluated on a
+        // live track (`evaluate_candidate`'s Beacon branch): it is
+        // captured once and judged exactly once at its track's true
+        // close, when a final WPM reading exists. A refinement re-reads
+        // the word; it does not change that contract (Codex review, PR
+        // #520). The permanent checks above have re-judged the refined
+        // call, so the captured reading is updated and the normal
+        // close-time validation (`resolve_pending_beacons`) still
+        // decides -- including its final-speed check.
+        if spot_type == SpotType::Beacon && !is_allowlisted {
+            let mut updated = false;
+            for pb in self
+                .tracks
+                .values_mut()
+                .flat_map(|t| t.pending_beacons.iter_mut())
+                .filter(|pb| pb.origin_track_id == track_id && pb.word_seq == word_seq)
+            {
+                pb.candidate = candidate.clone();
+                pb.char_confidences = refined.confidences.clone();
+                updated = true;
+            }
+            let reason = if updated {
+                Reason::BeaconPending
+            } else {
+                // Nothing is pending anymore (the capture was
+                // permanently rejected, or the pending beacon was lost
+                // to eviction): the refined reading has nothing to
+                // update and nowhere to be published.
+                Reason::BeaconDiscarded
+            };
+            self.decide(at, Some(reason), || withheld(reason));
+            return Vec::new();
+        }
+        if !confidence::has_acoustic_evidence(&refined.confidences) {
+            self.decide(at, Some(Reason::NoEvidence), || {
+                withheld(Reason::NoEvidence)
+            });
+            return Vec::new();
+        }
+        let tier = self.patterns.tier(&candidate);
+        let mut confidence = confidence::c_call(&refined.confidences, reps);
+        if let Some(scp) = &self.scp {
+            confidence = confidence::apply_scp_boost(confidence, scp.contains(&candidate));
+        }
+        let at = at.with_call_confidence(confidence);
+        let emission_state = if reps >= self.level.required_reps(tier) {
+            EmissionState::Confirmed
+        } else {
+            EmissionState::Tentative
+        };
+        if !is_allowlisted && spot_type != SpotType::Beacon && reps < self.level.required_reps(tier)
+        {
+            self.decide(at, Some(Reason::Repetition), || {
+                withheld(Reason::Repetition)
+            });
+            // MAN-208: the refined reading is still below its repetition
+            // requirement, so the episode stays a refinement candidate.
+            self.note_refine_hint(track_id, word_seq, None);
+            return Vec::new();
+        }
+        let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
+        let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
+            self.ledger
+                .better_supported_rival(track_id, &candidate, sample_ts)
+        } else {
+            None
+        };
+        if let Some((rival_call, rival_support)) = rival {
+            let rival_for_hint = rival_call.clone();
+            self.suppression_counts.variant += 1;
+            self.decide(at, Some(Reason::Variant), || {
+                let mut d = withheld(Reason::Variant);
+                d.rival = Some(Rival {
+                    call: rival_call,
+                    support: rival_support,
+                });
+                d
+            });
+            self.note_refine_hint(track_id, word_seq, Some(rival_for_hint));
+            return Vec::new();
+        }
+        let input = self.input_of(track_id);
+        if self
+            .dedupe
+            .last_sample_ts(&candidate, freq_hz, input)
+            .is_some_and(|last| sample_ts < last)
+        {
+            self.decide(at, Some(Reason::Dedupe), || withheld(Reason::Dedupe));
+            return Vec::new();
+        }
+        let outcome = self
+            .dedupe
+            .assess(&candidate, freq_hz, snr_db, spot_type, sample_ts, input);
+        if outcome != DedupeOutcome::Emit {
+            self.count_cross_input_dedupe(outcome, input);
+            self.decide(at, Some(Reason::Dedupe), || withheld(Reason::Dedupe));
+            return Vec::new();
+        }
+        let (rst, qrl_query) = self.track_annotations(track_id);
+        let spot = Spot {
+            callsign: candidate,
+            freq_hz,
+            snr_db,
+            wpm,
+            spot_type,
+            confidence,
+            emission_state,
+            track_id,
+            sample_ts,
+            rst,
+            qrl_query,
+            mode: SpotMode::Cw,
+            baud: None,
+        };
+        match self.admit(spot, reps, is_allowlisted, Confirmation::ExactRepeat, at) {
+            Some(spot) => vec![spot],
+            None => Vec::new(),
+        }
+    }
+
     /// MAN-207: the observation record, for `ObservationLog::revise`,
     /// `take_appended` and `note_discontinuity`.
     pub fn observations_mut(&mut self) -> &mut ObservationLog {
@@ -1071,7 +1646,7 @@ impl Validator {
                 draft.scores.word_confidence = Some(confidence::geo_mean(&word.confidences));
             }
             if self.observations.detail() == crate::observation::Detail::Text {
-                let context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
+                let mut context: Vec<&str> = word.context_seqs.map_or_else(Vec::new, |(lo, hi)| {
                     track
                         .words
                         .iter()
@@ -1079,6 +1654,11 @@ impl Validator {
                         .map(|w| w.text.as_str())
                         .collect()
                 });
+                if draft.cause == Cause::Refined {
+                    if let Some(hypothesis) = word.refine_hypothesis {
+                        context.push(hypothesis);
+                    }
+                }
                 draft.trace = Some(TextTrace::new(
                     &word.text,
                     &word.confidences,
@@ -1216,6 +1796,13 @@ impl Validator {
         self.scp = scp;
     }
 
+    /// MAN-542: replaces the pattern table for a scheduled list refresh.
+    /// Tracks, repetition counts and `suppression_counts` are untouched; the
+    /// new tiers apply from the next evaluation.
+    pub fn replace_patterns(&mut self, patterns: Arc<pattern::Table>) {
+        self.patterns = patterns;
+    }
+
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
     /// ARCHITECTURE §8).
     pub fn suppression_counts(&self) -> SuppressionCounts {
@@ -1315,6 +1902,7 @@ impl Validator {
                     track.qrl_query |= message::is_qrl_query(&word.text);
                     word.seq = track.next_word_seq;
                     word.end_ts = *sample_ts;
+                    word.decoded_wpm = track.wpm;
                     // MAN-207 D6: the previous word's `ends_turn` is final
                     // once a later word is pushed.
                     word.episode = track
@@ -1358,6 +1946,7 @@ impl Validator {
                 let track = self.tracks.entry(*track_id).or_default();
                 track.wpm = *wpm;
                 track.wpm_confirmed = true;
+                track.wpm_since_word_seq = track.next_word_seq;
                 // No retry here, and no Beacon-WPM decision here either
                 // (round 7 redesign) -- a non-allowlisted Beacon
                 // candidate is only ever judged once, at `TrackClosed`,
@@ -2337,7 +2926,6 @@ impl Validator {
             }
         }
         // MAN-106 zero-evidence abstention gate: a candidate whose every
-        // character carried zero decoder confidence (the `?`-placeholder
         // contract) has no acoustic evidence, so no public emission --
         // regardless of database membership. Investigation 11: "Do not
         // let a callsign database overwhelm contradictory sound" -- here,
@@ -2378,6 +2966,9 @@ impl Validator {
             if fused.as_ref().is_none_or(|f| f.call != candidate) {
                 let reason = Reason::Repetition;
                 self.decide(at, Some(reason), || withheld(reason).with_reps(reps));
+                // MAN-208: a candidate below its repetition requirement is
+                // the refinement scheduler's ambiguity signal.
+                self.note_refine_hint(track_id, resolved_word_seq, None);
             }
             return self.try_fused(&fused_site, fused);
         }
@@ -2413,6 +3004,7 @@ impl Validator {
             None
         };
         if let Some((rival_call, rival_support)) = rival {
+            let rival_for_hint = rival_call.clone();
             self.suppression_counts.variant += 1;
             self.decide(at, Some(Reason::Variant), || {
                 let mut d = withheld(Reason::Variant).with_reps(reps);
@@ -2422,6 +3014,9 @@ impl Validator {
                 });
                 d
             });
+            // MAN-208: a better-supported rival withholding this candidate
+            // is the refinement scheduler's ambiguity signal.
+            self.note_refine_hint(track_id, resolved_word_seq, Some(rival_for_hint));
             return None;
         }
 
@@ -4532,6 +5127,29 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
     }
 
     #[test]
+    fn replaced_pattern_table_lowers_the_repetition_bar() {
+        // QQ9@@@ is unlisted in the bundled patterns: five repetitions.
+        let with_qq9 = cty::Table::parse(&format!("{}{QQ9_ENTITY}", crate::CTY_DAT));
+        let mut v =
+            Validator::from_tables(FS, Arc::new(with_qq9), Some(Arc::new(scp::Set::bundled())))
+                .with_patterns(Arc::new(pattern::Table::bundled()));
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let words = ["CQ", "DE", "QQ9ZZZ", "QQ9ZZZ", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        let before = v.suppression_counts();
+        v.replace_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
+        assert_eq!(v.suppression_counts(), before);
+        let mut spots = run(&transmission_events(2, &words, 200_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 300_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    #[test]
     fn replaced_reference_tables_leave_operator_lists_and_counts_alone() {
         let mut v =
             Validator::new(FS, CTY_FIXTURE, None).with_blocklist(Blocklist::parse("K5ARH\n"));
@@ -5699,5 +6317,611 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "gate must be swept periodically even with no TrackClosed at all, not just accumulate one entry per historical callsign (got {})",
             v.gate.len()
         );
+    }
+
+    // ---- MAN-208: bounded delayed refinement of ambiguous decodes ----
+
+    /// A refinement result for a five-character call, as the engine-side
+    /// scheduler would produce one from a scratch replay.
+    fn refined(call: &str, span: (u64, u64), hypothesis: &'static str) -> RefinedWord {
+        RefinedWord {
+            call: call.to_string(),
+            confidences: vec![0.95; call.chars().count()],
+            span,
+            word_confidence: 0.95,
+            hypothesis,
+        }
+    }
+
+    /// The `(seq, span)` of the track's only word with this text.
+    fn word_named(v: &Validator, track_id: u32, text: &str) -> (u64, (u64, u64)) {
+        let track = &v.tracks[&track_id];
+        let word = track
+            .words
+            .iter()
+            .find(|w| w.text == text)
+            .unwrap_or_else(|| panic!("no {text} word"));
+        (word.seq, (word.start_ts, word.end_ts))
+    }
+
+    /// Gherkin 1's shape: an ambiguous `K3ABC` decode at t=1_000_000, a
+    /// clean `K3ABD` repetition 8 s later (96 kS/s audio rate) on the same
+    /// track. Returns the validator and every spot so far (none expected).
+    fn ambiguous_then_clean_repeat(v: &mut Validator) {
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        assert!(
+            run(&events, v).is_empty(),
+            "ambiguous first decode alone never spots"
+        );
+        let later = transmission_events(1, &["DE", "K3ABD", "K"], 1_768_000);
+        assert!(
+            run(&later, v).is_empty(),
+            "a single clean repetition alone never spots"
+        );
+    }
+
+    #[test]
+    fn a_refined_episode_confirmed_by_a_later_repetition_spots_at_the_later_ts() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        // The scheduler re-decodes 32 ms of stream later; the repetition
+        // completed at its own boundary, start+800.
+        let spots = v.apply_refinement(1, seq, refined("K3ABD", span, "wpm:25"), 1_800_000);
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K3ABD");
+        assert_eq!(
+            spots[0].sample_ts, 1_768_800,
+            "the spot carries the later repetition's RF time, not the first decode's"
+        );
+    }
+
+    /// Validate round 2 (MAN-208): a call-changing refinement must revise
+    /// the SAME occurrence in the variant-arbitration ledger too, not only
+    /// in the repetition gate. Before the fix the ledger kept the stale
+    /// `K3ABC` (0.95) reading next to the clean `K3ABD` (0.90) repetition:
+    /// one rep each, the stale reading winning the confidence tie-break,
+    /// so the rescue was withheld as a Variant by the very evidence it
+    /// had just superseded.
+    #[test]
+    fn a_call_changing_refinement_revises_the_rival_ledger_occurrence() {
+        let mut v = recording(CTY_FIXTURE);
+        let word_at = |text: &str, conf: f32, start: u64| -> Vec<DecoderEvent> {
+            let mut events = Vec::new();
+            let mut ts = start;
+            for w in ["DE", text, "K"] {
+                let c = if w == text { conf } else { 0.95 };
+                for ch in w.chars() {
+                    events.push(DecoderEvent::char_decoded(1, ts, Glyph::Char(ch), c));
+                    ts += 100;
+                }
+                events.push(DecoderEvent::word_boundary(1, ts));
+                ts += 100;
+            }
+            events
+        };
+        assert!(run(&word_at("K3ABC", 0.95, 1_000_000), &mut v).is_empty());
+        assert!(run(&word_at("K3ABD", 0.90, 1_768_000), &mut v).is_empty());
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let mut fix = refined("K3ABD", span, "engine:hsmm");
+        fix.confidences = vec![0.90; 5];
+        fix.word_confidence = 0.90;
+        let spots = v.apply_refinement(1, seq, fix, 1_800_000);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|s| s.callsign.as_str())
+                .collect::<Vec<_>>(),
+            ["K3ABD"],
+            "the stale K3ABC reading must not veto its own correction"
+        );
+        assert_eq!(
+            v.ledger.support(1, "K3ABC", v.now_ts).reps,
+            0,
+            "the occurrence's K3ABC reading left the ledger"
+        );
+        assert_eq!(
+            v.ledger.support(1, "K3ABD", v.now_ts).reps,
+            2,
+            "moved, not added: the occurrence plus its repetition"
+        );
+    }
+
+    /// Validate round 2 (MAN-208): a candidate's speed is reported stable
+    /// only once the track has decoded `STABLE_SPEED_WORDS` words since
+    /// its last `SpeedUpdate` -- the estimate held, it did not just jump.
+    #[test]
+    fn refine_candidates_report_speed_stability_by_words_held() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let stable = |v: &Validator| {
+            v.refine_candidates(v.now_ts, 10 * FS as u64)
+                .iter()
+                .find(|c| c.call == "K3ABC")
+                .expect("candidate")
+                .wpm_stable
+        };
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 28.0,
+        });
+        assert!(!stable(&v), "a speed that just changed is not stable");
+        let (one, next) = word_events(1, "DE", 1_900_000);
+        run(&one, &mut v);
+        assert!(!stable(&v), "one word is not yet a held estimate");
+        let (two, _) = word_events(1, "K", next);
+        run(&two, &mut v);
+        assert!(stable(&v), "held across two words");
+    }
+
+    #[test]
+    fn refine_candidates_are_read_only_and_expire_at_the_lookback() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let before = v.gate.counted_total();
+        let observations = v.observations().iter().count();
+        let candidates = v.refine_candidates(v.now_ts, 10 * FS as u64);
+        assert!(!candidates.is_empty());
+        assert!(candidates
+            .windows(2)
+            .all(|c| (c[0].track_id, c[0].word_seq) < (c[1].track_id, c[1].word_seq)));
+        assert_eq!(v.gate.counted_total(), before);
+        assert_eq!(v.observations().iter().count(), observations);
+        assert!(v
+            .refine_candidates(v.now_ts + 11 * FS as u64, 10 * FS as u64)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_refinement_that_reassigns_the_call_moves_the_repetition_not_adds_one() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let before = v.gate.counted_total();
+        let spots = v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_800_000);
+        assert_eq!(spots.len(), 1);
+        assert_eq!(v.gate.counted_total(), before, "support moved, not added");
+        // The losing callsign lost the occurrence's support: a second clean
+        // K3ABC repetition still needs two of its own.
+        let again = transmission_events(1, &["DE", "K3ABC", "K"], 2_500_000);
+        let spots = run(&again, &mut v);
+        assert!(spots.is_empty(), "K3ABC reopened from 1 rep: {spots:?}");
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABC", v.now_ts)
+            .expect("K3ABC entry");
+        assert_eq!(snapshot.counted.len(), 1, "only its own new repetition");
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABD", v.now_ts)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 2, "moved occurrence + repetition");
+    }
+
+    #[test]
+    fn two_agreeing_refinements_leave_the_repetition_count_unchanged() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let first = v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_800_000);
+        assert_eq!(first.len(), 1);
+        let between = v.gate.counted_total();
+        // A second refinement of the same evidence under a different
+        // timing hypothesis agrees: nothing may move or be added.
+        let second = v.apply_refinement(1, seq, refined("K3ABD", span, "wpm:25"), 1_832_000);
+        assert_eq!(v.gate.counted_total(), between);
+        assert!(
+            second.is_empty(),
+            "an agreeing refinement re-emits nothing: {second:?}"
+        );
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABD", v.now_ts)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 2);
+    }
+
+    #[test]
+    fn a_rescued_spot_is_never_emitted_at_the_refined_spans_older_ts() {
+        let mut v = recording(CTY_FIXTURE);
+        // No later repetition exists: the refinement alone has one moved
+        // occurrence of support and must not emit at the old span's time.
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        assert!(run(&events, &mut v).is_empty());
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let spots = v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_100_000);
+        assert!(spots.is_empty(), "no second repetition, no spot: {spots:?}");
+    }
+
+    #[test]
+    fn a_refinement_of_an_evicted_word_is_an_orphaned_revision_not_a_spot() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        assert!(run(&events, &mut v).is_empty());
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        // Evict the word from the 16-word window.
+        for i in 0..17u64 {
+            run(
+                &transmission_events(1, &["QSL"], 1_100_000 + i * 100_000),
+                &mut v,
+            );
+        }
+        let before = v.gate.counted_total();
+        let orphaned = v.observations().losses().orphaned_revisions;
+        let spots = v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 3_000_000);
+        assert!(spots.is_empty());
+        assert_eq!(
+            v.observations().losses().orphaned_revisions,
+            orphaned + 1,
+            "the orphaned revision is counted, not silent"
+        );
+        assert_eq!(v.gate.counted_total(), before, "no repetition change");
+    }
+
+    #[test]
+    fn a_refinement_does_not_reopen_the_losing_callsign() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let spots = v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_800_000);
+        assert_eq!(spots.len(), 1);
+        assert_eq!(spots[0].callsign, "K3ABD");
+        // The losing callsign has no live candidate left: nothing about it
+        // is re-evaluated, and no later window rescan resurrects it.
+        let tail = transmission_events(1, &["K"], 1_900_000);
+        assert!(run(&tail, &mut v).is_empty());
+        let candidates = v.refine_candidates(v.now_ts, 10 * FS as u64);
+        assert!(
+            candidates.iter().all(|c| c.call != "K3ABC"),
+            "the refined word no longer reads as ambiguous: {candidates:?}"
+        );
+    }
+
+    #[test]
+    fn a_refinement_never_increases_any_repetition_count() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let total = v.gate.counted_total();
+        // A disagreeing refinement moves the support back; conservation
+        // must hold through every reassignment, not just the first.
+        v.apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_800_000);
+        assert_eq!(v.gate.counted_total(), total);
+        v.apply_refinement(1, seq, refined("K3ABC", span, "wpm:25"), 1_832_000);
+        assert_eq!(
+            v.gate.counted_total(),
+            total,
+            "repeated refinements conserve counted occurrences"
+        );
+    }
+
+    // ---- MAN-515: the narrow refinement guard and its outcomes ----
+
+    /// The `N3NXI` -> `EEETT` loss in miniature: a refinement that would
+    /// turn a spottable call into garbage is refused, the word keeps its
+    /// text and support, and a later clean repetition still spots it.
+    #[test]
+    fn refinement_never_turns_a_spottable_call_into_garbage() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000);
+        assert!(
+            run(&events, &mut v).is_empty(),
+            "one repetition never spots"
+        );
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let counted = v.gate.counted_total();
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert!(spots.is_empty());
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq, "the word keeps its text");
+        assert_eq!(v.gate.counted_total(), counted, "nothing moved");
+        let snapshot = v
+            .gate
+            .support_snapshot(14_000_000.0, "K3ABD", v.now_ts)
+            .expect("K3ABD entry");
+        assert_eq!(snapshot.counted.len(), 1, "the occurrence still counts");
+        assert!(
+            v.gate
+                .support_snapshot(14_000_000.0, "EEETT", v.now_ts)
+                .is_none_or(|s| s.counted.is_empty()),
+            "no support moved to the garbage reading"
+        );
+        let later = transmission_events(1, &["DE", "K3ABD", "K"], 1_768_000);
+        let spots = run(&later, &mut v);
+        assert_eq!(
+            spots
+                .iter()
+                .map(|s| s.callsign.as_str())
+                .collect::<Vec<_>>(),
+            ["K3ABD"],
+            "the kept occurrence plus a clean repetition spots"
+        );
+    }
+
+    /// The HSMM `AC3GYH` context case: a non-call word is not spottable,
+    /// so a refinement of it still applies (`NEE` -> `DE`).
+    #[test]
+    fn refinement_of_a_non_call_word_still_applies() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["NEE", "K3ABD", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "NEE");
+        let mut fix = refined("DE", span, "engine:legacy");
+        fix.confidences = vec![0.95; 2];
+        let (_, outcome) = v.apply_refinement_with_outcome(1, seq, fix, 1_100_000);
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(word_named(&v, 1, "DE").0, seq, "the word now reads DE");
+    }
+
+    #[test]
+    fn plausible_to_plausible_refinement_still_moves_support() {
+        let mut v = recording(CTY_FIXTURE);
+        ambiguous_then_clean_repeat(&mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (spots, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("K3ABD", span, "engine:legacy"),
+            1_800_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Changed);
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K3ABD");
+        assert_eq!(spots[0].sample_ts, 1_768_800);
+    }
+
+    #[test]
+    fn unchanged_and_orphaned_outcomes() {
+        let mut v = recording(CTY_FIXTURE);
+        let events = transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000);
+        run(&events, &mut v);
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("K3ABC", span, "wpm-seed"), 1_050_000);
+        assert_eq!(outcome, RefinementOutcome::Unchanged);
+        for i in 0..17u64 {
+            run(
+                &transmission_events(1, &["QSL"], 1_100_000 + i * 100_000),
+                &mut v,
+            );
+        }
+        let (spots, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("EEETT", span, "wpm-seed"), 3_000_000);
+        assert!(spots.is_empty());
+        assert_eq!(
+            outcome,
+            RefinementOutcome::Orphaned,
+            "an evicted word is orphaned, never rejected"
+        );
+    }
+
+    /// The rejection is recorded once, as a withheld decision about the
+    /// refined reading, under the permanent check it failed.
+    #[test]
+    fn a_rejected_refinement_records_one_grammar_or_cty_decision() {
+        let mut v = recording(CTY_FIXTURE).with_observations(ObservationPolicy::records());
+        run(
+            &transmission_events(1, &["DE", "K3ABD", "K"], 1_000_000),
+            &mut v,
+        );
+        v.take_decisions();
+        let (seq, span) = word_named(&v, 1, "K3ABD");
+        let (_, outcome) = v.apply_refinement_with_outcome(
+            1,
+            seq,
+            refined("EEETT", span, "engine:legacy"),
+            1_100_000,
+        );
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].call, "EEETT");
+        assert_eq!(log[0].reason, Some(Reason::Grammar));
+        let records: Vec<_> = v
+            .observations()
+            .iter()
+            .filter(|o| o.draft.cause == Cause::Refined)
+            .collect();
+        assert_eq!(records.len(), 1, "one Refined record");
+        assert_eq!(
+            records[0].draft.decision().and_then(|d| d.reason),
+            Some(Reason::Grammar)
+        );
+        // A plausible reading whose prefix the table does not allocate
+        // fails cty instead.
+        let (_, outcome) =
+            v.apply_refinement_with_outcome(1, seq, refined("Z3ABD", span, "wpm-seed"), 1_150_000);
+        assert_eq!(outcome, RefinementOutcome::Rejected);
+        let log = v.take_decisions();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].reason, Some(Reason::Cty));
+        assert_eq!(word_named(&v, 1, "K3ABD").0, seq);
+    }
+
+    /// A beacon-shaped transmission (`V V V` + call, twice) whose first
+    /// callsign word carries an unresolved per-character alternative --
+    /// the shape `refine_candidates` admits (the word is attempted, from
+    /// its `capture_pending_beacon`, and keeps alternatives) and the
+    /// scheduler re-decodes. The second cycle's clean repetition reads
+    /// the true call, which is also what makes the frame parse capture
+    /// the first, ambiguous reading.
+    fn beacon_events_with_an_alternative(
+        ambiguous: &str,
+        true_call: &str,
+        alt: char,
+    ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        let mut ts = 0u64;
+        for (cycle, call) in [ambiguous, true_call].into_iter().enumerate() {
+            for word in ["V", "V", "V"] {
+                let (mut w, next) = word_events(1, word, ts);
+                events.append(&mut w);
+                ts = next;
+            }
+            let damaged_at = call.chars().count() - 1;
+            for (i, c) in call.chars().enumerate() {
+                let damaged = cycle == 0 && i == damaged_at;
+                events.push(DecoderEvent::CharDecoded {
+                    track_id: 1,
+                    sample_ts: ts,
+                    glyph: Glyph::Char(c),
+                    confidence: if damaged { 0.45 } else { 0.95 },
+                    alternatives: if damaged {
+                        vec![(Glyph::Char(alt), 0.40)]
+                    } else {
+                        Vec::new()
+                    },
+                });
+                ts += 100;
+            }
+            events.push(DecoderEvent::word_boundary(1, ts));
+            ts += 100;
+        }
+        events
+    }
+
+    /// Codex review, PR #520: a non-allowlisted beacon word with decoder
+    /// alternatives is refinement-admitted (`capture_pending_beacon` marks
+    /// it attempted), but a refinement may not publish it: a beacon is
+    /// judged exactly once at its track's true close. The refinement
+    /// updates the captured pending beacon's reading; the normal
+    /// close-time validation still decides.
+    #[test]
+    fn a_refined_beacon_stays_pending_and_resolves_at_its_tracks_close() {
+        let mut v = recording(CTY_FIXTURE);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        assert!(
+            run(
+                &beacon_events_with_an_alternative("K5ARH", "K5ARW", 'W'),
+                &mut v
+            )
+            .is_empty(),
+            "captured pending, never emitted on a live track"
+        );
+        let (seq, span) = word_named(&v, 1, "K5ARH");
+        assert!(
+            v.refine_candidates(v.now_ts, 10 * FS as u64)
+                .iter()
+                .any(|c| c.word_seq == seq),
+            "the ambiguous beacon word is a refinement candidate"
+        );
+        let spots = v.apply_refinement(1, seq, refined("K5ARW", span, "engine:hsmm"), 500_000);
+        assert!(
+            spots.is_empty(),
+            "a refined beacon never emits while its track is active: {spots:?}"
+        );
+        let pending: Vec<&str> = v.tracks[&1]
+            .pending_beacons
+            .iter()
+            .map(|pb| pb.candidate.as_str())
+            .collect();
+        assert!(
+            pending.iter().all(|c| *c == "K5ARW"),
+            "the captured reading carries the refinement: {pending:?}"
+        );
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARW");
+        assert_eq!(spots[0].spot_type, SpotType::Beacon);
+    }
+
+    /// Codex review, PR #520: the close-time validation a refinement must
+    /// not bypass includes the final-speed check -- a track that closes
+    /// with an implausibly fast WPM reading (> MAX_PLAUSIBLE_WPM) rejects
+    /// its pending beacons, refined or not.
+    #[test]
+    fn a_refined_beacon_on_a_track_that_closes_too_fast_never_spots() {
+        let mut v = recording(CTY_FIXTURE);
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 55.0,
+        });
+        assert!(run(
+            &beacon_events_with_an_alternative("K5ARH", "K5ARW", 'W'),
+            &mut v
+        )
+        .is_empty());
+        let (seq, span) = word_named(&v, 1, "K5ARH");
+        let spots = v.apply_refinement(1, seq, refined("K5ARW", span, "engine:hsmm"), 500_000);
+        assert!(spots.is_empty(), "got {spots:?}");
+        let spots = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(spots.is_empty(), "got {spots:?}");
+        assert!(v.suppression_counts().pending_beacon_rejected_wpm >= 1);
+    }
+}
+
+#[cfg(test)]
+mod man525_tests {
+    use super::nearest_gap_hz;
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn nearest_gap_equals_the_fold_bit_for_bit() {
+        // MAN-525: the binary-searched gap equals main's fold over every
+        // other track, bit for bit, including NaN, +inf, -0.0 and
+        // duplicate frequencies (a non-finite own frequency falls back to
+        // the fold itself).
+        let mut compared = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = seed ^ 0x5EED_0525;
+            let n = 1 + (splitmix64(&mut rng) % 80) as u32;
+            let mut tracks: Vec<(u32, f64)> = Vec::new();
+            for i in 0..n {
+                let id = i * 3 + 1;
+                let f = match splitmix64(&mut rng) % 23 {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => -0.0,
+                    3 if !tracks.is_empty() => {
+                        tracks[(splitmix64(&mut rng) % tracks.len() as u64) as usize].1
+                    }
+                    _ => 14e6 + (splitmix64(&mut rng) % 200_000) as f64 * 0.37,
+                };
+                tracks.push((id, f));
+            }
+            let mut sorted: Vec<(f64, u32)> = tracks
+                .iter()
+                .filter(|(_, f)| f.is_finite())
+                .map(|&(id, f)| (f, id))
+                .collect();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for &(id, f) in &tracks {
+                let fold = tracks
+                    .iter()
+                    .filter(|(other, _)| *other != id)
+                    .map(|(_, other)| (other - f).abs())
+                    .fold(f64::INFINITY, f64::min);
+                let gap = nearest_gap_hz(&sorted, id, f).unwrap_or(fold);
+                assert_eq!(
+                    gap.to_bits(),
+                    fold.to_bits(),
+                    "seed {seed} track {id} freq {f}: {gap} vs {fold}"
+                );
+                compared += 1;
+            }
+        }
+        println!("MAN-525 gap differential: {compared} gaps compared");
+        assert!(compared > 5_000, "only {compared} gaps compared");
     }
 }

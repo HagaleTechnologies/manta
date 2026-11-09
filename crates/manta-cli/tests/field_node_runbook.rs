@@ -4,10 +4,12 @@
 //! drain, the companion units call subcommands and flags `scripts/field-node.py` really has,
 //! and the runbook cites only metrics `/metrics` renders and links only files that exist.
 
+#[path = "common/launch.rs"]
+mod launch;
+
 use regex::Regex;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 const KIT_DIR: &str = "docs/RUNBOOKS/field-node";
 const RUNBOOK: &str = "docs/RUNBOOKS/secondary-skimmer-field-node.md";
@@ -168,14 +170,7 @@ fn systemd_seconds(value: &str) -> u64 {
 #[test]
 fn example_config_validates_feature_aware() {
     let config = repo_root().join(KIT_DIR).join("manta-field.toml");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // `config check` reads `MANTA_CONFIG` and `MANTA_<TABLE>_<KEY>` and rejects unknown
-    // `MANTA_*` names, so the test runner's own environment must not leak into the child.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = launch::manta();
     let out = cmd
         .args(["config", "check", "--config"])
         .arg(&config)

@@ -61,6 +61,7 @@ lowest-numbered track that sent any event besides `TrackPromoted` and
 | `timing` | object or null | until learned | The primary track's last `TimingUpdate`, without `event`, `trackId` and `sampleTs`. See [`timing`](#timing). `null` when the track sent none. |
 | `rtty` | array | never | Every RTTY signal the detector marked (SPEC §2.6); empty when there is none. See [`rtty` entries](#rtty-entries). |
 | `badSamples` | integer | never | Input samples replaced with silence because they were NaN, infinite or too large (SPEC §1.3 step 0). Omitted when 0. |
+| `inputConditioning` | object | when a conditioning stage is on | What the input-conditioning chain did (MAN-496): `impulse` and `dc` stage objects (always both, their `mode` saying `off`), `spans` and `spansDropped` from the bounded span log. Counts are exact. Omitted when every `[input]` stage is `off`, so a clean run's JSON keeps its pre-MAN-496 shape. |
 
 ## `run --json` and `listen --json`
 
@@ -251,6 +252,7 @@ the text report.
 | `distinctChars` | integer | never | Distinct decoded characters, prosigns left out. |
 | `spotsConfirmed` | integer | never | Validated spots. |
 | `badSamples` | integer | never | Input samples replaced with silence. Omitted when 0. |
+| `inputConditioning` | object | never | What the input-conditioning chain observed (MAN-495): doctor runs every stage that is not `apply` as `observe`, so the object is always present when a receiver ran. The `impulse` and `dc` stage objects, `spans` and `spansDropped` are the decode `inputConditioning` shape; `dc.overChannelNoiseDb` is doctor-only (the offset's level over the median channel noise floor). Omitted in checks-only output, where no receiver ran. |
 | `verdict` | string | never | `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE`, `WEAK_NO_DECODE` or `DECODING`, as the text report's `verdict:` line. |
 | `checks` | array | never | One object per check line, in the text report's order. See [`checks` entries](#checks-entries). |
 | `checksStatus` | string | never | The worst check status: `FAIL` if any check failed, else `WARN` if any warned, else `PASS`. |

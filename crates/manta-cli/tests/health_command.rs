@@ -5,25 +5,13 @@
 //! docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md.
 
 mod common;
+use common::manta;
 
 use common::{fake_server, http_reply};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, Instant};
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    // `health` reads `MANTA_CONFIG` and `MANTA_<TABLE>_<KEY>`, so the test
-    // runner's own environment must never leak into the child. Tests that
-    // exercise the env tier set theirs explicitly.
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()

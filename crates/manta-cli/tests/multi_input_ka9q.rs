@@ -9,14 +9,18 @@
 //! docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md).
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[path = "common/launch.rs"]
+mod launch;
+use launch::{free_ports, manta};
+
 use manta_input::ka9q::wire::{self, ChannelStatus, Encoding, RtpHeader};
 use num_complex::Complex32;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -25,16 +29,6 @@ use std::time::{Duration, Instant};
 const RATE: u64 = 96_000;
 const PER_PACKET: usize = 180;
 const READY_MARKER: &str = "manta: listening on";
-
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
 
 static NEXT: AtomicU8 = AtomicU8::new(101);
 
@@ -48,12 +42,6 @@ fn unique_group() -> Ipv4Addr {
         (pid / 250 % 250) as u8,
         NEXT.fetch_add(1, Ordering::Relaxed),
     )
-}
-
-/// `N` distinct ports, every listener held until all are read (MAN-371).
-fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }
 
 fn free_udp_port() -> u16 {

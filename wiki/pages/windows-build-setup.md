@@ -10,7 +10,7 @@ sources:
   - CONTRIBUTING.md
   - scripts/check-release-ci.py
   - scripts/check-soapy-release.py
-  - docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md
+  - docs/archive/plans/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
   - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
 verified:

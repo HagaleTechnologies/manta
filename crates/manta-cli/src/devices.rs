@@ -189,8 +189,8 @@ impl DeviceReport {
             output.push_str("Select an audio input with --device NAME; names match case-insensitively by substring.\n");
         }
         if self.soapy.status == "disabled" {
-            // MAN-82: the default release archives lack Soapy; point at the one that has it.
-            output.push_str("SoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\n");
+            // MAN-82, MAN-539: the default release archives lack SoapySDR; point at the two that have it.
+            output.push_str("SoapySDR: unavailable in this build; download manta-linux-x86_64-soapy.tar.gz (Ubuntu 24.04 x86_64) or manta-linux-arm64-soapy.tar.gz (64-bit Raspberry Pi OS bookworm), or build from source with --features soapy.\n");
         } else if self.soapy.error.is_some() {
             output.push_str("SoapySDR devices: enumeration failed.\n");
         } else if self.soapy.devices.is_empty() {
@@ -329,7 +329,7 @@ mod tests {
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
             report.text(),
-            "Audio inputs: none found.\nSoapySDR: unavailable in this build; on Ubuntu 24.04 x86_64, download manta-linux-x86_64-soapy.tar.gz, or build from source with --features soapy.\nNo openHPSDR radio answered discovery.\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
+            "Audio inputs: none found.\nSoapySDR: unavailable in this build; download manta-linux-x86_64-soapy.tar.gz (Ubuntu 24.04 x86_64) or manta-linux-arm64-soapy.tar.gz (64-bit Raspberry Pi OS bookworm), or build from source with --features soapy.\nNo openHPSDR radio answered discovery.\nKiwiSDR: use --kiwi-host HOST.\nka9q-radio: use --ka9q-group GROUP, the data group of a radiod IQ channel (avahi-browse -rt _rtp._udp lists them).\n"
         );
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["audio"]["status"], "ok");

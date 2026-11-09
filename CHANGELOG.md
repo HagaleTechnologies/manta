@@ -22,7 +22,47 @@ the git history and `docs/DECISIONS/`.
 
 ## [Unreleased]
 
+### Added
+
+- MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
+  segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
+  reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
+  `tuning_range_hz` overlaps its segment, so plans on the default range are
+  unchanged. An `"all"` entry whose range already reached 50 MHz now also
+  plans 6m, and refuses a bare centre inside 6m such as `"50050"` as a
+  repeat. See
+  [docs/DECISIONS/2026-11-08-man543-6m-band.md](docs/DECISIONS/2026-11-08-man543-6m-band.md).
+- MAN-539: a SoapySDR release archive for 64-bit Raspberry Pi OS
+  (`manta-linux-arm64-soapy.tar.gz`, built and verified on Debian bookworm),
+  and SoapySDR with the RTL-SDR, Airspy and HackRF modules in the Docker
+  image on every platform. `manta devices` on a build without SoapySDR names
+  both archives.
+- MAN-493: the three remaining oracle-bypass experiments for
+  `manta oracle --funnel`. `--funnel-bypass known-timing` seeds the bypass
+  decoder at the truth speed, forcing the `usableTiming` stage (unavailable
+  `noRbnWpm`/`hsmmEngine` without a truth speed or on the hsmm engine);
+  `known-transitions` and `known-transcript` take synthetic keying truth
+  through the engine API (`run_synthetic_bypass`, the
+  `loss_funnel_synthetic` example) and stay off the CLI. No production
+  decode path changes.
+
 ### Decoder output
+
+- MAN-208: bounded replay revisits ambiguous observations on the single-input
+  and multi-input listen paths and in offline `manta decode`. Support moves
+  between callsigns (in the repetition gate and the rival ledger) without adding
+  repetitions, and spots retain the later supporting RF timestamp. A speed
+  change triggers a replay only once it has held across two words.
+  `[decode.refine]` controls the budget; eight `manta_refine_*` counters report
+  activity. RF recall remains unmeasured.
+- MAN-515: Refinement no longer flips a legacy or edge-legacy base to HSMM,
+  replays a seeded timing hypothesis once per speed, and never moves a
+  callsign's support to a reading that cannot be spotted.
+  `manta_refine_replays_total`, `manta_refine_changed_total` and
+  `manta_refine_rejected_total` report how many replays changed a word.
+- MAN-494: optional per-input IQ correction uses a controlled-tone calibration
+  to remove receiver images. It defaults to off. Observe and a centre mismatch
+  preserve samples; mirror evidence never enables correction by itself.
 
 - MAN-200: a decode whose samples overlap a decode the repetition gate
   already counted, such as a replay or a second track on the same signal,
@@ -144,6 +184,55 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-485: `[input].digital_modes = ["FT8", "FT4"]` enables FT8/FT4 CQ
+  skimming from covered IQ windows in builds with `--features ftx`.
+  Spots publish on the JSON stream as `mode` `"FT8"`/`"FT4"`, with
+  `dxGrid` from the CQ and the UTC slot timestamp. Startup lines report
+  attempted and skipped windows; the four `manta_ftx_` metric families
+  appear only for attempted windows. CW decoder output is unchanged.
+
+- MAN-495: `manta doctor` now observes the input-conditioning chain. Every
+  stage not set to `apply` runs as `observe` in doctor's own run (an `off`
+  stage included, so diagnostics exist on a default config; an `apply`
+  stage stays applied), `doctor --json` gains an `inputConditioning`
+  object (always present when a receiver ran, absent in checks-only
+  output) in decode's shape plus the doctor-only
+  `dc.overChannelNoiseDb`, measured against the median channel noise
+  floor over the first second of input, and the text report prints one
+  canonical `input:` line per finding before `verdict:` -- a DC offset
+  from +6 dB over the channel noise upward, a short impulse, or a paused
+  impulse stage. A clean receiver prints no new line. The IQ-imbalance
+  surface (`iq` object, mirror line, `--iq-tone-hz`) lands with MAN-494's
+  IQ stage. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
+- MAN-496: the `[input]` conditioning keys `dc_block` and
+  `impulse_suppress` (each `off`, `observe` or `apply`, default `off`,
+  restart-only), turning MAN-203's input-conditioning stages on for
+  `decode`, `run` and `soak`, with per-input settings for multiple receivers.
+  `run` publishes `manta_input_conditioned_samples_total` by source, stage
+  and mark, starting at zero for configured modes and summed across reconnects.
+  `decode --json` gains an `inputConditioning` object (omitted
+  when every stage is `off`) with exact per-stage counts and the bounded
+  span log; `manta config` prints a set stage in the input summary. See
+  docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md.
+- MAN-142: two opt-in spot outputs. `[pskreporter]` (`enabled = true`, off
+  by default) reports validated CQ and beacon spots (`spot_types = "all"`
+  for every type) to PSKReporter's public map at
+  `report.pskreporter.info:4739` as IPFIX over UDP, each call at most once
+  per band every 5 minutes, in at most one datagram every 5 minutes. It
+  needs `[server]` with a grid, and a file replay reports only to a loopback
+  host. `[[wsjtx_output]]` sends every validated spot to a LAN address
+  (unicast, broadcast or multicast) as WSJT-X `Heartbeat`, `Status`,
+  `Decode` and `Close` messages, one instance per band (`manta-20m`), with
+  `Off air` set on a file replay. `[[wsjtx_relay]]` now ignores datagrams
+  from manta's own output (`manta_relay_dropped_total{reason="own_output"}`).
+  With `[server]`, `/metrics` gains `manta_pskreporter_reports_total`,
+  `manta_pskreporter_datagrams_total`, `manta_pskreporter_dropped_total`,
+  `manta_wsjtx_output_spots_total`, `manta_wsjtx_output_datagrams_total`
+  and `manta_wsjtx_output_dropped_total`. Spots are unchanged. Tested
+  against fake local listeners; a live PSKReporter report and a real
+  logger are still to be checked. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - MAN-200: `[spot] repetition_fusion` (default `false`). When on, damaged
   copies of one station's CQ/DE/UP self-ID, such as `W1AV`, `W1EW` and
   `M1AW`, can together confirm `W1AW`. Live-state `candidateDecision`
@@ -161,6 +250,16 @@ the git history and `docs/DECISIONS/`.
   `manta_call_occurrences_not_candidate_total{role}`. Spots, `decode`'s
   stdout and every wire format are unchanged. See
   [docs/DECISIONS/2026-11-03-man207-observation-record.md](docs/DECISIONS/2026-11-03-man207-observation-record.md).
+- MAN-198 first slice: `manta oracle --funnel PATH` runs the recording
+  once more through the production pipeline and writes a stage-attributed
+  loss funnel (JSON Lines): a header, one `lossFunnel` record per RBN
+  episode charged to exactly one earliest failed stage (or none when
+  delivered), and a `lossFunnelSummary` with candidate, confirmed and
+  leased track births kept apart. Diagnostic only: the oracle's stdout and
+  `--jsonl` are unchanged. `--funnel-bypass known-frequency` adds the
+  known-frequency oracle-bypass experiment after the production summary,
+  flagged `oracleAssisted`: an upper bound, never a score. See
+  docs/DECISIONS/2026-11-03-man198-loss-funnel.md.
 - MAN-141: `spectrum_udp` in an `[input]`/`[[input]]` sends that receiver's
   power spectrum to N1MM+'s Spectrum Display (UDP 13064), as CW Skimmer's
   "Send Spectrum via UDP" does: an XML `<Spectrum>` datagram about 3 times
@@ -317,6 +416,9 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-539: the Docker image is built with `--features soapy`, so its
+  `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
+  three device modules.
 - MAN-139: **breaking for scripts that parse `--json`.**
   `manta decode --json`, `manta run --json`/`listen --json` and
   `manta doctor --json` name fields as the JSON spot stream does:
@@ -373,6 +475,23 @@ the git history and `docs/DECISIONS/`.
   `verified` stamps and `manifest.json` are refreshed and CI-pinned (MAN-152).
 
 ### Fixed
+
+- MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
+  audio, SoapySDR; ka9q already did) now reports a stopped stream through
+  `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),
+  before its own loss/reconnect bound, so a held call's spot is emitted
+  without waiting out the stall bound or a reconnect and the same stream
+  keeps reading and spots again after it resumes. A Kiwi peer that keeps
+  pinging while sending no IQ can no longer hide the outage forever, two
+  DDCs on one HPSDR radio each get the report, a grouped member's soft
+  stall no longer retires its whole radio generation, and audio resumes
+  on the same device instead of reopening. Hard failure bounds and
+  reconnect policy are unchanged. See
+  docs/DECISIONS/2026-11-04-man489-live-source-stall-settlement.md.
+- MAN-497: dropping a lone protocol-1 HPSDR receiver sends the stop command
+  twice, as protocol 2 does, so one lost UDP datagram no longer leaves the
+  radio streaming and refused as in use on rediscovery. Decoder output is
+  unchanged.
 
 - MAN-407: after a ka9q-radio input reconnects, spot timestamps are no
   longer stamped late when the reopen thread stalls before it drains the

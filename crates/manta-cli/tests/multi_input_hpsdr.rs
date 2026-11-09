@@ -1,11 +1,15 @@
 //! MAN-307 acceptance against real child processes and a loopback Protocol 1 radio.
+#[path = "common/launch.rs"]
+mod launch;
+use launch::{free_ports, manta};
+
 use num_complex::Complex32;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -18,20 +22,6 @@ const NAMES: [&str; 4] = ["80m", "40m", "20m", "15m"];
 const FREQUENCIES: [u32; 4] = [3525000, 7025000, 14025000, 21025000];
 const CALLS: [&str; 4] = ["W1AW", "JA1ABC", "DL1ABC", "VK2ABC"];
 
-fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
-    cmd
-}
-fn ports() -> [u16; 3] {
-    let listeners: [TcpListener; 3] =
-        std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    listeners.map(|l| l.local_addr().unwrap().port())
-}
 fn config(
     path: &Path,
     port: u16,
@@ -39,7 +29,7 @@ fn config(
     declaration: Option<usize>,
     transforms: bool,
 ) -> [u16; 3] {
-    let ports = ports();
+    let ports: [u16; 3] = free_ports();
     let mut text = format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {}\njson_port = {}\nmetrics_port = {}\nstatus_interval_secs = 1\n", ports[0], ports[1], ports[2]);
     for i in 0..count {
         let name = NAMES
@@ -860,7 +850,10 @@ fn failed_startup_retires_another_groups_completed_radio() {
     assert!(unknown.sessions.lock().unwrap().is_empty());
     wait_until(
         Duration::from_secs(2),
-        || opened.generations().iter().any(|s| s.stops == 1),
+        // MAN-474 keeps the immediate pair and adds timed stop retries.
+        // Exact retry counts depend on scheduling; stale retirement is
+        // checked separately by manta-input's replacement-session test.
+        || opened.generations().iter().any(|s| s.stops >= 2),
         || format!("{:?}", opened.generations()),
     );
     assert_eq!(opened.generations().len(), 1);

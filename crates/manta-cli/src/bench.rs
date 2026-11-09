@@ -108,10 +108,10 @@ pub(crate) struct SensitivityArgs {
     /// Decode engine: `legacy` (the default), `edge-legacy`, or `hsmm`.
     ///
     /// When --config also names an engine, this flag wins.
-    #[arg(long, value_parser = crate::parse_engine)]
+    #[arg(long, value_parser = crate::cli_parse::parse_engine)]
     pub engine: Option<Engine>,
     /// Reweight acoustically viable word readings: on or off. Overrides [decode].
-    #[arg(long, value_parser = crate::parse_prior)]
+    #[arg(long, value_parser = crate::cli_parse::parse_prior)]
     pub prior: Option<manta_decode::config_file::PriorSwitch>,
     /// TOML config file. Its [decode] and [detector] settings apply; every
     /// other table is ignored, and the environment is never read
@@ -474,13 +474,13 @@ pub(crate) fn pipeline_config(
         detector: loaded.detector,
         ..PipelineConfig::default()
     };
-    let spot = crate::resolve_spot_pinned(
+    let spot = crate::resolve::resolve_spot_pinned(
         vec![],
         None,
         None,
         None,
         None,
-        crate::CliPins::default(),
+        crate::resolve::CliPins::default(),
         None,
         &crate::config::SpotFile::default(),
     );
@@ -1232,6 +1232,7 @@ mod tests {
             timing: None,
             rtty: Vec::new(),
             bad_samples: 0,
+            input_conditioning: None,
             sample_rate_hz: 192_000.0,
         }
     }

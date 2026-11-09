@@ -87,8 +87,8 @@ manta-cli ──▶ manta-engine ──▶ manta-input ──▶ manta-dsp, copp
         │            │        ├──▶ manta-decode
         │            │        └──▶ manta-spot ──────▶ manta-decode
         ├──────────────────▶ manta-server ──▶ manta-spot
-        └──────────────────▶ manta-decode, manta-input, manta-spot,
-                             manta-testkit, coppa-audio
+        └──────────────────▶ manta-decode, manta-dsp, manta-input,
+                             manta-spot, manta-testkit, coppa-audio
 manta-testkit ──▶ manta-dsp, manta-decode, manta-input, coppa-channel
 manta-soak-harness ──▶ manta-dsp, manta-input, manta-engine, manta-testkit
 ```
@@ -99,8 +99,29 @@ and `manta-testkit → coppa-channel` (Watterson fading, see the M1
 pinned-decisions doc).
 
 The graph shows `[dependencies]` only; dev-only edges (for example
-`manta-cli → manta-dsp` and `manta-engine → manta-testkit`) are test
+`manta-cli → coppa-channel` and `manta-engine → manta-testkit`) are test
 fixtures and left out.
+
+Inside `manta-cli`, `src/main.rs` holds the clap tree (`Cli`, `enum Command`)
+and the dispatch in `run_command`. MAN-548 moved each piece of the daemon's
+wiring into its own module
+([decision record](docs/DECISIONS/2026-11-08-man548-main-rs-split.md)):
+
+- `run_cmd.rs`: `RunArgs` (the `run`/`listen` flags) and `run`, the daemon.
+- `source_spec.rs`: `LiveSourceSpec`, source opening and the source warnings.
+- `recording.rs`: `--record-iq` checks, start, finish and report.
+- `cli_parse.rs`: the clap `value_parser` functions and their ranges.
+- `session_epoch.rs`: the session epoch and spot-id nonce for replays.
+- `resolve.rs`: `CliOverrides`, `Resolved`, `resolve` and `spec_from_file`.
+- `daemon_client.rs`: `manta status`'s client and the `http_get` that
+  `manta health` shares.
+- `spot_server.rs`: `start_spot_server` and its `SpotServerParams`.
+
+Unit tests do not sit inline in these files. Each module's tests are in
+`src/<module>/tests.rs`, the tests of what stays in `main.rs` are in
+`src/tests.rs`, and fixtures that two or more of them share are in
+`src/test_support.rs`. `crates/manta-cli/tests/module_layout.rs` checks this
+layout.
 
 ### Reused from coppa vs. new
 
@@ -135,7 +156,10 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
-  native SoapySDR library (CI, contributors without hardware).
+  native SoapySDR library (CI, contributors without hardware). In `manta-cli`,
+  `soapy_opts` is the one module that names the feature: its `SoapyArgs` flags
+  exist only in a `soapy` build, and the `SoapyOpts` settings exist in every
+  build (MAN-550).
 - **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
   (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
@@ -203,6 +227,20 @@ counter. Decimation resets filter history and converts gaps with carried
 remainders. Acquisition timing is captured at the radio's start command;
 buffered samples and discarded old-generation samples are accounted for once.
 See `docs/DECISIONS/2026-10-19-man307-hpsdr-multiple-receivers.md`.
+
+**Input conditioning** (MAN-203): `manta-dsp::condition` is an optional chain
+the channelizer runs on each new sample right after the MAN-234 sample guard
+(SPEC §1.3 step 0a), set by `PipelineConfig::conditioning`. Each stage is off
+(the default, bit-identical to no chain), observe or apply, records the
+samples it touched as spans with counters, and has an exact inverse. The
+stages are impulse suppression (isolated runs of up to 4 samples repaired by
+interpolation, with a 21-sample lookahead the channelizer's window watermark
+honours), DC removal (a 5 Hz blocker), then fixed calibrated IQ correction
+(MAN-494). The tone meter reads final post-DC samples before correction; the
+mirror monitor reads each hop and never supplies coefficients. Each input
+carries its own calibration. `check` never conditions, so
+it reports the raw receiver. See
+`docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md`.
 
 **Variable-width capture** (issue #169): an optional decimation stage
 (`manta-dsp::decimate::Decimator`, wrapped as
@@ -389,7 +427,10 @@ Per track, operating on the ~375 Hz complex channel stream:
    the classification/likelihood consumers that want it), tracked with EMA.
    Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
    inter-element and inter-word gap
-   thresholds (dit's speed-detector lesson).
+   thresholds (dit's speed-detector lesson). An optional bank of up to three
+   speed hypotheses (MAN-544, `timing::bank`, off by default) can replace
+   the tracker after a speed step or a mis-locked opening (legacy and
+   edge-legacy engines).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
    the Morse code tree** — small-Viterbi rather than hard thresholding, so a
@@ -488,7 +529,11 @@ transmission may never produce again).
    The independent `data/patterns.lst` is derived from vendored MASTER.SCP:
    `+` means at least two calls share that pattern; a plain entry means one.
    `--patterns` / `[spot].pattern_path` replaces it. Changing `--scp` alone
-   does not change the pattern table. CW operators repeat their calls;
+   does not change the pattern table. With `[spot].pattern_url` set and
+   `refresh_lists` on, `run` from a live receiver downloads a replacement
+   (manta's format or RBN's `Patt3Ch.lst`) every 7 days and swaps it in
+   through the third `ReferenceLists` cell (MAN-542,
+   `docs/DECISIONS/2026-11-09-man542-pattern-list-refresh.md`). CW operators repeat their calls;
    single decodes are overwhelmingly garble. **Deviates from "the same track" (MAN-166,
    `docs/DECISIONS/2026-09-09-man166-confirm-hops-and-track-cap.md`)**: a
    real signal's `track_id` changes across a close+reopen, so repetition is
@@ -762,6 +807,23 @@ sample time. See
   Relayed spots skip manta's validator, keep the source's SNR verbatim and
   are timed by arrival. `docs/DECISIONS/2026-10-27-man320-relay-local-skimmers-and-wsjtx.md`
   records the design.
+- **Spot outputs to PSKReporter and LAN loggers (MAN-142).** Two opt-in
+  `SpotBus::subscribe()` readers, each one tokio task in the tracked
+  `ClientTasks` set, so the shutdown drain awaits its final send.
+  `pskreporter::run` (`[pskreporter]`) batches validated spots into IPFIX
+  datagrams for `report.pskreporter.info:4739` (`pskreporter::ipfix` writes
+  the bytes, `pskreporter::batch` applies PSKReporter's pacing rules: one
+  report per call per band per 300 s, one datagram per 300 s unless it
+  fills). `wsjtx_output::run` (`[[wsjtx_output]]`) sends each spot to a LAN
+  address as WSJT-X `Heartbeat`/`Status`/`Decode`/`Close` datagrams, one
+  instance per band (`manta-<band>`); `relay::wsjtx` drops datagrams with
+  that `Id` prefix as `own_output`. Neither blocks `publish`: a reader that
+  falls behind counts the spots it lost as `lagged` and carries on, and
+  every other loss is counted by reason too. `manta-cli` binds both sockets
+  before anything is spawned (`spot_outputs.rs`), and a file replay reports
+  to PSKReporter only at a loopback host.
+  `docs/DECISIONS/2026-11-03-man142-pskreporter-and-wsjtx-udp-outputs.md`
+  records the design.
 - Both servers are thin fan-out consumers of the spot bus; slow clients
   are disconnected, never back-pressure the pipeline. At shutdown each
   client's queued backlog is drained on a best-effort basis bounded by a
@@ -802,7 +864,7 @@ sample time. See
 ## 8. Configuration & observability
 
 - **Single TOML config** (MAN-261,
-  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with eight
+  `docs/DECISIONS/2026-10-06-man261-config-surface.md`): one file with twelve
   tables — `[server]` (station callsign, which may carry an RBN `-N`
   per-band SSID per
   `docs/DECISIONS/2026-09-07-man-89-station-callsign-ssid-grammar.md`;
@@ -810,7 +872,9 @@ sample time. See
   `[[rbn_uplink]]`, `[rbn_compare]` (MAN-301: live grading against RBN's
   feed; needs `[server]`), `[[skimmer_relay]]` and `[[wsjtx_relay]]`
   (MAN-320: relay a local skimmer's or WSJT-X's spots through an enabled
-  `[[rbn_uplink]]`), `[input]` (source type and its keys, dial frequency,
+  `[[rbn_uplink]]`), `[pskreporter]` and `[[wsjtx_output]]` (MAN-142:
+  spots to PSKReporter and to WSJT-X-aware LAN loggers), `[callsign_lookup]`
+  (MAN-318: withhold calls QRZ.com does not list), `[input]` (source type and its keys, dial frequency,
   capture rate, ppm correction), `[spot]` (watch list, blocklist and notch
   files, and `cty.dat`/`master.scp` overrides), `[detector]` (thresholds, timers, track cap) and `[decode]` —
   read by `run`, `soak`, `doctor`, `check` and `calibrate` (`--config`, else
@@ -1194,8 +1258,9 @@ non-blocking send plus shared atomics and short locks between them.
   input that fails or panics ends only its own thread.
 - **Decoder pool.** Inside `process_hops` the per-hop work (detector,
   ownership, promotion, eviction) is sequential. Then one rayon parallel pass
-  on rayon's global pool drains each active track's `pending` buffer through
-  its decoder: tracks are work items, decoders are independent `Send` state
+  on rayon's global pool drains each active track's lead-in (MAN-199: the
+  recorded hops before its promotion, replayed once) and then its `pending`
+  buffer through its decoder: tracks are work items, decoders are independent `Send` state
   machines with no shared state. The pass is joined before `process_hops`
   returns and its events are sequenced by `(sample_ts, track_id)` (SPEC §6
   rule 6), so thread scheduling never reaches the output. `close_all` runs
@@ -1207,15 +1272,16 @@ non-blocking send plus shared atomics and short locks between them.
   entries, the oldest are dropped back down to `MAX_UNQUALIFIED_BACKLOG`
   (SPEC §2.8; at the default cap of 7500, a 9375-entry high-water mark).
 - **tokio.** `start_spot_server` builds its own multi-thread runtime for
-  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink and
-  the `[rbn_compare]` feed. Only `manta-cli` and `manta-server` depend on
+  telnet, JSON/WebSocket, metrics, the live-state stream, the RBN uplink,
+  the `[rbn_compare]` feed, the relays and the MAN-142 spot outputs
+  (`[pskreporter]`, `[[wsjtx_output]]`). Only `manta-cli` and `manta-server` depend on
   tokio.
 - **Bridge.** The decode thread never awaits. Spots and live-state records
   cross through `SpotBus` (§7): a short `std::sync::Mutex` section and a
   `tokio::sync::broadcast` send, which does not block, so no subscriber
   back-pressures the loop. A lagging telnet, JSON Lines or WebSocket client
-  is disconnected; the internal subscribers (the RBN uplink's forward loop
-  and `[rbn_compare]`) count the missed records and carry on. Counters and
+  is disconnected; the internal subscribers (the RBN uplink's forward loop,
+  `[rbn_compare]` and the MAN-142 spot outputs) count the missed records and carry on. Counters and
   gauges are atomics, plus short `Mutex` sections for RTTY marks and
   per-band maps, that the decode thread writes: server tasks poll
   `ListenObservers` every `ACTIVE_TRACKS_POLL_INTERVAL` (MAN-118 D6), and
@@ -1226,7 +1292,8 @@ non-blocking send plus shared atomics and short locks between them.
   the KiwiSDR connect, the list refresher's DNS lookup); and two background
   threads that hand the validator new lists: `manta-reload` (SIGHUP, through
   `OperatorListsUpdate`) and `manta-lists` (`[spot].refresh_lists`, through
-  `ReferenceLists`). The decode thread picks those up before it feeds the
+  `ReferenceLists`, whose three cells hold `cty.dat`, `MASTER.SCP` and the
+  callsign-pattern list). The decode thread picks those up before it feeds the
   validator its next event. `manta-lookup` (`[callsign_lookup]`, MAN-318)
   does QRZ.com's HTTPS requests and hands answers back through a channel
   the decode thread polls once per batch, never waiting on it; only after
@@ -1279,3 +1346,31 @@ consecutive overflows surfaces, as a lost connection
 warning). Until the trigger fires the synchronous loop stays: it is
 deterministic by construction and has no thread boundary between pipeline
 stages to get wrong.
+
+### Delayed refinement (MAN-208)
+
+Every decode path feeds a batch's decoder events to the validator, then runs
+one refinement pass over retained ambiguous words. On a single input
+(`listen`, and the offline `decode_source_observed` loop, which validates each
+batch as it is produced) the pass is `TrackManager::refine_step`; the manager
+records decoder inputs in per-track FIFOs before draining its decoder pool. In
+a multi-input session each front end exports those inputs on the common clock
+with its batch (`Batch::refine_feed`), and the shared back end retains them
+beside the one validator (`SharedRefine`). The pass's clock is its owner's
+stream position, never a batch event's timestamp. Input gaps clear retention
+(only the gapped input's tracks on the multi-input path); closed tracks lose
+their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
+The ceiling evicts the oldest ring front from an ordered index and keeps a
+running count, so recording costs O(log tracks), not a scan of every ring
+([MAN-525](docs/DECISIONS/2026-11-08-man525-refine-bookkeeping-cost.md)).
+
+`validator → refinement candidates → retained hops → scratch TrackDecoder →
+Validator::apply_refinement → spot sink` is a feedback path over preserved
+observations. Revisions keep the original occurrence and span. Moving support
+between callsigns never creates a repetition. The RF timestamp is the newest
+supporting occurrence's timestamp; the observation's decision timestamp is when
+the replay completes. The scheduler pauses its scratch decoder at the batch hop
+budget and resumes it next batch. It expires episode bookkeeping with the
+validator window. Metrics travel through the atomic decode-quality observer.
+See the [decision record](docs/DECISIONS/2026-11-05-man208-delayed-refinement.md)
+for the current scope and measurement limits.

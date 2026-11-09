@@ -32,8 +32,9 @@ apply them only when `--config` or `MANTA_CONFIG` names a file. Given
 variable: they dial that address even when `MANTA_CONFIG` names a missing or
 invalid file, and check neither the file nor the variables. `decode`,
 `oracle` and `bench sensitivity` read only the file `--config` names and never
-the environment, so their output does not depend on it. `[[rbn_uplink]]` cannot be
-set from the environment. `[callsign_lookup]` can, through
+the environment, so their output does not depend on it. `[[rbn_uplink]]`,
+`[[skimmer_relay]]`, `[[wsjtx_relay]]`, `[pskreporter]` and `[[wsjtx_output]]`
+cannot be set from the environment. `[callsign_lookup]` can, through
 `MANTA_CALLSIGN_LOOKUP_*`, so the QRZ.com password can stay out of the file. An unknown table, key or `MANTA_*` variable is an
 error that names it; `MANTA_GIT_SHA` and `MANTA_FEATURES` are build-time
 variables and are skipped at run time.
@@ -57,14 +58,14 @@ listed here change what the command does.
 
 | Command | Tables it applies | Environment |
 |---|---|---|
-| `run` (alias `listen`) | all ten | yes |
+| `run` (alias `listen`) | all twelve | yes |
 | `soak` | `[input]` `[spot]` `[detector]` `[decode]`; `[server]` is ignored with a note | yes |
 | `doctor` | `[input]` `[spot]` `[detector]` `[decode]`, plus `[server]`, `[[rbn_uplink]]` and `[rbn_compare]` to check them without starting a server or logging in (MAN-126; see [RUNBOOKS/setup-checks.md](RUNBOOKS/setup-checks.md)) | yes |
-| `config check` | all ten, resolved exactly as `run` resolves them | yes |
+| `config check` | all twelve, resolved exactly as `run` resolves them | yes |
 | `check` | `[input]`: the source, `capture_rate_hz` and `center_freq_hz` | yes |
 | `status` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
 | `health` | `[server]` `metrics_bind_addr` and `metrics_port`, to find the daemon's `/healthz`; a named config that resolves to no `[server]` table is an error | yes, but `MANTA_SERVER_*` only alongside a config file; `--addr` loads no config file and applies no `MANTA_*` variable |
-| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm`; several `[[input]]` entries that disagree on it need `--freq-correction-ppm` | no |
+| `decode` | `[decode]` `[detector]` `[spot]` and `input.freq_correction_ppm` plus `input.dc_block`, `input.impulse_suppress` and the IQ keys; entries that disagree on ppm need `--freq-correction-ppm`; conflicting conditioning settings require a config for the recording's receiver | no |
 | `oracle` | `[decode]` | no |
 | `bench sensitivity` | `[decode]` `[detector]` | no |
 | `grade` | `[rbn_compare]` `window_secs`, the tolerances and the spotter lists, from the file `--config` names; its flags win | no |
@@ -106,8 +107,9 @@ with a `[server]` table) re-reads the file and applies `[spot]` `allowlist`,
 `blocklist_path` and `notch_path`, and each `[[rbn_uplink]]` block's `dry_run`.
 Every other key, `cty_path`, `scp_path` and the list-refresh keys included,
 needs a restart; a reload logs the changed keys it did not apply. A
-`refresh_lists` download replaces `cty.dat` or `MASTER.SCP` on its own
-schedule, not on `SIGHUP`. A file that fails the checks above is
+`refresh_lists` download replaces `cty.dat`, `MASTER.SCP` or, with
+`pattern_url` set, the callsign-pattern list on its own schedule, not on
+`SIGHUP`. A file that fails the checks above is
 logged and ignored. See
 [DECISIONS/2026-10-10-man78-live-reload.md](DECISIONS/2026-10-10-man78-live-reload.md).
 
@@ -293,6 +295,107 @@ manta.toml: [[wsjtx_relay]] 127.0.0.1:2237 is listed twice
 manta.toml: [[wsjtx_relay]]: listen "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
 ```
 
+## [pskreporter]
+
+Reports validated spots to PSKReporter (pskreporter.info) as IPFIX datagrams
+over UDP, in the format PSKReporter's developer page describes (MAN-142).
+Each report carries the spotted call, its RF frequency in whole Hz, the SNR
+(manta's 2500 Hz figure, rounded), the mode (`CW`, or `RTTY`) and the spot's
+time. The receiver is `[server].station_callsign` without its `-N` SSID, at
+the `[server]` locator, with decoding software `manta <version>` and
+`antenna`. PSKReporter's own rules set the pace: each call is reported at
+most once per band every 300 s, and manta sends at most one datagram every
+300 s (sooner only when a datagram would pass 1400 bytes), never when nothing
+is pending. The first datagram goes out 300 to 329 s after startup. At
+shutdown manta sends what is still pending.
+
+An enabled table needs `[server]` with a location: `operator_grid`, or
+`operator_lat` and `operator_lon`. The environment cannot set these keys.
+Every key needs a restart; a SIGHUP never applies them. `doctor` does not
+check this table.
+
+**Reports are public.** Anyone can see them on PSKReporter's map and
+statistics pages, under the station call at its locator. That is why
+`enabled` defaults to `false`. Do not also report the same call from WSJT-X,
+JTDX or CW Skimmer: PSKReporter would get every spot twice.
+
+**File replay.** A file replay reports only to a loopback `host`
+(`127.0.0.0/8` or `localhost`), so a recording's spots never reach the public
+map. With any other host, `manta run` prints this note and starts no
+reporter (the metric families still show, at 0):
+
+```
+note: [pskreporter] is off for file replay: report.pskreporter.info is not a loopback address, and a recording's spots must not reach PSKReporter's public map
+```
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `enabled` | `false` | live: `run` with `[server]` | `true` reports spots publicly to PSKReporter. |
+| `host` | `"report.pskreporter.info"` | live: `run` with `[server]` | PSKReporter's collector, or a local test listener's IPv4 address. Resolved when the first datagram is due and again hourly; never at startup. IPv6 addresses are rejected: PSKReporter has none. |
+| `port` | `4739` | live: `run` with `[server]` | PSKReporter's IPFIX port. `14739` is PSKReporter's packet-analysis test listener. |
+| `antenna` | `""` | live: `run` with `[server]` | Shown on PSKReporter's map, e.g. `"Inverted V at 12 m"`. At most 254 bytes, no control characters; empty sends an empty field. |
+| `spot_types` | `"cq_beacon"` | live: `run` with `[server]` | `cq_beacon` (CQ and beacon spots) or `all`, as for `[[rbn_uplink]]`. |
+
+Load errors (exit 1, from `config check`, `run`, `doctor` and a SIGHUP
+reload alike):
+
+```
+manta.toml: [pskreporter] needs a [server] table (it reports the spots the servers publish)
+manta.toml: [pskreporter] is enabled but [server] has no location -- set [server].operator_grid (e.g. "EM10dh") or operator_lat and operator_lon; PSKReporter places every report at the receiver's locator
+manta.toml: [pskreporter]: host is empty -- set PSKReporter's host name ("report.pskreporter.info") or a test listener's IPv4 address
+manta.toml: [pskreporter]: host "::1" is an IPv6 address -- PSKReporter has no IPv6 address; use a host name or an IPv4 address
+manta.toml: [pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 (14739 for its test listener)
+manta.toml: [pskreporter]: antenna is 300 bytes; PSKReporter keeps at most 254
+manta.toml: [[pskreporter]] is not supported -- use a single [pskreporter] table
+MANTA_PSKREPORTER_ENABLED: [pskreporter] cannot be set from the environment; use the config file
+```
+
+## [[wsjtx_output]]
+
+Sends every validated spot to `destination` as WSJT-X UDP `NetworkMessage`
+datagrams (schema 3), for loggers that already listen for WSJT-X, such as
+GridTracker or JTAlert (MAN-142). Each band is its own WSJT-X instance,
+`manta-20m`, `manta-40m` and so on (`manta-unknown` outside the amateur
+bands). manta sends a `Heartbeat` when an instance first appears and every
+15 s after, a `Status` (dial frequency, mode `CW` or `RTTY`, the station call
+and grid) before a spot on a new kHz or mode and after each heartbeat, one
+`Decode` per spot (`CQ <call>` for a CQ spot, `DE <call>` for every other
+type; the 2500 Hz SNR; `Low confidence` for a tentative spot), and a `Close`
+per instance at shutdown. It never sends `QSO Logged` or `Logged ADIF`, and
+never reads from the socket.
+
+Every block may be repeated with another `destination`. An enabled block
+needs `[server]`; the environment cannot set these keys. Every key needs a
+restart; a SIGHUP never applies them. `doctor` does not check this table. A
+file replay runs it, with WSJT-X's `Off air` flag set on every `Decode`.
+
+**Anyone on the network can read it.** A unicast `destination` reaches one
+host. A broadcast address (manta sets `SO_BROADCAST`) or a multicast group
+(TTL 1, loopback on) reaches every host on the local segment. See
+[RUNBOOKS/network-exposure.md](RUNBOOKS/network-exposure.md).
+
+**Sharing a multicast group.** If WSJT-X, a logger and manta's own
+`[[wsjtx_relay]]` already share a group such as `224.0.0.1:2237` (see the
+`[[wsjtx_relay]]` section above), point `destination` at the same group.
+`[[wsjtx_relay]]` ignores every datagram whose `Id` starts with `manta-`,
+counts it as `own_output`, and never forwards it to the uplink.
+
+| Key | Default | Wired | Notes |
+|---|---|---|---|
+| `destination` | none; example `"127.0.0.1:2237"`; required | live: `run` with `[server]` | A logger's `IP:port`, an IPv4 broadcast address such as `192.168.1.255:2237`, or an IPv4 multicast group such as `224.0.0.1:2237`. Port `0`, `0.0.0.0`, `::` and IPv6 multicast are rejected. |
+| `enabled` | `true` | live: `run` with `[server]` | `false` keeps the block but sends nothing. |
+
+Load errors (exit 1, from the same entry points as `[pskreporter]`'s):
+
+```
+manta.toml: [[wsjtx_output]] needs a [server] table (it sends the spots the servers publish)
+manta.toml: [[wsjtx_output]] 192.168.1.255:2237 is listed twice
+manta.toml: [[wsjtx_output]]: destination "0.0.0.0:2237" is not an address manta can send to -- use a logger's address, a broadcast address such as "192.168.1.255:2237", or a multicast group such as "224.0.0.1:2237"
+manta.toml: [[wsjtx_output]]: destination "[ff02::1]:2237" is an IPv6 multicast group -- use an IPv4 group such as "224.0.0.1:2237", or a unicast address
+manta.toml: wsjtx_output must be written [[wsjtx_output]] (an array of tables)
+MANTA_WSJTX_OUTPUT_DESTINATION: [[wsjtx_output]] cannot be set from the environment; use the config file
+```
+
 ## [callsign_lookup]
 
 Spots only callsigns QRZ.com lists (MAN-318), off by default. A call QRZ.com
@@ -364,17 +467,36 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. On an SDRplay this is an attenuation scale: a higher value is less sensitive, and `0` is the most sensitive setting. On the RSP1B measured, `40` already puts the IF stage at its maximum reduction and `46` to `48` failed to start the stream ([gain record](DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md)). |
 | `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr unless `bands` is set | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
-| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
+| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. `"all"` is 160m to 10m, plus 6m when `tuning_range_hz` overlaps its segment (MAN-543). See [Band plans: bands](#band-plans-bands) (MAN-310). |
 | `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
 | `receivers` | none; example `4` | live: `type = "hpsdr"` | Optional hardware capacity declaration, integer 1 to 255, on the first entry for a radio only. Shared HL2 radios report capacity at startup; other gateware needs this fallback. The smaller reported/declared count applies. This is not the active receiver count. |
 | `group` | none; example `"239.101.6.1"`; required for ka9q | live: `type = "ka9q"` | Multicast data group of one ka9q-radio (radiod) IQ channel: an IPv4 multicast address, or the name in the channel's `data =` line, resolved by the system resolver when the source opens. Checked when the file loads; an IPv6 group is refused. manta reads the channel's sample rate, encoding and frequency from radiod's status packets. `--ka9q-group` overrides it. |
 | `ssrc` | none; example `14100000`; unset reads the group's only channel | live: `type = "ka9q"` | SSRC of the channel to read, 0 to 4294967295; needed only when the group carries more than one channel. `--ka9q-ssrc` overrides it. |
 | `interface` | none; example `"192.168.1.20"`; unset joins on the kernel's choice | live: `type = "ka9q"` | IPv4 address of the local interface to join the group on (an interface name is refused). manta also joins on `127.0.0.1`, for a radiod on the same machine. `--ka9q-interface` overrides it. |
+| `iq_correction` | `"off"` | live: `decode`, `run`, `soak`; restart required | `off`, `observe` or `apply`. Observe never changes samples. Apply requires the complete controlled-tone calibration triple below. |
+| `iq_gain_ratio` | none; example `1.05` | per input; restart required | Finite gain ratio, 0.5 through 2.0. Supply all three calibration values together. |
+| `iq_phase_deg` | none; example `2.0` | per input; restart required | Finite phase error, -45 through 45 degrees, from a controlled tone. Remeasure after a receiver gain change. |
+| `iq_calibrated_center_hz` | none; example `14000000.0` | per input; restart required | Finite positive receiver centre in Hz when measured. Apply requires actual source centre agreement within 1 Hz. A mismatch leaves samples unchanged and warns once per input, including reconnects. Calibration is refused with `bands`. |
 | `freq_correction_ppm` | `0.0` | live: `run`, `soak`, `doctor`, `decode`; dropped when a source flag replaces a typed `[input]` | Oscillator correction, ppm, -1000 to 1000. `--freq-correction-ppm` overrides it. |
+| `digital_modes` | `[]` | `run` only; any type; restart required | Decode `"FT8"`, `"FT4"` or both from windows fully inside this input's usable passband. Needs a build with `--features ftx` and a `[server]` table; unknown or repeated modes are refused. `MANTA_INPUT_DIGITAL_MODES='["FT8"]'` overrides the file. Startup lines say which windows are decoded or skipped. Spots go only to the [JSON stream](SPOT-SCHEMA.md). Keep the system clock synchronised to network time; the first FT8 spot can take up to 30 s because the partial startup slot is skipped. One FT8 window cost about 4% of one core at 96 kS/s in the MAN-323 prototype; FT4 doubles the decode rate on 7.5 s slots. |
+| `dc_block` | `"off"` | live: `decode`, `run`, `soak`; restart required | The DC-removal input-conditioning stage's mode: `off`, `observe` (measure and annotate, never write a sample) or `apply` (correct the samples and annotate them). MAN-496; `decode --json` reports what ran as `inputConditioning`. See [docs/DECISIONS/2026-11-03-man203-reversible-input-conditioning.md](DECISIONS/2026-11-03-man203-reversible-input-conditioning.md). |
+| `impulse_suppress` | `"off"` | live: `decode`, `run`, `soak`; restart required | The short-impulse-suppression conditioning stage's mode: `off`, `observe` or `apply` (repair isolated runs of a few samples, keeping the originals in the log). MAN-496. |
+| `cw_segments_hz` | none; example `[[14000000, 14030000], [14040000, 14060000]]`; unset keeps full CW coverage | live: `run`, `decode`; restart required | Inclusive calibrated RF ranges, Hz, in which manta decodes CW; an empty list pauses CW decoding. MAN-30; see [CW sub-segments and UTC schedules](#cw-sub-segments-and-utc-schedules) below. |
+| `cw_schedule` | none; example `[]` | live: `run`, `decode`; restart required | Daily `[[input.cw_schedule]]` entries (`at_utc`, `segments_hz`) that replace the base ranges from that UTC time. MAN-30. |
+| `cw_overrides` | none; example `[]` | live: `run`, `decode`; restart required | Dated `[[input.cw_overrides]]` entries that replace the base and daily ranges during an absolute UTC interval. MAN-30. |
 | `center_freq_hz` | none; example `14030000.0`; unset leaves frequencies as audio offsets, and `run` with `[server]` refuses a source that carries no frequency of its own | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Your radio's dial frequency, Hz, for a source that carries none. `--dial-freq-hz` overrides it. |
 | `capture_rate_hz` | none; example `48000.0`; unset decodes at the receiver's own rate | live: `run`, `soak`, `doctor`, `check`; dropped when a source flag replaces a typed `[input]` | Decimated sample rate, Hz. It must be at least 1000 (checked before the receiver opens), divide the receiver's rate by a power of two, and be 93.75 Hz (the channel spacing) times a power of two of at least 4, so in practice 1500, 3000, 6000, 12000, 24000, 48000, 96000 and so on. A rate that divides evenly but fails the last rule, such as 50000 from a 100 kS/s receiver, is rejected at startup. The decimator's transition band (the outer ~9.4% of each side, 24 of 256 channels at 48 kS/s — beyond the <= 1 dB point at 0.4526 x the rate) is not usable: the reported passband, `manta check`, SETT segments and tracked channels stop at the trusted band, and `run`/`soak` say so in one startup line naming the source's intersected passband. `--capture-rate-hz` overrides it. |
 | `replay_epoch` | none; example `1700000000`; unset uses the file's modification time | live: `run` with `[server]` and a file source; ignored elsewhere | Unix seconds that the recording's first sample stands for. `--replay-epoch` overrides it. |
+
+The IQ keys also work in each `[[input]]` entry. Each input keeps its own
+calibration. A recording decoded with multiple entries must have identical IQ
+settings in every entry, or `decode` refuses the ambiguous configuration.
+`MANTA_INPUT_IQ_CORRECTION=observe` and the three numeric environment overlays
+use the same validation as the file. All four keys require a restart.
+`check` and frequency `calibrate` inspect raw samples. IQ values come from a
+controlled tone capture, never from a suspected mirror in ordinary traffic.
+The doctor measurement command is separate work in MAN-495.
 
 ### HPSDR protocol 2
 
@@ -469,6 +591,7 @@ type = "kiwi"
 host = "kiwi.example.net"
 bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
 #tuning_range_hz = [3000000.0, 30000000.0]
+#bands = ["6m"] with tuning_range_hz = [0.0, 61440000.0] (hpsdr or soapy that tunes 50 MHz)
 ```
 
 The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;
@@ -488,6 +611,16 @@ beacon. The segment limits are not configurable.
 | 15m | 21000–21070 | 21150 | 21000–21150 |
 | 12m | 24890–24915 | 24930 | 24890–24930 |
 | 10m | 28000–28070 | 28200 | 28000–28200 |
+| 6m | 50000–50100 | – | 50000–50100 |
+
+6m is the one band above 30 MHz (MAN-543). Its segment is the CW-only part
+of the 6 m band plans, and its bottom is the 6 m beacon sub-band, so beacon
+callsigns are spotted from it. NCDXF has no 6 m beacon. To skim 6m, set
+`tuning_range_hz` to reach it (the default stops at 30 MHz), and give the
+stream at least 110.5 kHz (192000 Hz in practice): at 96000 Hz it is two
+streams, which an hpsdr or soapy entry refuses. `"all"` adds 6m only when
+`tuning_range_hz` overlaps its segment. See
+[the 6m decision record](DECISIONS/2026-11-08-man543-6m-band.md).
 
 How a plan is made:
 
@@ -505,7 +638,9 @@ How a plan is made:
   the cross-input dedupe spots it once. A running track is never stopped.
 - **Tuning range.** A band outside `tuning_range_hz` is skipped, a band
   partly outside it is clipped, and a bare centre outside it is skipped,
-  each with a note. Nothing left to skim is an error.
+  each with a note. Nothing left to skim is an error. `"all"` is 160m to
+  10m, plus 6m when `tuning_range_hz` overlaps its segment, so the default
+  range never adds a 6m note.
 - **Repeats.** A band listed twice, a band `"all"` already includes, or a
   bare centre inside a listed band is refused.
 
@@ -608,9 +743,11 @@ per receiver. Each entry takes the keys above, plus `name`. A one-entry
 
 Which decodes become spots. `allowlist`, `blocklist_path` and `notch_path`
 reload on SIGHUP; every other key needs a restart. With `refresh_lists` on,
-`run` from a live receiver also replaces `cty.dat` and `MASTER.SCP` on its
-own schedule. See
-[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md).
+`run` from a live receiver also replaces `cty.dat`, `MASTER.SCP` and, when
+`pattern_url` is set, the callsign-pattern list on its own schedule. See
+[DECISIONS/2026-10-12-man316-reference-list-refresh.md](DECISIONS/2026-10-12-man316-reference-list-refresh.md)
+and
+[DECISIONS/2026-11-09-man542-pattern-list-refresh.md](DECISIONS/2026-11-09-man542-pattern-list-refresh.md).
 
 | Key | Default | Wired | Notes |
 |---|---|---|---|
@@ -620,15 +757,16 @@ own schedule. See
 | `cty_path` | none; example `"cty.dat"`; unset uses the built-in `cty.dat` | live: `run`, `soak`, `doctor`, `decode` | AD1C's country-prefix file. A relative path set in the file is relative to the file's directory; from `--cty`, which overrides it, or `MANTA_SPOT_CTY_PATH` it is relative to the working directory. See [DECISIONS/2026-10-10-man79-operator-cty-scp-override.md](DECISIONS/2026-10-10-man79-operator-cty-scp-override.md). |
 | `scp_path` | none; example `"MASTER.SCP"`; unset uses the built-in `master.scp` | live: `run`, `soak`, `doctor`, `decode` | Known-callsign list that raises confidence. A relative path set in the file is relative to the file's directory; from `--scp`, which overrides it, or `MANTA_SPOT_SCP_PATH` it is relative to the working directory. |
 | `calls_heard_path` | none; example `"calls-heard.txt"` | restart-only: `run`, `soak`, `doctor`, `decode` | Optional local calls-heard file. One CALL per line with an optional count, e.g. `W1AW 12`. Blank and `#`/`!!` comment lines are skipped; a missing file supplies no frequency evidence. Relative paths resolve against the config file directory, or the working directory for `MANTA_SPOT_CALLS_HEARD_PATH`. SIGHUP does not reload this file. No download is performed. |
-| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url`, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
-| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
+| `refresh_lists` | `false` | live: `run` with a live source; file replay ignores it | Downloads `cty.dat` every 7 days and `MASTER.SCP` every day from `cty_url` and `scp_url` and, when `pattern_url` is set, the callsign-pattern list every 7 days, with `If-Modified-Since`. A download replaces the list in use only after it parses and passes the completeness checks; a failed or rejected one is logged as a `warning: list refresh:` line, counted in `manta_list_refresh_total{outcome="failed"}` and retried an hour later, and the list in use stays. Skipped for a list that `cty_path`/`scp_path`/`pattern_path` or `cty_sha256`/`scp_sha256` sets. `soak`, `decode` and file replay never download. Needs outbound TCP port 80. |
+| `list_cache_dir` | none; example `"/var/cache/manta"`; unset keeps downloads in memory only | live: `run` with a live source; file replay ignores it | Where accepted downloads are kept (`cty/<sha256>.dat`, `scp/<sha256>.scp`, `patterns/<sha256>.lst`, each list's `state.json`; the 30 newest versions per list), so a restart starts from the last good download. `cty_sha256`/`scp_sha256` pins also look here, for every validating command, when `cty_path`/`scp_path` is not set. A relative path set in the file is relative to the file's directory; from `MANTA_SPOT_LIST_CACHE_DIR` it is relative to the working directory. The systemd unit and Compose file set it to `/var/cache/manta`. |
 | `cty_url` | `"http://www.country-files.com/cty/cty.dat"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `cty.dat`. Only `http://` URLs: `https://` is refused at load, because manta has no TLS support. Redirects and chunked responses count as failures. Point it at a local mirror to share one download. |
 | `scp_url` | `"http://www.supercheckpartial.com/MASTER.SCP"` | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads `MASTER.SCP`. Same rules as `cty_url`. |
+| `pattern_url` | none; example `"http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"`; unset downloads no pattern list | live: `run` with a live source; file replay ignores it | Where `refresh_lists` downloads the callsign-pattern list, checked every 7 days under the same rules as `cty_url`. Unset: the pattern list is never downloaded. Not used when `pattern_path` is set. Accepts manta's `[+]PATTERN` format and RBN's `Patt3Ch.lst`; lines longer than 7 characters or in a shape manta's rule never produces are skipped and counted in the `updated` line. A download that is not pattern-shaped, lacks a canary call's pattern or lists under half the built-in copy's patterns is rejected. Changing it changes which calls need 2, 3 or 5 repetitions; see [DECISIONS/2026-11-09-man542-pattern-list-refresh.md](DECISIONS/2026-11-09-man542-pattern-list-refresh.md). `MANTA_SPOT_PATTERN_URL` sets it. |
 | `cty_sha256` | none; example `"e9ff91a3c3ab28c5f7dbcffb4280944a84645ed53d41cb4c68a41f132ee13fd1"`; unset uses `cty_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `cty.dat` whose SHA-256 is this (64 hex digits, as in the `lists:` log line). If `cty_path` is set, that file must match and nothing else is tried; otherwise manta looks in the built-in copy, then `list_cache_dir`. manta stops before reading the source if no copy matches. A pinned list is never refreshed. `--cty-sha256` overrides it; `MANTA_SPOT_CTY_SHA256` sets it. |
 | `scp_sha256` | none; example `"00692208fa86b1498dcd6fc0f88e14d2a1a0462ba5d481855da5de69be4e3cf0"`; unset uses `scp_path`, the cache or the built-in copy | live: `run`, `soak`, `doctor`, `decode` | Use exactly the `MASTER.SCP` whose SHA-256 is this, looked up like `cty_sha256`. `--scp-sha256` overrides it; `MANTA_SPOT_SCP_SHA256` sets it. |
 | `validation_level` | `"normal"` | live: `run`, `soak`, `doctor`, `decode` | `"normal"`: 2 repetitions for a common pattern, 3 for a listed pattern, 5 for an unlisted pattern. `"minimal"`: 2 for every call. Allowlisted calls and beacons are exempt. Advertised to the Aggregator as `vlNormal` or `vlMinimal`. `MANTA_SPOT_VALIDATION_LEVEL` overrides the file for live commands. |
 | `repetition_fusion` | `false` | restart-only: `run`, `soak`, `doctor`, `decode` | `true` lets damaged copies of one station's CQ, DE or UP self-ID count toward its repetition requirement. Copies on one input within one channel (93.75 Hz) and 90 s, each at most 2 edits from every other, are lined up character by character. A call is confirmed when every position holds a strict majority of the copies with a lead of at least half a copy, from at least as many separate messages as the call's pattern tier needs. Copies of the same samples (a replay, a second track on one signal) count once. No character is used that no copy read or listed as an alternative. The confirmed call then passes the usual checks, and its `candidateDecision` carries `"confirmation": "fused"`. The default stays off until recorded and live RBN regression gates pass. `MANTA_SPOT_REPETITION_FUSION` overrides the file for live commands. See [DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md](DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md). |
-| `pattern_path` | none; example `"patterns.lst"`; unset uses the built-in list | live: `run`, `soak`, `doctor`, `decode` | Callsign-pattern list, independent of `scp_path`. One pattern per line; `+K5@@@` marks a common pattern, `K5@@@` a listed one. Leading `#` starts a comment; `@` represents a letter, `#` a digit after the literal prefix. A relative path set in the file is relative to the file's directory; `--patterns` or `MANTA_SPOT_PATTERN_PATH` overrides it relative to the working directory. |
+| `pattern_path` | none; example `"patterns.lst"`; unset uses the built-in list | live: `run`, `soak`, `doctor`, `decode` | Callsign-pattern list, independent of `scp_path`. One pattern per line; `+K5@@@` marks a common pattern, `K5@@@` a listed one. Leading `#` starts a comment; `@` represents a letter, `#` a digit after the literal prefix. A relative path set in the file is relative to the file's directory; `--patterns` or `MANTA_SPOT_PATTERN_PATH` overrides it relative to the working directory. `pattern_path` takes manta's format only; to use RBN's list, set `pattern_url`. A set `pattern_path` is never refreshed. |
 
 ## [detector]
 
@@ -726,6 +864,7 @@ the measured best values.
 | `spectral_min_bias_db` | `1.5` | live: edge-legacy and hsmm; not `oracle` | Neighbouring-channel noise correction, dB. |
 | `spectral_beta` | `0.5` | live: edge-legacy and hsmm; not `oracle` | Weight of the neighbouring-channel noise estimate; 0 or more. |
 | `refine_bw_hz` | `0.0` | live: every engine; not `oracle` | Narrowband refiner bandwidth before decoding, Hz; 0 or more, and `0` turns it off. The track manager applies it, and `oracle` decodes without one. |
+| `refine` | `{ enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }` | every engine | Delayed refinement of ambiguous decodes, as the `[decode.refine]` sub-table; an absent sub-table means these documented defaults, and `enabled = false` restores the pure causal baseline. |
 | `dur_sigma` | `0.22` | live: hsmm only | Element-length tolerance; at least 0.001. See [SPEC-v2 §7](SPEC-decode-core-v2.md#7-configuration-keys-v1-9-additive). |
 | `mark_insert_penalty` | `-1.5` | live: hsmm only | Penalty against reading noise as an extra element. |
 | `beam` | `12` | live: hsmm only | Hypotheses kept per step; at least 1. |
@@ -755,3 +894,70 @@ The loader also rejects `[detector] guard_hz`, which SPEC §9 does not list:
 it is the internal DC/Nyquist spawn guard, set from the input source
 (600 Hz for live audio, 0 otherwise; see
 [MAN-273](DECISIONS/2026-10-16-man273-hilbert-image-guard.md)).
+
+### CW sub-segments and UTC schedules
+
+Each `[input]` or `[[input]]` can restrict CW decoder coverage. These fields
+never retune a receiver. They reduce per-track work, not the full-passband FFT
+cost. Capture and tuning coverage do not promise active CW coverage.
+
+```toml
+[[input]]
+name = "20m"
+type = "kiwi"
+host = "kiwi.example.org"
+port = 8073
+freq_hz = 14050000
+cw_segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "06:00"
+segments_hz = [[14000000, 14060000]]
+
+[[input.cw_schedule]]
+at_utc = "18:00"
+segments_hz = [[14000000, 14030000], [14040000, 14060000]]
+
+[[input.cw_overrides]]
+start_utc = 2026-11-28T00:00:00Z
+end_utc = 2026-11-30T00:00:00Z
+segments_hz = [[14000000, 14060000]]
+```
+
+`cw_segments_hz` lists inclusive absolute RF ranges in Hz. Omit it for current
+coverage; an empty list disables CW decoding for this input. Every range needs
+two finite, positive endpoints with lower < upper. Overlapping or touching
+ranges are combined. Ranges outside the captured passband contribute no coverage;
+a band-plan entry can span several streams.
+
+`cw_schedule` selects the most recent daily `at_utc`, including yesterday's last
+entry before today's first switch. Use exactly `HH:MM`, `00:00` through `23:59`,
+without duplicate times. UTC has no daylight-saving adjustment. Each entry
+replaces the base ranges rather than adding to them.
+
+`cw_overrides` replaces daily or base coverage during an absolute interval,
+including its start and excluding its end. Use UTC TOML datetimes with `Z`, whole
+seconds, from 1970 through 2100-01-01. Intervals must not overlap; adjacent
+intervals are valid. At an interval's end, the current daily or base coverage
+resumes. Empty `segments_hz` pauses CW decoding.
+
+Membership uses the calibrated RF estimate, with the estimator's existing
+boundary uncertainty. Trusted-band, analytic-image and digital-window vetoes
+still apply. Decoding inside a default digital exclusion also needs the existing
+`digital_window_filter` setting to permit it. Newly admitted signals acquire
+normally. Excluded tracks release their decoders without flushing a final word.
+Retained tracks keep their state. Acquisition, spectrum and other modes continue.
+
+Live inputs switch before the first processing batch after the UTC boundary.
+A blocked read postpones processing; resumed processing selects current coverage.
+File inputs use replay epoch plus sample time, even with realtime playback.
+Scheduled legacy files require `replay_epoch`; native recordings can use their
+recorded epoch. Looped files use the advancing session sample clock. Replay
+boundaries split decoder batches so excluded input never reaches a decoder.
+
+Policy edits require restart. Loaded schedules switch automatically without
+signals on all supported operating systems. SIGHUP reports edits as restart-only.
+Use `manta config check --config <file>` to validate. No new RBN registration
+exchange is provided. Local timezones, recurring weekday rules and sunrise/sunset
+scheduling are deferred. Removing the keys and restarting restores old coverage;
+remove them before downgrading to a version that does not recognize them.

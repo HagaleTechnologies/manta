@@ -1,13 +1,11 @@
 //! Operator output contracts. Machine values are intentionally not rounded.
+#[path = "common/launch.rs"]
+mod launch;
+
 use std::process::{Command, Output};
 
 fn manta() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            cmd.env_remove(key);
-        }
-    }
+    let mut cmd = launch::manta();
     cmd.env_remove("RUST_LOG");
     cmd
 }
@@ -136,10 +134,15 @@ fn config_inspection_keeps_quotes_exact_values_and_redaction() {
 }
 
 fn fixture(dir: &std::path::Path) -> std::path::PathBuf {
-    let spec = manta_testkit::vectors::VectorSpec {
+    let mut spec = manta_testkit::vectors::VectorSpec {
         duration_s: 30.0,
         ..manta_testkit::vectors::v1()
     };
+    // MAN-199: with the lead-in the decoder hears V1's clean 20 WPM keying
+    // from its first mark and estimates exactly 20.0, which the raw-JSON
+    // checks below cannot tell from a rounded value. An off-grid speed
+    // keeps them meaningful.
+    spec.signals[0].wpm = 21.0;
     manta_testkit::vectors::write_fixture_set(&spec, dir).unwrap();
     dir.join("v1.wav")
 }

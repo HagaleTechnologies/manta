@@ -24,7 +24,7 @@ use manta_testkit::scene::{render_scene, SignalSpec};
 /// so the whole clip ended with zero tracks and `decode_samples` returned
 /// "no signal found". Not a CER problem, a scene-construction gap exposed
 /// by wiring the real detector in (Task 11 Step 0,
-/// docs/superpowers/plans/2026-07-19-m2-detector-track-pool.md).
+/// docs/archive/plans/plans/2026-07-19-m2-detector-track-pool.md).
 ///
 /// First tried: keep the once-keyed "AB" and prepend a silent lead-in
 /// comfortably over the 2.05 s floor. Measured and rejected: with a

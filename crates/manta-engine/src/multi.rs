@@ -125,6 +125,8 @@ pub struct InputObservers {
     pub static_crashes: Option<Arc<AtomicU64>>,
     /// Input samples replaced as unusable on this input (MAN-234).
     pub bad_samples: Option<Arc<AtomicU64>>,
+    /// Exact input-conditioning counts across segments.
+    pub conditioned: Option<Arc<crate::ConditioningObserver>>,
     /// This input's marked RTTY signals.
     pub rtty: Option<Arc<RttyObserver>>,
     /// MAN-141: this input's spectrum tap (`ListenObservers::spectrum`,
@@ -139,6 +141,10 @@ pub type InputOpener = Box<dyn FnOnce() -> Result<Box<dyn IqSource>> + Send>;
 
 /// One input to open.
 pub struct InputSpec {
+    /// This input's CW coverage, independent of the other inputs.
+    pub cw_policy: crate::cw_segments::Policy,
+    /// Fixed conditioning for this receiver, never borrowed from another input.
+    pub conditioning: crate::ConditioningConfig,
     /// The input's `[[input]]` name: thread name, log and error text.
     pub name: String,
     pub open: InputOpener,
@@ -241,6 +247,8 @@ struct Parked {
 pub struct OpenedInputs {
     inputs: Vec<OpenedInput>,
     ppm: Vec<f64>,
+    cw_policies: Vec<crate::cw_segments::Policy>,
+    conditioning: Vec<crate::ConditioningConfig>,
     observers: Vec<InputObservers>,
     parked: Vec<Parked>,
     common_rate_hz: f64,
@@ -292,6 +300,8 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     let mut pending = Vec::with_capacity(n);
     let mut ppm = Vec::with_capacity(n);
+    let mut cw_policies = Vec::with_capacity(n);
+    let mut conditioning = Vec::with_capacity(n);
     let mut observers = Vec::with_capacity(n);
     // One shared completion channel, so the first failure is observed the
     // moment it arrives instead of after every earlier opener has returned
@@ -309,7 +319,9 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
             .name(format!("manta-input-{name}"))
             .spawn(move || input_thread(name, open, spawn_band_hz, index, done_tx, go_rx, stop))
             .map_err(|e| anyhow!("input \"{}\": cannot start its thread: {e}", spec.name))?;
+        cw_policies.push(spec.cw_policy);
         ppm.push(spec.freq_correction_ppm);
+        conditioning.push(spec.conditioning);
         observers.push(spec.observers);
         pending.push(Parked { go: go_tx, handle });
     }
@@ -320,6 +332,8 @@ pub fn open_inputs(specs: Vec<InputSpec>, stop: Arc<AtomicBool>) -> Result<Opene
     let mut opened = OpenedInputs {
         inputs: Vec::new(),
         ppm,
+        cw_policies,
+        conditioning,
         observers,
         parked: pending,
         common_rate_hz: 0.0,
@@ -468,7 +482,7 @@ pub fn listen_inputs(
         .map(|&ppm| manta_spot::calibration_factor_from_ppm(ppm).map_err(|e| anyhow!(e)))
         .collect::<Result<Vec<f64>>>()?;
     let validator = cfg.shared_validator(rate, n as u32)?;
-    let mut back = crate::listen::Back::new(&shared, validator, rate);
+    let mut back = crate::listen::Back::new(&shared, validator, rate, &cfg.decode);
 
     let live = matches!(clock, SessionClock::Live { .. });
     let (live_tx, live_rx) = mpsc::sync_channel::<(usize, Msg)>(LIVE_QUEUE_BATCHES);
@@ -484,8 +498,17 @@ pub fn listen_inputs(
             Outbox::Replay(tx)
         };
         let fs = opened.inputs[index].sample_rate_hz;
+        let mut input_cfg = cfg.clone();
+        input_cfg.cw_policy = opened.cw_policies[index].clone();
+        input_cfg.freq_correction_ppm = opened.ppm[index];
+        input_cfg.cw_clock = if live {
+            crate::cw_segments::Clock::Live
+        } else {
+            crate::cw_segments::Clock::Samples
+        };
+        input_cfg.conditioning = opened.conditioning[index].clone();
         let go = Go {
-            cfg: cfg.clone(),
+            cfg: input_cfg,
             clock: SourceClock {
                 scale: (rate / fs).round() as u64,
                 offset: offsets[index],
@@ -496,6 +519,7 @@ pub fn listen_inputs(
                 active_tracks: opened.observers[index].active_tracks.clone(),
                 static_crashes: opened.observers[index].static_crashes.clone(),
                 bad_samples: opened.observers[index].bad_samples.clone(),
+                conditioned: opened.observers[index].conditioned.clone(),
                 rtty: opened.observers[index].rtty.clone(),
                 decode_latency: shared.decode_latency.clone(),
                 decode_quality: shared.decode_quality.clone(),

@@ -17,6 +17,7 @@ use super::{
     GapStats, HpsdrConfig, INITIAL_BURST_REPEATS, MAX_CONSECUTIVE_MALFORMED,
     MAX_CONSECUTIVE_TIMEOUTS, READ_TIMEOUT, RECV_BUF_LEN,
 };
+use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -87,7 +88,8 @@ const RX_TX_SPECIFIC_EVERY: Duration = Duration::from_millis(200);
 const GENERAL_EVERY: Duration = Duration::from_millis(800);
 
 /// How many times `Drop` sends high-priority with run = 0 (D8).
-const STOP_REPEATS: usize = 2;
+/// Protocol 1 also uses this count in `HpsdrSession::retire`.
+pub(crate) const STOP_REPEATS: usize = 2;
 
 /// Production stall bound (D13): the same 40 x 250 ms budget as protocol 1,
 /// measured as elapsed time since the last valid IQ datagram.
@@ -241,6 +243,19 @@ pub struct Protocol2IqSource {
     health_counters: Arc<InputHealthCounters>,
     /// Elapsed time with no valid IQ datagram before `read()` errors (D13).
     pub(crate) stall_after: Duration,
+    /// MAN-489: the one-shot soft-stall episode behind `take_stalled`:
+    /// a delivering radio whose IQ stopped reports the stop once, inside
+    /// the 5 s bound, before this hard failure and without losing the
+    /// session. `stall_after` stays the hard bound.
+    pub(crate) stall: StallEpisode,
+    /// MAN-489 review: when the current queue-empty wait began, so the
+    /// soft stall's `Ok(0)` return cannot restart the hard bound on the
+    /// next read (a permanently silent radio must still fail at
+    /// `stall_after` from its last delivery, not soft + `stall_after`).
+    /// `None` while samples flow; set at the first waiting receive of an
+    /// outage, cleared by the next valid IQ datagram, so a genuine parked
+    /// consumer's pause still never counts as the radio's silence.
+    wait_entered: Option<Instant>,
     /// Consecutive malformed datagrams before `read()` errors (D13).
     pub(crate) max_consecutive_malformed: u32,
     /// MAN-308: `Some` with `input.auto_attenuation`.
@@ -310,6 +325,8 @@ impl Protocol2IqSource {
             confirmed_live: Arc::new(AtomicBool::new(false)),
             health_counters: Arc::new(InputHealthCounters::new()),
             stall_after: STALL_AFTER,
+            stall: StallEpisode::new(SOFT_STALL_AFTER),
+            wait_entered: None,
             max_consecutive_malformed: MAX_CONSECUTIVE_MALFORMED,
             // Engaged before the bring-up sends, so a reopen's restored
             // level goes out with run = 1 (MAN-308 D6).
@@ -486,6 +503,9 @@ impl Protocol2IqSource {
         let now = Instant::now();
         let since_last = self.unaccounted(now);
         self.last_valid_iq = now;
+        // MAN-489 review: delivery ends the waiting episode, so the next
+        // outage anchors its stall clocks afresh.
+        self.wait_entered = None;
         let event = self.tracker.observe(seq);
         if !matches!(event, wire::SeqEvent::Stale) {
             self.last_accepted_iq = now;
@@ -645,13 +665,34 @@ impl Protocol2IqSource {
     }
 
     /// Receive datagrams until the queue holds DDC0 samples (D5 demux).
-    fn fill_queue(&mut self) -> Result<()> {
+    /// Returns `false` instead when a soft stall was reported (MAN-489):
+    /// the queue is still empty and `read()` must return `Ok(0)` with its
+    /// `take_stalled` flag pending.
+    fn fill_queue(&mut self) -> Result<bool> {
         // D13's stall clock runs only while a read waits: time the caller
         // spent not reading (a multi-input run parks sources until every
         // opener finishes) is not the radio's silence, and the IQ it sent
         // meanwhile is still queued on the socket (MAN-305 review).
-        let entered = Instant::now();
+        // MAN-489 review: the anchor persists across a soft stall's
+        // `Ok(0)` return (cleared only by the next valid IQ datagram), so
+        // the continuation of the same outage keeps its original hard
+        // budget instead of starting a fresh `stall_after` clock.
+        let entered = *self.wait_entered.get_or_insert_with(Instant::now);
         while self.queue_pos >= self.queue.len() {
+            // MAN-489: a delivering radio whose IQ datagrams stopped --
+            // status traffic keeps flowing -- reports the stop once inside
+            // the 5 s bound, on the same protected clock the hard bound
+            // uses, so a parked consumer's pause still cannot look like a
+            // stall. The soft return does not move `last_valid_iq`, so the
+            // hard budget below runs on unchanged across it.
+            if self.stall.due(
+                self.last_valid_iq.max(entered),
+                Instant::now(),
+                self.stall_after,
+            ) {
+                self.stall.report();
+                return Ok(false);
+            }
             if self.last_valid_iq.max(entered).elapsed() >= self.stall_after {
                 bail!(
                     "HPSDR protocol 2 radio {host} stalled: no IQ datagram for {secs} s -- if the \
@@ -697,7 +738,7 @@ impl Protocol2IqSource {
                 self.malformed()?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -745,13 +786,24 @@ impl IqSource for Protocol2IqSource {
                 }
             }
         }
-        self.fill_queue()?;
+        // MAN-489: `false` means a soft stall was reported; the flag rides
+        // the `Ok(0)` below and the radio stays connected.
+        if !self.fill_queue()? {
+            return Ok(0);
+        }
         let avail = &self.queue[self.queue_pos..];
         let n = buf.len().min(avail.len());
         buf[..n].copy_from_slice(&avail[..n]);
         self.queue_pos += n;
         self.read_returned = Instant::now();
+        self.stall.note_delivery();
         Ok(n)
+    }
+
+    /// MAN-489: consumed once per sample outage; see the private
+    /// `StallEpisode` episode state.
+    fn take_stalled(&mut self) -> bool {
+        self.stall.take()
     }
 
     fn take_discontinuity(&mut self) -> Option<u64> {
@@ -795,6 +847,11 @@ pub(crate) mod fake {
     use std::sync::{Arc, Mutex};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, Instant};
+
+    /// The widest offset from `base` a test binds: the foreign socket at
+    /// `base + FOREIGN_PORT_OFFSET`, clear of the radio's `base..=base + 11`.
+    /// `bind` takes only a base whose whole span fits in a `u16` (MAN-497).
+    pub(crate) const FOREIGN_PORT_OFFSET: u16 = 40;
 
     /// One datagram the fake received: port offset from `base`, bytes,
     /// source.
@@ -903,7 +960,7 @@ pub(crate) mod fake {
             for _ in 0..200 {
                 let first = UdpSocket::bind("127.0.0.1:0").unwrap();
                 let base = first.local_addr().unwrap().port();
-                if base > u16::MAX - 11 {
+                if base > u16::MAX - FOREIGN_PORT_OFFSET {
                     continue;
                 }
                 let mut cmd = vec![first];
@@ -1047,7 +1104,7 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
-    use super::fake::{iq_datagram, FakeP2Radio};
+    use super::fake::{iq_datagram, FakeP2Radio, FOREIGN_PORT_OFFSET};
     use super::*;
     use std::net::SocketAddr;
     use std::sync::Mutex;
@@ -1362,7 +1419,7 @@ mod tests {
         let mut src = open(&fake);
         let to = fake.wait_for_run();
         fake.send_iq_bytes(&[0u8; 100]);
-        let foreign = UdpSocket::bind(("127.0.0.1", fake.base + 40))
+        let foreign = UdpSocket::bind(("127.0.0.1", fake.base + FOREIGN_PORT_OFFSET))
             .or_else(|_| UdpSocket::bind("127.0.0.1:0"))
             .unwrap();
         let fport = foreign.local_addr().unwrap().port();
@@ -1433,6 +1490,85 @@ mod tests {
         let err = src.read(&mut buf).unwrap_err().to_string();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.contains("stalled: no IQ datagram"), "{err}");
+    }
+
+    /// MAN-489: a delivering radio whose IQ datagrams stop -- while status
+    /// keeps flowing -- reports `Ok(0)` with `take_stalled` pending once,
+    /// before the hard failure, on the same session; delivery re-arms, so
+    /// a second outage reports again; a permanent outage still fails at
+    /// the original hard bound.
+    #[test]
+    fn a_stopped_radio_reports_a_soft_stall_once_re_arms_and_still_fails_hard() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        src.stall = StallEpisode::new(Duration::from_millis(250));
+        src.stall_after = Duration::from_secs(1);
+        let _status = fake.stream_status(Duration::from_millis(20));
+        fake.send_iq(0);
+        assert_eq!(read_one(&mut src), (0, 238));
+        // IQ stops; status traffic keeps arriving and must not hide it.
+        let started = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(1), "{reported:?}");
+        assert!(src.take_stalled());
+        assert!(!src.take_stalled());
+        // The same session resumes without a reconnect.
+        fake.send_iq(1);
+        assert_eq!(read_one(&mut src), (1, 238));
+        assert!(!src.take_stalled());
+        // A second outage reports again, and a permanent one still errors
+        // at the hard bound (the soft return did not reset it).
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert!(src.take_stalled());
+        let err = src.read(&mut buf).unwrap_err().to_string();
+        assert!(err.contains("stalled: no IQ datagram for 1 s"), "{err}");
+    }
+
+    /// MAN-489 review: the soft report must not restart the hard bound.
+    /// Measured from the last delivery, through the soft report, to the
+    /// hard error, the total stays inside the original `stall_after` --
+    /// a regression that re-anchors the wait on the read after the soft
+    /// return would wait soft + `stall_after`.
+    #[test]
+    fn a_permanent_outage_keeps_its_hard_budget_across_the_soft_report() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        src.stall = StallEpisode::new(Duration::from_millis(500));
+        src.stall_after = Duration::from_secs(1);
+        fake.send_iq(0);
+        assert_eq!(read_one(&mut src), (0, 238));
+        // IQ stops for good; the stall clocks run from that delivery.
+        let started = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        assert!(src.take_stalled());
+        let err = src.read(&mut buf).unwrap_err().to_string();
+        let total = started.elapsed();
+        assert!(err.contains("stalled: no IQ datagram for 1 s"), "{err}");
+        assert!(
+            total < Duration::from_millis(1_400),
+            "hard budget must not restart after the soft report, took {total:?}"
+        );
+    }
+
+    /// MAN-489 phase 5: at production durations (4.5 s soft, 10 s hard)
+    /// the report lands inside the ticket's 5 s bound.
+    #[test]
+    fn a_stopped_radio_reports_within_the_production_five_second_bound() {
+        let fake = FakeP2Radio::start();
+        let mut src = open(&fake);
+        let _status = fake.stream_status(Duration::from_millis(20));
+        fake.send_iq(0);
+        assert_eq!(read_one(&mut src), (0, 238));
+        // IQ stops; status traffic keeps arriving and must not hide it.
+        let started = Instant::now();
+        let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+        assert_eq!(src.read(&mut buf).unwrap(), 0);
+        let reported = started.elapsed();
+        assert!(reported < Duration::from_secs(5), "{reported:?}");
+        assert!(src.take_stalled());
     }
 
     /// MAN-308: a handle whose notice records every change.

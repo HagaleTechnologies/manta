@@ -6,7 +6,7 @@
 //! group, and this bench isn't wired into CI (GitHub-hosted runners aren't
 //! Mac-series or Pi4 hardware, and perf assertions on shared CI runners
 //! are flaky). See
-//! docs/superpowers/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
+//! docs/archive/plans/specs/2026-07-24-m2-pileup-cpu-budget-design.md.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use manta_engine::PipelineConfig;
@@ -69,6 +69,19 @@ fn bench_cpu_budget(c: &mut Criterion) {
                 black_box(&cfg),
             )
             .unwrap()
+        })
+    });
+    let mut restricted = cfg.clone();
+    restricted.cw_policy = manta_engine::cw_segments::Policy::new(
+        Some(manta_engine::cw_segments::Ranges::new(vec![(13_990_000.0, 14_010_000.0)]).unwrap()),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    group.bench_function("192khz_300tracks_restricted", |b| {
+        b.iter(|| {
+            manta_engine::decode_samples(black_box(&iq), fs, center_freq_hz, black_box(&restricted))
+                .unwrap()
         })
     });
     group.finish();

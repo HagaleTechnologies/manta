@@ -36,6 +36,9 @@ pub use recording::{
 };
 
 mod overflow;
+
+mod stall;
+
 #[cfg(feature = "soapy")]
 pub mod soapy;
 #[cfg(feature = "soapy")]

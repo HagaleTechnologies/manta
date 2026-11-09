@@ -46,8 +46,13 @@ pub(crate) fn check(config_flag: Option<PathBuf>) -> Result<()> {
     // rejects source types this build cannot open), blocklist/notch reads.
     // Never `spec.open()`, never `is_rf_aware()` (it opens IQ WAVs), never
     // `start_spot_server`.
-    let prepared =
-        crate::prepare_live(crate::CliOverrides::none(), path.clone(), None, true, None)?;
+    let prepared = crate::prepare_live(
+        crate::resolve::CliOverrides::none(),
+        path.clone(),
+        None,
+        true,
+        None,
+    )?;
     crate::refuse_rbn_compare_replay(&prepared.resolved, false)?;
     reject_placeholders(&prepared.loaded)?;
     reject_duplicate_ports(&prepared.loaded)?;
@@ -567,6 +572,31 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
             r.listen, r.callsign, r.enabled
         ));
     }
+    // MAN-142: the two spot outputs, file-only and restart-only.
+    lines.push(match &loaded.pskreporter {
+        None => "pskreporter: none".to_string(),
+        Some(p) => format!(
+            "pskreporter: enabled={} host={} port={} spot_types={} antenna={}",
+            p.enabled,
+            p.host,
+            p.port,
+            p.spot_types.as_str(),
+            if p.antenna.is_empty() {
+                "none".to_string()
+            } else {
+                manta_server::human::quoted(&p.antenna)
+            }
+        ),
+    });
+    if loaded.wsjtx_output.is_empty() {
+        lines.push("wsjtx_output: none".to_string());
+    }
+    for w in &loaded.wsjtx_output {
+        lines.push(format!(
+            "wsjtx_output: destination={} enabled={}",
+            w.destination, w.enabled
+        ));
+    }
 
     lines.push(match &loaded.callsign_lookup {
         None => "callsign_lookup: none".to_string(),
@@ -626,6 +656,13 @@ fn summary(origin_line: &str, loaded: &Loaded) -> Vec<String> {
     if let Some(path) = &spot.calls_heard_path {
         if let Some(line) = lines.last_mut() {
             line.push_str(&format!(" calls_heard_path={}", path.display()));
+        }
+    }
+    // MAN-542 D12: shown only when set, so a config without it prints
+    // what it always did.
+    if let Some(url) = &spot.pattern_url {
+        if let Some(line) = lines.last_mut() {
+            line.push_str(&format!(" pattern_url={url}"));
         }
     }
 
@@ -739,6 +776,19 @@ fn input_summary(file: &crate::config::InputFile) -> String {
             "freq_correction_ppm",
             shared.freq_correction_ppm.map(|v| v.to_string()),
         ),
+        // MAN-496: only when set, so every existing summary is unchanged.
+        (
+            "dc_block",
+            shared
+                .dc_block
+                .map(|m| crate::config::stage_mode_str(m).to_string()),
+        ),
+        (
+            "impulse_suppress",
+            shared
+                .impulse_suppress
+                .map(|m| crate::config::stage_mode_str(m).to_string()),
+        ),
         (
             "center_freq_hz",
             shared.center_freq_hz.map(|v| v.to_string()),
@@ -776,7 +826,11 @@ fn input_summary(file: &crate::config::InputFile) -> String {
 /// D3/D4: stderr notes that never change the exit code. I/O-free: the dial
 /// note matches the source kind rather than calling `is_rf_aware()`, which
 /// opens IQ WAVs. MAN-90: an enabled uplink is experimental.
-fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> Vec<String> {
+fn notes(
+    loaded: &Loaded,
+    resolved: &crate::resolve::Resolved,
+    source: ConfigSource,
+) -> Vec<String> {
     let mut notes = Vec::new();
     for group in crate::config::hpsdr_allocations(&loaded.inputs) {
         if group.members.len() > 1 {
@@ -804,7 +858,8 @@ fn notes(loaded: &Loaded, resolved: &crate::Resolved, source: ConfigSource) -> V
     if resolved.dial_freq_hz.is_none()
         && matches!(
             resolved.spec,
-            crate::LiveSourceSpec::AudioDevice(_) | crate::LiveSourceSpec::File { .. }
+            crate::source_spec::LiveSourceSpec::AudioDevice(_)
+                | crate::source_spec::LiveSourceSpec::File { .. }
         )
     {
         notes.push(
@@ -880,7 +935,8 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
     if !spot.refresh_lists {
         return notes;
     }
-    let lists = [
+    let no_pin = None;
+    let mut lists = vec![
         (
             "cty",
             "cty.dat",
@@ -896,6 +952,17 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
             spot.scp_url(),
         ),
     ];
+    // MAN-542 D13: the pattern list joins only with `pattern_url` set; it
+    // has no pin.
+    if let Some(url) = &spot.pattern_url {
+        lists.push((
+            "pattern",
+            "the pattern list",
+            &spot.pattern_path,
+            &no_pin,
+            url.as_str(),
+        ));
+    }
     // `load` already parsed every URL, so a failure here cannot happen.
     let refreshed: Vec<crate::list_http::HttpUrl> = lists
         .iter()
@@ -933,6 +1000,7 @@ fn list_refresh_notes(spot: &crate::config::SpotFile) -> Vec<String> {
 
 /// `www.country-files.com and www.supercheckpartial.com (TCP port 80)`: each
 /// distinct host once, then the port; `host:port` forms when the ports differ.
+/// Three or more hosts read `A, B and C` (MAN-542).
 fn download_endpoints(urls: &[crate::list_http::HttpUrl]) -> String {
     let ports: BTreeSet<u16> = urls.iter().map(|u| u.port).collect();
     let mut names: Vec<String> = Vec::new();
@@ -946,7 +1014,10 @@ fn download_endpoints(urls: &[crate::list_http::HttpUrl]) -> String {
             names.push(name);
         }
     }
-    let names = names.join(" and ");
+    let names = match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.join(""),
+    };
     match ports.iter().next() {
         Some(port) if ports.len() == 1 => format!("{names} (TCP port {port})"),
         _ => names,
@@ -985,8 +1056,8 @@ mod tests {
         load_text(body).unwrap_or_else(|e| panic!("{body:?} did not load: {e:#}"))
     }
 
-    fn resolved(loaded: &Loaded) -> crate::Resolved {
-        crate::resolve(crate::CliOverrides::none(), loaded).unwrap()
+    fn resolved(loaded: &Loaded) -> crate::resolve::Resolved {
+        crate::resolve::resolve(crate::resolve::CliOverrides::none(), loaded).unwrap()
     }
 
     fn lines_of(body: &str) -> Vec<String> {
@@ -1002,6 +1073,21 @@ mod tests {
     }
 
     // ---- Phase 2: the summary and notes
+
+    /// MAN-496: a set conditioning stage prints in the input summary; an
+    /// all-off config's line is unchanged.
+    #[test]
+    fn conditioning_stages_print_in_the_input_summary_when_set() {
+        let set = lines_of(
+            "[input]\ntype = \"audio\"\ndc_block = \"apply\"\nimpulse_suppress = \"observe\"\n",
+        );
+        assert_eq!(
+            line(&set, "input:"),
+            "input: type=audio device=default dc_block=apply impulse_suppress=observe"
+        );
+        let off = lines_of("[input]\ntype = \"audio\"\n");
+        assert_eq!(line(&off, "input:"), "input: type=audio device=default");
+    }
 
     #[test]
     fn server_listeners_includes_live_only_when_live_port_is_set() {
@@ -1231,6 +1317,42 @@ mod tests {
         let lines = lines_of("[decode]\nengine = \"legacy\"\n");
         assert_eq!(line(&lines, "skimmer_relay:"), "skimmer_relay: none");
         assert_eq!(line(&lines, "wsjtx_relay:"), "wsjtx_relay: none");
+    }
+
+    #[test]
+    fn summary_lists_pskreporter_and_wsjtx_output() {
+        let lines = lines_of(
+            "[server]\nstation_callsign = \"W5AU\"\noperator_grid = \"EM10dh\"\n\
+             [pskreporter]\nenabled = true\nantenna = \"Inverted V at 12 m\"\n\
+             [[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n",
+        );
+        assert_eq!(
+            line(&lines, "pskreporter:"),
+            "pskreporter: enabled=true host=report.pskreporter.info port=4739 \
+             spot_types=cq_beacon antenna=\"Inverted V at 12 m\""
+        );
+        assert_eq!(
+            line(&lines, "wsjtx_output:"),
+            "wsjtx_output: destination=192.168.1.255:2237 enabled=true"
+        );
+        let at = |p: &str| lines.iter().position(|l| l.starts_with(p)).unwrap();
+        assert_eq!(at("pskreporter:"), at("wsjtx_relay:") + 1, "{lines:#?}");
+        assert_eq!(at("wsjtx_output:"), at("pskreporter:") + 1, "{lines:#?}");
+        assert_eq!(
+            at("callsign_lookup:"),
+            at("wsjtx_output:") + 1,
+            "{lines:#?}"
+        );
+
+        let lines = lines_of("[server]\nstation_callsign = \"W5AU\"\n[pskreporter]\n");
+        assert_eq!(
+            line(&lines, "pskreporter:"),
+            "pskreporter: enabled=false host=report.pskreporter.info port=4739 \
+             spot_types=cq_beacon antenna=none"
+        );
+        let lines = lines_of("[decode]\nengine = \"legacy\"\n");
+        assert_eq!(line(&lines, "pskreporter:"), "pskreporter: none");
+        assert_eq!(line(&lines, "wsjtx_output:"), "wsjtx_output: none");
     }
 
     #[test]
@@ -1815,7 +1937,10 @@ mod tests {
              scp_url = \"http://mirror.lan:8080/MASTER.SCP\"\n",
         );
         assert!(
-            has(&n, "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"),
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from mirror.lan (TCP port 8080) while"
+            ),
             "{n:?}"
         );
         let n = notes_of(
@@ -1828,6 +1953,98 @@ mod tests {
                  www.supercheckpartial.com:80 while"
             ),
             "{n:?}"
+        );
+    }
+
+    /// MAN-542: `pattern_url` joins the host list and the summary only when
+    /// set; `pattern_path` keeps it out and draws its own note.
+    #[test]
+    fn pattern_url_joins_the_refresh_notes_and_the_summary() {
+        const URL: &str = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+        let on = "[spot]\nrefresh_lists = true\nlist_cache_dir = \"/var/cache/manta\"\n";
+        let without: Vec<String> = notes_of(on);
+        assert!(
+            has(
+                &without,
+                "note: list refresh downloads over plain HTTP from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 80) while"
+            ),
+            "{without:?}"
+        );
+        assert!(
+            !without.iter().any(|n| n.contains("pattern")),
+            "{without:?}"
+        );
+        let spot_line = |body: &str| line(&lines_of(body), "spot:").to_string();
+        assert!(!spot_line(on).contains("pattern_url"));
+
+        let with_url = format!("{on}pattern_url = \"{URL}\"\n");
+        let n = notes_of(&with_url);
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from www.country-files.com, \
+                 www.supercheckpartial.com and data.reversebeacon.net (TCP port 80) while"
+            ),
+            "{n:?}"
+        );
+        assert!(!n.iter().any(|n| n.ends_with(" alone")), "{n:?}");
+        assert!(
+            spot_line(&with_url).ends_with(&format!(" repetition_fusion=off pattern_url={URL}")),
+            "{}",
+            spot_line(&with_url)
+        );
+        // After `calls_heard_path` when both are set.
+        let both = format!("{with_url}calls_heard_path = \"/tmp/heard.txt\"\n");
+        let l = spot_line(&both);
+        let heard = l.find(" calls_heard_path=").unwrap();
+        let url = l.find(" pattern_url=").unwrap();
+        assert!(heard < url && l.ends_with(URL), "{l}");
+
+        let with_path = format!("{with_url}pattern_path = \"/etc/manta/patterns.lst\"\n");
+        let n = notes_of(&with_path);
+        assert!(
+            has(
+                &n,
+                "note: list refresh downloads over plain HTTP from www.country-files.com and \
+                 www.supercheckpartial.com (TCP port 80) while"
+            ),
+            "{n:?}"
+        );
+        assert!(
+            has(
+                &n,
+                "note: pattern_path is set, so list refresh leaves the pattern list alone"
+            ),
+            "{n:?}"
+        );
+        // A path with no URL: nothing to leave alone.
+        let n = notes_of(&format!("{on}pattern_path = \"/etc/manta/patterns.lst\"\n"));
+        assert!(!n.iter().any(|n| n.contains("pattern")), "{n:?}");
+    }
+
+    #[test]
+    fn download_endpoints_join_two_and_three_hosts() {
+        let urls = |list: &[&str]| -> Vec<crate::list_http::HttpUrl> {
+            list.iter()
+                .map(|u| crate::list_http::HttpUrl::parse(u).unwrap())
+                .collect()
+        };
+        assert_eq!(
+            download_endpoints(&urls(&["http://a.lan/x", "http://b.lan/y"])),
+            "a.lan and b.lan (TCP port 80)"
+        );
+        assert_eq!(
+            download_endpoints(&urls(&[
+                "http://a.lan/x",
+                "http://b.lan/y",
+                "http://c.lan/z"
+            ])),
+            "a.lan, b.lan and c.lan (TCP port 80)"
+        );
+        assert_eq!(
+            download_endpoints(&urls(&["http://a.lan/x"])),
+            "a.lan (TCP port 80)"
         );
     }
 
@@ -2010,6 +2227,9 @@ mod tests {
 
     /// Keys with no built-in default: the scaffold shows an example (D10).
     const NO_DEFAULT: &[(&str, &str)] = &[
+        ("input", "iq_gain_ratio"),
+        ("input", "iq_phase_deg"),
+        ("input", "iq_calibrated_center_hz"),
         ("server", "live_port"),
         ("server", "rtty_telnet_port"),
         ("server", "station_callsign"),
@@ -2027,6 +2247,7 @@ mod tests {
         ("skimmer_relay", "port"),
         ("skimmer_relay", "callsign"),
         ("wsjtx_relay", "callsign"),
+        ("wsjtx_output", "destination"),
         ("input", "type"),
         ("input", "device"),
         ("input", "path"),
@@ -2042,6 +2263,7 @@ mod tests {
         ("input", "ssrc"),
         ("input", "interface"),
         ("input", "center_freq_hz"),
+        ("input", "cw_segments_hz"),
         ("input", "capture_rate_hz"),
         ("input", "replay_epoch"),
         ("input", "record_iq"),
@@ -2058,6 +2280,7 @@ mod tests {
         ("spot", "cty_sha256"),
         ("spot", "scp_sha256"),
         ("spot", "pattern_path"),
+        ("spot", "pattern_url"),
     ];
 
     /// `Option` keys whose absence means a built-in value: setting them to
@@ -2073,6 +2296,10 @@ mod tests {
         ("server", "json_max_pings_per_ip"),
         ("server", "metrics_max_requests_per_ip"),
         ("input", "freq_correction_ppm"),
+        // MAN-496: a written "off" loads as Some(Off), the builtin default
+        // over an absent key, exactly like freq_correction_ppm's 0.0.
+        ("input", "dc_block"),
+        ("input", "impulse_suppress"),
         ("spot", "cty_url"),
         ("spot", "scp_url"),
     ];
@@ -2095,7 +2322,10 @@ mod tests {
     /// The loader's own key list for `table`: serde's `expected one of ...`
     /// for an unknown key (every table is `deny_unknown_fields`).
     fn loader_keys(table: &str) -> BTreeSet<String> {
-        let header = if matches!(table, "rbn_uplink" | "skimmer_relay" | "wsjtx_relay") {
+        let header = if matches!(
+            table,
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output"
+        ) {
             format!("[[{table}]]")
         } else {
             format!("[{table}]")
@@ -2106,8 +2336,11 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("[{table}] accepted an unknown key"))
         );
+        // serde words a two-key table "expected `a` or `b`" (MAN-142's
+        // `[[wsjtx_output]]`), and a longer one "expected one of ...".
         let list = err
             .split_once("expected one of")
+            .or_else(|| err.split_once("expected "))
             .unwrap_or_else(|| panic!("[{table}]: no key list in {err:?}"))
             .1;
         let keys: BTreeSet<String> = regex::Regex::new(r"`([a-z][a-z0-9_]*)`")
@@ -2115,7 +2348,7 @@ mod tests {
             .captures_iter(list)
             .map(|c| c[1].to_string())
             .collect();
-        assert!(keys.len() >= 3, "[{table}]: {err}");
+        assert!(keys.len() >= 2, "[{table}]: {err}");
         keys
     }
 
@@ -2160,6 +2393,12 @@ mod tests {
                 "{SERVER}[[rbn_uplink]]\nenabled = true\ntarget_host = \"h\"\ntarget_port = 1\n\
                  [[wsjtx_relay]]\ncallsign = \"W1AW\"\n"
             ),
+            // MAN-142: an enabled `[pskreporter]` needs `[server]` and a
+            // grid; the scaffold's `enabled = false` loads alone.
+            ("pskreporter", _) => "[pskreporter]\n".to_string(),
+            ("wsjtx_output", _) => {
+                format!("{SERVER}[[wsjtx_output]]\ndestination = \"127.0.0.1:2237\"\n")
+            }
             ("input", "port" | "password") => {
                 "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000.0\n".to_string()
             }
@@ -2189,6 +2428,8 @@ mod tests {
             "rbn_compare" => a.rbn_compare == b.rbn_compare,
             "skimmer_relay" => a.skimmer_relay == b.skimmer_relay,
             "wsjtx_relay" => a.wsjtx_relay == b.wsjtx_relay,
+            "pskreporter" => a.pskreporter == b.pskreporter,
+            "wsjtx_output" => a.wsjtx_output == b.wsjtx_output,
             "callsign_lookup" => a.callsign_lookup == b.callsign_lookup,
             "input" => a.input == b.input,
             "spot" => a.spot == b.spot,

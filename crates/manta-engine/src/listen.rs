@@ -8,7 +8,7 @@ use crate::live::{LiveStateSink, LiveTap};
 use crate::quality::DecodeQualityObserver;
 use crate::spectrum::{SpectrumAccumulator, SpectrumFeed, SpectrumSink};
 use crate::track::{first_hop_after_gap, CloseCounts};
-use crate::PipelineConfig;
+use crate::{ConditioningReport, PipelineConfig};
 use anyhow::Result;
 use manta_decode::events::{ClosureKind, DecoderEvent};
 use manta_input::{IqSource, ReadContinuity};
@@ -27,6 +27,43 @@ const CHUNK_SAMPLES: usize = 2048;
 /// through `TrackManager::process_hops` in `CHUNK_SAMPLES` pieces like
 /// steady-state reads (MAN-374), and its events emitted as one batch.
 const CALIBRATION_SECONDS: f64 = 2.0;
+
+/// Exact per-stage, per-mark counts published by one input across segments.
+#[derive(Default)]
+pub struct ConditioningObserver {
+    counts: [[AtomicU64; 4]; 2],
+}
+
+impl ConditioningObserver {
+    /// Snapshot indexed by `Stage as usize`, then `Mark as usize`.
+    pub fn snapshot(&self) -> [[u64; 4]; 2] {
+        std::array::from_fn(|s| std::array::from_fn(|m| self.counts[s][m].load(Ordering::Relaxed)))
+    }
+
+    fn report(&self, counts: [[u64; 4]; 2]) {
+        for (stage, row) in counts.iter().enumerate() {
+            for (mark, &count) in row.iter().enumerate() {
+                self.counts[stage][mark].fetch_max(count, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+fn conditioning_counts(
+    ch: &manta_dsp::channelizer::Channelizer,
+    base: [[u64; 4]; 2],
+) -> [[u64; 4]; 2] {
+    use manta_dsp::condition::{Mark, Stage};
+    let mut counts = base;
+    if let Some(log) = ch.conditioning() {
+        for stage in [Stage::Impulse, Stage::Dc] {
+            for mark in Mark::ALL {
+                counts[stage as usize][mark as usize] += log.count(stage, mark);
+            }
+        }
+    }
+    counts
+}
 
 /// Optional live handles into a running `listen()` loop, for a caller that
 /// needs to observe engine-owned state the callbacks can't see.
@@ -69,7 +106,8 @@ pub struct ListenObservers {
     /// refresh replaces. The running `Validator` takes their current tables
     /// at the start (so the caller builds this from the same
     /// `PipelineConfig`, `ReferenceLists::new(cfg.cty_table(),
-    /// cfg.scp_set())`) and again before the next decoder event after a
+    /// cfg.scp_set(), cfg.pattern_table())`; MAN-542 added the pattern
+    /// list) and again before the next decoder event after a
     /// `store`. `None` (the default) skips the check entirely, so `listen()`'s
     /// existing callers pay nothing.
     pub reference_lists: Option<Arc<ReferenceLists>>,
@@ -84,6 +122,15 @@ pub struct ListenObservers {
     /// discontinuity starts), stored with `fetch_max` after each processed
     /// chunk so it never goes backwards. `None` (the default) skips it.
     pub bad_samples: Option<Arc<AtomicU64>>,
+    /// Exact conditioning counts summed across reconnect segments.
+    pub conditioned: Option<Arc<ConditioningObserver>>,
+    /// MAN-495: the full conditioning report -- counts, long runs, the
+    /// last DC level and the final segment's spans -- folded across
+    /// reconnect segments exactly like `conditioned`, for a caller that
+    /// needs the whole report (doctor) rather than the counts alone.
+    /// Published after each processed chunk under a short mutex;
+    /// `None` (the default) skips it, so existing callers pay nothing.
+    pub conditioning_report: Option<Arc<Mutex<ConditioningReport>>>,
     /// MAN-314: the currently marked RTTY signals (SPEC §2.6), stored
     /// whenever the marked set or a marked signal's metadata changes (so a
     /// store is not by itself a mark or clear), emptied on a segment
@@ -120,6 +167,11 @@ pub struct ListenObservers {
     /// A source with no RF centre publishes nothing. `None` (the default)
     /// skips everything, so `listen()`'s existing callers pay nothing.
     pub spectrum: Option<Arc<dyn SpectrumSink>>,
+    /// MAN-198: the loss funnel's write-only track trace -- every candidate
+    /// birth, confirmation and close (`crate::funnel::FunnelTrace`). Set
+    /// only by `crate::funnel::run_funnel`; decoding and spots are
+    /// unchanged. `None` (the default) records nothing.
+    pub funnel_trace: Option<Arc<crate::funnel::FunnelTrace>>,
 }
 
 /// MAN-314: the decode loop's currently marked RTTY signals, calibrated.
@@ -303,12 +355,14 @@ impl OperatorListsUpdate {
 
 /// MAN-316: the decode loop's view of `ListenObservers::reference_lists`:
 /// the generation of each list its validator already holds, so a `store`
-/// costs one table swap and an unchanged list costs two atomic loads per
+/// costs one table swap and an unchanged list costs three atomic loads per
 /// event.
 struct ReferenceWatch {
     lists: Arc<ReferenceLists>,
     seen_cty: u64,
     seen_scp: u64,
+    /// MAN-542: the callsign-pattern list's generation.
+    seen_patterns: u64,
 }
 
 impl ReferenceWatch {
@@ -319,16 +373,18 @@ impl ReferenceWatch {
             lists,
             seen_cty: 0,
             seen_scp: 0,
+            seen_patterns: 0,
         };
         watch.apply(validator);
         watch
     }
 
-    /// Hands `validator` the current tables if either list moved since the
+    /// Hands `validator` the current tables if any list moved since the
     /// last call.
     fn sync(&mut self, validator: &mut Validator) {
         if self.lists.cty.generation() != self.seen_cty
             || self.lists.scp.generation() != self.seen_scp
+            || self.lists.patterns.generation() != self.seen_patterns
         {
             self.apply(validator);
         }
@@ -338,10 +394,16 @@ impl ReferenceWatch {
         // Generations before values: a `store` landing in between leaves a
         // generation behind its value, so the next `sync` swaps again rather
         // than recording the new generation against the old table.
-        let (cty_gen, scp_gen) = (self.lists.cty.generation(), self.lists.scp.generation());
+        let (cty_gen, scp_gen, patterns_gen) = (
+            self.lists.cty.generation(),
+            self.lists.scp.generation(),
+            self.lists.patterns.generation(),
+        );
         validator.replace_reference_tables(self.lists.cty.load(), Some(self.lists.scp.load()));
+        validator.replace_patterns(self.lists.patterns.load());
         self.seen_cty = cty_gen;
         self.seen_scp = scp_gen;
+        self.seen_patterns = patterns_gen;
     }
 }
 
@@ -438,7 +500,7 @@ impl Segment {
 /// position, so only hops at or after a loss's boundary carry it, however
 /// the reads were split.
 #[derive(Debug, Default)]
-struct HeldLosses(std::collections::VecDeque<(u64, u64)>);
+pub(crate) struct HeldLosses(std::collections::VecDeque<(u64, u64)>);
 
 impl HeldLosses {
     /// A loss of `k` samples just before segment sample `at`, read when
@@ -446,7 +508,7 @@ impl HeldLosses {
     /// every hop still to come is past (`at + filter_len <= processed`) are
     /// dropped first; the calibration fill processes nothing until it is
     /// full, so its losses are all kept.
-    fn record(&mut self, at: u64, k: u64, processed: u64, filter_len: u64) {
+    pub(crate) fn record(&mut self, at: u64, k: u64, processed: u64, filter_len: u64) {
         while self
             .0
             .front()
@@ -459,7 +521,7 @@ impl HeldLosses {
 
     /// Hop `m`'s sample clock: its segment position on `seg_base`, less the
     /// held losses whose boundary lies after that position.
-    fn hop_ts(&self, seg_base: u64, pad_hops: u64, hop: u64, m: u64) -> u64 {
+    pub(crate) fn hop_ts(&self, seg_base: u64, pad_hops: u64, hop: u64, m: u64) -> u64 {
         let pos = m.saturating_sub(pad_hops) * hop;
         let ahead: u64 = self
             .0
@@ -504,8 +566,13 @@ fn new_segment(
     occupancy: bool,
     spectrum: Option<&SpectrumFeed>,
 ) -> Result<Segment> {
-    let ch = manta_dsp::channelizer::Channelizer::new(fs, center_freq_hz)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // MAN-203: the configured input-conditioning chain (off by default).
+    let ch = manta_dsp::channelizer::Channelizer::with_conditioning(
+        fs,
+        center_freq_hz,
+        &cfg.conditioning,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let hop = ch.hop() as u64;
     let pad_samples = ch.filter_len();
     let pad_hops = (pad_samples as u64).div_ceil(hop);
@@ -518,6 +585,7 @@ fn new_segment(
     );
     // MAN-13 (D3): each input numbers its tracks in its own residue class.
     tm.set_track_id_space(ids);
+    tm.set_cw_policy(cfg);
     tm.resume_track_ids_from(next_id);
     tm.skip_preroll_hops(pad_hops);
     // MAN-312 (SPEC §2.7): judge static crashes over the source's real
@@ -593,6 +661,7 @@ fn settle_lookups(
 fn emit(
     events: Vec<DecoderEvent>,
     validator: &mut Validator,
+    refine: Option<&mut dyn crate::refine::RefinePass>,
     ctx: &mut EmitCtx<'_>,
     on_event: &mut impl FnMut(&DecoderEvent),
     on_spot: &mut impl FnMut(&crate::Spot),
@@ -642,6 +711,19 @@ fn emit(
     // with their decisions, after the batch's own.
     for spot in validator.poll_lookups() {
         on_spot(&spot);
+    }
+    // MAN-208: the deterministic, budget-bounded refinement pass for this
+    // batch: re-run preserved observations of admitted ambiguous episodes
+    // under an alternate configuration and route any rescue through the
+    // same spot sink. Same single-ownership point as the `ingest` loop
+    // above, on both paths: a single input's `TrackManager`, or a
+    // multi-input session's shared retention (`SharedRefine`). Its clock
+    // is the owner's stream position. A no-op while `[decode.refine]
+    // enabled = false`.
+    if let Some(refine) = refine {
+        for spot in refine.refine_pass(validator) {
+            on_spot(&spot);
+        }
     }
     if let Some(tap) = ctx.live.as_mut() {
         tap.decisions(validator.take_decisions());
@@ -832,6 +914,25 @@ pub fn listen_with_observers(
         }
     };
     // MAN-234: samples replaced by segments a discontinuity already replaced.
+    let mut conditioned_base = [[0; 4]; 2];
+    // MAN-495: the same fold for the full-report observer: the base holds
+    // the closed segments' folded report (modes from `cfg.conditioning`,
+    // zero counts to start), and each publish stores base + the current
+    // segment's cumulative log, so repeated publishes within a segment
+    // never double-count (`add` sums, the slot is overwritten).
+    let mut conditioning_report_base = ConditioningReport::for_config(&cfg.conditioning);
+    let report_conditioning =
+        |ch: &manta_dsp::channelizer::Channelizer,
+         base: &ConditioningReport,
+         slot: &Option<Arc<Mutex<ConditioningReport>>>| {
+            if let Some(slot) = slot {
+                let mut report = base.clone();
+                if let Some(log) = ch.conditioning() {
+                    report.add(log);
+                }
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = report;
+            }
+        };
     let mut bad_base: u64 = 0;
     let report_bad_samples = |n: u64| {
         if let Some(counter) = &observers.bad_samples {
@@ -857,6 +958,7 @@ pub fn listen_with_observers(
         occupancy,
         spectrum.as_ref(),
     )?;
+    seg.tm.set_funnel_trace(observers.funnel_trace.clone());
     let mut seg_base: u64 = 0;
 
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
@@ -951,6 +1053,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -960,6 +1063,14 @@ pub fn listen_with_observers(
     report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
+    report_conditioning(
+        &seg.ch,
+        &conditioning_report_base,
+        &observers.conditioning_report,
+    );
     rtty.update(&seg.tm);
     if let Some(obs) = lifecycle {
         obs.publish_counts(
@@ -978,6 +1089,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -987,6 +1099,9 @@ pub fn listen_with_observers(
     report_confirmations(confirmations_base + seg.tm.confirmations());
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if let Some(obs) = lifecycle {
         obs.publish_counts(
@@ -1019,23 +1134,37 @@ pub fn listen_with_observers(
         let n = match src.read(&mut chunk) {
             Ok(n) => n,
             Err(e) => {
-                report_active_tracks(0);
+                // MAN-199: the segment's tracks close through the same
+                // routine as every other close, so their queued evidence is
+                // flushed and each emitting track gets its `TrackClosed`. A
+                // read error is not evidence the signal ended, so this is
+                // the bookkeeping close `run_input_front` takes too.
                 if let Some(obs) = lifecycle {
-                    obs.clear_active();
+                    obs.observe_peak(seg.tm.active_track_count());
                 }
                 // MAN-201: a call that was held for its role is decided now;
-                // nothing later will settle it. Not evidence the signal
-                // ended, so the outage teardown.
-                let finish_events = seg.tm.finish_for_discontinuity();
+                // nothing later will settle it.
+                let events = seg.tm.finish_for_discontinuity();
                 emit(
-                    finish_events,
+                    events,
                     &mut validator,
+                    Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
                 );
+                report_active_tracks(0);
                 rtty.restart(seg_base + seg_consumed);
                 settle_lookups(&mut validator, &mut ctx, &mut on_spot);
+                // The final close moved the close and gate counts.
+                if let Some(obs) = lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        validator.gate_records_total(),
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                    obs.clear_active();
+                }
                 on_tracks(0);
                 return Err(e);
             }
@@ -1049,6 +1178,7 @@ pub fn listen_with_observers(
                 emit(
                     finish_events,
                     &mut validator,
+                    Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                     &mut ctx,
                     &mut on_event,
                     &mut on_spot,
@@ -1089,6 +1219,7 @@ pub fn listen_with_observers(
             emit(
                 finish_events,
                 &mut validator,
+                Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1101,13 +1232,17 @@ pub fn listen_with_observers(
             confirmations_base += seg.tm.confirmations();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
+            conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
+            if let Some(log) = seg.ch.conditioning() {
+                conditioning_report_base.add(log);
+            }
             // The old segment's marks clear where its samples end.
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
             seg = match new_segment(
                 fs,
-                center_freq_hz,
+                src.center_freq_hz(),
                 rf_passband_hz,
                 trusted_band_hz,
                 guard_hz,
@@ -1126,6 +1261,7 @@ pub fn listen_with_observers(
                     return Err(e);
                 }
             };
+            seg.tm.set_funnel_trace(observers.funnel_trace.clone());
             let hops = seg.channelize(&padding);
             let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
@@ -1133,6 +1269,7 @@ pub fn listen_with_observers(
             emit(
                 events,
                 &mut validator,
+                Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
                 &mut ctx,
                 &mut on_event,
                 &mut on_spot,
@@ -1160,6 +1297,7 @@ pub fn listen_with_observers(
         emit(
             events,
             &mut validator,
+            Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
             &mut ctx,
             &mut on_event,
             &mut on_spot,
@@ -1169,6 +1307,14 @@ pub fn listen_with_observers(
         report_confirmations(confirmations_base + seg.tm.confirmations());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         report_bad_samples(bad_base + seg.ch.bad_samples());
+        if let Some(observer) = &observers.conditioned {
+            observer.report(conditioning_counts(&seg.ch, conditioned_base));
+        }
+        report_conditioning(
+            &seg.ch,
+            &conditioning_report_base,
+            &observers.conditioning_report,
+        );
         rtty.update(&seg.tm);
         if let Some(obs) = lifecycle {
             obs.publish_counts(
@@ -1202,6 +1348,7 @@ pub fn listen_with_observers(
     emit(
         events,
         &mut validator,
+        Some(&mut seg.tm as &mut dyn crate::refine::RefinePass),
         &mut ctx,
         &mut on_event,
         &mut on_spot,
@@ -1209,6 +1356,14 @@ pub fn listen_with_observers(
     settle_lookups(&mut validator, &mut ctx, &mut on_spot);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
+    report_conditioning(
+        &seg.ch,
+        &conditioning_report_base,
+        &observers.conditioning_report,
+    );
     // `finish()` flushes and drops every decoder and closes every remaining
     // track: nothing is being decoded once the stream has ended, so both
     // observers must settle back to 0 rather than be left holding the last
@@ -1246,6 +1401,10 @@ pub(crate) struct Batch {
     /// The input's band sample when this batch crossed one of its stream
     /// seconds, on the common clock; only with a live-state sink.
     pub(crate) band: Option<crate::live::BandSample>,
+    /// MAN-208: the decoder inputs the input's `TrackManager` would have
+    /// retained for refinement replay, on the common clock, for the back
+    /// end's shared retention (`SharedRefine`).
+    pub(crate) refine_feed: Vec<crate::refine::RefineFeed>,
 }
 
 /// MAN-13 (D1): the shared back end of a multi-input session: the one
@@ -1263,6 +1422,9 @@ pub(crate) struct Back<'a> {
     /// MAN-14: where the validator's per-input cross-input dedupe counts
     /// go after each batch; `None` skips the copy.
     suppressions: Option<Arc<SuppressionObserver>>,
+    /// MAN-208: every input's retained observations and the one
+    /// refinement scheduler, beside the one validator.
+    refine: crate::refine::SharedRefine,
 }
 
 impl<'a> Back<'a> {
@@ -1272,6 +1434,7 @@ impl<'a> Back<'a> {
         shared: &'a crate::multi::SharedObservers,
         mut validator: Validator,
         rate_hz: f64,
+        decode_cfg: &manta_decode::decoder::DecodeConfig,
     ) -> Self {
         let references = shared
             .reference_lists
@@ -1296,7 +1459,18 @@ impl<'a> Back<'a> {
             open: BTreeSet::new(),
             input_end_ts: Vec::new(),
             suppressions: shared.suppressions.clone(),
+            refine: crate::refine::SharedRefine::new(
+                decode_cfg,
+                rate_hz,
+                shared.decode_quality.clone(),
+            ),
         }
+    }
+
+    /// MAN-208: the shared refinement scheduler's counters.
+    #[cfg(test)]
+    pub(crate) fn refine_counters(&self) -> crate::refine::RefineCounters {
+        *self.refine.counters()
     }
 
     /// MAN-14: publishes the validator's per-input cross-input dedupe
@@ -1351,9 +1525,15 @@ impl<'a> Back<'a> {
                 }
             }
         }
+        let validator = &self.validator;
+        self.refine
+            .ingest(batch.refine_feed, &batch.events, batch.end_ts, |id| {
+                validator.input_of(id) as usize == input
+            });
         emit(
             batch.events,
             &mut self.validator,
+            Some(&mut self.refine as &mut dyn crate::refine::RefinePass),
             &mut self.ctx,
             on_event,
             on_spot,
@@ -1413,11 +1593,15 @@ impl<'a> Back<'a> {
             emit(
                 events,
                 &mut self.validator,
+                None,
                 &mut self.ctx,
                 on_event,
                 on_spot,
             );
         }
+        let validator = &self.validator;
+        self.refine
+            .drop_input(|id| validator.input_of(id) as usize == input);
         if let Some(tap) = self.ctx.live.as_mut() {
             tap.retain_input_tracks(input, n_inputs, &[]);
         }
@@ -1430,6 +1614,7 @@ pub(crate) struct FrontObservers {
     pub(crate) active_tracks: Option<Arc<AtomicU64>>,
     pub(crate) static_crashes: Option<Arc<AtomicU64>>,
     pub(crate) bad_samples: Option<Arc<AtomicU64>>,
+    pub(crate) conditioned: Option<Arc<ConditioningObserver>>,
     pub(crate) rtty: Option<Arc<RttyObserver>>,
     pub(crate) decode_latency: Option<Arc<DecodeLatencyObserver>>,
     pub(crate) decode_quality: Option<Arc<DecodeQualityObserver>>,
@@ -1478,6 +1663,23 @@ fn to_common(
         .collect()
 }
 
+/// MAN-208: maps a front end's retention feed onto the session clock, as
+/// `to_common` maps its events.
+fn refine_feed_to_common(
+    feed: Vec<crate::refine::RefineFeed>,
+    clock: crate::multi::SourceClock,
+) -> Vec<crate::refine::RefineFeed> {
+    feed.into_iter()
+        .map(|step| match step {
+            crate::refine::RefineFeed::Entry(id, mut e) => {
+                e.3 = clock.to_common(e.3);
+                crate::refine::RefineFeed::Entry(id, e)
+            }
+            gap => gap,
+        })
+        .collect()
+}
+
 /// MAN-13 (D1): one input's front end -- the part of
 /// `listen_with_observers` before the validator, run on the input's own
 /// thread. Reads `src` until EOF, `stop`, a read error or `send` returning
@@ -1511,6 +1713,7 @@ pub(crate) fn run_input_front(
     };
     // MAN-234: samples replaced by segments a discontinuity already
     // replaced, as `listen_with_observers` counts them.
+    let mut conditioned_base = [[0; 4]; 2];
     let mut bad_base: u64 = 0;
     let report_bad_samples = |n: u64| {
         if let Some(counter) = &observers.bad_samples {
@@ -1544,16 +1747,19 @@ pub(crate) fn run_input_front(
         observers.live_ids,
         spectrum.as_ref(),
     )?;
+    // MAN-208: the back end owns refinement; this input exports.
+    seg.tm.export_refine_feed();
     let mut seg_base: u64 = 0;
     let mut seg_consumed: u64 = 0;
     let padding = vec![Complex32::new(0.0, 0.0); seg.ch.filter_len()];
     let batch =
-        |events: Vec<DecoderEvent>, end_local: u64, tm: &crate::track::TrackManager| Batch {
+        |events: Vec<DecoderEvent>, end_local: u64, tm: &mut crate::track::TrackManager| Batch {
             events: to_common(events, clock, calibration_factor),
             end_ts: clock.to_common(end_local),
             n_tracks: tm.decoding_track_count(),
             live_ids: observers.live_ids.then(|| tm.track_ids()),
             band: None,
+            refine_feed: refine_feed_to_common(tm.take_refine_feed(), clock),
         };
     let mut band_ticker = observers
         .live_ids
@@ -1630,20 +1836,26 @@ pub(crate) fn run_input_front(
     let events = seg.tm.process_hops(&hops, |m| {
         seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
     });
-    let b = batch(events, fill_end, &seg.tm);
+    let b = batch(events, fill_end, &mut seg.tm);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if !send(b) {
         return Ok(());
     }
     let events = seg.process_fill(&calib[..filled], seg_base);
-    let mut b = batch(events, fill_end, &seg.tm);
+    let mut b = batch(events, fill_end, &mut seg.tm);
     tick(&mut b, &mut seg.tm, fill_end);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     rtty.update(&seg.tm);
     if !send(b) {
         return Ok(());
@@ -1668,7 +1880,7 @@ pub(crate) fn run_input_front(
             // MAN-201, as `listen_with_observers`.
             if src.take_stalled() {
                 let finish_events = seg.tm.finish_for_discontinuity();
-                if !send(batch(finish_events, seg_base + seg_consumed, &seg.tm)) {
+                if !send(batch(finish_events, seg_base + seg_consumed, &mut seg.tm)) {
                     return Ok(());
                 }
                 stalled = true;
@@ -1694,16 +1906,17 @@ pub(crate) fn run_input_front(
         if let Some(gap) = cont.discontinuity {
             // MAN-423: held losses are already in `seg_base`.
             let finish_events = seg.tm.finish_for_discontinuity();
-            pending.push(batch(finish_events, seg_base + seg_consumed, &seg.tm));
+            pending.push(batch(finish_events, seg_base + seg_consumed, &mut seg.tm));
             let next_id = seg.tm.next_track_id();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
+            conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
             rtty.restart(seg_base + seg_consumed);
             seg_base += seg_consumed + gap;
             seg_consumed = 0;
             seg = new_segment(
                 fs,
-                center_freq_hz,
+                src.center_freq_hz(),
                 rf_passband_hz,
                 trusted_band_hz,
                 guard_hz,
@@ -1715,11 +1928,12 @@ pub(crate) fn run_input_front(
                 observers.live_ids,
                 spectrum.as_ref(),
             )?;
+            seg.tm.export_refine_feed();
             let hops = seg.channelize(&padding);
             let events = seg.tm.process_hops(&hops, |m| {
                 seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
             });
-            pending.push(batch(events, seg_base, &seg.tm));
+            pending.push(batch(events, seg_base, &mut seg.tm));
         } else if cont.unknown_gap {
             // MAN-202, as `listen_with_observers`.
             seg.tm
@@ -1734,12 +1948,15 @@ pub(crate) fn run_input_front(
             seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
         });
         seg_consumed += n as u64;
-        let mut b = batch(events, seg_base + seg_consumed, &seg.tm);
+        let mut b = batch(events, seg_base + seg_consumed, &mut seg.tm);
         tick(&mut b, &mut seg.tm, seg_base + seg_consumed);
         pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
         report_bad_samples(bad_base + seg.ch.bad_samples());
+        if let Some(observer) = &observers.conditioned {
+            observer.report(conditioning_counts(&seg.ch, conditioned_base));
+        }
         rtty.update(&seg.tm);
         if let (Some(obs), Some(t0)) = (&observers.decode_latency, t0) {
             obs.observe(t0.elapsed());
@@ -1763,10 +1980,13 @@ pub(crate) fn run_input_front(
         } else {
             seg.tm.finish()
         };
-    let mut last = batch(events, seg_base + seg_consumed, &seg.tm);
+    let mut last = batch(events, seg_base + seg_consumed, &mut seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
     report_bad_samples(bad_base + seg.ch.bad_samples());
+    if let Some(observer) = &observers.conditioned {
+        observer.report(conditioning_counts(&seg.ch, conditioned_base));
+    }
     report_active_tracks(0);
     rtty.restart(seg_base + seg_consumed);
     send(last);
@@ -1839,6 +2059,139 @@ mod tests {
         events
     }
 
+    /// MAN-208: `transmission`, with the call's last character left
+    /// ambiguous (an unresolved decoder alternative) -- the scheduler's
+    /// ambiguity trigger.
+    fn ambiguous_transmission(track_id: u32, start_ts: u64) -> Vec<DecoderEvent> {
+        transmission(track_id, start_ts)
+            .into_iter()
+            .map(|ev| match ev {
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph: manta_decode::tree::Glyph::Char('W'),
+                    confidence,
+                    ..
+                } if sample_ts == start_ts + 600 => DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph: manta_decode::tree::Glyph::Char('W'),
+                    confidence,
+                    alternatives: vec![(manta_decode::tree::Glyph::Char('M'), 0.4)],
+                },
+                other => other,
+            })
+            .collect()
+    }
+
+    /// Validate round 2 (MAN-208, PR #520): the refinement pass's clock is
+    /// its owner's stream position, never the batch's event timestamps. A
+    /// batch whose only event closes an UNRELATED track (`TrackClosed`
+    /// sorts at `u64::MAX`) used to expire every retained candidate and
+    /// prune the per-episode cap bookkeeping.
+    #[test]
+    fn an_unrelated_track_closure_does_not_expire_retained_refinement_work() {
+        let fs = 96_000.0;
+        let cfg = PipelineConfig::default();
+        let mut validator = cfg.validator(fs).unwrap();
+        for ev in ambiguous_transmission(1, 1_000_000) {
+            validator.ingest(&ev);
+        }
+        assert!(
+            !validator
+                .refine_candidates(1_100_000, 10 * fs as u64)
+                .is_empty(),
+            "fixture: the once-heard W1AW is a refinement candidate"
+        );
+        let mut tm =
+            crate::track::TrackManager::new(64, fs, 14_000_000.0, cfg.detector, cfg.decode.clone());
+        tm.set_refine_stream_position(1_100_000);
+        let mut ctx = EmitCtx {
+            lists: None,
+            quality: None,
+            calibration_factor: 1.0,
+            live: None,
+            references: None,
+        };
+        emit(
+            vec![DecoderEvent::TrackClosed {
+                track_id: 7,
+                closure: ClosureKind::SignalEnded,
+            }],
+            &mut validator,
+            Some(&mut tm as &mut dyn crate::refine::RefinePass),
+            &mut ctx,
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(
+            tm.refine_counters().admitted_total,
+            1,
+            "the candidate on track 1 must survive track 7's closure"
+        );
+    }
+
+    /// MAN-208 validate round 2: one input's batches through the shared back
+    /// end (`Back`) carry their retention feed, and the scheduler there
+    /// admits and replays the once-heard candidate, as a single-input
+    /// `TrackManager` does. Before, the multi-input `emit` passed no
+    /// refinement owner at all.
+    #[test]
+    fn the_multi_input_back_end_runs_the_refinement_scheduler() {
+        let fs = 96_000.0;
+        let cfg = PipelineConfig::default();
+        let none = crate::multi::SharedObservers::default();
+        let mut back = Back::new(&none, cfg.shared_validator(fs, 2).unwrap(), fs, &cfg.decode);
+        // Input 0 owns odd track ids (TrackIdSpace): track 1. Its call
+        // word spans 1_000_300..=1_000_700; retain ~2 s of hops from 1 s
+        // before it.
+        let feed: Vec<crate::refine::RefineFeed> = (0..750u64)
+            .map(|i| {
+                crate::refine::RefineFeed::Entry(
+                    1,
+                    (0.0, 0.0, None, 1_000_000 - 96_000 + i * 256, 0.0, 0.0),
+                )
+            })
+            .collect();
+        back.ingest(
+            0,
+            2,
+            Batch {
+                events: ambiguous_transmission(1, 1_000_000),
+                end_ts: 1_100_000,
+                n_tracks: 1,
+                live_ids: None,
+                band: None,
+                refine_feed: feed,
+            },
+            &mut |_| {},
+            &mut |_| {},
+        );
+        let c = back.refine_counters();
+        assert_eq!(c.admitted_total, 1, "{c:?}");
+        assert!(c.replayed_hops_total > 0, "{c:?}");
+        // An input gap on the OTHER input leaves input 0's retention alone;
+        // its own gap breaks it.
+        let mut shared = crate::refine::SharedRefine::new(&cfg.decode, fs, None);
+        shared.ingest(
+            vec![crate::refine::RefineFeed::Entry(
+                1,
+                (0.0, 0.0, None, 10, 0.0, 0.0),
+            )],
+            &[],
+            10,
+            |id| id % 2 == 1,
+        );
+        shared.ingest(vec![crate::refine::RefineFeed::InputGap], &[], 11, |id| {
+            id % 2 == 0
+        });
+        assert_eq!(shared.retained_entries(), 1);
+        shared.ingest(vec![crate::refine::RefineFeed::InputGap], &[], 12, |id| {
+            id % 2 == 1
+        });
+        assert_eq!(shared.retained_entries(), 0);
+    }
+
     #[test]
     fn back_publishes_cross_input_dedupe_counts_per_withheld_input() {
         let observer = Arc::new(SuppressionObserver::new(2));
@@ -1851,6 +2204,7 @@ mod tests {
             &shared,
             cfg.shared_validator(48_000.0, 2).unwrap(),
             48_000.0,
+            &cfg.decode,
         );
         let batch = |end_ts, events| Batch {
             events,
@@ -1858,6 +2212,7 @@ mod tests {
             n_tracks: 1,
             live_ids: None,
             band: None,
+            refine_feed: Vec::new(),
         };
         let mut spots = Vec::new();
         // Input 0 (track 1) spots W1AW first; input 1 (track 2) hears the
@@ -1888,7 +2243,12 @@ mod tests {
         assert_eq!(observer.per_input(), counts);
         // No observer registered: the same batches run without one.
         let none = crate::multi::SharedObservers::default();
-        let mut quiet = Back::new(&none, cfg.shared_validator(48_000.0, 2).unwrap(), 48_000.0);
+        let mut quiet = Back::new(
+            &none,
+            cfg.shared_validator(48_000.0, 2).unwrap(),
+            48_000.0,
+            &cfg.decode,
+        );
         quiet.ingest(
             0,
             2,
@@ -1912,6 +2272,7 @@ mod tests {
                 &shared,
                 cfg.shared_validator(48_000.0, 2).unwrap(),
                 48_000.0,
+                &cfg.decode,
             );
             let batch = |end_ts, events| Batch {
                 events,
@@ -1919,6 +2280,7 @@ mod tests {
                 n_tracks: 1,
                 live_ids: None,
                 band: None,
+                refine_feed: Vec::new(),
             };
             let meta = |track_id, sample_ts| DecoderEvent::TrackMeta {
                 track_id,
@@ -1998,6 +2360,65 @@ mod tests {
             c.not_cw,
             c.unkeyed,
         ]
+    }
+
+    #[test]
+    fn funnel_trace_observer_leaves_events_and_spots_unchanged() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let run = |observers| {
+            let mut events = Vec::new();
+            let mut spots = Vec::new();
+            listen_with_observers(
+                Box::new(FixedFreqSource {
+                    samples: rendered.samples.clone(),
+                    cursor: 0,
+                    fs: spec.fs,
+                    center_freq_hz: spec.center_freq_hz,
+                }),
+                &PipelineConfig::default(),
+                Arc::new(AtomicBool::new(false)),
+                observers,
+                |ev| events.push(ev.clone()),
+                |spot| spots.push(spot.clone()),
+                |_| {},
+            )
+            .unwrap();
+            (events, spots)
+        };
+        let expected = run(ListenObservers::default());
+        let trace = crate::funnel::FunnelTrace::new();
+        assert_eq!(
+            expected,
+            run(ListenObservers {
+                funnel_trace: Some(trace.clone()),
+                ..Default::default()
+            })
+        );
+        let log = trace.take();
+        let spawned = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Spawned { .. }))
+            .count();
+        let closed = log
+            .records
+            .iter()
+            .filter(|r| matches!(r, crate::funnel::TrackTraceRecord::Closed { .. }))
+            .count();
+        assert!(spawned >= 1);
+        assert!(closed <= spawned);
+        assert!(log
+            .records
+            .iter()
+            .any(|r| matches!(r, crate::funnel::TrackTraceRecord::Confirmed { .. })));
+        // The census sees the strong station's own channels rise while its
+        // track owns them; no source mask applies to a complex-IQ file.
+        assert!(log
+            .vetoes
+            .keys()
+            .any(|(_, _, v)| *v == crate::funnel::SpawnVeto::OwnedByTrack));
+        assert!(log.vetoes.keys().all(|(_, _, v)| !v.is_source_mask()));
     }
 
     #[test]
@@ -2183,9 +2604,11 @@ mod tests {
         });
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -2643,6 +3066,81 @@ mod tests {
         }
     }
 
+    /// MAN-208 validate round 2: both live paths -- one input
+    /// (`listen_with_observers`) and a multi-input session
+    /// (`listen_inputs`, front ends feeding the shared back end) -- run the
+    /// refinement scheduler over real decoder inputs: the rival-withheld
+    /// `K3ABC` is admitted and replayed, visible in the `/metrics`
+    /// counters. Before, the multi-input path never refined.
+    #[test]
+    fn both_live_paths_run_the_refinement_scheduler() {
+        use crate::quality::DecodeQualityObserver;
+        let (spec, samples) = crate::tests::man208_rival_scene();
+        let cfg = crate::tests::man208_hsmm_config(true);
+        let source = || FixedFreqSource {
+            samples: samples.clone(),
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        };
+
+        let single = Arc::new(DecodeQualityObserver::new());
+        listen_with_observers(
+            Box::new(source()),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                decode_quality: Some(single.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+
+        let mut src = Some(source());
+        let opened = crate::multi::open_inputs(
+            vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
+                name: "a".into(),
+                open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
+                freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
+                observers: Default::default(),
+                spawn_band_hz: None,
+            }],
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let multi = Arc::new(DecodeQualityObserver::new());
+        crate::multi::listen_inputs(
+            opened,
+            &cfg,
+            crate::multi::SessionClock::Replay,
+            crate::multi::SharedObservers {
+                decode_quality: Some(multi.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+
+        for (path, obs) in [("single", &single), ("multi", &multi)] {
+            let [admitted, replayed_hops, ..] = obs.snapshot().refine;
+            assert!(admitted >= 1, "{path}: nothing admitted");
+            assert!(replayed_hops > 0, "{path}: nothing replayed");
+        }
+        assert_eq!(
+            single.snapshot().refine,
+            multi.snapshot().refine,
+            "one input decodes the same through either path"
+        );
+    }
+
     /// MAN-312: a source whose RF passband is narrower than its stream,
     /// like rig audio.
     struct NarrowSource {
@@ -2725,6 +3223,149 @@ mod tests {
         assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
         assert!(readings.contains(&1), "{readings:?}");
         assert_eq!(readings.last(), Some(&2), "{readings:?}");
+    }
+
+    #[test]
+    fn conditioning_observer_counts_exactly_across_reconnects_and_per_input_overrides() {
+        use manta_dsp::condition::{ConditioningConfig, Mark, Stage, StageMode};
+        let (spec, iq) = v1_6s();
+        let cfg = PipelineConfig {
+            conditioning: ConditioningConfig {
+                dc: StageMode::Apply,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let padding = manta_dsp::channelizer::Channelizer::new(spec.fs, spec.center_freq_hz)
+            .unwrap()
+            .filter_len();
+        let expected = 2 * (iq.len() + padding) as u64;
+        let counter = Arc::new(ConditioningObserver::default());
+        let mut readings = Vec::new();
+        listen_with_observers(
+            Box::new(GapSource::new(
+                iq.clone(),
+                spec.fs,
+                spec.center_freq_hz,
+                48_000,
+            )),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                conditioned: Some(counter.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| readings.push(counter.snapshot()[Stage::Dc as usize][Mark::Corrected as usize]),
+        )
+        .unwrap();
+        let final_count = counter.snapshot()[Stage::Dc as usize][Mark::Corrected as usize];
+        assert_eq!(final_count, expected);
+        assert!(readings.windows(2).all(|w| w[0] <= w[1]));
+        // Per-input settings override the shared default, without leaking to a sibling.
+        let counters: Vec<_> = (0..2)
+            .map(|_| Arc::new(ConditioningObserver::default()))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let inputs = (0..2)
+            .map(|i| {
+                let samples = iq.clone();
+                crate::InputSpec {
+                    name: format!("rx{i}"),
+                    open: Box::new(move || {
+                        Ok(Box::new(GapSource::new(
+                            samples,
+                            spec.fs,
+                            spec.center_freq_hz,
+                            48_000,
+                        )))
+                    }),
+                    freq_correction_ppm: 0.0,
+                    cw_policy: Default::default(),
+                    conditioning: if i == 0 {
+                        cfg.conditioning.clone()
+                    } else {
+                        Default::default()
+                    },
+                    observers: crate::InputObservers {
+                        conditioned: Some(counters[i].clone()),
+                        ..Default::default()
+                    },
+                    spawn_band_hz: None,
+                }
+            })
+            .collect();
+        let opened = crate::open_inputs(inputs, stop).unwrap();
+        crate::listen_inputs(
+            opened,
+            &PipelineConfig::default(),
+            crate::SessionClock::Replay,
+            crate::SharedObservers::default(),
+            |_| {},
+            |_| {},
+            |_, _| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            counters[0].snapshot()[Stage::Dc as usize][Mark::Corrected as usize],
+            expected
+        );
+        assert_eq!(counters[1].snapshot(), [[0; 4]; 2]);
+    }
+
+    /// MAN-495: the full-report observer folds across a reconnect segment
+    /// exactly like the counts observer -- counts sum over both segments,
+    /// the DC level is the last one seen, and the spans are the final
+    /// segment's.
+    #[test]
+    fn conditioning_report_observer_accumulates_across_a_reconnect_segment() {
+        use manta_dsp::condition::{ConditioningConfig, StageMode};
+        let (spec, iq) = v1_6s();
+        let cfg = PipelineConfig {
+            conditioning: ConditioningConfig {
+                dc: StageMode::Apply,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let padding = manta_dsp::channelizer::Channelizer::new(spec.fs, spec.center_freq_hz)
+            .unwrap()
+            .filter_len();
+        let expected = 2 * (iq.len() + padding) as u64;
+        let slot = Arc::new(Mutex::new(ConditioningReport::for_config(
+            &cfg.conditioning,
+        )));
+        listen_with_observers(
+            Box::new(GapSource::new(
+                iq.clone(),
+                spec.fs,
+                spec.center_freq_hz,
+                48_000,
+            )),
+            &cfg,
+            Arc::new(AtomicBool::new(false)),
+            ListenObservers {
+                conditioning_report: Some(slot.clone()),
+                ..Default::default()
+            },
+            |_| {},
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        let report = slot.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(report.dc.mode, "apply", "{report:?}");
+        assert_eq!(report.impulse.mode, "off", "{report:?}");
+        assert_eq!(report.dc.corrected_samples, expected, "{report:?}");
+        assert!(report.dc.level_dbfs.is_some(), "{report:?}");
+        // The final segment's rings: one coalesced corrected span covering
+        // that segment's whole input (lead-in padding plus the buffer).
+        assert_eq!(report.spans.len(), 1, "{report:?}");
+        assert_eq!(report.spans[0].stage, "dc");
+        assert_eq!(report.spans[0].mark, "corrected");
+        assert_eq!(report.spans[0].samples, (iq.len() + padding) as u64);
     }
 
     /// Runs `listen_with_observers` with a bad-sample observer, returning
@@ -3152,9 +3793,11 @@ mod tests {
         let mut src = Some(src);
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3292,9 +3935,11 @@ mod tests {
         let mut src = Some(src);
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -3527,9 +4172,11 @@ mod tests {
         let mut src = Some(LossThenGapSource::v1_192k(1.0, 11_900, 1.7, gap));
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || Ok(Box::new(src.take().unwrap()) as Box<dyn IqSource>)),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -4014,6 +4661,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let opened = crate::multi::open_inputs(
             vec![crate::multi::InputSpec {
+                cw_policy: Default::default(),
                 name: "a".into(),
                 open: Box::new(move || {
                     Ok(Box::new(EndsWithGapSource {
@@ -4027,6 +4675,7 @@ mod tests {
                     }) as Box<dyn IqSource>)
                 }),
                 freq_correction_ppm: 0.0,
+                conditioning: Default::default(),
                 observers: Default::default(),
                 spawn_band_hz: None,
             }],
@@ -4535,19 +5184,30 @@ mod tests {
         )))
     }
 
-    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+    /// MAN-542: the lists a caller builds from `cfg`, all three of its
+    /// tables, as `ListenObservers::reference_lists` requires.
+    fn reference_lists_for(cfg: &PipelineConfig) -> Arc<ReferenceLists> {
         Arc::new(ReferenceLists::new(
-            Arc::new(manta_spot::cty::Table::bundled()),
-            Arc::new(manta_spot::scp::Set::bundled()),
+            cfg.cty_table(),
+            cfg.scp_set(),
+            cfg.pattern_table(),
         ))
     }
 
-    /// Stores `cty_with_qq9()` from inside a read, including the EOF read:
+    fn bundled_reference_lists() -> Arc<ReferenceLists> {
+        reference_lists_for(&PipelineConfig::default())
+    }
+
+    /// What `StoringSource` does to the lists at its store read.
+    type Store = Box<dyn Fn(&ReferenceLists) + Send>;
+
+    /// Runs `store` from inside a read, including the EOF read:
     /// `OfferingSource` for a list refresh.
     struct StoringSource {
         inner: FixedFreqSource,
         lists: Arc<ReferenceLists>,
         store_at: Option<u64>,
+        store: Store,
         reads: Arc<AtomicU64>,
     }
 
@@ -4563,7 +5223,7 @@ mod tests {
         fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
             let k = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
             if self.store_at == Some(k) {
-                self.lists.cty.store(cty_with_qq9());
+                (self.store)(&self.lists);
             }
             self.inner.read(buf)
         }
@@ -4583,13 +5243,34 @@ mod tests {
         loop_text: bool,
         store_at: Option<u64>,
     ) -> (Vec<(String, u64)>, u64) {
+        // MAN-95: QQ9 calls' patterns are common, so the repetition gate
+        // needs two messages, as these scenes were timed for.
+        let cfg = PipelineConfig {
+            patterns: Some(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n+QQ9@\n").unwrap(),
+            )),
+            ..Default::default()
+        };
+        let lists = reference_lists_for(&cfg);
+        let store: Store = Box::new(|lists| lists.cty.store(cty_with_qq9()));
+        scene_spots((seconds, wpm, text, loop_text), cfg, lists, store_at, store)
+    }
+
+    /// `qq9_spots`' scene (`(seconds, wpm, text, loop_text)`) with the
+    /// caller's `cfg`, starting lists and store.
+    fn scene_spots(
+        (seconds, wpm, text, loop_text): (f64, f32, &str, bool),
+        mut cfg: PipelineConfig,
+        lists: Arc<ReferenceLists>,
+        store_at: Option<u64>,
+        store: Store,
+    ) -> (Vec<(String, u64)>, u64) {
         let mut spec = manta_testkit::vectors::v1();
         spec.duration_s = seconds;
         spec.signals[0].wpm = wpm;
         spec.signals[0].text = text.into();
         spec.signals[0].loop_text = loop_text;
         let samples = manta_testkit::vectors::render(&spec).unwrap().samples;
-        let lists = bundled_reference_lists();
         let reads = Arc::new(AtomicU64::new(0));
         let src = StoringSource {
             inner: FixedFreqSource {
@@ -4600,15 +5281,10 @@ mod tests {
             },
             lists: lists.clone(),
             store_at,
+            store,
             reads: reads.clone(),
         };
-        let mut cfg = PipelineConfig::default();
         cfg.detector.warmup_hops = 0;
-        // MAN-95: QQ9 calls' patterns are common, so the repetition gate
-        // needs two messages, as these scenes were timed for.
-        cfg.patterns = Some(Arc::new(
-            manta_spot::pattern::Table::parse("+QQ9@@@\n+QQ9@\n").unwrap(),
-        ));
         let mut spots = Vec::new();
         listen_with_observers(
             Box::new(src),
@@ -4652,6 +5328,65 @@ mod tests {
                 "no spot may come out before the store at read {k}: {spots:?}"
             );
         }
+    }
+
+    /// MAN-542: the looped QQ9ZZZ scene with `cty_with_qq9()` from the
+    /// start and the lists' pattern table `patterns`; at read `store_at`, a
+    /// `+QQ9@@@` pattern table is stored.
+    fn looped_qq9_patterns(
+        patterns: Arc<manta_spot::pattern::Table>,
+        store_at: Option<u64>,
+    ) -> (Vec<(String, u64)>, u64) {
+        let cfg = PipelineConfig::default();
+        let lists = Arc::new(ReferenceLists::new(cty_with_qq9(), cfg.scp_set(), patterns));
+        let store: Store = Box::new(|lists| {
+            lists.patterns.store(Arc::new(
+                manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap(),
+            ))
+        });
+        scene_spots(
+            (10.0, 60.0, "CQ CQ DE QQ9ZZZ QQ9ZZZ K", true),
+            cfg,
+            lists,
+            store_at,
+            store,
+        )
+    }
+
+    #[test]
+    fn pattern_list_swapped_mid_stream_lowers_the_bar_from_the_next_event() {
+        let bundled = || Arc::new(manta_spot::pattern::Table::bundled());
+        let (control, _) = looped_qq9_patterns(bundled(), None);
+        assert!(
+            control.is_empty(),
+            "QQ9@@@ is unlisted in the bundled patterns, so two transmissions are not enough: {control:?}"
+        );
+        for k in [2, 40] {
+            let (spots, _) = looped_qq9_patterns(bundled(), Some(k));
+            assert!(
+                spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+                "a pattern store at read {k} must let QQ9ZZZ spot, got {spots:?}"
+            );
+            assert!(
+                spots.iter().all(|(_, read)| *read >= k),
+                "no spot may come out before the store at read {k}: {spots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_pattern_table_is_what_the_watch_starts_with() {
+        // The lists carry `cfg`'s `+QQ9@@@` table, so the watch keeps it.
+        let configured = Arc::new(manta_spot::pattern::Table::parse("+QQ9@@@\n").unwrap());
+        let (spots, _) = looped_qq9_patterns(configured, None);
+        assert!(
+            spots.iter().any(|(call, _)| call == "QQ9ZZZ"),
+            "got {spots:?}"
+        );
+        // Lists carrying the bundled patterns are the validator's source of
+        // truth even when `cfg` set none: no spot.
+        let (spots, _) = looped_qq9_patterns(Arc::new(manta_spot::pattern::Table::bundled()), None);
+        assert!(spots.is_empty(), "got {spots:?}");
     }
 
     /// MAN-78 remediate-9 timing, for a list refresh: "V DE QQ9E K DE QQ9E
@@ -5253,6 +5988,51 @@ mod tests {
         );
     }
 
+    /// MAN-199: a read error closes the segment's tracks through the same
+    /// routine as every other close before the error propagates, so each
+    /// emitting track gets its bookkeeping `TrackClosed` (a read error is
+    /// not evidence the signal ended) instead of vanishing silently.
+    #[test]
+    fn listen_closes_its_tracks_before_propagating_a_read_error() {
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        let src: Box<dyn manta_input::IqSource> = Box::new(FailsAtEndSource {
+            samples: rendered.samples,
+            cursor: 0,
+            fs: spec.fs,
+            center_freq_hz: spec.center_freq_hz,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut events: Vec<DecoderEvent> = Vec::new();
+        let err = listen_with_observers(
+            src,
+            &PipelineConfig::default(),
+            stop,
+            ListenObservers::default(),
+            |ev| events.push(ev.clone()),
+            |_spot| {},
+            |_n| {},
+        )
+        .expect_err("the source fails instead of reaching EOF");
+        assert!(
+            err.to_string().contains("source disconnected"),
+            "the original read error must be propagated unchanged, got {err}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                DecoderEvent::TrackClosed {
+                    closure: ClosureKind::Bookkeeping {
+                        survivor_track_id: None
+                    },
+                    ..
+                }
+            )),
+            "V1's emitting track must be closed (bookkeeping, no survivor) before the error \
+             propagates, got {events:?}"
+        );
+    }
+
     /// A live-shaped source: short reads that never reach EOF, and a Ctrl-C
     /// that lands during its first read -- i.e. while `listen` is still
     /// filling its startup calibration buffer.
@@ -5412,6 +6192,7 @@ mod tests {
             let src_stop = stop.clone();
             let opened = crate::multi::open_inputs(
                 vec![crate::multi::InputSpec {
+                    cw_policy: Default::default(),
                     name: "a".into(),
                     open: Box::new(move || {
                         Ok(Box::new(EndsDuringCalibrationSource {
@@ -5421,6 +6202,7 @@ mod tests {
                         }) as Box<dyn IqSource>)
                     }),
                     freq_correction_ppm: 0.0,
+                    conditioning: Default::default(),
                     observers: Default::default(),
                     spawn_band_hz: None,
                 }],

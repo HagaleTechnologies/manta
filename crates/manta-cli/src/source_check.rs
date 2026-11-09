@@ -1,12 +1,26 @@
 //! Open and measure a source without starting the decoding pipeline.
 
 use super::*;
+use crate::cli_parse::parse_capture_rate_hz;
+use crate::cli_parse::parse_dial_freq_hz;
+use crate::cli_parse::parse_hpsdr_freq_hz;
+use crate::cli_parse::parse_hpsdr_mac;
+use crate::cli_parse::parse_hpsdr_rate_hz;
+use crate::cli_parse::parse_ka9q_group;
+use crate::resolve::CliOverrides;
+use crate::source_spec::HpsdrOpts;
+use crate::source_spec::HpsdrProtocolArg;
+use crate::source_spec::Ka9qOpts;
+use crate::source_spec::KiwiOpts;
+use crate::source_spec::LiveSourceSpec;
 use manta_engine::check::{check_source, CheckOptions, CheckReport, StopReason};
 
 #[derive(clap::Args)]
 // MAN-306: --hpsdr-protocol needs an HPSDR selector: a host, a MAC, or
 // the flags of a hostless (discovered) radio.
 #[command(group(clap::ArgGroup::new("hpsdr_selector").args(["hpsdr_host", "hpsdr_mac", "hpsdr_port", "hpsdr_freq_hz", "hpsdr_rate_hz"]).multiple(true)))]
+// MAN-550: --soapy-driver, flattened from soapy_opts, joins `source_selector` too.
+#[command(mut_args(crate::soapy_opts::join_source_selector))]
 pub(crate) struct Args {
     /// Audio WAV path, equivalent to --source PATH.
     #[arg(value_name = "SOURCE", group = "source_selector")]
@@ -33,8 +47,7 @@ pub(crate) struct Args {
     source: Option<PathBuf>,
     /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
     #[arg(help_heading = "KiwiSDR source")]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"], requires = "kiwi_freq_hz"))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"], requires = "kiwi_freq_hz"))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]), requires = "kiwi_freq_hz")]
     #[arg(group = "source_selector")]
     kiwi_host: Option<String>,
     /// KiwiSDR receiver port.
@@ -62,49 +75,13 @@ pub(crate) struct Args {
         help_heading = "KiwiSDR source"
     )]
     kiwi_password: String,
-    /// SoapySDR device arguments, e.g. "driver=rtlsdr".
-    ///
-    /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
-    /// builds made with the `soapy` feature.
-    #[cfg(feature = "soapy")]
-    #[arg(help_heading = "SoapySDR source")]
-    #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "kiwi_host"])]
-    #[arg(group = "source_selector")]
-    soapy_driver: Option<String>,
-    /// Receiver centre frequency, in Hz. Required with --soapy-driver.
-    #[cfg(feature = "soapy")]
-    #[arg(
-        long = "soapy-freq-hz",
-        alias = "soapy-freq",
-        requires = "soapy_driver",
-        help_heading = "SoapySDR source"
-    )]
-    soapy_freq_hz: Option<f64>,
-    /// Sample rate, in Hz. Required with --soapy-driver.
-    #[cfg(feature = "soapy")]
-    #[arg(
-        long = "soapy-rate-hz",
-        alias = "soapy-rate",
-        requires = "soapy_driver",
-        help_heading = "SoapySDR source"
-    )]
-    soapy_rate_hz: Option<f64>,
-    /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
-    /// gain. Omit to let the device use AGC.
-    ///
-    /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
-    /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
-    /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
-    /// signal you know is present.
-    #[cfg(feature = "soapy")]
-    #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
-    soapy_gain: Option<f64>,
+    #[command(flatten)]
+    soapy: crate::soapy_opts::SoapyArgs,
     /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
     ///
     /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
     #[arg(help_heading = "HPSDR source")]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "ka9q_group", "kiwi_host"]))]
     #[arg(group = "source_selector")]
     #[arg(conflicts_with_all = ["path", "device", "source"])]
     #[arg(conflicts_with = "hpsdr_mac")]
@@ -156,8 +133,7 @@ pub(crate) struct Args {
     /// encoding and frequency from radiod's status packets; it does not
     /// create or retune channels.
     #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"]))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]))]
     #[arg(group = "source_selector")]
     ka9q_group: Option<String>,
     /// RTP data port of the group.
@@ -240,13 +216,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
                 freq: args.kiwi_freq_hz,
                 password: args.kiwi_password,
             },
-            #[cfg(feature = "soapy")]
-            soapy: SoapyOpts {
-                driver: args.soapy_driver,
-                freq: args.soapy_freq_hz,
-                rate: args.soapy_rate_hz,
-                gain: args.soapy_gain,
-            },
+            soapy: args.soapy.into(),
             hpsdr: HpsdrOpts {
                 host: args.hpsdr_host,
                 mac: args.hpsdr_mac,
@@ -274,7 +244,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         },
     )?;
     // MAN-309: only `run` records; say so rather than ignore it silently.
-    if let Some(note) = crate::record_iq_ignored_note("check", &loaded) {
+    if let Some(note) = crate::resolve::record_iq_ignored_note("check", &loaded) {
         crate::logging::note(&note);
     }
     let options = CheckOptions {

@@ -207,12 +207,15 @@ fn sighup_applies_a_new_blocklist_without_dropping_clients_or_history() {
     .unwrap();
     std::fs::write(
         &config,
-        server_toml(
-            "operator_qth = \"Testville\"",
-            &format!(
-                "cty_path = \"{}\"\nvalidation_level = \"minimal\"\n",
-                cty.display()
-            ),
+        format!(
+            "{}\n[input]\ncw_segments_hz = []\n",
+            server_toml(
+                "operator_qth = \"Testville\"",
+                &format!(
+                    "cty_path = \"{}\"\nvalidation_level = \"minimal\"\n",
+                    cty.display()
+                ),
+            )
         ),
     )
     .unwrap();
@@ -226,6 +229,7 @@ fn sighup_applies_a_new_blocklist_without_dropping_clients_or_history() {
             "server.operator_qth",
             "spot.cty_path",
             "spot.validation_level",
+            "input.cw_segments_hz",
         ],
         LINE_TIMEOUT,
     );

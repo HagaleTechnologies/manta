@@ -3,7 +3,7 @@
 
 use crate::config::HpsdrAllocation;
 use crate::reconnect::{InputHealthTotals, SendSource};
-use crate::ResolvedInput;
+use crate::resolve::ResolvedInput;
 use anyhow::{anyhow, bail, Context, Result};
 use manta_input::IqSource;
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
@@ -360,6 +360,8 @@ impl Member {
                 missing: None,
                 unknown_gap: false,
                 resumed: None,
+                delivering: false,
+                stalled: false,
             });
         }
     }
@@ -381,6 +383,12 @@ pub(crate) struct GroupSource {
     /// MAN-202: the current inner source's unknown-length loss.
     unknown_gap: bool,
     resumed: Option<u64>,
+    /// MAN-489: samples returned to the engine since this member's last
+    /// stall report -- its own one-shot latch arm, separate from the
+    /// generation's shared productive state.
+    delivering: bool,
+    /// MAN-489: the pending stall report (`take_stalled`).
+    stalled: bool,
 }
 impl GroupSource {
     pub(crate) fn input_health(&self) -> Option<Arc<InputHealthTotals>> {
@@ -437,6 +445,16 @@ impl IqSource for GroupSource {
                 .is_none_or(|(g, _)| !self.group.is_current(g))
             {
                 self.current = None;
+                // MAN-489: a productive member reports its outage once
+                // before parking in `group.wait` -- its own real failure or
+                // a sibling retiring the generation -- so the engine
+                // settles what it holds while the replacement opens, and
+                // never a second report without fresh samples in between.
+                if self.delivering {
+                    self.delivering = false;
+                    self.stalled = true;
+                    return Ok(0);
+                }
                 let Some(generation) = self.group.wait(self.index)? else {
                     self.gap = Some(
                         (self
@@ -477,6 +495,8 @@ impl IqSource for GroupSource {
             let inner_missing = source.take_missing_samples();
             // MAN-202: an unknown-length loss is forwarded the same way.
             let inner_unknown = source.take_unknown_gap();
+            // MAN-489: the inner source's one-shot stall flag.
+            let inner_stalled = source.take_stalled();
             if !self.group.is_current(generation) {
                 continue;
             }
@@ -499,7 +519,30 @@ impl IqSource for GroupSource {
                     self.samples += n as u64 + inner_gap.unwrap_or(0) + inner_missing.unwrap_or(0);
                     self.boundary = generation.started_at
                         + Duration::from_secs_f64(self.samples as f64 / self.metadata.rate);
+                    self.delivering = true;
                     return Ok(n);
+                }
+                // MAN-489: the inner source's soft stall rides the inner
+                // `Ok(0)`. Report it once and keep the generation -- a
+                // stream that stopped sending samples is not a radio that
+                // needs replacing -- and keep reading the same stream for
+                // the resume. Hook values that accompany the zero are
+                // retained; the outage boundary arithmetic (`resumed`) is
+                // left to the read that delivers again, so it stays
+                // exactly what it was without the report.
+                Ok(_) if inner_stalled => {
+                    if let Some(k) = inner_missing {
+                        *self.missing.get_or_insert(0) += k;
+                    }
+                    self.unknown_gap |= inner_unknown;
+                    if self.delivering {
+                        self.delivering = false;
+                        self.stalled = true;
+                        return Ok(0);
+                    }
+                    // Already reported this outage; wait on the same
+                    // stream rather than returning an unflagged zero.
+                    continue;
                 }
                 Ok(_) | Err(_) => self.group.failed(generation),
             }
@@ -513,6 +556,11 @@ impl IqSource for GroupSource {
     }
     fn take_unknown_gap(&mut self) -> bool {
         std::mem::take(&mut self.unknown_gap)
+    }
+    /// MAN-489: consumed once per sample outage; see the inner source's
+    /// own `take_stalled`.
+    fn take_stalled(&mut self) -> bool {
+        std::mem::take(&mut self.stalled)
     }
 }
 impl Drop for GroupSource {
@@ -623,7 +671,7 @@ fn resolve(group: &HpsdrAllocation) -> std::result::Result<SocketAddr, String> {
         let mac = group
             .mac
             .as_deref()
-            .map(crate::parse_hpsdr_mac)
+            .map(crate::cli_parse::parse_hpsdr_mac)
             .transpose()?;
         return select_radio(port, &broadcast_destinations(port), mac)
             .map(|radio| SocketAddr::new(radio.ip, port))
@@ -732,13 +780,13 @@ pub(crate) fn prepare(
                     auto_attenuation: attenuation.clone(),
                 };
                 let opened = manta_input::hpsdr::open_receiver(&cfg, allocation.protocol)?;
-                crate::log_hpsdr_open_line(&host, port, &opened);
-                crate::warn_if_attenuation_needs_protocol_2(&cfg, &opened);
+                crate::source_spec::log_hpsdr_open_line(&host, port, &opened);
+                crate::source_spec::warn_if_attenuation_needs_protocol_2(&cfg, &opened);
                 // MAN-259: the open call's runtime before the radio started
                 // streaming is outage, not samples.
                 let started_at = entered + opened.source.acquisition_start_offset();
                 let (capture, dial) = transforms[0];
-                let source = crate::transform_source(opened.source, capture, dial)
+                let source = crate::source_spec::transform_source(opened.source, capture, dial)
                     .context("prepare HPSDR receivers")?;
                 return Ok(Opened {
                     sources: vec![source],
@@ -764,7 +812,7 @@ pub(crate) fn prepare(
                 .into_iter()
                 .zip(&transforms)
                 .map(|(raw, &(capture, dial))| {
-                    crate::transform_source(Box::new(raw), capture, dial)
+                    crate::source_spec::transform_source(Box::new(raw), capture, dial)
                 })
                 .collect::<Result<Vec<_>>>();
             match sources {
@@ -799,6 +847,7 @@ pub(crate) fn prepare(
 mod tests {
     use super::*;
     use manta_input::InputHealthCounters;
+    use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{mpsc, Barrier};
 
@@ -975,7 +1024,14 @@ mod tests {
             .map(|mut src| {
                 std::thread::spawn(move || {
                     let mut buf = [Complex32::default(); 4];
-                    src.read(&mut buf).unwrap();
+                    // MAN-489: each productive member reports the failed
+                    // generation's outage once before waiting for the
+                    // replacement, so the engine settles what it holds
+                    // during the reopen.
+                    assert_eq!(src.read(&mut buf).unwrap(), 0);
+                    assert!(src.take_stalled());
+                    assert!(!src.take_stalled());
+                    assert_eq!(src.read(&mut buf).unwrap(), 4);
                     assert_eq!(buf[0].re, 1.0);
                     assert_eq!(src.take_discontinuity(), Some(47996));
                     assert_eq!(src.take_discontinuity(), None);
@@ -1081,6 +1137,222 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
+    /// What a scripted member source does next (MAN-489 tests).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Script {
+        /// Deliver four samples of `f32`.
+        Samples(f32),
+        /// `Ok(0)` with `take_stalled` pending.
+        Stall,
+        /// A real read error.
+        Fail,
+    }
+
+    /// A member source whose reads follow a script the test controls; an
+    /// exhausted script parks the reader like a source waiting for
+    /// samples, until the test pushes more.
+    struct ScriptedSource {
+        script: Arc<Mutex<VecDeque<Script>>>,
+        stalled: bool,
+        counters: Arc<InputHealthCounters>,
+    }
+
+    impl IqSource for ScriptedSource {
+        fn sample_rate(&self) -> f64 {
+            48000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            7e6
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            loop {
+                match self.script.lock().unwrap().pop_front() {
+                    Some(Script::Samples(v)) => {
+                        buf[..4].fill(Complex32::new(v, 0.0));
+                        return Ok(4);
+                    }
+                    Some(Script::Stall) => {
+                        self.stalled = true;
+                        return Ok(0);
+                    }
+                    Some(Script::Fail) => bail!("radio lost"),
+                    None => std::thread::sleep(Duration::from_millis(2)),
+                }
+            }
+        }
+        fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+            Some(self.counters.clone())
+        }
+        fn take_stalled(&mut self) -> bool {
+            std::mem::take(&mut self.stalled)
+        }
+    }
+
+    /// A group whose members read scripted sources, plus the handles to
+    /// steer each member's script. Opens/retires count the coordinator's
+    /// generations, as `fixture` does.
+    struct ScriptedFixture {
+        group: Arc<Group>,
+        scripts: Vec<Arc<Mutex<VecDeque<Script>>>>,
+        opens: Arc<AtomicUsize>,
+        retires: Arc<AtomicUsize>,
+    }
+
+    fn scripted_group(scripts: Vec<Vec<Script>>) -> ScriptedFixture {
+        let handles: Vec<_> = scripts
+            .into_iter()
+            .map(|s| Arc::new(Mutex::new(s.into_iter().collect())))
+            .collect();
+        let members = handles.len();
+        let opens = Arc::new(AtomicUsize::new(0));
+        let count = opens.clone();
+        let retires = Arc::new(AtomicUsize::new(0));
+        let retired = retires.clone();
+        let worker_handles = handles.clone();
+        let group = Group::new(
+            Box::new(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                let sources = worker_handles
+                    .iter()
+                    .map(|script| {
+                        Box::new(ScriptedSource {
+                            script: script.clone(),
+                            stalled: false,
+                            counters: Arc::new(InputHealthCounters::new()),
+                        }) as SendSource
+                    })
+                    .collect();
+                let retired = retired.clone();
+                Ok(Opened {
+                    sources,
+                    started_at: Instant::now(),
+                    retire: Box::new(move || {
+                        retired.fetch_add(1, Ordering::SeqCst);
+                    }),
+                })
+            }),
+            Arc::new(AtomicBool::new(false)),
+            (0..members).map(|_| Box::new(|_| {}) as Health).collect(),
+            Arc::new(Instant::now),
+        );
+        ScriptedFixture {
+            group,
+            scripts: handles,
+            opens,
+            retires,
+        }
+    }
+
+    /// MAN-489: an inner soft stall is exposed once, the generation is
+    /// not retired or reopened, the sibling keeps delivering, and the same
+    /// generation resumes and reports a second outage.
+    #[test]
+    fn an_inner_soft_stall_is_forwarded_once_without_retiring_the_generation() {
+        let f = scripted_group(vec![
+            vec![
+                Script::Samples(1.0),
+                Script::Stall,
+                Script::Samples(2.0),
+                Script::Stall,
+            ],
+            vec![
+                Script::Samples(1.0),
+                Script::Samples(1.0),
+                Script::Samples(1.0),
+            ],
+        ]);
+        let group = f.group.clone();
+        let mut sources = open_pair(&group);
+        let generation = current(&group);
+        // Both members deliver first.
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert_eq!(sources[1].read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        // Member 0's stream stops: one report, no synthetic gap, and the
+        // generation stays current.
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(sources[0].take_stalled());
+        assert!(!sources[0].take_stalled());
+        assert_eq!(sources[0].take_discontinuity(), None);
+        assert_eq!(f.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(f.retires.load(Ordering::Relaxed), 0);
+        assert!(group.is_current(&generation));
+        // The sibling keeps delivering on the same generation.
+        assert_eq!(sources[1].read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        // The same generation resumes and stops again: a second report.
+        let mut buf = [Complex32::default(); 4];
+        assert_eq!(sources[0].read(&mut buf).unwrap(), 4);
+        assert_eq!(buf[0].re, 2.0);
+        assert!(!sources[0].take_stalled());
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(sources[0].take_stalled());
+        assert_eq!(f.opens.load(Ordering::Relaxed), 1);
+        assert_eq!(f.retires.load(Ordering::Relaxed), 0);
+        group.stop.store(true, Ordering::Relaxed);
+        group.changed.notify_all();
+    }
+
+    /// MAN-489: a productive member's real failure reports its outage once
+    /// before the member waits for the replacement generation.
+    #[test]
+    fn a_productive_members_real_failure_reports_before_waiting_for_reopen() {
+        let f = scripted_group(vec![vec![Script::Samples(1.0), Script::Fail]]);
+        let group = f.group.clone();
+        let scripts = &f.scripts;
+        let mut source = Member {
+            group: group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        // The radio errors: the outage is reported once, then the member
+        // waits for the replacement.
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(source.take_stalled());
+        assert!(!source.take_stalled());
+        assert_eq!(f.retires.load(Ordering::Relaxed), 1);
+        // The replacement delivers; the discontinuity of the outage is
+        // reported with its first samples, as before.
+        scripts[0].lock().unwrap().push_back(Script::Samples(9.0));
+        let mut buf = [Complex32::default(); 4];
+        assert_eq!(source.read(&mut buf).unwrap(), 4);
+        assert_eq!(buf[0].re, 9.0);
+        assert!(!source.take_stalled());
+        assert_eq!(f.opens.load(Ordering::Relaxed), 2);
+        group.stop.store(true, Ordering::Relaxed);
+        group.changed.notify_all();
+    }
+
+    /// MAN-489: a soft stall followed by generation loss does not produce
+    /// a second report without fresh samples.
+    #[test]
+    fn a_soft_stall_then_generation_loss_reports_nothing_new() {
+        let f = scripted_group(vec![vec![Script::Samples(1.0), Script::Stall]]);
+        let group = f.group.clone();
+        let scripts = &f.scripts;
+        let mut source = Member {
+            group: group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(source.take_stalled());
+        // The sibling-generation loss (here: the radio failing outright)
+        // arrives while member 0 already reported this outage.
+        scripts[0].lock().unwrap().push_back(Script::Fail);
+        // No second report: the next read goes to the replacement, whose
+        // first samples end the outage.
+        scripts[0].lock().unwrap().push_back(Script::Samples(5.0));
+        let mut buf = [Complex32::default(); 4];
+        assert_eq!(source.read(&mut buf).unwrap(), 4);
+        assert_eq!(buf[0].re, 5.0);
+        assert!(!source.take_stalled());
+        group.stop.store(true, Ordering::Relaxed);
+        group.changed.notify_all();
+    }
+
     #[test]
     fn stop_abandons_blocked_open_and_retires_late_success() {
         let (entered_tx, entered_rx) = mpsc::channel();
@@ -1156,7 +1428,11 @@ mod tests {
         f.group.wait(0).unwrap().unwrap();
         // Delay after it starts has already acquired buffered samples.
         *f.time.lock().unwrap() += Duration::from_secs(2);
-        sources[0].read(&mut [Complex32::default(); 4]).unwrap();
+        // MAN-489: the productive member's outage is reported once before
+        // the replacement's samples are read.
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(sources[0].take_stalled());
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 4);
         assert_eq!(sources[0].take_discontinuity(), Some(143996));
         assert_eq!(
             sources[0].boundary,
@@ -1394,6 +1670,10 @@ mod tests {
         *f.time.lock().unwrap() += Duration::from_secs(1);
         let mut source = sources.remove(0);
         let reader = std::thread::spawn(move || {
+            // MAN-489: the productive member's outage is reported once
+            // before the member waits for the replacement generation.
+            assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 0);
+            assert!(source.take_stalled());
             let n = source.read(&mut [Complex32::default(); 4]).unwrap();
             (n, source.take_discontinuity())
         });

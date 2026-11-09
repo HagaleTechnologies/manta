@@ -1,5 +1,6 @@
-//! MAN-316: keeps `cty.dat` and `MASTER.SCP` current while `manta run`
-//! reads a live receiver. Startup picks each list's version (pin, path,
+//! MAN-316: keeps `cty.dat`, `MASTER.SCP` and, with `pattern_url`, the
+//! callsign-pattern list (MAN-542) current while `manta run` reads a live
+//! receiver. Startup picks each list's version (pin, path,
 //! cache, built in: D3), and a `manta-lists` thread re-downloads the lists
 //! it manages on a fixed schedule (D8), swapping a download that passes
 //! `manta_spot::reference`'s acceptance checks into every consumer through
@@ -12,8 +13,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use manta_server::metrics::{ListOrigin, ListRefreshOutcome, Metrics};
-use manta_spot::reference::{accept_cty, accept_scp, ReferenceLists};
-use manta_spot::{cty, scp};
+use manta_spot::reference::{accept_cty, accept_patterns, accept_scp, ReferenceLists};
+use manta_spot::{cty, pattern, scp};
 
 use crate::list_cache::{from_unix_secs, sha256_hex, unix_secs, Cache, ListKind, State};
 use crate::list_http::{self, FetchLimits, Fetched, HttpUrl};
@@ -126,18 +127,27 @@ impl InUse {
     }
 }
 
-/// `lists: cty <desc>; scp <desc>`.
-pub(crate) fn lists_line(cty: &InUse, scp: &InUse) -> String {
-    format!("lists: cty {}; scp {}", cty.describe(), scp.describe())
+/// `lists: cty <desc>; scp <desc>; patterns <desc>`, in `ListKind::ALL`
+/// order.
+pub(crate) fn lists_line(in_use: &[InUse; 3]) -> String {
+    let [cty, scp, patterns] = in_use;
+    format!(
+        "lists: cty {}; scp {}; patterns {}",
+        cty.describe(),
+        scp.describe(),
+        patterns.describe()
+    )
 }
 
 /// Design §4: what `run`/`soak` print for a file source with refresh on.
-pub(crate) fn file_replay_note(cty: &InUse, scp: &InUse) -> String {
+pub(crate) fn file_replay_note(in_use: &[InUse; 3]) -> String {
+    let [cty, scp, patterns] = in_use;
     format!(
-        "note: list refresh is off for file replay, so the run is repeatable; using cty {} and \
-         scp {}; pin a downloaded copy with --cty-sha256 or --scp-sha256",
+        "note: list refresh is off for file replay, so the run is repeatable; using cty {}, \
+         scp {} and patterns {}; pin a downloaded copy with --cty-sha256 or --scp-sha256",
         cty.describe(),
-        scp.describe()
+        scp.describe(),
+        patterns.describe()
     )
 }
 
@@ -149,11 +159,12 @@ pub(crate) fn left_alone_note(in_use: &InUse) -> Option<String> {
         (Origin::File(_), ListKind::Scp) => "scp_path",
         (Origin::Pinned(_), ListKind::Cty) => "cty_sha256",
         (Origin::Pinned(_), ListKind::Scp) => "scp_sha256",
+        (Origin::File(_), ListKind::Patterns) => "pattern_path",
         _ => return None,
     };
     Some(format!(
         "note: {key} is set, so list refresh leaves {} alone",
-        in_use.kind.file_name()
+        in_use.kind.operator_name()
     ))
 }
 
@@ -162,10 +173,12 @@ pub(crate) fn bundled_sha256(kind: ListKind) -> String {
     sha256_hex(bundled_text(kind).as_bytes())
 }
 
-fn bundled_text(kind: ListKind) -> &'static str {
+/// The built-in copy's text.
+pub(crate) fn bundled_text(kind: ListKind) -> &'static str {
     match kind {
         ListKind::Cty => manta_spot::CTY_DAT,
         ListKind::Scp => manta_spot::MASTER_SCP,
+        ListKind::Patterns => manta_spot::PATTERNS_LST,
     }
 }
 
@@ -175,6 +188,7 @@ fn bundled_retrieved_at(kind: ListKind) -> Option<SystemTime> {
     match kind {
         ListKind::Cty => manta_spot::vintage::cty_dat_retrieved_at(),
         ListKind::Scp => manta_spot::vintage::master_scp_retrieved_at(),
+        ListKind::Patterns => manta_spot::vintage::patterns_lst_generated_at(),
     }
 }
 
@@ -196,18 +210,28 @@ pub(crate) fn due(now: SystemTime, state: Option<&State>, kind: ListKind) -> boo
     now >= next_due(now, state, kind)
 }
 
-/// A table that passed the acceptance checks, either kind.
+/// A table that passed the acceptance checks, any kind.
 enum Accepted {
     Cty(cty::Table),
     Scp(scp::Set),
+    /// MAN-542.
+    Patterns(pattern::Downloaded),
 }
 
 impl Accepted {
-    /// `7497 prefixes` / `50020 calls`.
+    /// `7497 prefixes` / `50020 calls` / `6036 patterns` (with
+    /// `, M unmatchable lines skipped` when there are any).
     fn size(&self) -> String {
         match self {
             Accepted::Cty(table) => format!("{} prefixes", table.len()),
             Accepted::Scp(set) => format!("{} calls", set.len()),
+            Accepted::Patterns(downloaded) => match downloaded.skipped_lines {
+                0 => format!("{} patterns", downloaded.table.len()),
+                skipped => format!(
+                    "{} patterns, {skipped} unmatchable lines skipped",
+                    downloaded.table.len()
+                ),
+            },
         }
     }
 
@@ -215,6 +239,7 @@ impl Accepted {
         match self {
             Accepted::Cty(table) => lists.cty.store(Arc::new(table)),
             Accepted::Scp(set) => lists.scp.store(Arc::new(set)),
+            Accepted::Patterns(downloaded) => lists.patterns.store(Arc::new(downloaded.table)),
         }
     }
 }
@@ -223,6 +248,7 @@ impl Accepted {
 struct Bundled {
     cty: cty::Table,
     scp: scp::Set,
+    patterns: pattern::Table,
 }
 
 impl Bundled {
@@ -230,53 +256,67 @@ impl Bundled {
         Bundled {
             cty: cty::Table::bundled(),
             scp: scp::Set::bundled(),
+            patterns: pattern::Table::bundled(),
         }
     }
 
-    /// UTF-8 check, then `accept_cty`/`accept_scp` (D5).
+    /// UTF-8 check, then `accept_cty`/`accept_scp`/`accept_patterns` (D5).
     fn accept(&self, kind: ListKind, bytes: &[u8]) -> Result<Accepted, String> {
         let text = std::str::from_utf8(bytes).map_err(|_| "it is not UTF-8 text".to_string())?;
         match kind {
             ListKind::Cty => accept_cty(text, &self.cty).map(Accepted::Cty),
             ListKind::Scp => accept_scp(text, &self.scp).map(Accepted::Scp),
+            ListKind::Patterns => accept_patterns(text, &self.patterns).map(Accepted::Patterns),
         }
     }
 }
 
-/// D3 steps 3 and 4 for every list a pin or path did not choose: the
-/// cache's current version when refresh is on, `cache` is set, the version
+/// The tables a run starts from before the cache is consulted: each list's
+/// pin, path or built-in copy.
+pub(crate) struct StartupTables {
+    pub(crate) cty: Arc<cty::Table>,
+    pub(crate) scp: Arc<scp::Set>,
+    pub(crate) patterns: Arc<pattern::Table>,
+}
+
+/// D3 steps 3 and 4 for each kind in `candidates` that no pin or path
+/// chose: the cache's current version when `cache` is set, the version
 /// verifies, passes acceptance and was downloaded after the built-in copy's
-/// retrieval date; else the built-in copy. A cache that is present but
-/// unusable is a `warning: list cache: …` line. Returns the shared lists
-/// and the version of each in use, cty first.
+/// retrieval date; else the table in `tables`. `candidates` is empty with
+/// refresh off, and names `Patterns` only when the pattern list is managed
+/// (MAN-542 D11). A cache that is present but unusable is a
+/// `warning: list cache: …` line. Returns the shared lists and the version
+/// of each in use, in `ListKind::ALL` order.
 pub(crate) fn resolve_startup(
-    cty_table: Arc<cty::Table>,
-    cty_in_use: InUse,
-    scp_set: Arc<scp::Set>,
-    scp_in_use: InUse,
-    refresh_on: bool,
+    tables: StartupTables,
+    in_use: [InUse; 3],
+    candidates: &[ListKind],
     cache: Option<&Cache>,
-) -> (ReferenceLists, [InUse; 2]) {
-    let mut cty_pair = (cty_table, cty_in_use);
-    let mut scp_pair = (scp_set, scp_in_use);
-    if let (true, Some(cache)) = (refresh_on, cache) {
+) -> (ReferenceLists, [InUse; 3]) {
+    let StartupTables {
+        mut cty,
+        mut scp,
+        mut patterns,
+    } = tables;
+    let mut in_use = in_use;
+    if let Some(cache) = cache.filter(|_| !candidates.is_empty()) {
         let bundled = Bundled::parse();
-        if !cty_pair.1.is_operator_choice() {
-            if let Some((Accepted::Cty(table), in_use)) = from_cache(cache, ListKind::Cty, &bundled)
-            {
-                cty_pair = (Arc::new(table), in_use);
+        for (index, kind) in ListKind::ALL.into_iter().enumerate() {
+            if !candidates.contains(&kind) || in_use[index].is_operator_choice() {
+                continue;
             }
-        }
-        if !scp_pair.1.is_operator_choice() {
-            if let Some((Accepted::Scp(set), in_use)) = from_cache(cache, ListKind::Scp, &bundled) {
-                scp_pair = (Arc::new(set), in_use);
+            let Some((accepted, cached)) = from_cache(cache, kind, &bundled) else {
+                continue;
+            };
+            match accepted {
+                Accepted::Cty(table) => cty = Arc::new(table),
+                Accepted::Scp(set) => scp = Arc::new(set),
+                Accepted::Patterns(downloaded) => patterns = Arc::new(downloaded.table),
             }
+            in_use[index] = cached;
         }
     }
-    (
-        ReferenceLists::new(cty_pair.0, scp_pair.0),
-        [cty_pair.1, scp_pair.1],
-    )
+    (ReferenceLists::new(cty, scp, patterns), in_use)
 }
 
 /// The cache's current version of `kind`, when it may be used at startup.
@@ -345,7 +385,7 @@ impl RefreshSetup {
             .iter()
             .map(|list| {
                 let every = match list.in_use.kind {
-                    ListKind::Cty => "every 7 days",
+                    ListKind::Cty | ListKind::Patterns => "every 7 days",
                     ListKind::Scp => "every day",
                 };
                 format!("{} {every} from {}", list.in_use.kind.name(), list.url)
@@ -730,7 +770,7 @@ mod tests {
     const DAY: Duration = Duration::from_secs(86_400);
     const HOUR: Duration = Duration::from_secs(3600);
 
-    /// The test fixture already used in main.rs: a prefix the bundled
+    /// The test fixture already in src/test_support.rs: a prefix the bundled
     /// cty.dat does not allocate.
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 
@@ -822,11 +862,9 @@ mod tests {
         st.downloaded_at = u64::MAX;
         cache.write_state(ListKind::Cty, &st).unwrap();
         let (lists, in_use) = resolve_startup(
-            Arc::new(cty::Table::bundled()),
-            InUse::bundled(ListKind::Cty),
-            Arc::new(scp::Set::bundled()),
-            InUse::bundled(ListKind::Scp),
-            true,
+            bundled_tables(),
+            bundled_in_use(),
+            &[ListKind::Cty, ListKind::Scp],
             Some(&cache),
         );
         assert_eq!(in_use[0], InUse::bundled(ListKind::Cty));
@@ -892,6 +930,7 @@ mod tests {
         ReferenceLists::new(
             Arc::new(cty::Table::bundled()),
             Arc::new(scp::Set::bundled()),
+            std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
         )
     }
 
@@ -908,24 +947,47 @@ mod tests {
         sha
     }
 
+    fn bundled_tables() -> StartupTables {
+        StartupTables {
+            cty: Arc::new(cty::Table::bundled()),
+            scp: Arc::new(scp::Set::bundled()),
+            patterns: Arc::new(pattern::Table::bundled()),
+        }
+    }
+
+    fn bundled_in_use() -> [InUse; 3] {
+        ListKind::ALL.map(InUse::bundled)
+    }
+
+    /// MAN-542: the bundled list in RBN's Skimmer style (CRLF, `+ PATTERN`
+    /// or two spaces and `PATTERN`), plus `+ QQ9@@@` and two lines no
+    /// admitted call can match: 6,037 patterns, 2 skipped.
+    fn skimmer_patterns_with_qq9() -> String {
+        let mut out: String = manta_spot::PATTERNS_LST
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| match line.strip_prefix('+') {
+                Some(pattern) => format!("+ {pattern}\r\n"),
+                None => format!("  {line}\r\n"),
+            })
+            .collect();
+        out.push_str("+ QQ9@@@\r\n  3E5##@@@\r\n  A2#@\r\n");
+        out
+    }
+
     #[test]
     fn startup_resolution_precedence() {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::new(dir.path().to_path_buf());
         let recent = SystemTime::now();
         let cached_sha = write_cache(&cache, ListKind::Cty, qq9_cty().as_bytes(), recent);
-        let bundled_cty = Arc::new(cty::Table::bundled());
-        let bundled_scp = Arc::new(scp::Set::bundled());
+        let all = ListKind::ALL;
+        let cty_scp = [ListKind::Cty, ListKind::Scp];
 
         // The cache beats bundled when refresh is on.
-        let (lists, in_use) = resolve_startup(
-            bundled_cty.clone(),
-            InUse::bundled(ListKind::Cty),
-            bundled_scp.clone(),
-            InUse::bundled(ListKind::Scp),
-            true,
-            Some(&cache),
-        );
+        let (lists, in_use) =
+            resolve_startup(bundled_tables(), bundled_in_use(), &cty_scp, Some(&cache));
         assert_eq!(in_use[0].sha256, cached_sha);
         assert!(matches!(in_use[0].origin, Origin::Cache { .. }));
         assert!(in_use[0].confirmed_at.is_some());
@@ -933,14 +995,7 @@ mod tests {
         assert_eq!(in_use[1], InUse::bundled(ListKind::Scp));
 
         // Refresh off: the cache is never read.
-        let (_, in_use) = resolve_startup(
-            bundled_cty.clone(),
-            InUse::bundled(ListKind::Cty),
-            bundled_scp.clone(),
-            InUse::bundled(ListKind::Scp),
-            false,
-            Some(&cache),
-        );
+        let (_, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &[], Some(&cache));
         assert_eq!(in_use[0], InUse::bundled(ListKind::Cty));
 
         // A path (and a pin) beats the cache.
@@ -951,45 +1006,83 @@ mod tests {
             Origin::Pinned(PinSource::Bundled),
         );
         for chosen in [file, pinned] {
-            let (lists, in_use) = resolve_startup(
-                bundled_cty.clone(),
-                chosen.clone(),
-                bundled_scp.clone(),
-                InUse::bundled(ListKind::Scp),
-                true,
-                Some(&cache),
-            );
+            let tables = bundled_tables();
+            let configured = tables.cty.clone();
+            let mut start = bundled_in_use();
+            start[0] = chosen.clone();
+            let (lists, in_use) = resolve_startup(tables, start, &cty_scp, Some(&cache));
             assert_eq!(in_use[0], chosen);
-            assert!(Arc::ptr_eq(&lists.cty.load(), &bundled_cty));
+            assert!(Arc::ptr_eq(&lists.cty.load(), &configured));
         }
 
         // A cache older than the built-in copy's retrieval date loses.
         let old_dir = tempfile::tempdir().unwrap();
         let old = Cache::new(old_dir.path().to_path_buf());
         write_cache(&old, ListKind::Cty, qq9_cty().as_bytes(), at(1_700_000_000));
-        let (_, in_use) = resolve_startup(
-            bundled_cty.clone(),
-            InUse::bundled(ListKind::Cty),
-            bundled_scp.clone(),
-            InUse::bundled(ListKind::Scp),
-            true,
-            Some(&old),
-        );
+        let (_, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &cty_scp, Some(&old));
         assert_eq!(in_use[0], InUse::bundled(ListKind::Cty));
 
         // A cache that fails acceptance loses (and is warned about).
         let bad_dir = tempfile::tempdir().unwrap();
         let bad = Cache::new(bad_dir.path().to_path_buf());
         write_cache(&bad, ListKind::Scp, b"<html>404</html>\n", recent);
-        let (_, in_use) = resolve_startup(
-            bundled_cty,
-            InUse::bundled(ListKind::Cty),
-            bundled_scp,
-            InUse::bundled(ListKind::Scp),
-            true,
-            Some(&bad),
-        );
+        let (_, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &cty_scp, Some(&bad));
         assert_eq!(in_use[1], InUse::bundled(ListKind::Scp));
+
+        // MAN-542: a cached pattern version is used only when `Patterns` is
+        // a candidate (D11).
+        let pat_dir = tempfile::tempdir().unwrap();
+        let pat = Cache::new(pat_dir.path().to_path_buf());
+        let pat_sha = write_cache(
+            &pat,
+            ListKind::Patterns,
+            skimmer_patterns_with_qq9().as_bytes(),
+            recent,
+        );
+        let (lists, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &all, Some(&pat));
+        assert_eq!(in_use[2].sha256, pat_sha);
+        assert!(matches!(in_use[2].origin, Origin::Cache { .. }));
+        assert_eq!(
+            lists.patterns.load().tier("QQ9ZZZ"),
+            manta_spot::PatternTier::Common
+        );
+        let (lists, in_use) =
+            resolve_startup(bundled_tables(), bundled_in_use(), &cty_scp, Some(&pat));
+        assert_eq!(in_use[2], InUse::bundled(ListKind::Patterns));
+        assert_eq!(
+            lists.patterns.load().tier("QQ9ZZZ"),
+            manta_spot::PatternTier::Unlisted
+        );
+        // A `pattern_path` file beats the cache.
+        let tables = bundled_tables();
+        let configured = tables.patterns.clone();
+        let mut start = bundled_in_use();
+        start[2] = InUse::new(
+            ListKind::Patterns,
+            "d".repeat(64),
+            Origin::File("p.lst".into()),
+        );
+        let (lists, in_use) = resolve_startup(tables, start.clone(), &all, Some(&pat));
+        assert_eq!(in_use[2], start[2]);
+        assert!(Arc::ptr_eq(&lists.patterns.load(), &configured));
+        // A version downloaded before `PATTERNS_LST_GENERATED` loses.
+        let old_pat_dir = tempfile::tempdir().unwrap();
+        let old_pat = Cache::new(old_pat_dir.path().to_path_buf());
+        let generated = manta_spot::vintage::patterns_lst_generated_at().unwrap();
+        write_cache(
+            &old_pat,
+            ListKind::Patterns,
+            skimmer_patterns_with_qq9().as_bytes(),
+            generated - DAY,
+        );
+        let (_, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &all, Some(&old_pat));
+        assert_eq!(in_use[2], InUse::bundled(ListKind::Patterns));
+        // A cached web page loses.
+        let bad_pat_dir = tempfile::tempdir().unwrap();
+        let bad_pat = Cache::new(bad_pat_dir.path().to_path_buf());
+        write_cache(&bad_pat, ListKind::Patterns, b"<html>404</html>\n", recent);
+        let (_, in_use) = resolve_startup(bundled_tables(), bundled_in_use(), &all, Some(&bad_pat));
+        assert_eq!(in_use[2], InUse::bundled(ListKind::Patterns));
     }
 
     #[test]
@@ -1003,12 +1096,34 @@ mod tests {
                 downloaded_at: at(1_789_505_548),
             },
         );
+        let patterns = InUse::bundled(ListKind::Patterns);
+        let bundled_patterns = bundled_sha256(ListKind::Patterns);
+        let in_use = [bundled.clone(), cached.clone(), patterns.clone()];
         assert_eq!(
-            lists_line(&bundled, &cached),
+            lists_line(&in_use),
             format!(
                 "lists: cty built in (sha256 {sha}); scp from the cache (sha256 {sha}, \
-                 downloaded 2026-09-15)"
+                 downloaded 2026-09-15); patterns built in (sha256 {bundled_patterns})"
             )
+        );
+        assert_eq!(
+            file_replay_note(&in_use),
+            format!(
+                "note: list refresh is off for file replay, so the run is repeatable; using cty \
+                 built in (sha256 {sha}), scp from the cache (sha256 {sha}, downloaded \
+                 2026-09-15) and patterns built in (sha256 {bundled_patterns}); pin a downloaded \
+                 copy with --cty-sha256 or --scp-sha256"
+            )
+        );
+        assert_eq!(left_alone_note(&patterns), None);
+        let pattern_path = InUse::new(
+            ListKind::Patterns,
+            sha.clone(),
+            Origin::File("p.lst".into()),
+        );
+        assert_eq!(
+            left_alone_note(&pattern_path).unwrap(),
+            "note: pattern_path is set, so list refresh leaves the pattern list alone"
         );
         let pinned = InUse::new(
             ListKind::Cty,
@@ -1145,6 +1260,150 @@ mod tests {
         );
         assert_eq!(refresher.runs[0].in_use.origin, Origin::Download);
         assert_eq!(refresher.next_wake(), Some(now + ListKind::Cty.interval()));
+    }
+
+    #[test]
+    fn startup_line_names_each_managed_list() {
+        let urls = [
+            "http://a/cty.dat",
+            "http://b/MASTER.SCP",
+            "http://c/patt3ch.lst",
+        ];
+        let setup = RefreshSetup {
+            lists: ListKind::ALL
+                .into_iter()
+                .zip(urls)
+                .map(|(kind, url)| ListSetting {
+                    url: HttpUrl::parse(url).unwrap(),
+                    in_use: InUse::bundled(kind),
+                })
+                .collect(),
+            cache: Some(Cache::new("/var/cache/manta".into())),
+            limits: fast_limits(),
+        };
+        assert_eq!(
+            setup.startup_line(),
+            format!(
+                "list refresh: on; cty every 7 days from {}, scp every day from {}, patterns \
+                 every 7 days from {}; cache /var/cache/manta",
+                urls[0], urls[1], urls[2]
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_once_takes_a_skimmer_format_pattern_list() {
+        let body = skimmer_patterns_with_qq9();
+        let lm = "Mon, 22 Jun 2026 13:50:20 GMT";
+        let (base, server) = serve(vec![
+            ok(body.as_bytes(), Some(lm)),
+            b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n".to_vec(),
+        ]);
+        let url = HttpUrl::parse(&format!("{base}/Patt3Ch.lst")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::new(dir.path().to_path_buf());
+        let lists = Arc::new(bundled_lists());
+        let now = at(1_800_000_000);
+        let mut refresher = refresher_for(
+            ListKind::Patterns,
+            url,
+            Some(cache.clone()),
+            lists.clone(),
+            now,
+        );
+        assert_eq!(
+            refresher.refresh_once(ListKind::Patterns, now),
+            ListRefreshOutcome::Updated
+        );
+        assert_eq!(
+            (
+                lists.cty.generation(),
+                lists.scp.generation(),
+                lists.patterns.generation()
+            ),
+            (0, 0, 1)
+        );
+        assert_eq!(
+            lists.patterns.load().tier("QQ9ZZZ"),
+            manta_spot::PatternTier::Common
+        );
+        let sha = sha256_hex(body.as_bytes());
+        assert!(cache.version_path(ListKind::Patterns, &sha).is_file());
+        let st = cache.load_state(ListKind::Patterns).unwrap().unwrap();
+        assert_eq!(st.sha256, sha);
+        assert_eq!(
+            refresher.runs[0].in_use.origin,
+            Origin::Download,
+            "the run now names the download"
+        );
+        let later = now + DAY;
+        assert_eq!(
+            refresher.refresh_once(ListKind::Patterns, later),
+            ListRefreshOutcome::Unchanged
+        );
+        assert_eq!(lists.patterns.generation(), 1);
+        let requests = server.requests.lock().unwrap();
+        assert!(
+            requests[1].contains(&format!("If-Modified-Since: {lm}")),
+            "{}",
+            requests[1]
+        );
+    }
+
+    #[test]
+    fn pattern_downloads_that_fail_acceptance_keep_the_list() {
+        let without_zs: String = manta_spot::PATTERNS_LST
+            .lines()
+            .filter(|line| line.trim() != "+ZS6@@@")
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let canaries: Vec<String> = manta_spot::reference::CTY_CANARIES
+            .iter()
+            .map(|(call, _)| manta_spot::pattern::pattern_of(call))
+            .collect();
+        let mut small: Vec<String> = canaries.iter().map(|p| format!("+{p}")).collect();
+        small.extend(
+            manta_spot::PATTERNS_LST
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter(|l| !canaries.iter().any(|c| c == l.trim_start_matches('+')))
+                .map(str::to_owned)
+                .take(2999 - canaries.len()),
+        );
+        let small = small.join("\n");
+        let semicolon = format!("{}K5@@@;\n", manta_spot::PATTERNS_LST);
+        let bodies = [
+            b"<html><body>404 Not Found</body></html>\n".to_vec(),
+            without_zs.into_bytes(),
+            small.into_bytes(),
+            semicolon.into_bytes(),
+        ];
+        let now = at(1_800_000_000);
+        for body in bodies {
+            let (base, _server) = serve(vec![ok(&body, None)]);
+            let url = HttpUrl::parse(&format!("{base}/Patt3Ch.lst")).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let cache = Cache::new(dir.path().to_path_buf());
+            let lists = Arc::new(bundled_lists());
+            let mut refresher = refresher_for(
+                ListKind::Patterns,
+                url,
+                Some(cache.clone()),
+                lists.clone(),
+                now,
+            );
+            assert_eq!(
+                refresher.refresh_once(ListKind::Patterns, now),
+                ListRefreshOutcome::Failed,
+                "{}",
+                String::from_utf8_lossy(&body[..body.len().min(60)])
+            );
+            assert_eq!(lists.patterns.generation(), 0);
+            assert_eq!(refresher.runs[0].in_use, InUse::bundled(ListKind::Patterns));
+            assert_eq!(cache.load_state(ListKind::Patterns).unwrap(), None);
+            assert_eq!(refresher.next_wake(), Some(now + RETRY_AFTER_FAILURE));
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! MAN-316: the on-disk cache of downloaded reference lists under
 //! `[spot].list_cache_dir`. Version files are immutable and named by the
-//! SHA-256 of their bytes (`cty/<sha>.dat`, `scp/<sha>.scp`); `state.json`
+//! SHA-256 of their bytes (`cty/<sha>.dat`, `scp/<sha>.scp` and, with
+//! `pattern_url` set, `patterns/<sha>.lst` since MAN-542); `state.json`
 //! names the current one. Every write goes to a unique temporary name and
 //! is renamed into place, so a crash or two daemons sharing the directory
 //! never leave a half-written file. See the MAN-316 plan, Design §6.
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Versions of each list kept by `prune`: about 3 MB of cty, about 11 MB
-/// of scp.
+/// of scp, about 3 MB of patterns.
 pub(crate) const KEPT_VERSIONS: usize = 30;
 
 const STATE_FILE: &str = "state.json";
@@ -28,16 +29,19 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub(crate) enum ListKind {
     Cty,
     Scp,
+    /// MAN-542: the callsign-pattern list, managed only with `pattern_url`.
+    Patterns,
 }
 
 impl ListKind {
-    pub(crate) const ALL: [ListKind; 2] = [ListKind::Cty, ListKind::Scp];
+    pub(crate) const ALL: [ListKind; 3] = [ListKind::Cty, ListKind::Scp, ListKind::Patterns];
 
     /// The cache subdirectory, metric label and log-line name.
     pub(crate) fn name(self) -> &'static str {
         match self {
             ListKind::Cty => "cty",
             ListKind::Scp => "scp",
+            ListKind::Patterns => "patterns",
         }
     }
 
@@ -46,22 +50,24 @@ impl ListKind {
         match self {
             ListKind::Cty => "dat",
             ListKind::Scp => "scp",
+            ListKind::Patterns => "lst",
         }
     }
 
     /// How often a live `run` checks for a new copy.
     pub(crate) fn interval(self) -> Duration {
         match self {
-            ListKind::Cty => 7 * DAY,
+            ListKind::Cty | ListKind::Patterns => 7 * DAY,
             ListKind::Scp => DAY,
         }
     }
 
-    /// The list's usual file name, as operator-facing text names it.
-    pub(crate) fn file_name(self) -> &'static str {
+    /// The list as operator-facing text names it.
+    pub(crate) fn operator_name(self) -> &'static str {
         match self {
             ListKind::Cty => "cty.dat",
             ListKind::Scp => "MASTER.SCP",
+            ListKind::Patterns => "the pattern list",
         }
     }
 }
@@ -350,6 +356,32 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    #[test]
+    fn pattern_kind_metadata() {
+        assert_eq!(
+            ListKind::ALL,
+            [ListKind::Cty, ListKind::Scp, ListKind::Patterns]
+        );
+        let p = ListKind::Patterns;
+        assert_eq!(p.name(), "patterns");
+        assert_eq!(p.extension(), "lst");
+        assert_eq!(p.interval(), 7 * DAY);
+        assert_eq!(p.operator_name(), "the pattern list");
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::new(tmp.path().to_path_buf());
+        let bytes = manta_spot::PATTERNS_LST.as_bytes();
+        let sha = sha256_hex(bytes);
+        assert!(cache
+            .version_path(p, &sha)
+            .ends_with(format!("patterns/{sha}.lst")));
+        let state = state_for(bytes, 7);
+        cache.store(p, bytes, &state).unwrap();
+        assert_eq!(cache.load_current(p), Ok(Some((state, bytes.to_vec()))));
+        cache.prune(p, &sha).unwrap();
+        assert!(cache.version_path(p, &sha).exists());
+        assert_eq!(cache.load_current(ListKind::Cty), Ok(None));
     }
 
     #[test]

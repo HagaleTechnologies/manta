@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ead44ce71e0b86635736ed2923ef14b39ee01fdba3ef51c4303490adbeb1cbd9",
+      "hash": "sha256:d47cbfbada9012ef5cef9ae283ec47ef70a0f65e51b48f2f6bd27cf4391d481b",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -355,7 +355,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:7ff72f447f8b2dd8d04c8ce0ea03c30ea4176fb5c436a0ed101aee68b4adf217",
+      "hash": "sha256:e3bfa62980783f19f895db5acb7881ff021ec43c9e6e943f5948893fc4e440e0",
       "id": "uplink-health-observability",
       "kind": "interface",
       "links": [
@@ -412,7 +412,7 @@
         "CONTRIBUTING.md",
         "scripts/check-release-ci.py",
         "scripts/check-soapy-release.py",
-        "docs/superpowers/specs/2026-09-11-man212-windows-platform-support-design.md",
+        "docs/archive/plans/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
         "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
       ],

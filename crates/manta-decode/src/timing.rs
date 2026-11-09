@@ -2,6 +2,9 @@
 
 use std::collections::VecDeque;
 
+mod bank;
+pub use bank::{SpeedBankConfig, SwitchRecord, TimingBank, TimingHypothesis};
+
 const CLUSTER_ALPHA: f32 = 0.15; // SPEC §9 decode.cluster_alpha
 const RATIO_MIN: f32 = 2.2; // SPEC §9 decode.mu_ratio_bounds
                             // SPEC §9 decode.mu_ratio_bounds upper end, **[DEVIATION]** (MAN-315 D5):
@@ -486,6 +489,35 @@ impl SpeedTracker {
         self.apply_constraints();
         self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
         true
+    }
+
+    /// MAN-493: seed the mark clusters from a truth WPM. An
+    /// oracle-bypass experiment's entry point only -- no production
+    /// caller. Sets the state a successful `bootstrap` amounts to: the
+    /// dit/dah cluster pair ready with centroids at the truth dit
+    /// (`1200/wpm` ms, clamped to `DIT_CLAMP_MS`) and three dits, and
+    /// `wpm_ema` at the clamped seed's own PARIS speed. The dit cluster
+    /// stays `lo_uncorroborated` (the seed is one truth value, not a
+    /// measured mark), so the MAN-398 gap-corroborated recovery can still
+    /// re-anchor a seed that a sustained run of real marks contradicts;
+    /// marks that agree with it keep the ordinary EMA and drift rules.
+    pub fn seed_wpm(&mut self, wpm: f32) {
+        if !wpm.is_finite() || wpm <= 0.0 {
+            return;
+        }
+        let dit = (1200.0 / wpm).clamp(DIT_CLAMP_MS.0, DIT_CLAMP_MS.1);
+        self.pair.lo = dit;
+        self.pair.hi = 3.0 * dit;
+        self.pair.ready = true;
+        self.pair.confirmed = true;
+        self.pair.placeholder_is_lo = false;
+        self.pair.init.clear();
+        self.pair.lo_n = 0;
+        self.ring.clear();
+        self.recent.clear();
+        self.mu_egap_ms = None;
+        self.lo_uncorroborated = true;
+        self.wpm_ema = Some(1200.0 / self.dit_estimate_ms());
     }
 
     /// Feed one mark duration, updating the clusters, constraints, and drift check. SPEC §4.1.
@@ -1053,8 +1085,9 @@ impl TimingEstimates {
 ///
 /// Values are stored in dits of the dit period at observation time (the
 /// caller passes `SpeedTracker::dit_estimate_ms`), so ratios survive slow
-/// speed drift. MAN-111 (scored boundaries) and MAN-113 (WPM hypotheses)
-/// read `estimates()`; this model itself uses only the means.
+/// speed drift. MAN-111 (scored boundaries) reads `estimates()`; this
+/// model itself uses only the means. The MAN-544 speed hypothesis bank
+/// (`timing::bank`) reads neither and resets it on a switch.
 #[derive(Debug, Clone, Default)]
 pub struct SenderTiming {
     stats: [ClassStats; 5],
@@ -1152,6 +1185,47 @@ mod tests {
         for &d in durs {
             t.on_mark(d);
         }
+    }
+
+    /// MAN-493: a seeded tracker is ready at the seed before any mark.
+    #[test]
+    fn seeded_speed_tracker_is_ready_at_the_seed() {
+        let mut t = SpeedTracker::new();
+        assert!(!t.ready());
+        t.seed_wpm(20.0);
+        assert!(t.ready());
+        let w = t.wpm().expect("seed reports a speed");
+        assert!((w - 20.0).abs() / 20.0 < 0.01, "{w}");
+        assert!((t.mu_dit_ms() - 60.0).abs() < 0.01);
+        // Out-of-range seeds clamp to the dit clamp, not an impossible dit.
+        t.seed_wpm(200.0); // 6 ms dit -> clamped to 20 ms = 60 WPM
+        assert!((t.mu_dit_ms() - 20.0).abs() < 0.01);
+        assert!((t.wpm().unwrap() - 60.0).abs() / 60.0 < 0.01);
+    }
+
+    /// MAN-493: the seed is a starting point, not a lock. Seeded at 40 and
+    /// fed 20 WPM marks (dit 60, dah 180, element gap 60), the MAN-398
+    /// recovery re-anchors the scale once the marks and gaps contradict
+    /// it, and the tracker reports 20 WPM.
+    #[test]
+    fn seeded_tracker_still_adapts() {
+        let mut t = SpeedTracker::new();
+        t.seed_wpm(40.0);
+        assert!((t.wpm().unwrap() - 40.0).abs() < 0.5);
+        for i in 0..12 {
+            t.on_mark(if i % 2 == 0 { 60.0 } else { 180.0 });
+            t.on_element_gap(60.0);
+        }
+        let w = t.wpm().unwrap();
+        assert!((w - 20.0).abs() <= 2.0, "{w}");
+        assert!((t.mu_dit_ms() - 60.0).abs() <= 5.0, "{}", t.mu_dit_ms());
+        // A seed the marks agree with stays put.
+        let mut agree = SpeedTracker::new();
+        agree.seed_wpm(20.0);
+        for i in 0..5 {
+            agree.on_mark(if i % 2 == 0 { 60.0 } else { 180.0 });
+        }
+        assert!((agree.wpm().unwrap() - 20.0).abs() <= 1.0);
     }
 
     #[test]

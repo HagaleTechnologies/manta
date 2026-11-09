@@ -1,11 +1,9 @@
-<p align="center">
+<h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-    <img src="assets/logo-light.svg" alt="manta" width="160">
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-lockup-dark.svg">
+    <img src="assets/logo-lockup-light.svg" alt="manta" width="400">
   </picture>
-</p>
-
-<h1 align="center">manta</h1>
+</h1>
 
 <p align="center">
   Open-source wideband CW skimmer. Every CW signal in an SDR passband, decoded at once,
@@ -29,6 +27,11 @@ Beacon Network) and modern consumers (such as [cqdx](https://cqdx.app)) can
 ingest it without changes.
 
 No GUI. CLI, a TOML config file, and Prometheus metrics.
+
+Live listening (one input or several) and offline `manta decode` can replay
+ambiguous observations under bounded budgets. `[decode.refine] enabled = false` opts out. See the
+[configuration reference](docs/CONFIG.md) and
+[measurement limits](docs/DECISIONS/2026-11-05-man208-delayed-refinement.md).
 
 ```console
 $ telnet manta.example.org 7300
@@ -77,6 +80,7 @@ clone of this repository.
 | macOS, Apple silicon | `manta-macos-arm64.tar.gz` |
 | Windows x86-64 | `manta-windows-x86_64.zip` |
 | Linux x86-64 with SoapySDR, Ubuntu 24.04 | `manta-linux-x86_64-soapy.tar.gz` |
+| Linux arm64 with SoapySDR, 64-bit Raspberry Pi OS bookworm | `manta-linux-arm64-soapy.tar.gz` |
 
 On Linux or macOS, put your archive's name in place of
 `manta-linux-x86_64.tar.gz`:
@@ -101,9 +105,10 @@ config, the man pages (see [Tab completion and man pages](#tab-completion-and-ma
 and the kit for running manta as a service
 ([packaging/README.md](packaging/README.md)). The standard release
 archives support KiwiSDR, HPSDR, audio and WAV input. For SoapySDR on
-Ubuntu 24.04 x86_64, download `manta-linux-x86_64-soapy.tar.gz`. It
-includes the SoapySDR input support and requires the system libraries and
-device module below. You do not need Rust or a manta source checkout.
+Ubuntu 24.04 x86_64, download `manta-linux-x86_64-soapy.tar.gz`. On
+64-bit Raspberry Pi OS (bookworm or later), download
+`manta-linux-arm64-soapy.tar.gz`. Each includes the SoapySDR input support
+and requires the system libraries and device module below. You do not need Rust or a manta source checkout.
 Linux binaries need the ALSA runtime library (`libasound2`, see the notes
 below). macOS binaries are not signed or notarized: if macOS refuses to run
 one you downloaded in a browser, clear the flag with
@@ -195,6 +200,41 @@ That can mean the receiver's module is not installed, the receiver is
 unplugged, or your user lacks permission to open the device. The module's
 own messages can add more lines on stderr.
 
+### SoapySDR on Raspberry Pi OS (arm64)
+
+`manta-linux-arm64-soapy.tar.gz` is the Linux arm64 binary with SoapySDR
+input, built and tested on Debian bookworm, for 64-bit Raspberry Pi OS
+bookworm or later (MAN-539). Like the x86_64 archive, it loads the
+SoapySDR library installed on your system and bundles no device module:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends libasound2 libsoapysdr0.8 soapysdr0.8-module-rtlsdr
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64-soapy.tar.gz
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+tar xzf manta-linux-arm64-soapy.tar.gz
+cd manta-linux-arm64-soapy
+./manta --version
+./manta devices
+```
+
+Bookworm's ALSA runtime package is `libasound2`; on a Raspberry Pi OS
+based on Debian 13 it is `libasound2t64`. `./manta --version` lists the
+feature:
+
+```text
+manta 0.1.0 (git <build-id>; features: soapy)
+```
+
+The module table, the SDRplay prerequisites, the loader error for a
+missing `libsoapysdr0.8` and the `no match` error are the same as in
+[SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64); Debian bookworm
+packages the same modules as Ubuntu 24.04. If you do not need SoapySDR,
+use `manta-linux-arm64.tar.gz` instead. The
+[Raspberry Pi guide](docs/GUIDES/raspberry-pi.md) installs either archive
+as a service.
+
 ### Build from source
 
 You need Rust 1.98+ and a `git` executable on `PATH`. Git is a build-time
@@ -231,6 +271,12 @@ Each release also publishes a multi-arch image (`linux/amd64`,
 ```sh
 docker run --rm ghcr.io/hagaletechnologies/manta:latest --help
 ```
+
+The image includes SoapySDR with the RTL-SDR, Airspy and HackRF modules
+(MAN-539). A USB receiver needs `--device /dev/bus/usb --group-add plugdev`
+on `docker run` and a udev rule on the host that gives `plugdev` access to
+the receiver: see
+[packaging/README.md](packaging/README.md#docker-compose).
 
 ### Tab completion and man pages
 
@@ -286,8 +332,12 @@ pages into `<dir>`.
   with `error: unexpected argument`. SoapySDR support for RTL-SDR, Airspy,
   SDRplay and HackRF is in the `manta-linux-x86_64-soapy.tar.gz` release
   archive for Ubuntu 24.04 x86_64 (see [SoapySDR on Linux
-  x86_64](#soapysdr-on-linux-x86_64)). To build it yourself, install the
-  native SoapySDR development library first, then use `--features soapy`.
+  x86_64](#soapysdr-on-linux-x86_64)), in the
+  `manta-linux-arm64-soapy.tar.gz` archive for 64-bit Raspberry Pi OS
+  bookworm (see [SoapySDR on Raspberry Pi OS
+  (arm64)](#soapysdr-on-raspberry-pi-os-arm64)) and in the Docker image. To
+  build it yourself, install the native SoapySDR development library first,
+  then use `--features soapy`.
 - Windows binaries from the release workflow link the MSVC runtime
   statically, so they need no Visual C++ Redistributable. A Windows build
   from source links it dynamically unless you set
@@ -632,7 +682,7 @@ JSON Lines) is unchanged.
 | Sound card (rig audio passband) | `listen --device`, `--dial-freq-hz` for absolute frequencies | Working, 48 kHz input only |
 | KiwiSDR over the network | `listen --kiwi-host` — any receiver from the public directory at <https://kiwisdr.com/public/> | Working |
 | OpenHPSDR radios: protocol 1 (Hermes-Lite 2, Red Pitaya, QMTech) and protocol 2 (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2) | `listen --hpsdr-host` or `--hpsdr-mac`, included in every build, no native radio dependency; radios that answer Metis UDP discovery on the LAN are found automatically when no host is set (Hermes-Lite 2 and ANAN-class radios both connect); a Red Pitaya always needs `--hpsdr-host`, because its avahi/mDNS discovery is not implemented. `--hpsdr-protocol auto` (the default) asks the radio which protocol it speaks | Working; both protocols verified against reference sources and a fake radio, not yet against hardware |
-| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` release archive ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64)), **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features soapy` | Working, needs hardware soak |
+| RTL-SDR, Airspy, SDRplay, HackRF, anything SoapySDR drives | `listen --soapy-driver`, feature `soapy` — in the `manta-linux-x86_64-soapy.tar.gz` and `manta-linux-arm64-soapy.tar.gz` release archives ([SoapySDR on Linux x86_64](#soapysdr-on-linux-x86_64), [on Raspberry Pi OS](#soapysdr-on-raspberry-pi-os-arm64)) and the Docker image, **not** in the other archives or the install line above; from source, needs the SoapySDR system library, then `--features soapy` | Working, needs hardware soak |
 | ka9q-radio (radiod) multicast IQ channel: RX-888, Airspy, anything radiod drives | `listen --ka9q-group`; no build feature | Working; protocol checked against ka9q-radio's docs and headers, not yet against a live radiod |
 
 The source frequency and rate flags end in `-hz`: `--kiwi-freq-hz`,
@@ -654,8 +704,9 @@ manta doctor --config manta.toml --duration 10
 
 Audio selectors are names matched case-insensitively by substring, not numeric
 indexes. `devices` lists input-capable devices without opening a stream. From
-the `manta-linux-x86_64-soapy.tar.gz` archive or a `--features soapy` build,
-it also lists complete Soapy selector strings for `--soapy-driver`; any other
+a SoapySDR archive (`manta-linux-x86_64-soapy.tar.gz` or
+`manta-linux-arm64-soapy.tar.gz`), the Docker image or a `--features soapy`
+build, it also lists complete Soapy selector strings for `--soapy-driver`; any other
 binary says where to get one. openHPSDR radios are discovered automatically when
 no host is set: a Hermes-Lite 2 or an ANAN-class radio answers and connects,
 and a Red Pitaya needs `--hpsdr-host HOST`
@@ -754,6 +805,14 @@ the live-state stream only if it sets `[server].live_port`.
   publishes nothing about what its ingest accepts, so the login and line
   format are manta's assumption, and the uplink ships in dry-run. To reach
   RBN today, let an RBN Aggregator read the telnet server above.
+- **PSKReporter (opt-in, public)** — with `[pskreporter] enabled = true`,
+  manta reports CQ and beacon spots to pskreporter.info's public map, each
+  call at most once per band every 5 minutes. See
+  [docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md).
+- **WSJT-X UDP for LAN loggers (opt-in)** — a `[[wsjtx_output]]` block sends
+  every spot to a LAN address as WSJT-X `Status` and `Decode` messages, so
+  loggers that listen for WSJT-X, such as GridTracker, can read them. Same
+  [guide](docs/GUIDES/pskreporter-and-lan-loggers.md).
 - **Prometheus metrics** (`:7302/metrics`) — spot, client, uplink and
   source-health counters. Some gauges are still placeholders;
   ARCHITECTURE §8 says which.
@@ -896,12 +955,13 @@ criteria.
   waterfall. manta can feed N1MM+'s Spectrum Display the power spectrum it
   already computes (`[input] spectrum_udp`, MAN-141), but it draws no
   waterfall or band scope itself.
-- Not a general digital-mode skimmer. manta decodes no FT8 or RTTY (FT8 and
-  RTTY decoding are out of scope for 1.0, though the channelizer
-  architecture does not preclude them later). It can forward WSJT-X's
-  FT8/FT4 CQ decodes through its uplink (MAN-320). Decoding RTTY stays a
-  non-goal for now; recognising it so that its tones never become CW tracks
-  is in scope (MAN-314).
+- Not a general digital-mode skimmer. manta decodes FT8 and FT4 when built
+  with `--features ftx` and an input sets
+  [`digital_modes`](docs/CONFIG.md#input) (MAN-323/MAN-485), publishing CQ
+  spots on the JSON stream only; RTTY decoding remains a non-goal, though
+  recognising its tones so they never become CW tracks is in scope
+  (MAN-314). It can also forward WSJT-X's FT8/FT4 CQ decodes through its
+  uplink (MAN-320).
 - Not a cluster network. `manta` relays its own spots, and those of the
   operator's own local skimmers and WSJT-X (MAN-320), to RBN; it takes no
   spots from other stations and serves no relayed spots to clients.
@@ -934,6 +994,8 @@ researchers each start, and lists every runbook.
 (a ka9q-radio (radiod) channel over multicast) ·
 [docs/GUIDES/n1mm-spectrum.md](docs/GUIDES/n1mm-spectrum.md)
 (a receiver's spectrum in N1MM+'s Spectrum Display) ·
+[docs/GUIDES/pskreporter-and-lan-loggers.md](docs/GUIDES/pskreporter-and-lan-loggers.md)
+(spots to PSKReporter and to WSJT-X-aware LAN loggers) ·
 [docs/RUNBOOKS/network-exposure.md](docs/RUNBOOKS/network-exposure.md)
 (exposing the servers safely) · the "Run it as a node" section above ·
 [docs/CONFIG.md](docs/CONFIG.md) (every config key, its default and what

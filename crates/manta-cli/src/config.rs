@@ -1,6 +1,6 @@
 //! MAN-261: the daemon's single config file. One TOML parse, a strict
 //! top-level check, the `MANTA_*` environment overlay, then one typed parse
-//! per table. CLI flags are merged on top in main.rs (`resolve`), giving the
+//! per table. CLI flags are merged on top in resolve.rs (`resolve`), giving the
 //! precedence CLI flag > `MANTA_<TABLE>_<KEY>` > file > built-in default.
 //! See docs/SPEC-decode-core.md §9 and
 //! docs/DECISIONS/2026-10-06-man261-config-surface.md.
@@ -16,7 +16,8 @@ use manta_decode::decoder::DecodeConfig;
 use manta_engine::config_file::DetectorConfigToml;
 use manta_engine::DetectorConfig;
 use manta_server::config::{
-    RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig, WsjtxRelayConfig,
+    PskReporterConfig, RbnCompareConfig, RbnUplinkConfig, ServerConfig, SkimmerRelayConfig,
+    WsjtxOutputConfig, WsjtxRelayConfig,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -30,6 +31,8 @@ pub(crate) const KNOWN_TABLES: &[&str] = &[
     "rbn_compare",
     "skimmer_relay",
     "wsjtx_relay",
+    "pskreporter",
+    "wsjtx_output",
     "callsign_lookup",
     "input",
     "spot",
@@ -91,12 +94,16 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("callsign_lookup", "qrz_password"),
     ("callsign_lookup", "qrz_url"),
     ("input", "type"),
+    ("input", "iq_correction"),
     ("input", "device"),
     ("input", "path"),
     ("input", "record_iq"),
     // MAN-141: `MANTA_INPUT_SPECTRUM_NAME=20` is the string "20".
     ("input", "spectrum_udp"),
     ("input", "spectrum_name"),
+    // MAN-496: `MANTA_INPUT_DC_BLOCK=apply` is the string mode "apply".
+    ("input", "dc_block"),
+    ("input", "impulse_suppress"),
     ("input", "iq_format"),
     ("input", "host"),
     ("input", "mac"),
@@ -116,6 +123,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "list_cache_dir"),
     ("spot", "cty_url"),
     ("spot", "scp_url"),
+    // MAN-542.
+    ("spot", "pattern_url"),
     ("spot", "cty_sha256"),
     ("spot", "scp_sha256"),
     ("spot", "pattern_path"),
@@ -168,6 +177,12 @@ pub(crate) struct Loaded {
     /// MAN-320: `[[wsjtx_relay]]` blocks as written, validated (disabled
     /// ones included). Restart-only.
     pub wsjtx_relay: Vec<WsjtxRelayConfig>,
+    /// MAN-142: `[pskreporter]` as written, validated (`None` when the
+    /// table is absent; present even when `enabled = false`). Restart-only.
+    pub pskreporter: Option<PskReporterConfig>,
+    /// MAN-142: `[[wsjtx_output]]` blocks as written, validated (disabled
+    /// ones included). Restart-only.
+    pub wsjtx_output: Vec<WsjtxOutputConfig>,
     /// MAN-318: `[callsign_lookup]` as written, validated (`None` when the
     /// table is absent; present even when `enabled = false`).
     pub callsign_lookup: Option<CallsignLookupConfig>,
@@ -312,6 +327,10 @@ pub(crate) struct SpotFile {
     /// `http://` URL at load. See [`SpotFile::cty_url`].
     pub cty_url: Option<String>,
     pub scp_url: Option<String>,
+    /// MAN-542: where `refresh_lists` downloads the callsign-pattern list.
+    /// No default: unset, the pattern list is never downloaded. An
+    /// `http://` URL, checked at load like `cty_url`.
+    pub pattern_url: Option<String>,
     /// MAN-316: a pinned list version, validated and lowercased by
     /// [`parse_sha256`] at load.
     pub cty_sha256: Option<String>,
@@ -348,6 +367,7 @@ struct SpotToml {
     list_cache_dir: Option<PathBuf>,
     cty_url: Option<String>,
     scp_url: Option<String>,
+    pattern_url: Option<String>,
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
     pattern_path: Option<PathBuf>,
@@ -475,6 +495,11 @@ impl InputKind {
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
+    cw_segments_hz: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    cw_schedule: Vec<CwDaily>,
+    #[serde(default)]
+    cw_overrides: Vec<CwOverride>,
     /// MAN-13: the input's name (required with two or more `[[input]]`).
     name: Option<String>,
     #[serde(rename = "type")]
@@ -511,7 +536,18 @@ struct InputToml {
     /// MAN-308: hpsdr protocol 2's automatic step attenuation.
     auto_attenuation: Option<bool>,
     // Shared keys, valid with any (or no) type.
+    digital_modes: Option<Vec<String>>,
+    iq_correction: Option<String>,
+    iq_gain_ratio: Option<f64>,
+    iq_phase_deg: Option<f64>,
+    iq_calibrated_center_hz: Option<f64>,
     freq_correction_ppm: Option<f64>,
+    /// MAN-496: the DC-removal conditioning stage's mode, written `off`,
+    /// `observe` or `apply` (default `off`, restart-only).
+    dc_block: Option<String>,
+    /// MAN-496: the impulse-suppression conditioning stage's mode, written
+    /// `off`, `observe` or `apply` (default `off`, restart-only).
+    impulse_suppress: Option<String>,
     center_freq_hz: Option<f64>,
     capture_rate_hz: Option<f64>,
     replay_epoch: Option<i64>,
@@ -521,6 +557,133 @@ struct InputToml {
     /// `IP:port`, under `spectrum_name` (default `manta <name>`).
     spectrum_udp: Option<String>,
     spectrum_name: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwDaily {
+    at_utc: String,
+    segments_hz: Vec<Vec<f64>>,
+}
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CwOverride {
+    start_utc: toml::value::Datetime,
+    end_utc: toml::value::Datetime,
+    segments_hz: Vec<Vec<f64>>,
+}
+
+fn cw_policy(t: &InputToml) -> std::result::Result<manta_engine::cw_segments::Policy, String> {
+    use manta_engine::cw_segments::{Policy, Ranges};
+    let name = t
+        .name
+        .as_deref()
+        .unwrap_or_else(|| t.kind.as_ref().map_or("audio", |k| k.name()));
+    let prefix = |e: String| format!("input \"{name}\": {e}");
+    let ranges = |v: &[Vec<f64>], field: &str| -> std::result::Result<Ranges, String> {
+        let mut out = Vec::new();
+        for (i, r) in v.iter().enumerate() {
+            if r.len() != 2 || Ranges::new(vec![(r[0], r[1])]).is_err() {
+                return Err(prefix(format!(
+                    "{field}[{i}] must contain two finite positive Hz values with lo < hi"
+                )));
+            }
+            out.push((r[0], r[1]));
+        }
+        Ranges::new(out).map_err(|e| prefix(e.into()))
+    };
+    let base = t
+        .cw_segments_hz
+        .as_ref()
+        .map(|v| ranges(v, "cw_segments_hz"))
+        .transpose()?;
+    let mut daily = Vec::new();
+    for (i, e) in t.cw_schedule.iter().enumerate() {
+        let b = e.at_utc.as_bytes();
+        if b.len() != 5 || b[2] != b':' || ![b[0], b[1], b[3], b[4]].iter().all(u8::is_ascii_digit)
+        {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        let h = (b[0] - b'0') as u16 * 10 + (b[1] - b'0') as u16;
+        let m = (b[3] - b'0') as u16 * 10 + (b[4] - b'0') as u16;
+        if h > 23 || m > 59 {
+            return Err(prefix(format!("cw_schedule[{i}].at_utc must be HH:MM UTC")));
+        }
+        daily.push((
+            h * 60 + m,
+            ranges(&e.segments_hz, &format!("cw_schedule[{i}].segments_hz"))?,
+        ));
+    }
+    let mut overrides = Vec::new();
+    for (i, e) in t.cw_overrides.iter().enumerate() {
+        let err = || {
+            prefix(format!(
+                "cw_overrides[{i}] requires UTC start_utc < end_utc"
+            ))
+        };
+        let a = cw_utc(&e.start_utc).ok_or_else(err)?;
+        let b = cw_utc(&e.end_utc).ok_or_else(err)?;
+        if a >= b {
+            return Err(err());
+        }
+        overrides.push((
+            a,
+            b,
+            ranges(&e.segments_hz, &format!("cw_overrides[{i}].segments_hz"))?,
+        ));
+    }
+    Policy::new(base, daily, overrides).map_err(prefix)
+}
+
+// Validate the Gregorian calendar and count days without a timezone dependency.
+fn cw_utc(v: &toml::value::Datetime) -> Option<i64> {
+    if v.offset != Some(toml::value::Offset::Z) {
+        return None;
+    }
+    let d = v.date?;
+    let t = v.time?;
+    if t.nanosecond.unwrap_or(0) != 0
+        || t.hour > 23
+        || t.minute > 59
+        || t.second.unwrap_or(0) > 59
+        || d.year < 1970
+        || d.year > 2100
+    {
+        return None;
+    }
+    let leap = |y: u16| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let months = [
+        31,
+        if leap(d.year) { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if d.month == 0 || d.month > 12 || d.day == 0 || d.day > months[d.month as usize - 1] {
+        return None;
+    }
+    let mut days = 0i64;
+    for y in 1970..d.year {
+        days += if leap(y) { 366 } else { 365 };
+    }
+    days += months[..d.month as usize - 1]
+        .iter()
+        .map(|&n| i64::from(n))
+        .sum::<i64>()
+        + i64::from(d.day)
+        - 1;
+    let seconds = days * 86400
+        + i64::from(t.hour) * 3600
+        + i64::from(t.minute) * 60
+        + i64::from(t.second.unwrap_or(0));
+    crate::cli_parse::check_replay_epoch("UTC", seconds).ok()
 }
 
 /// MAN-305: `input.protocol`, written `"auto"`, `"1"`, `"2"` or the
@@ -580,7 +743,15 @@ pub(crate) struct InputFile {
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct SharedInput {
+    /// MAN-485: enabled FT8/FT4 modes, in startup-summary order.
+    pub digital_modes: Vec<manta_engine::ftx::FtxMode>,
+    pub cw_policy: manta_engine::cw_segments::Policy,
+    pub conditioning: manta_dsp::condition::ConditioningConfig,
     pub freq_correction_ppm: Option<f64>,
+    /// MAN-496: `input.dc_block`, parsed (default `off` when unset).
+    pub dc_block: Option<manta_dsp::condition::StageMode>,
+    /// MAN-496: `input.impulse_suppress`, parsed (default `off`).
+    pub impulse_suppress: Option<manta_dsp::condition::StageMode>,
     pub center_freq_hz: Option<f64>,
     pub capture_rate_hz: Option<f64>,
     pub replay_epoch: Option<i64>,
@@ -589,6 +760,44 @@ pub(crate) struct SharedInput {
     /// MAN-141: `run` sends this input's spectrum to N1MM+'s Spectrum
     /// Display.
     pub spectrum: Option<SpectrumOut>,
+}
+
+impl SharedInput {
+    /// MAN-496: this entry's `[input]` conditioning keys as the engine's
+    /// config (every unset stage off).
+    pub fn conditioning(&self) -> manta_dsp::condition::ConditioningConfig {
+        manta_dsp::condition::ConditioningConfig {
+            impulse: self.impulse_suppress.unwrap_or_default(),
+            dc: self.dc_block.unwrap_or_default(),
+            ..self.conditioning.clone()
+        }
+    }
+}
+
+/// MAN-496: one `[input]` conditioning key (`dc_block`, `impulse_suppress`)
+/// as the operator writes it: `off`, `observe` or `apply`.
+fn stage_mode(
+    key: &str,
+    text: &str,
+) -> std::result::Result<manta_dsp::condition::StageMode, String> {
+    match text {
+        "off" => Ok(manta_dsp::condition::StageMode::Off),
+        "observe" => Ok(manta_dsp::condition::StageMode::Observe),
+        "apply" => Ok(manta_dsp::condition::StageMode::Apply),
+        other => Err(format!(
+            "[input] {key} must be \"off\", \"observe\" or \"apply\", not {}",
+            crate::fmt::quoted(other)
+        )),
+    }
+}
+
+/// MAN-496: a conditioning stage mode as it is written and printed.
+pub(crate) fn stage_mode_str(mode: manta_dsp::condition::StageMode) -> &'static str {
+    match mode {
+        manta_dsp::condition::StageMode::Off => "off",
+        manta_dsp::condition::StageMode::Observe => "observe",
+        manta_dsp::condition::StageMode::Apply => "apply",
+    }
 }
 
 /// MAN-141: `input.spectrum_udp` and `input.spectrum_name`, checked.
@@ -809,6 +1018,14 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         &skimmer_relay,
         &wsjtx_relay,
     )?;
+    let pskreporter = take_typed::<PskReporterConfig>(&doc, "pskreporter", &origin, &overlay)?;
+    let wsjtx_output = take_relays::<WsjtxOutputConfig>(&doc, "wsjtx_output", &origin)?;
+    check_spot_outputs(
+        &origin,
+        server.as_ref(),
+        pskreporter.as_ref(),
+        &wsjtx_output,
+    )?;
     let mut notes = Vec::new();
     let rbn_compare = take_typed::<RbnCompareConfig>(&doc, "rbn_compare", &origin, &overlay)?;
     if let Some(rc) = &rbn_compare {
@@ -868,6 +1085,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             .map(|p| resolve_path("spot", "list_cache_dir", p)),
         cty_url: check_list_url("cty_url", spot_toml.cty_url).map_err(&spot_err)?,
         scp_url: check_list_url("scp_url", spot_toml.scp_url).map_err(&spot_err)?,
+        pattern_url: check_list_url("pattern_url", spot_toml.pattern_url).map_err(&spot_err)?,
         cty_sha256: check_pin("cty_sha256", spot_toml.cty_sha256).map_err(&spot_err)?,
         scp_sha256: check_pin("scp_sha256", spot_toml.scp_sha256).map_err(&spot_err)?,
         pattern_path: spot_toml
@@ -915,6 +1133,26 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             inputs
         }
     };
+    // MAN-485 D4: every config entry point shares these publication and
+    // build-feature rules, including SIGHUP's restart-only validation.
+    if inputs
+        .iter()
+        .any(|input| !input.input.shared.digital_modes.is_empty())
+    {
+        if server.is_none() {
+            bail!(
+                "{origin}: [input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table{}",
+                overlay.suffix("input")
+            );
+        }
+        if !manta_engine::ftx::decoder_compiled() {
+            bail!(
+                "{origin}: [input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}{}",
+                crate::build_info::FEATURES,
+                overlay.suffix("input")
+            );
+        }
+    }
     let input = inputs[0].input.clone();
 
     let mut env_vars: Vec<String> = overlay.vars_by_table.into_values().flatten().collect();
@@ -926,6 +1164,8 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
         rbn_compare,
         skimmer_relay,
         wsjtx_relay,
+        pskreporter,
+        wsjtx_output,
         callsign_lookup,
         decode,
         detector,
@@ -958,7 +1198,7 @@ fn known_tables_list() -> String {
     KNOWN_TABLES
         .iter()
         .map(|t| match *t {
-            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" => format!("[[{t}]]"),
+            "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output" => format!("[[{t}]]"),
             _ => format!("[{t}]"),
         })
         .collect::<Vec<_>>()
@@ -1000,8 +1240,11 @@ fn check_top_level(doc: &toml::Table, origin: &str) -> Result<()> {
             );
         }
         match (key.as_str(), value) {
-            ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay", toml::Value::Array(_)) => {}
-            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay"), _) => {
+            (
+                "rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output",
+                toml::Value::Array(_),
+            ) => {}
+            (name @ ("rbn_uplink" | "skimmer_relay" | "wsjtx_relay" | "wsjtx_output"), _) => {
                 bail!("{origin}: {name} must be written [[{name}]] (an array of tables)")
             }
             // MAN-13: several receivers, one entry each.
@@ -1132,6 +1375,53 @@ fn check_relays(
         }
         if r.enabled && !uplink_on {
             return Err(needs_uplink("wsjtx_relay", &label));
+        }
+    }
+    Ok(())
+}
+
+/// MAN-142 (D3, D8, D13): the cross-table rules for `[pskreporter]` and
+/// `[[wsjtx_output]]`. Both read the spots the servers publish, so an
+/// enabled one needs `[server]`; PSKReporter also needs the station's
+/// locator, because every report is placed at it.
+fn check_spot_outputs(
+    origin: &str,
+    server: Option<&ServerConfig>,
+    pskreporter: Option<&PskReporterConfig>,
+    wsjtx_output: &[WsjtxOutputConfig],
+) -> Result<()> {
+    if let Some(p) = pskreporter {
+        p.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+        if p.enabled {
+            let Some(server) = server else {
+                bail!(
+                    "{origin}: [pskreporter] needs a [server] table (it reports the spots the \
+                     servers publish)"
+                );
+            };
+            // `station_location` already ran in `load` for `[server]`, so
+            // only "absent" is left to refuse here.
+            if !matches!(server.station_location(), Ok(Some(_))) {
+                bail!(
+                    "{origin}: [pskreporter] is enabled but [server] has no location -- set \
+                     [server].operator_grid (e.g. \"EM10dh\") or operator_lat and operator_lon; \
+                     PSKReporter places every report at the receiver's locator"
+                );
+            }
+        }
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for w in wsjtx_output {
+        w.validate().map_err(|e| anyhow!("{origin}: {e}"))?;
+        let label = w.label();
+        if !seen.insert(label.clone()) {
+            bail!("{origin}: [[wsjtx_output]] {label} is listed twice");
+        }
+        if w.enabled && server.is_none() {
+            bail!(
+                "{origin}: [[wsjtx_output]] needs a [server] table (it sends the spots the \
+                 servers publish)"
+            );
         }
     }
     Ok(())
@@ -1385,7 +1675,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
         if group.members.len() > 1
             && matches!(group.protocol, manta_input::hpsdr::HpsdrProtocol::Two)
         {
-            bail!("{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\"");
+            bail!(
+                "{origin}: [[input]] \"{first}\": HPSDR protocol 2 opens one receiver per radio in manta; give each band its own receiver with protocol \"1\""
+            );
         }
         // MAN-308 D1: several receivers on one radio run protocol 1, which
         // has no attenuator manta drives.
@@ -1400,7 +1692,9 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
                 )
             }) {
                 let name = &inputs[index].name;
-                bail!("{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta");
+                bail!(
+                    "{origin}: [[input]] \"{name}\": auto_attenuation needs a radio with one receiver; several receivers on one radio speak protocol 1 in manta"
+                );
             }
         }
         for &index in group.members.iter().skip(1) {
@@ -1413,19 +1707,30 @@ fn validate_hpsdr_allocations(inputs: &[NamedInput], origin: &str) -> Result<()>
             }) = &inputs[index].input.source
             {
                 if receivers.is_some() {
-                    bail!("{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": receivers belongs on the first input for this HPSDR radio (\"{first}\")"
+                    );
                 }
                 if *protocol != group.protocol {
-                    bail!("{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")");
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": protocol must match the HPSDR radio's other receivers (set by input \"{first}\")"
+                    );
                 }
                 if *rate_hz != group.rate {
-                    bail!("{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")", group.rate);
+                    bail!(
+                        "{origin}: [[input]] \"{name}\": rate_hz must match the HPSDR radio's other receivers ({} Hz, set by input \"{first}\")",
+                        group.rate
+                    );
                 }
             }
         }
         if let Some(capacity) = group.receivers {
             if group.members.len() > capacity {
-                bail!("{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured", group.endpoint(), group.members.len());
+                bail!(
+                    "{origin}: [[input]] \"{first}\": HPSDR radio at {} declares {capacity} receivers; {} bands are configured",
+                    group.endpoint(),
+                    group.members.len()
+                );
             }
         }
         manta_input::HpsdrConfig {
@@ -1469,6 +1774,7 @@ fn take_entry(
         };
         return Ok((vec![one], Vec::new()));
     };
+    iq_conditioning(&t)?;
     if t.freq_hz.is_some() {
         return Err(
             "input.bands and input.freq_hz both set the receiver's centre; keep one".to_string(),
@@ -1484,7 +1790,7 @@ fn take_entry(
                     .map(|x| float_hz(*x))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ))
+            ));
         }
     };
     let texts = band_item_texts(&bands)?;
@@ -1497,7 +1803,7 @@ fn take_entry(
         .ok_or_else(|| "input.bands needs input.type (one of kiwi, soapy, hpsdr)".to_string())?;
     let rate_hz = match kind {
         InputKind::Kiwi => None,
-        InputKind::Hpsdr => Some(crate::check_hpsdr_rate_hz(
+        InputKind::Hpsdr => Some(crate::cli_parse::check_hpsdr_rate_hz(
             "input.rate_hz",
             t.rate_hz
                 .ok_or("input.rate_hz is required when input.type = \"hpsdr\"")?,
@@ -1510,7 +1816,7 @@ fn take_entry(
     };
     let capture_rate_hz = t
         .capture_rate_hz
-        .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+        .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
         .transpose()?;
     let width_hz = crate::band_streams::stream_width_hz(kind, rate_hz, capture_rate_hz);
     let usable_hz = crate::band_streams::usable_width_hz(width_hz);
@@ -1766,11 +2072,78 @@ fn raw_iq(t: &InputToml) -> std::result::Result<Option<(manta_input::RawIqFormat
 }
 
 fn check_hpsdr_mac(text: &str) -> std::result::Result<String, String> {
-    let mac = crate::parse_hpsdr_mac(text).map_err(|_| {
+    let mac = crate::cli_parse::parse_hpsdr_mac(text).map_err(|_| {
         "input.mac must contain twelve hexadecimal digits, for example AA:BB:CC:DD:EE:FF"
             .to_string()
     })?;
     Ok(manta_input::hpsdr::discovery::format_mac(&mac))
+}
+
+/// MAN-485 D4: accept exact wire spellings and normalize to the mode order.
+fn digital_modes(
+    texts: Option<&[String]>,
+) -> std::result::Result<Vec<manta_engine::ftx::FtxMode>, String> {
+    use manta_engine::ftx::FtxMode;
+    let mut modes = BTreeSet::new();
+    for text in texts.unwrap_or_default() {
+        let mode = FtxMode::parse(text).ok_or_else(|| {
+            format!(
+                "digital_modes: {} is not a mode manta decodes; use \"FT8\", \"FT4\" or both",
+                crate::fmt::quoted(text),
+            )
+        })?;
+        if !modes.insert(mode) {
+            return Err(format!(
+                "digital_modes: {} is repeated; list each mode once",
+                crate::fmt::quoted(text)
+            ));
+        }
+    }
+    Ok(FtxMode::ALL
+        .into_iter()
+        .filter(|mode| modes.contains(mode))
+        .collect())
+}
+
+/// IQ correction is always a fixed, receiver-specific calibration.
+fn iq_conditioning(
+    t: &InputToml,
+) -> std::result::Result<manta_dsp::condition::ConditioningConfig, String> {
+    use manta_dsp::condition::{iq::IqCalibration, ConditioningConfig, StageMode};
+    let mode = match t.iq_correction.as_deref().unwrap_or("off") {
+        "off" => StageMode::Off,
+        "observe" => StageMode::Observe,
+        "apply" => StageMode::Apply,
+        value => {
+            return Err(format!(
+                "iq_correction must be \"off\", \"observe\" or \"apply\", not {}",
+                crate::fmt::quoted(value)
+            ));
+        }
+    };
+    let calibration = match (t.iq_gain_ratio, t.iq_phase_deg, t.iq_calibrated_center_hz) {
+        (None, None, None) if mode == StageMode::Apply => return Err("iq_correction = \"apply\" needs iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz".to_string()),
+        (None, None, None) => None,
+        (Some(gain_ratio), Some(phase_deg), Some(center_freq_hz)) => {
+            for (key, value, valid, range) in [
+                ("iq_gain_ratio", gain_ratio, (0.5..=2.0).contains(&gain_ratio), "0.5 through 2.0"),
+                ("iq_phase_deg", phase_deg, (-45.0..=45.0).contains(&phase_deg), "-45 through 45 degrees"),
+                ("iq_calibrated_center_hz", center_freq_hz, center_freq_hz > 0.0, "positive Hz"),
+            ] {
+                if !value.is_finite() || !valid { return Err(format!("{key} must be finite and {range}")); }
+            }
+            if t.bands.is_some() { return Err("IQ calibration cannot be used with bands; each stream needs its own calibration".to_string()); }
+            let calibration = IqCalibration { gain_ratio, phase_deg, center_freq_hz };
+            calibration.validate()?;
+            Some(calibration)
+        }
+        _ => return Err("iq_gain_ratio, iq_phase_deg and iq_calibrated_center_hz must be supplied together".to_string()),
+    };
+    Ok(ConditioningConfig {
+        iq: mode,
+        iq_calibration: calibration,
+        ..Default::default()
+    })
 }
 
 fn validate_input(
@@ -1778,21 +2151,34 @@ fn validate_input(
     resolve_path: &dyn Fn(&str, PathBuf) -> PathBuf,
 ) -> std::result::Result<InputFile, String> {
     let shared = SharedInput {
+        digital_modes: digital_modes(t.digital_modes.as_deref())?,
+        cw_policy: cw_policy(&t)?,
+        conditioning: iq_conditioning(&t)?,
         freq_correction_ppm: t
             .freq_correction_ppm
-            .map(crate::check_freq_correction_ppm)
+            .map(crate::cli_parse::check_freq_correction_ppm)
+            .transpose()?,
+        dc_block: t
+            .dc_block
+            .as_deref()
+            .map(|v| stage_mode("dc_block", v))
+            .transpose()?,
+        impulse_suppress: t
+            .impulse_suppress
+            .as_deref()
+            .map(|v| stage_mode("impulse_suppress", v))
             .transpose()?,
         center_freq_hz: t
             .center_freq_hz
-            .map(|v| crate::check_dial_freq_hz("input.center_freq_hz", v))
+            .map(|v| crate::cli_parse::check_dial_freq_hz("input.center_freq_hz", v))
             .transpose()?,
         capture_rate_hz: t
             .capture_rate_hz
-            .map(|v| crate::check_capture_rate_hz("input.capture_rate_hz", v))
+            .map(|v| crate::cli_parse::check_capture_rate_hz("input.capture_rate_hz", v))
             .transpose()?,
         replay_epoch: t
             .replay_epoch
-            .map(|v| crate::check_replay_epoch("input.replay_epoch", v))
+            .map(|v| crate::cli_parse::check_replay_epoch("input.replay_epoch", v))
             .transpose()?,
         record_iq: t.record_iq.clone().map(|p| resolve_path("record_iq", p)),
         spectrum: spectrum_out(&t)?,
@@ -1844,7 +2230,7 @@ fn validate_input(
             rate_hz: finite_positive("rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
             gain_db: match t.gain_db {
                 Some(g) if !g.is_finite() => {
-                    return Err(format!("input.gain_db must be finite, got {g}"))
+                    return Err(format!("input.gain_db must be finite, got {g}"));
                 }
                 g => g,
             },
@@ -1860,7 +2246,7 @@ fn validate_input(
                         .ok_or_else(|| "receivers must be an integer from 1 to 255".to_string())
                 })
                 .transpose()?,
-            port: port(crate::HPSDR_CONTROL_PORT)?,
+            port: port(crate::cli_parse::HPSDR_CONTROL_PORT)?,
             host: {
                 if t.host.is_some() && t.mac.is_some() {
                     return Err("input.host and input.mac cannot both be set".into());
@@ -1874,8 +2260,11 @@ fn validate_input(
                 .map(ProtocolValue::protocol)
                 .transpose()?
                 .unwrap_or_default(),
-            freq_hz: crate::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
-            rate_hz: crate::check_hpsdr_rate_hz("input.rate_hz", req(t.rate_hz, "rate_hz", name)?)?,
+            freq_hz: crate::cli_parse::check_hpsdr_freq_hz("input.freq_hz", req_freq(t.freq_hz)?)?,
+            rate_hz: crate::cli_parse::check_hpsdr_rate_hz(
+                "input.rate_hz",
+                req(t.rate_hz, "rate_hz", name)?,
+            )?,
             // MAN-308 D1: `protocol` parsed above, so this re-read cannot fail.
             auto_attenuation: match t.auto_attenuation {
                 Some(true)
@@ -1998,13 +2387,15 @@ fn apply_env_overlay(doc: &mut toml::Table, vars: &[(OsString, OsString)]) -> Re
             bail!("{name}: [[rbn_uplink]] cannot be set from the environment; use the config file");
         }
         for (prefix, table) in [
-            ("SKIMMER_RELAY_", "skimmer_relay"),
-            ("WSJTX_RELAY_", "wsjtx_relay"),
+            ("SKIMMER_RELAY_", "[[skimmer_relay]]"),
+            ("WSJTX_RELAY_", "[[wsjtx_relay]]"),
+            // MAN-142 (D1): a switch that publishes the station's spots
+            // belongs in the reviewed file, like `[[rbn_uplink]]`.
+            ("PSKREPORTER_", "[pskreporter]"),
+            ("WSJTX_OUTPUT_", "[[wsjtx_output]]"),
         ] {
             if rest.starts_with(prefix) {
-                bail!(
-                    "{name}: [[{table}]] cannot be set from the environment; use the config file"
-                );
+                bail!("{name}: {table} cannot be set from the environment; use the config file");
             }
         }
         let Some((table, key)) = ENV_TABLES.iter().find_map(|(prefix, table)| {
@@ -2125,6 +2516,91 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digital_modes_parses_and_bands_streams_inherit_it() {
+        use manta_engine::ftx::FtxMode;
+        // The parser and expansion are feature-independent; load below owns
+        // the build-feature refusal.
+        let t: InputToml = toml::from_str(
+            "type = 'kiwi'\nhost = 'h'\nbands = ['20m']\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        let (inputs, _) = take_entry(t, "kiwi".into(), None, "[input]", &|_, p| p).unwrap();
+        assert_eq!(inputs.len(), 12);
+        for input in inputs {
+            assert_eq!(input.input.shared.digital_modes, FtxMode::ALL);
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_repeated_digital_mode_is_refused() {
+        let err = err_of("[input]\ndigital_modes = ['JT65']\n");
+        assert!(err.ends_with("[input]: digital_modes: \"JT65\" is not a mode manta decodes; use \"FT8\", \"FT4\" or both"), "{err}");
+        let err = err_of("[input]\ndigital_modes = ['FT8', 'FT8']\n");
+        assert!(
+            err.ends_with("[input]: digital_modes: \"FT8\" is repeated; list each mode once"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn digital_modes_needs_a_server_table() {
+        let err = err_of("[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with("[input]: digital_modes publishes FT8/FT4 spots on the JSON stream, which needs a [server] table"), "{err}");
+        assert!(load_file("[input]\ndigital_modes = []\n")
+            .unwrap()
+            .input
+            .shared
+            .digital_modes
+            .is_empty());
+    }
+
+    #[cfg(not(feature = "ftx"))]
+    #[test]
+    fn digital_modes_needs_the_ftx_feature() {
+        let err =
+            err_of("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT8']\n");
+        assert!(err.ends_with(&format!("[input]: digital_modes needs a manta built with the ftx feature (cargo build --release -p manta-cli --features ftx, Linux or macOS); this build has features: {}", crate::build_info::FEATURES)), "{err}");
+    }
+
+    #[cfg(feature = "ftx")]
+    #[test]
+    fn digital_modes_loads_with_the_ftx_feature() {
+        let loaded = load_file(
+            "[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4', 'FT8']\n",
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.digital_modes,
+            manta_engine::ftx::FtxMode::ALL
+        );
+    }
+
+    #[test]
+    fn the_environment_overrides_digital_modes() {
+        let result = load_env(
+            Some("[server]\nstation_callsign = 'W3XYZ'\n[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[\"FT8\"]")],
+        );
+        #[cfg(feature = "ftx")]
+        assert_eq!(
+            result.unwrap().input.shared.digital_modes,
+            [manta_engine::ftx::FtxMode::Ft8]
+        );
+        #[cfg(not(feature = "ftx"))]
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("digital_modes needs a manta built with the ftx feature"));
+        // Empty arrays work in every build and override an enabled file key.
+        let disabled = load_env(
+            Some("[input]\ndigital_modes = ['FT4']\n"),
+            &[("MANTA_INPUT_DIGITAL_MODES", "[]")],
+        )
+        .unwrap();
+        assert!(disabled.input.shared.digital_modes.is_empty());
+    }
 
     #[test]
     fn pattern_validation_level_accepts_minimal_and_rejects_unknown() {
@@ -2635,7 +3111,9 @@ mod tests {
     #[test]
     fn hpsdr_hostless_inputs_with_different_selectors_are_separate_radios() {
         let entry = |name: &str, selector: &str| {
-            format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}")
+            format!(
+                "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n{selector}"
+            )
         };
         // Distinct MACs, or a pinned entry beside an unqualified one: two
         // radios offline. The run refuses the pair if both resolve to one
@@ -2736,6 +3214,84 @@ mod tests {
         );
     }
 
+    // MAN-496: the `[input]` conditioning keys, shared like
+    // freq_correction_ppm (valid with any or no type, restart-only).
+    #[test]
+    fn conditioning_keys_parse_off_observe_apply() {
+        use manta_dsp::condition::StageMode;
+        let l = load_file(
+            "[[input]]\ntype = \"audio\"\ndc_block = \"observe\"\nimpulse_suppress = \"apply\"\n",
+        )
+        .unwrap();
+        assert_eq!(l.inputs[0].input.shared.dc_block, Some(StageMode::Observe));
+        assert_eq!(
+            l.inputs[0].input.shared.impulse_suppress,
+            Some(StageMode::Apply)
+        );
+        let off = load_file("[[input]]\ntype = \"audio\"\ndc_block = \"off\"\n").unwrap();
+        assert_eq!(off.inputs[0].input.shared.dc_block, Some(StageMode::Off));
+        assert_eq!(
+            off.inputs[0].input.shared.impulse_suppress, None,
+            "an unset key defaults to off, not to a written off"
+        );
+        assert_eq!(
+            l.inputs[0].input.shared.conditioning(),
+            manta_dsp::condition::ConditioningConfig {
+                impulse: StageMode::Apply,
+                dc: StageMode::Observe,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn bad_conditioning_mode_value_is_refused() {
+        let f = write_cfg("[input]\ntype = \"audio\"\ndc_block = \"on\"\n");
+        let err = match load(Some(f.path()), Env::Ignore) {
+            Ok(_) => panic!("dc_block = \"on\" loaded"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("[input] dc_block must be \"off\", \"observe\" or \"apply\", not \"on\""),
+            "{err}"
+        );
+        let f = write_cfg(&format!(
+            "{}\n[[input]]\nname = \"rig\"\ntype = \"file\"\npath = \"/x.wav\"\nimpulse_suppress = \"AGGRESSIVE\"\n",
+            file_entry("one", "")
+        ));
+        let err = match load(Some(f.path()), Env::Ignore) {
+            Ok(_) => panic!("impulse_suppress = \"AGGRESSIVE\" loaded"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("[[input]]"),
+            "a second entry's error carries the entry prefix: {err}"
+        );
+        assert!(
+            err.contains(
+                "[input] impulse_suppress must be \"off\", \"observe\" or \"apply\", \
+                 not \"AGGRESSIVE\""
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn conditioning_env_overlay_reads_string_modes() {
+        use manta_dsp::condition::StageMode;
+        let v = vars(&[
+            ("MANTA_INPUT_DC_BLOCK", "apply"),
+            ("MANTA_INPUT_IMPULSE_SUPPRESS", "observe"),
+        ]);
+        let f = write_cfg("[[input]]\ntype = \"audio\"\n");
+        let l = load(Some(f.path()), Env::Read(&v)).unwrap();
+        assert_eq!(l.inputs[0].input.shared.dc_block, Some(StageMode::Apply));
+        assert_eq!(
+            l.inputs[0].input.shared.impulse_suppress,
+            Some(StageMode::Observe)
+        );
+    }
+
     #[test]
     fn input_names_are_required_with_two_or_more_entries() {
         let err = err_of(&format!(
@@ -2827,6 +3383,58 @@ mod tests {
     }
 
     #[test]
+    fn cw_segments_policy_parses_for_each_input_kind_and_expanded_streams() {
+        for (kind, keys) in [
+            ("audio", ""),
+            ("file", "path = 'x.wav'"),
+            ("kiwi", "host = 'kiwi.example.org'\nfreq_hz = 14050000"),
+            (
+                "soapy",
+                "driver = 'test'\nfreq_hz = 14050000\nrate_hz = 48000",
+            ),
+            (
+                "hpsdr",
+                "host = '127.0.0.1'\nfreq_hz = 14050000\nrate_hz = 192000",
+            ),
+            ("ka9q", "group = '239.1.2.3'"),
+        ] {
+            let body = format!(
+                "[input]\ntype = '{kind}'\n{keys}\ncw_segments_hz = [[14000000,14060000]]\n"
+            );
+            let loaded = load_file(&body).unwrap();
+            assert!(
+                loaded
+                    .input
+                    .shared
+                    .cw_policy
+                    .active_at(0)
+                    .unwrap()
+                    .contains(14030000.),
+                "{kind}"
+            );
+        }
+        let loaded=load_file("[input]\ntype = 'kiwi'\nhost = 'kiwi.example.org'\nbands = ['20m']\ncw_segments_hz = [[7000000,14060000]]\n").unwrap();
+        assert!(loaded.inputs.len() > 1);
+        assert!(loaded
+            .inputs
+            .iter()
+            .all(|i| i.input.shared.cw_policy == loaded.input.shared.cw_policy));
+        for text in [
+            "2026-02-30T00:00:00Z",
+            "2026-11-28T00:00:00+00:00",
+            "1969-01-01T00:00:00Z",
+            "2101-01-01T00:00:00Z",
+        ] {
+            let parsed = toml::from_str::<CwOverride>(&format!(
+                "start_utc = {text}\nend_utc = 2026-11-30T00:00:00Z\nsegments_hz = []"
+            ));
+            if let Ok(parsed) = parsed {
+                assert!(cw_utc(&parsed.start_utc).is_none(), "{text}");
+            }
+        }
+    }
+
+    #[test]
     fn replay_epoch_belongs_on_the_first_entry() {
         let first = file_entry("a", "replay_epoch = 1700000000\n");
         assert!(load_file(&format!("{first}{}", file_entry("b", ""))).is_ok());
@@ -2864,7 +3472,9 @@ mod tests {
     }
 
     fn hpsdr_entry(name: &str, host: &str, extra: &str) -> String {
-        format!("[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}")
+        format!(
+            "[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"{host}\"\nrate_hz = 192000.0\nfreq_hz = 14030000.0\n{extra}"
+        )
     }
 
     #[test]
@@ -3158,7 +3768,8 @@ mod tests {
         let err = err_of("[relay_source]\nx = 1\n");
         assert!(
             err.contains(
-                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [callsign_lookup], [input], "
+                "[rbn_compare], [[skimmer_relay]], [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], \
+                 [callsign_lookup], [input], "
             ),
             "{err}"
         );
@@ -3208,6 +3819,230 @@ mod tests {
                 err.contains("cannot be set from the environment; use the config file"),
                 "{err}"
             );
+        }
+    }
+
+    // ---- MAN-142: [pskreporter] / [[wsjtx_output]]
+
+    const GRID: &str = "operator_grid = \"EM10dh\"\n";
+    const PSK_ON: &str = "[pskreporter]\nenabled = true\n";
+
+    #[test]
+    fn pskreporter_defaults_load_off() {
+        let loaded = load_file("[pskreporter]\n").unwrap();
+        let p = loaded.pskreporter.expect("the table is present");
+        assert!(!p.enabled);
+        assert_eq!(p.host, "report.pskreporter.info");
+        assert_eq!(p.port, 4739);
+        assert_eq!(p.antenna, "");
+        assert_eq!(
+            p.spot_types,
+            manta_server::config::UplinkSpotTypes::CqBeacon
+        );
+        assert!(load_file(SERVER).unwrap().pskreporter.is_none());
+    }
+
+    #[test]
+    fn an_enabled_pskreporter_needs_a_server() {
+        let err = err_of(PSK_ON);
+        assert!(
+            err.ends_with(
+                ": [pskreporter] needs a [server] table (it reports the spots the servers \
+                 publish)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_enabled_pskreporter_needs_a_station_location() {
+        let err = err_of(&format!("{SERVER}{PSK_ON}"));
+        assert!(
+            err.ends_with(
+                ": [pskreporter] is enabled but [server] has no location -- set \
+                 [server].operator_grid (e.g. \"EM10dh\") or operator_lat and operator_lon; \
+                 PSKReporter places every report at the receiver's locator"
+            ),
+            "{err}"
+        );
+        for location in [
+            "operator_grid = \"EM10\"\n",
+            GRID,
+            "operator_lat = 30.3\noperator_lon = -97.7\n",
+        ] {
+            let loaded = load_file(&format!("{SERVER}{location}{PSK_ON}"))
+                .unwrap_or_else(|e| panic!("{location:?}: {e:#}"));
+            assert!(loaded.pskreporter.unwrap().enabled, "{location:?}");
+        }
+    }
+
+    #[test]
+    fn a_disabled_pskreporter_needs_neither() {
+        let loaded = load_file("[pskreporter]\nenabled = false\n").unwrap();
+        assert!(!loaded.pskreporter.unwrap().enabled);
+        let loaded = load_file(&format!("{SERVER}[pskreporter]\n")).unwrap();
+        assert!(!loaded.pskreporter.unwrap().enabled);
+    }
+
+    #[test]
+    fn pskreporter_rejects_an_empty_host_an_ipv6_host_port_0_and_a_long_antenna() {
+        let long = "a".repeat(300);
+        for (key, msg) in [
+            (
+                "host = \"\"".to_string(),
+                ": [pskreporter]: host is empty -- set PSKReporter's host name \
+                 (\"report.pskreporter.info\") or a test listener's IPv4 address"
+                    .to_string(),
+            ),
+            (
+                "host = \"::1\"".to_string(),
+                ": [pskreporter]: host \"::1\" is an IPv6 address -- PSKReporter has no IPv6 \
+                 address; use a host name or an IPv4 address"
+                    .to_string(),
+            ),
+            (
+                "port = 0".to_string(),
+                ": [pskreporter]: port 0 is not a port -- PSKReporter listens on 4739 (14739 \
+                 for its test listener)"
+                    .to_string(),
+            ),
+            (
+                format!("antenna = \"{long}\""),
+                ": [pskreporter]: antenna is 300 bytes; PSKReporter keeps at most 254".to_string(),
+            ),
+        ] {
+            // Checked whether or not the table is enabled.
+            for enabled in ["true", "false"] {
+                let err = err_of(&format!(
+                    "{SERVER}{GRID}[pskreporter]\nenabled = {enabled}\n{key}\n"
+                ));
+                assert!(err.ends_with(&msg), "{key}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn pskreporter_must_be_a_single_table() {
+        let err = err_of(&format!("{SERVER}{GRID}[[pskreporter]]\nenabled = true\n"));
+        assert!(
+            err.ends_with(": [[pskreporter]] is not supported -- use a single [pskreporter] table"),
+            "{err}"
+        );
+    }
+
+    const OUTPUT: &str = "[[wsjtx_output]]\ndestination = \"192.168.1.255:2237\"\n";
+
+    #[test]
+    fn wsjtx_output_loads_enabled_with_its_destination() {
+        let loaded = load_file(&format!("{SERVER}{OUTPUT}")).unwrap();
+        assert_eq!(loaded.wsjtx_output.len(), 1);
+        assert!(loaded.wsjtx_output[0].enabled);
+        assert_eq!(loaded.wsjtx_output[0].label(), "192.168.1.255:2237");
+        let loaded = load_file(&format!("{SERVER}{OUTPUT}enabled = false\n")).unwrap();
+        assert!(!loaded.wsjtx_output[0].enabled);
+        let err = err_of(&format!("{SERVER}[[wsjtx_output]]\nenabled = true\n"));
+        assert!(err.contains("missing field `destination`"), "{err}");
+    }
+
+    #[test]
+    fn wsjtx_output_needs_a_server() {
+        let err = err_of(OUTPUT);
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_output]] needs a [server] table (it sends the spots the servers \
+                 publish)"
+            ),
+            "{err}"
+        );
+        // A disabled block sends nothing, so it needs none.
+        let loaded = load_file(&format!("{OUTPUT}enabled = false\n")).unwrap();
+        assert_eq!(loaded.wsjtx_output.len(), 1);
+    }
+
+    #[test]
+    fn wsjtx_output_rejects_unspecified_port_0_and_ipv6_multicast() {
+        for dest in ["0.0.0.0:2237", "[::]:2237", "192.168.1.255:0"] {
+            let err = err_of(&format!(
+                "{SERVER}[[wsjtx_output]]\ndestination = \"{dest}\"\n"
+            ));
+            assert!(
+                err.ends_with(&format!(
+                    ": [[wsjtx_output]]: destination \"{}\" is not an address manta can send \
+                     to -- use a logger's address, a broadcast address such as \
+                     \"192.168.1.255:2237\", or a multicast group such as \"224.0.0.1:2237\"",
+                    dest.parse::<std::net::SocketAddr>().unwrap()
+                )),
+                "{dest}: {err}"
+            );
+        }
+        let err = err_of(&format!(
+            "{SERVER}[[wsjtx_output]]\ndestination = \"[ff02::1]:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(
+                ": [[wsjtx_output]]: destination \"[ff02::1]:2237\" is an IPv6 multicast group \
+                 -- use an IPv4 group such as \"224.0.0.1:2237\", or a unicast address"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_is_listed_twice() {
+        let err = err_of(&format!("{SERVER}{OUTPUT}{OUTPUT}"));
+        assert!(
+            err.ends_with(": [[wsjtx_output]] 192.168.1.255:2237 is listed twice"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_must_be_an_array() {
+        let err = err_of(&format!(
+            "{SERVER}[wsjtx_output]\ndestination = \"127.0.0.1:2237\"\n"
+        ));
+        assert!(
+            err.ends_with(": wsjtx_output must be written [[wsjtx_output]] (an array of tables)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn wsjtx_output_accepts_unicast_broadcast_and_multicast() {
+        for dest in [
+            "127.0.0.1:2237",
+            "192.168.1.255:2237",
+            "255.255.255.255:2237",
+            "224.0.0.1:2237",
+            "[::1]:2237",
+        ] {
+            let loaded = load_file(&format!(
+                "{SERVER}[[wsjtx_output]]\ndestination = \"{dest}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{dest}: {e:#}"));
+            assert_eq!(
+                loaded.wsjtx_output[0].destination,
+                dest.parse::<std::net::SocketAddr>().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn the_environment_cannot_set_the_new_tables() {
+        for (var, msg) in [
+            (
+                "MANTA_PSKREPORTER_ENABLED",
+                "MANTA_PSKREPORTER_ENABLED: [pskreporter] cannot be set from the environment; \
+                 use the config file",
+            ),
+            (
+                "MANTA_WSJTX_OUTPUT_DESTINATION",
+                "MANTA_WSJTX_OUTPUT_DESTINATION: [[wsjtx_output]] cannot be set from the \
+                 environment; use the config file",
+            ),
+        ] {
+            let err = format!("{:#}", load_env(None, &[(var, "x")]).unwrap_err());
+            assert!(err.contains(msg), "{err}");
         }
     }
 
@@ -3606,6 +4441,57 @@ mod tests {
     }
 
     #[test]
+    fn pattern_url_has_no_default_and_parses_from_file_and_environment() {
+        assert_eq!(load_file("[spot]\n").unwrap().spot.pattern_url, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\npattern_url = \"http://mirror.lan/Patt3Ch.lst\"\n",
+        )
+        .unwrap();
+        let spot = load(Some(&path), Env::Ignore).unwrap().spot;
+        assert_eq!(
+            spot.pattern_url.as_deref(),
+            Some("http://mirror.lan/Patt3Ch.lst")
+        );
+        let v = vars(&[("MANTA_SPOT_PATTERN_URL", "http://10.0.0.1:8080/patt3ch.lst")]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_url.as_deref(),
+            Some("http://10.0.0.1:8080/patt3ch.lst"),
+            "the environment wins over the file"
+        );
+    }
+
+    #[test]
+    fn pattern_url_must_be_http() {
+        let url = "https://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+        let f = write_cfg(&format!("[spot]\npattern_url = \"{url}\"\n"));
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [spot]: pattern_url must be an http:// URL (manta has no TLS support), got \
+                 \"{url}\"",
+                f.path().display()
+            )
+        );
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_SPOT_PATTERN_URL", url)]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [spot]: pattern_url must be"),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("(environment: MANTA_SPOT_PATTERN_URL)"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn an_https_or_malformed_list_url_is_refused_before_io() {
         let f = write_cfg("[spot]\ncty_url = \"https://www.country-files.com/cty/cty.dat\"\n");
         let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
@@ -3689,6 +4575,94 @@ mod tests {
         assert_eq!(
             parse_sha256("abc"),
             Err("expected 64 hexadecimal digits (a SHA-256)".to_string())
+        );
+    }
+
+    #[test]
+    fn iq_keys_validate_modes_and_complete_calibrations() {
+        load_file("[input]\niq_correction = \"observe\"\n").unwrap();
+        for mode in ["off", "observe", "apply"] {
+            load_file(&format!("[input]\niq_correction = \"{mode}\"\niq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n")).unwrap();
+        }
+        for (body, message) in [
+            ("iq_correction = \"on\"", "iq_correction must be"),
+            ("iq_correction = \"apply\"", "needs iq_gain_ratio"),
+            ("iq_gain_ratio = 1.05", "must be supplied together"),
+        ] {
+            let err = err_of(&format!("[input]\n{body}\n"));
+            assert!(err.contains(message), "{err}");
+        }
+    }
+
+    #[test]
+    fn iq_calibration_ranges_environment_and_bands() {
+        let triple =
+            "iq_gain_ratio = 1.05\niq_phase_deg = 2.0\niq_calibrated_center_hz = 14000000.0\n";
+        for (key, value) in [
+            ("iq_gain_ratio", "0.49"),
+            ("iq_gain_ratio", "2.01"),
+            ("iq_gain_ratio", "nan"),
+            ("iq_phase_deg", "45.1"),
+            ("iq_phase_deg", "inf"),
+            ("iq_calibrated_center_hz", "0.0"),
+            ("iq_calibrated_center_hz", "nan"),
+        ] {
+            let mut doc: toml::Table = toml::from_str(triple).unwrap();
+            doc.insert(
+                key.into(),
+                toml::from_str::<toml::Table>(&format!("v = {value}"))
+                    .unwrap()
+                    .remove("v")
+                    .unwrap(),
+            );
+            let err = err_of(&format!("[input]\n{}", toml::to_string(&doc).unwrap()));
+            assert!(err.contains(key), "{err}");
+        }
+        let err = err_of(&format!(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nbands = \"20m\"\n{triple}"
+        ));
+        assert!(
+            err.contains("IQ calibration cannot be used with bands"),
+            "{err}"
+        );
+        let loaded = load_env(
+            None,
+            &[
+                ("MANTA_INPUT_IQ_CORRECTION", "observe"),
+                ("MANTA_INPUT_IQ_GAIN_RATIO", "1.05"),
+                ("MANTA_INPUT_IQ_PHASE_DEG", "2.0"),
+                ("MANTA_INPUT_IQ_CALIBRATED_CENTER_HZ", "14000000.0"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        assert_eq!(
+            loaded
+                .input
+                .shared
+                .conditioning
+                .iq_calibration
+                .unwrap()
+                .gain_ratio,
+            1.05
+        );
+        let loaded = load_file(&format!("[[input]]\nname = \"a\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"apply\"\n{triple}[[input]]\nname = \"b\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"observe\"\n")).unwrap();
+        assert_eq!(
+            loaded.inputs[0].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Apply
+        );
+        assert_eq!(
+            loaded.inputs[1].input.shared.conditioning.iq,
+            manta_dsp::condition::StageMode::Observe
+        );
+        let invalid = "[[input]]\nname = \"ok\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\n[[input]]\nname = \"rx1\"\ntype = \"audio\"\ncenter_freq_hz = 14000000.0\niq_correction = \"on\"\n";
+        let err = err_of(invalid);
+        assert!(
+            err.contains("rx1") && err.contains("iq_correction"),
+            "{err}"
         );
     }
 
@@ -3789,8 +4763,7 @@ mod tests {
         );
     }
 
-    const HPSDR_BODY: &str =
-        "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
+    const HPSDR_BODY: &str = "[input]\ntype = \"hpsdr\"\nhost = \"192.0.2.10\"\nfreq_hz = 7030000.0\nrate_hz = 192000.0\n";
 
     fn hpsdr_protocol_of(source: &Option<SourceFromFile>) -> manta_input::hpsdr::HpsdrProtocol {
         match source {
@@ -4959,7 +5932,8 @@ mod tests {
         assert!(
             err.ends_with(
                 "-- manta reads [server], [[rbn_uplink]], [rbn_compare], [[skimmer_relay]], \
-                 [[wsjtx_relay]], [callsign_lookup], [input], [spot], [detector], [decode]"
+                 [[wsjtx_relay]], [pskreporter], [[wsjtx_output]], [callsign_lookup], [input], [spot], \
+                 [detector], [decode]"
             ),
             "{err}"
         );

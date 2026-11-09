@@ -61,8 +61,11 @@ reporting semantics do not move.
   (`crates/manta-decode/src/decoder.rs` tests).
 - Integration: `manta-cli`'s `confidence_desaturation` test — the
   median correct-spot confidence on the deterministic AWGN 25 WPM
-  10-station scene is now strictly increasing across 3 → 9 → 15 dB, and
-  at 9 dB fewer than 10% of spots carry exactly 0.225. The research
+  10-station scene is higher at 15 dB than at both 3 and 9 dB, and
+  at 9 dB fewer than 10% of spots carry exactly 0.225. (Originally a
+  strict 3 → 9 → 15 dB rise; MAN-199 dropped the 3 dB < 9 dB step,
+  since the 3 dB median rests on 1-2 spots and MAN-199's lead-in adds a
+  correct 3 dB spot.) The research
   baseline of 83 of 100 pinned spots pools multiple AWGN cells and
   trials, so it is not a matched per-cell before/after comparison.
 - Golden decode gates unchanged: `q` multiplies every beam hypothesis's

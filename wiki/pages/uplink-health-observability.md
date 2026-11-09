@@ -27,4 +27,4 @@ MAN-44 added `manta status`, a CLI subcommand that fetches `GET /status` (a JSON
 - Design record and alternatives considered: `docs/DECISIONS/2026-09-04-man44-uplink-status-surface.md`.
 - Operator-facing usage: `docs/RUNBOOKS/uplink-health.md`.
 - Exposure posture (`/status` shares `/metrics`'s unauthenticated listener on `[server].metrics_bind_addr`, `127.0.0.1` by default since MAN-132): `docs/RUNBOOKS/network-exposure.md`.
-- Per-target registry (MAN-128) and windowed health classification (MAN-44): `crates/manta-server/src/metrics.rs`. JSON document + human renderer: `crates/manta-server/src/status_doc.rs`. CLI fetch/render: `crates/manta-cli/src/main.rs` (`Command::Status`).
+- Per-target registry (MAN-128) and windowed health classification (MAN-44): `crates/manta-server/src/metrics.rs`. JSON document + human renderer: `crates/manta-server/src/status_doc.rs`. CLI fetch/render: `crates/manta-cli/src/daemon_client.rs` (`run_status`, `fetch_status`), dispatched from `Command::Status` in `crates/manta-cli/src/main.rs`.
