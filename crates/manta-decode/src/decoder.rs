@@ -318,6 +318,9 @@ pub struct TrackDecoder {
     /// MAN-199: set only inside `push_lead_in_hop`, so `tick_meta` neither
     /// counts the hop nor moves the SPEC §5 report cadence.
     lead_in: bool,
+    /// MAN-117: the `Legacy` chain's per-hop run buffer, reused across hops
+    /// so `Demod::push_into` does not allocate. Empty between hops.
+    runs: Vec<Run>,
     /// MAN-199: a mark run has reached `on_run`. A space before it is a
     /// truncation (the decoder started inside it) and teaches nothing.
     mark_seen: bool,
@@ -386,6 +389,7 @@ impl TrackDecoder {
             after_gap: false,
             continuity_epoch: 0,
             lead_in: false,
+            runs: Vec::new(),
             mark_seen: false,
             warmup_min_mark_ms: None,
             post_gap_mark_seen: false,
@@ -643,10 +647,24 @@ impl TrackDecoder {
         spectral_ref_power: Option<f32>,
         sample_ts: u64,
     ) -> Vec<DecoderEvent> {
-        self.lead_in = true;
-        let events = self.push_hop(amp, power, spectral_ref_power, sample_ts);
-        self.lead_in = false;
+        let mut events = Vec::new();
+        self.push_lead_in_hop_into(amp, power, spectral_ref_power, sample_ts, &mut events);
         events
+    }
+
+    /// [`TrackDecoder::push_lead_in_hop`], appending its events to `out`.
+    /// Appends; never reads or clears `out` (MAN-117).
+    pub fn push_lead_in_hop_into(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+        out: &mut Vec<DecoderEvent>,
+    ) {
+        self.lead_in = true;
+        self.push_hop_into(amp, power, spectral_ref_power, sample_ts, out);
+        self.lead_in = false;
     }
 
     /// One hop: linear amplitude, linear power, optional spectral noise
@@ -658,12 +676,27 @@ impl TrackDecoder {
         spectral_ref_power: Option<f32>,
         sample_ts: u64,
     ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        self.push_hop_into(amp, power, spectral_ref_power, sample_ts, &mut events);
+        events
+    }
+
+    /// [`TrackDecoder::push_hop`], appending its events to `out` so the
+    /// engine's decoder pool can reuse one buffer (MAN-117). Appends; never
+    /// reads or clears `out`.
+    pub fn push_hop_into(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+        out: &mut Vec<DecoderEvent>,
+    ) {
         self.last_ts = sample_ts;
         match self.cfg.engine {
-            Engine::Legacy => self.push_envelope_legacy(amp, sample_ts),
+            Engine::Legacy => self.push_envelope_legacy(amp, sample_ts, out),
             Engine::EdgeLegacy => {
                 let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
-                let mut events = Vec::new();
                 // Codex review, PR #161 round 9: `push` can now return more
                 // than one eligible center per input sample (a shrinking
                 // hold window draining its backlog) -- see
@@ -671,14 +704,16 @@ impl TrackDecoder {
                 for ev in self.evidence.push(amp, n, sample_ts) {
                     self.snr_from_evidence(&ev);
                     for run in self.edge.push(&ev) {
-                        self.on_run(run, &mut events);
+                        self.on_run(run, out);
                     }
-                    self.check_flush_edge(&mut events);
+                    self.check_flush_edge(out);
                 }
-                self.tick_meta(&mut events);
-                events
+                self.tick_meta(out);
             }
-            Engine::Hsmm => self.push_hop_hsmm(amp, power, spectral_ref_power, sample_ts), // Task 8
+            Engine::Hsmm => {
+                // Task 8
+                out.extend(self.push_hop_hsmm(amp, power, spectral_ref_power, sample_ts));
+            }
         }
     }
 
@@ -687,17 +722,19 @@ impl TrackDecoder {
         self.push_hop(a, a * a, None, sample_ts)
     }
 
-    /// The `Legacy` engine's demod -> timing -> beam chain. SPEC §3–§5.
-    fn push_envelope_legacy(&mut self, a: f32, sample_ts: u64) -> Vec<DecoderEvent> {
-        let mut events = Vec::new();
+    /// The `Legacy` engine's demod -> timing -> beam chain, appending to
+    /// `events`. SPEC §3–§5. The runs go through the reused `self.runs`
+    /// buffer (MAN-117).
+    fn push_envelope_legacy(&mut self, a: f32, sample_ts: u64, events: &mut Vec<DecoderEvent>) {
         self.last_ts = sample_ts;
-        let runs = self.demod.push(a, sample_ts);
-        for run in runs {
-            self.on_run(run, &mut events);
+        let mut runs = std::mem::take(&mut self.runs);
+        self.demod.push_into(a, sample_ts, &mut runs);
+        for run in runs.drain(..) {
+            self.on_run(run, events);
         }
-        self.check_flush(&mut events);
-        self.tick_meta(&mut events);
-        events
+        self.runs = runs;
+        self.check_flush(events);
+        self.tick_meta(events);
     }
 
     /// The `Hsmm` engine's evidence -> token-passing -> commit chain. SPEC v2 §4.
