@@ -760,7 +760,6 @@ pub(crate) enum ReceiverKind {
     SoundCard,
     File,
     Kiwi,
-    #[cfg(feature = "soapy")]
     Soapy,
     Hpsdr,
     Ka9q,
@@ -773,7 +772,6 @@ impl ReceiverKind {
             ReceiverKind::SoundCard => "sound-card",
             ReceiverKind::File => "WAV file",
             ReceiverKind::Kiwi => "KiwiSDR",
-            #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => "SoapySDR",
             ReceiverKind::Hpsdr => "HPSDR",
             ReceiverKind::Ka9q => "ka9q-radio",
@@ -793,7 +791,6 @@ impl ReceiverKind {
                 "check --kiwi-host/input.host and --kiwi-port/input.port, and that the KiwiSDR \
                  has a free channel (open it in a web browser)"
             }
-            #[cfg(feature = "soapy")]
             ReceiverKind::Soapy => {
                 "check --soapy-driver/input.driver, and that SoapySDRUtil --find lists the \
                  radio; install its SoapySDR module if it does not"
@@ -1647,7 +1644,6 @@ mod tests {
                 &["--kiwi-host", "--kiwi-port", "free channel"],
             ),
         ];
-        #[cfg(feature = "soapy")]
         cases.push((
             crate::source_spec::LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
                 driver: Some("driver=rtlsdr".into()),

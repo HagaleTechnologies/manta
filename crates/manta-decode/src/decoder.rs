@@ -9,7 +9,9 @@ use crate::hsmm::{Committed, HsmmConfig, HsmmDecoder};
 use crate::noise::{NoiseConfig, NoiseTracker};
 use crate::prior::WordPrior;
 use crate::readings::ReadingsBeam;
-use crate::timing::{GapClass, GapClassifier, SenderTiming, SpeedTracker, TimingClass};
+use crate::timing::{
+    GapClass, GapClassifier, SenderTiming, SpeedBankConfig, SpeedTracker, TimingBank, TimingClass,
+};
 use crate::tree::{pattern_for, Glyph};
 use crate::HOP_MS;
 use std::collections::VecDeque;
@@ -78,6 +80,10 @@ pub struct DecodeConfig {
     /// `DecodeConfig` so every consumer of a decoded `[decode]` table (the
     /// engine's listen loop above all) sees the same refinement budgets.
     pub refine: RefineConfig,
+    /// MAN-544: the bounded speed/timing hypothesis bank (`Legacy` and
+    /// `EdgeLegacy`). Not a TOML option (as `steered_frontend`);
+    /// `width: 1`, the default, is the single-tracker decode.
+    pub speed_bank: SpeedBankConfig,
 }
 
 /// MAN-208: the `[decode.refine]` table's runtime form. A refinement
@@ -174,6 +180,7 @@ impl Default for DecodeConfig {
             refine_bw_hz: 0.0,
             steered_frontend: false,
             refine: RefineConfig::default(),
+            speed_bank: SpeedBankConfig::default(),
         }
     }
 }
@@ -214,6 +221,9 @@ pub struct TrackDecoder {
     edge: EdgeDemod,
     hsmm: HsmmDecoder,
     tracker: SpeedTracker,
+    /// MAN-544: challengers to `tracker` and their scores (the primary is
+    /// `tracker` itself). Inert at `width: 1`.
+    bank: TimingBank,
     gaps: GapClassifier,
     /// Runs buffered until the tracker is ready (first 5 marks). They are
     /// drained through gap classification + beam retroactively.
@@ -327,6 +337,7 @@ impl TrackDecoder {
         // three engines now share the same nominal threshold (timing.rs's
         // CHAR_GAP_DITS doc comment).
         let gaps = GapClassifier::new();
+        let bank = TimingBank::new(cfg.speed_bank);
         TrackDecoder {
             readings: ReadingsBeam::default(),
             track_id,
@@ -337,6 +348,7 @@ impl TrackDecoder {
             edge,
             hsmm,
             tracker: SpeedTracker::new(),
+            bank,
             gaps,
             pending: Vec::new(),
             cur_marks: Vec::new(),
@@ -407,8 +419,16 @@ impl TrackDecoder {
             return false;
         }
         self.tracker.seed_wpm(wpm);
+        self.bank.clear();
         self.demod.set_dit_ms(self.tracker.mu_dit_ms());
         true
+    }
+
+    /// MAN-544: the speed/timing hypothesis bank, for tests and the spike
+    /// harness. Not an event field.
+    #[doc(hidden)]
+    pub fn speed_bank(&self) -> &TimingBank {
+        &self.bank
     }
 
     /// Hops fed to this decoder so far. `manta-engine`'s peak-hold reset
@@ -558,6 +578,7 @@ impl TrackDecoder {
         self.flushed_gap_ms = None;
         self.single_flush_ms = None;
         self.pending.clear();
+        self.bank.clear();
         self.after_gap = true;
         self.post_gap_mark_seen = false;
         self.continuity_epoch = self.continuity_epoch.wrapping_add(1);
@@ -1170,6 +1191,17 @@ impl TrackDecoder {
                 // gap or assembles a character in the assumed scale.
                 let gaps = completed_gaps_ms(&self.pending);
                 self.tracker.resolve_unimodal_bootstrap(&gaps);
+                // MAN-544: the other reading of an ambiguous bootstrap
+                // becomes a challenger, scored from the replay on.
+                if self.cfg.speed_bank.width > 1 {
+                    let marks: Vec<f32> = self
+                        .pending
+                        .iter()
+                        .filter(|r| r.mark)
+                        .map(|r| r.hops as f32 * HOP_MS as f32)
+                        .collect();
+                    self.bank.on_ready(&self.tracker, &marks);
+                }
                 // Retroactively assemble the buffered runs; their marks
                 // already fed the tracker, so mark updates are skipped,
                 // while their element gaps are learned here (MAN-315 D3).
@@ -1196,8 +1228,11 @@ impl TrackDecoder {
             // run: the demod folded a remainder shorter than its debounce
             // window into this mark, so the length at the flush is the
             // closed length, short by less than that window (MAN-315 D2).
+            // The bank scores it here too: a flushed gap never reaches the
+            // `classify` call below (MAN-544).
             if let Some(flushed_ms) = self.flushed_gap_ms.take() {
                 self.observe_gap(GapClass::InterWord, flushed_ms);
+                self.bank.on_gap(&self.tracker, flushed_ms);
             }
             if live {
                 self.tracker.on_mark(dur_ms);
@@ -1219,25 +1254,34 @@ impl TrackDecoder {
                     self.single_flush_gaps.clear();
                 }
                 self.sync_sender_regime();
+                self.bank.on_mark(&self.tracker, dur_ms, true);
+                if self.bank.take_switch(&mut self.tracker) {
+                    self.on_speed_switch();
+                }
                 self.demod.set_dit_ms(self.tracker.mu_dit_ms());
                 if let Some(w) = self.tracker.wpm() {
                     self.report_wpm(w, events);
                 }
+            } else {
+                self.bank.on_mark(&self.tracker, dur_ms, false);
             }
             self.cur_marks.push(dur_ms);
             self.word_flushed = false;
         } else {
             if self.word_flushed {
                 // This gap was already handled by the 7-dit flush. Its
-                // closed length is the sender's word gap (MAN-315 D2).
+                // closed length is the sender's word gap (MAN-315 D2), and
+                // the bank scores it at that length (MAN-544).
                 if let Some(flushed_ms) = self.flushed_gap_ms.take() {
                     self.observe_gap(GapClass::InterWord, flushed_ms + dur_ms);
+                    self.bank.on_gap(&self.tracker, flushed_ms + dur_ms);
                 }
                 if let Some(flushed_ms) = self.single_flush_ms.take() {
                     self.observe_single_flush(flushed_ms + dur_ms);
                 }
                 return;
             }
+            self.bank.on_gap(&self.tracker, dur_ms);
             let class = self.gaps.classify(dur_ms, self.gap_unit_ms());
             self.observe_gap(class, dur_ms);
             match class {
@@ -1304,7 +1348,24 @@ impl TrackDecoder {
         if regime == self.sender_regime {
             return;
         }
-        self.sender_regime = regime;
+        self.reset_sender_timing();
+    }
+
+    /// MAN-544: the bank replaced the primary tracker. Everything learned
+    /// in the old scale's units goes: the gap classifier, the flushed
+    /// one-character-word gaps and the sender timing (explicitly: the new
+    /// primary's `regime()` may equal the old one's, so
+    /// `sync_sender_regime` would not see the change).
+    fn on_speed_switch(&mut self) {
+        self.gaps = GapClassifier::new();
+        self.single_flush_gaps.clear();
+        self.reset_sender_timing();
+    }
+
+    /// Drop the sender's timing learned in the current mark scale and
+    /// adopt the tracker's regime (MAN-315 D7).
+    fn reset_sender_timing(&mut self) {
+        self.sender_regime = self.tracker.regime();
         // `|=`: a second re-init before the next update must not drop a
         // reset that has not been reported yet.
         self.timing_reset_pending |= self.last_timing_total > 0;
@@ -1716,6 +1777,99 @@ mod tests {
         }
         push(0.0, 8 * dit_hops); // tail so the last word flushes by timeout
         env
+    }
+
+    /// MAN-544: `n` repetitions of `text` at `from` hops per dit, a
+    /// 3-dit join at `to` hops, then `m` repetitions at `to`.
+    fn rect_step_envelope(text: &str, from: u32, n: usize, to: u32, m: usize) -> Vec<f32> {
+        let rep = |k: usize| vec![text; k].join(" ");
+        let mut env = rect_envelope(&rep(n), from);
+        while env.last() == Some(&0.0) {
+            env.pop();
+        }
+        env.extend(std::iter::repeat_n(0.0, 3 * to as usize));
+        env.extend(rect_envelope(&rep(m), to));
+        env
+    }
+
+    /// MAN-544: decode `env` from `skip` with `bank`; the events and the
+    /// decoder.
+    fn decode_with_bank(
+        env: &[f32],
+        skip: usize,
+        bank: crate::timing::SpeedBankConfig,
+    ) -> (Vec<DecoderEvent>, TrackDecoder) {
+        let cfg = DecodeConfig {
+            speed_bank: bank,
+            ..Default::default()
+        };
+        let mut dec = TrackDecoder::new(1, cfg);
+        let mut events = Vec::new();
+        for (i, &a) in env.iter().skip(skip).enumerate() {
+            events.extend(dec.push_envelope(a, i as u64 * 256));
+        }
+        events.extend(dec.finish());
+        (events, dec)
+    }
+
+    #[test]
+    fn observe_only_bank_leaves_events_identical() {
+        use crate::timing::SpeedBankConfig;
+        let off = SpeedBankConfig {
+            width: 1,
+            switching: false,
+        };
+        let observe = SpeedBankConfig {
+            width: 3,
+            switching: false,
+        };
+        let cq10 = ["CQ TEST W1AW"; 10].join(" ");
+        let hh = ["HH"; 10].join(" ");
+        let mo = ["MO"; 10].join(" ");
+        let streams: Vec<(&str, Vec<f32>, usize)> = vec![
+            ("cq18", rect_envelope(&cq10, 18), 0),
+            ("cq9", rect_envelope(&cq10, 9), 0),
+            ("hh-from-5", rect_envelope(&hh, 12), 5),
+            ("mo12", rect_envelope(&mo, 12), 0),
+            (
+                "step30to12",
+                rect_step_envelope("CQ TEST W1AW", 30, 10, 12, 20),
+                0,
+            ),
+        ];
+        for (name, env, skip) in &streams {
+            let (a, _) = decode_with_bank(env, *skip, off);
+            let (b, dec) = decode_with_bank(env, *skip, observe);
+            assert_eq!(a, b, "{name}: observe-only changed the events");
+            if *name == "step30to12" {
+                let log: Vec<_> = dec.speed_bank().switch_log().copied().collect();
+                assert!(
+                    log.iter().any(|r| !r.applied),
+                    "{name}: no would-switch recorded"
+                );
+                assert!(log.iter().all(|r| !r.applied), "{log:?}");
+            }
+        }
+    }
+
+    /// MAN-544 (Codex review, PR #544): the bank scores every closed gap
+    /// once, the word gaps `check_flush` resolves included. Ten
+    /// `CQ TEST W1AW` at 18 hops per dit have 270 marks, so 269 gaps between
+    /// them and a trailing space; a bank fed only classified gaps scored 250
+    /// of those 270, the rest being word gaps the flush resolved.
+    #[test]
+    fn bank_scores_flushed_word_gaps_once() {
+        let observe = crate::timing::SpeedBankConfig {
+            width: 3,
+            switching: false,
+        };
+        let cq10 = ["CQ TEST W1AW"; 10].join(" ");
+        let (_, dec) = decode_with_bank(&rect_envelope(&cq10, 18), 0, observe);
+        let bank = dec.speed_bank();
+        assert_eq!(bank.marks_seen(), 270, "27 marks per CQ TEST W1AW");
+        // 269 gaps between marks, and the trailing 8-dit space the flush
+        // resolved before `finish`.
+        assert_eq!(bank.gaps_seen(), 270);
     }
 
     #[test]

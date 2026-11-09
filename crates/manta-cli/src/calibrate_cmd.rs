@@ -118,7 +118,6 @@ fn db(v: f64) -> String {
 pub(crate) fn apply_tune_hz(resolved: &mut Resolved, tune_hz: f64) -> Result<()> {
     match &mut resolved.spec {
         LiveSourceSpec::Kiwi(kiwi) => kiwi.freq = Some(tune_hz),
-        #[cfg(feature = "soapy")]
         LiveSourceSpec::Soapy(soapy) => soapy.freq = Some(tune_hz),
         LiveSourceSpec::Hpsdr(hpsdr) => {
             hpsdr.freq = Some(
@@ -355,7 +354,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
         source,
         source_iq,
         kiwi,
-        #[cfg(feature = "soapy")]
         soapy,
         hpsdr,
         ka9q,
@@ -394,7 +392,6 @@ fn input_overrides(cli: &CliOverrides, vars: &[(OsString, OsString)]) -> Vec<Str
     flag(kiwi.host.is_some(), "--kiwi-host");
     flag(kiwi.freq.is_some(), "--kiwi-freq-hz");
     // Every other --soapy-* flag requires the driver.
-    #[cfg(feature = "soapy")]
     flag(soapy.driver.is_some(), "--soapy-driver");
     flag(hpsdr.host.is_some(), "--hpsdr-host");
     flag(hpsdr.mac.is_some(), "--hpsdr-mac");
@@ -1013,7 +1010,6 @@ mod tests {
             _ => unreachable!(),
         }
         assert_eq!(r.dial_freq_hz, None);
-        #[cfg(feature = "soapy")]
         {
             let mut r = resolved_with(LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
                 driver: Some("driver=rtlsdr".into()),

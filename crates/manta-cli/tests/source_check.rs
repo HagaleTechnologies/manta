@@ -497,6 +497,31 @@ fn disabled_source_flags_are_usage_errors() {
     }
 }
 
+/// MAN-550: SOURCE and --soapy-driver both belong to `check`'s
+/// `source_selector` group, so naming both is a usage error in either order;
+/// a build without SoapySDR has no such flag at all.
+#[test]
+fn a_source_path_with_soapy_driver_is_a_usage_error() {
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        ["missing.wav", "--soapy-driver", "driver=rtlsdr"],
+        ["--soapy-driver", "driver=rtlsdr", "missing.wav"],
+    ] {
+        let output = check(dir.path(), &args);
+        status(&output, 2);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if cfg!(feature = "soapy") {
+            assert!(stderr.contains("cannot be used with"), "{args:?}: {stderr}");
+            assert!(stderr.contains("[SOURCE]"), "{args:?}: {stderr}");
+        } else {
+            assert!(
+                stderr.contains("unexpected argument '--soapy-driver'"),
+                "{args:?}: {stderr}"
+            );
+        }
+    }
+}
+
 #[test]
 fn devices_json_smoke_is_inventory_independent_and_does_not_load_config() {
     let output = manta()
