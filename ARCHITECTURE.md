@@ -135,7 +135,10 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
 - **SoapySDR** (`soapysdr` crate, feature-gated `soapy`): RTL-SDR (2.4 MS/s max,
   8-bit), Airspy HF+ (768 kS/s, the reference device), SDRplay. Runtime device
   selection by driver string. Feature-gating keeps the core buildable without the
-  native SoapySDR library (CI, contributors without hardware).
+  native SoapySDR library (CI, contributors without hardware). In `manta-cli`,
+  `soapy_opts` is the one module that names the feature: its `SoapyArgs` flags
+  exist only in a `soapy` build, and the `SoapyOpts` settings exist in every
+  build (MAN-550).
 - **OpenHPSDR** (UDP, both protocols, in every build): protocol 1 ("Metis":
   Hermes-Lite 2 and Pavel Demin's Red Pitaya and QMTech images) and protocol 2
   (ANAN-class: Hermes, Angelia, Orion, Orion II, Saturn/G2), behind one
@@ -403,7 +406,10 @@ Per track, operating on the ~375 Hz complex channel stream:
    the classification/likelihood consumers that want it), tracked with EMA.
    Handles 10–40+ WPM and drift; Farnsworth spacing tolerated by decoupling
    inter-element and inter-word gap
-   thresholds (dit's speed-detector lesson).
+   thresholds (dit's speed-detector lesson). An optional bank of up to three
+   speed hypotheses (MAN-544, `timing::bank`, off by default) can replace
+   the tracker after a speed step or a mis-locked opening (legacy and
+   edge-legacy engines).
 4. **Element→character decode**: marks/spaces classified against the tracked
    timing model with per-element likelihoods, then a **beam search (width 4) over
    the Morse code tree** — small-Viterbi rather than hard thresholding, so a
@@ -1328,6 +1334,9 @@ beside the one validator (`SharedRefine`). The pass's clock is its owner's
 stream position, never a batch event's timestamp. Input gaps clear retention
 (only the gapped input's tracks on the multi-input path); closed tracks lose
 their FIFO. An 8 MiB estimated entry ceiling bounds all tracks together.
+The ceiling evicts the oldest ring front from an ordered index and keeps a
+running count, so recording costs O(log tracks), not a scan of every ring
+([MAN-525](docs/DECISIONS/2026-11-08-man525-refine-bookkeeping-cost.md)).
 
 `validator → refinement candidates → retained hops → scratch TrackDecoder →
 Validator::apply_refinement → spot sink` is a feedback path over preserved

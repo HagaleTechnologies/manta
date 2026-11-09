@@ -7,7 +7,7 @@
 use manta_decode::decoder::{DecodeConfig, Engine};
 use manta_decode::events::DecoderEvent;
 use manta_decode::tree::Glyph;
-use manta_engine::refine::{RefineBuffers, RefineScheduler};
+use manta_engine::refine::{RefineBuffers, RefineCounters, RefineScheduler};
 use manta_spot::observation::Cause;
 use manta_spot::{ObservationPolicy, Validator};
 
@@ -227,18 +227,19 @@ fn scene(truth: &str, causal: &str, refine_enabled: bool, with_repetition: bool)
     } else {
         wave.boundary
     };
-    let candidate = validator
+    let (span, word_seq) = validator
         .refine_candidates(rep_boundary, 10 * FS as u64)
         .into_iter()
         .find(|c| c.call == causal)
+        .map(|c| (c.span, c.word_seq))
         .expect("the ambiguous word is a refine candidate");
     Scene {
         validator,
         scheduler: RefineScheduler::new(&decode_cfg, FS),
         buffers,
         decode_cfg,
-        span: candidate.span,
-        word_seq: candidate.word_seq,
+        span,
+        word_seq,
         rep_boundary,
         causal_spots,
     }
@@ -521,4 +522,292 @@ fn control_scene_without_ambiguity_emits_no_refined_records() {
         .observations()
         .iter()
         .all(|o| o.draft.cause != Cause::Refined));
+}
+
+/// MAN-525: a crowded node under a tight global retention bound, pinned on
+/// main (915db0e) so the bookkeeping refactor must reproduce every counter
+/// and rescue. 24 tracks: track `i + 1` reads `K3{x}{y}C` with a `D`
+/// alternative over a retained `K3{x}{y}D` waveform, a clean repetition 8 s
+/// later; bases 2000 samples apart, 500 Hz apart; hops recorded interleaved,
+/// hop by hop in track order, as `drain_pool` records them. Events are
+/// ingested per track in generated order (NOT sorted by timestamp: the call
+/// word's boundary is pinned to the RF flush point after the trailing `K`).
+struct Crowded {
+    retained: usize,
+    evicted: u64,
+    counters: RefineCounters,
+    refined_records: usize,
+    rescued: Vec<(String, u32, u64)>,
+}
+
+fn crowded(per_track_budget: usize) -> Crowded {
+    const N: u32 = 24;
+    let decode_cfg = DecodeConfig {
+        engine: Engine::Hsmm,
+        refine: manta_decode::decoder::RefineConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..DecodeConfig::default()
+    };
+    let mut validator =
+        Validator::new(FS, CTY, None).with_observations(ObservationPolicy::records());
+    let letters = ['A', 'B', 'C', 'D', 'E'];
+    let (mut waves, mut first, mut reps, mut last_rep) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
+    for i in 0..N {
+        let id = i + 1;
+        let base = 1_000_000u64 + u64::from(i) * 2_000;
+        let (x, y) = (letters[(i / 5) as usize % 5], letters[i as usize % 5]);
+        validator.ingest(&DecoderEvent::TrackMeta {
+            track_id: id,
+            sample_ts: base,
+            snr_2500_db: 20.0,
+            freq_hz: 14_000_000.0 + 500.0 * f64::from(i),
+            last_char_ts: base,
+        });
+        validator.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: id,
+            wpm: 25.0,
+        });
+        let wave = waveform(&format!("K3{x}{y}D"), base);
+        let (ev, _) = causal_events_boundary(
+            id,
+            &format!("K3{x}{y}C"),
+            base,
+            wave.word_start + 500,
+            wave.boundary,
+            true,
+        );
+        first.extend(ev);
+        let (ev, b) = causal_events(
+            id,
+            &format!("K3{x}{y}D"),
+            base + 768_000,
+            base + 768_000,
+            false,
+        );
+        reps.extend(ev);
+        last_rep = last_rep.max(b);
+        waves.push(wave);
+    }
+    for ev in first.iter().chain(reps.iter()) {
+        assert!(validator.ingest(ev).is_empty(), "no causal spot");
+    }
+    let mut buffers =
+        RefineBuffers::new(&decode_cfg.refine).with_entry_budget(N as usize * per_track_budget);
+    let longest = waves.iter().map(|w| w.hops.len()).max().unwrap();
+    for k in 0..longest {
+        for (i, w) in waves.iter().enumerate() {
+            if let Some(h) = w.hops.get(k) {
+                buffers.record(i as u32 + 1, *h);
+            }
+        }
+    }
+    let mut scheduler = RefineScheduler::new(&decode_cfg, FS);
+    let (mut now, mut rescued) = (last_rep + 32_000, Vec::new());
+    for _ in 0..80 {
+        for sp in scheduler.step(&mut buffers, &mut validator, &decode_cfg, now) {
+            rescued.push((sp.callsign, sp.track_id, sp.sample_ts));
+        }
+        now += 4096;
+    }
+    let refined_records = validator
+        .observations()
+        .iter()
+        .filter(|o| o.draft.cause == Cause::Refined)
+        .count();
+    Crowded {
+        retained: buffers.len(),
+        evicted: buffers.evicted_entries(),
+        counters: *scheduler.counters(),
+        refined_records,
+        rescued,
+    }
+}
+
+/// `K3{x}{y}D` for track `id`, and its rescue's RF time.
+fn crowded_rescue(id: u32) -> (String, u32, u64) {
+    let letters = ['A', 'B', 'C', 'D', 'E'];
+    let i = id - 1;
+    (
+        format!(
+            "K3{}{}D",
+            letters[(i / 5) as usize % 5],
+            letters[i as usize % 5]
+        ),
+        id,
+        1_768_500 + 2_000 * u64::from(i),
+    )
+}
+
+#[test]
+fn a_crowded_node_under_the_global_bound_refines_exactly_as_before() {
+    // Tight: the oldest 15 tracks lose their span (buffer misses), the
+    // newest 9 rescue; 32 admissions overflow a 16-deep backlog by 8.
+    let a = crowded(1_100);
+    assert_eq!(
+        (a.retained, a.evicted, a.refined_records),
+        (26_400, 8_016, 9)
+    );
+    assert_eq!(
+        a.counters,
+        RefineCounters {
+            admitted_total: 32,
+            replayed_hops_total: 9_932,
+            rescues_total: 9,
+            budget_exhausted_total: 6,
+            backlog_overflow_total: 8,
+            buffer_miss_total: 15,
+            no_reading_total: 0,
+            orphaned_revisions_total: 0,
+        }
+    );
+    assert_eq!(a.rescued, (16..=24).map(crowded_rescue).collect::<Vec<_>>());
+    // Looser: every span survives; re-admission churn through the backlog.
+    let b = crowded(1_250);
+    assert_eq!(
+        (b.retained, b.evicted, b.refined_records),
+        (30_000, 4_416, 24)
+    );
+    assert_eq!(
+        b.counters,
+        RefineCounters {
+            admitted_total: 123,
+            replayed_hops_total: 29_592,
+            rescues_total: 23,
+            budget_exhausted_total: 19,
+            backlog_overflow_total: 99,
+            buffer_miss_total: 0,
+            no_reading_total: 0,
+            orphaned_revisions_total: 0,
+        }
+    );
+    let order = [
+        9, 10, 7, 6, 5, 8, 3, 2, 4, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 1,
+    ];
+    assert_eq!(
+        b.rescued,
+        order.into_iter().map(crowded_rescue).collect::<Vec<_>>()
+    );
+    // Starved: every span is evicted; nothing replays.
+    let c = crowded(900);
+    assert_eq!(
+        (c.retained, c.evicted, c.refined_records),
+        (21_600, 12_816, 0)
+    );
+    assert_eq!(
+        c.counters,
+        RefineCounters {
+            admitted_total: 32,
+            buffer_miss_total: 24,
+            backlog_overflow_total: 8,
+            ..RefineCounters::default()
+        }
+    );
+    assert!(c.rescued.is_empty());
+}
+
+/// One ambiguous `K3xyC` track at `freq_hz`, `base` 2000 samples per id
+/// past 1_000_000, for the neighbour-gap fixtures.
+fn ambiguous_track(validator: &mut Validator, id: u32, freq_hz: f64) {
+    let letters = ['A', 'B', 'C', 'D', 'E'];
+    let i = id - 1;
+    let base = 1_000_000u64 + u64::from(i) * 2_000;
+    validator.ingest(&DecoderEvent::TrackMeta {
+        track_id: id,
+        sample_ts: base,
+        snr_2500_db: 20.0,
+        freq_hz,
+        last_char_ts: base,
+    });
+    validator.ingest(&DecoderEvent::SpeedUpdate {
+        track_id: id,
+        wpm: 25.0,
+    });
+    let call = format!(
+        "K3{}{}C",
+        letters[(i / 5) as usize % 5],
+        letters[i as usize % 5]
+    );
+    let (events, _) = causal_events(id, &call, base, base + 5_000, true);
+    for ev in &events {
+        validator.ingest(ev);
+    }
+}
+
+#[test]
+fn refine_candidates_report_the_nearest_other_track_gap() {
+    // MAN-525: the gap is the nearest OTHER track's frequency distance;
+    // two tracks on one frequency are 0 Hz apart, and a lone track has
+    // no neighbour at all.
+    let mut validator = Validator::new(FS, CTY, None);
+    for (id, freq) in [
+        (1, 14_000_000.0),
+        (2, 14_000_050.0),
+        (3, 14_000_050.0),
+        (4, 14_000_600.0),
+    ] {
+        ambiguous_track(&mut validator, id, freq);
+    }
+    let candidates = validator.refine_candidates(1_400_000, 10 * FS as u64);
+    assert_eq!(
+        candidates.iter().map(|c| c.track_id).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.neighbor_gap_hz)
+            .collect::<Vec<_>>(),
+        [50.0, 0.0, 0.0, 550.0]
+    );
+    let mut lone = Validator::new(FS, CTY, None);
+    ambiguous_track(&mut lone, 5, 14_000_000.0);
+    let candidates = lone.refine_candidates(1_400_000, 10 * FS as u64);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].neighbor_gap_hz, f64::INFINITY);
+}
+
+#[test]
+#[ignore = "timing probe; run in release with --ignored --nocapture"]
+fn refine_candidates_cost_by_track_count() {
+    // MAN-525: `refine_candidates` with N tracks holding one ambiguous
+    // `K3{x}{y}{z}` word each, 500 Hz apart. Never asserted on time.
+    let letters = ['A', 'B', 'C', 'D', 'E'];
+    for n in [25u32, 125] {
+        let mut validator = Validator::new(FS, CTY, None);
+        for i in 0..n {
+            let id = i + 1;
+            let base = 1_000_000u64 + u64::from(i) * 2_000;
+            validator.ingest(&DecoderEvent::TrackMeta {
+                track_id: id,
+                sample_ts: base,
+                snr_2500_db: 20.0,
+                freq_hz: 14_000_000.0 + 500.0 * f64::from(i),
+                last_char_ts: base,
+            });
+            let call = format!(
+                "K3{}{}{}",
+                letters[(i / 25) as usize % 5],
+                letters[(i / 5) as usize % 5],
+                letters[i as usize % 5]
+            );
+            let (events, _) = causal_events(id, &call, base, base + 5_000, true);
+            for ev in &events {
+                validator.ingest(ev);
+            }
+        }
+        let calls = 2_000u32;
+        let start = std::time::Instant::now();
+        let mut found = 0usize;
+        for _ in 0..calls {
+            found +=
+                std::hint::black_box(validator.refine_candidates(1_400_000, 10 * FS as u64)).len();
+        }
+        let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(calls);
+        println!(
+            "MAN525 tracks={n} candidates_per_call={} us_per_call={us:.2}",
+            found / calls as usize
+        );
+    }
 }

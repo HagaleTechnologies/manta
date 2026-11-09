@@ -731,29 +731,51 @@ pub struct RefinedWord {
     pub hypothesis: &'static str,
 }
 
+/// MAN-525: the nearest other track's frequency distance from `freq_hz`,
+/// read from `sorted` (finite frequencies, ascending by `(frequency,
+/// track_id)`) by binary search: the closest entry below `freq_hz`, and the
+/// first entry at or above it that is not `track_id` itself. Exact against
+/// the fold over every track because rounding is monotone (for
+/// `a <= b <= f`, `fl(f - b) <= fl(f - a)`). `None` for a non-finite
+/// `freq_hz`, which the caller answers with the fold.
+fn nearest_gap_hz(sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> Option<f64> {
+    if !freq_hz.is_finite() {
+        return None;
+    }
+    let p = sorted.partition_point(|&(f, _)| f < freq_hz);
+    let mut gap = f64::INFINITY;
+    if p > 0 {
+        gap = gap.min((sorted[p - 1].0 - freq_hz).abs());
+    }
+    if let Some(&(f, _)) = sorted[p..].iter().find(|&&(_, id)| id != track_id) {
+        gap = gap.min((f - freq_hz).abs());
+    }
+    Some(gap)
+}
+
 /// MAN-208: one retained occurrence the refinement scheduler may re-decode
-/// (`Validator::refine_candidates`). A read-only snapshot; deciding
-/// anything stays with the validator.
-#[derive(Debug, Clone)]
-pub struct RefineCandidate {
+/// (`Validator::refine_candidates`). A read-only view borrowing the
+/// validator; a caller that keeps a candidate across a mutation copies the
+/// plain fields it needs (MAN-525). Deciding anything stays with the
+/// validator.
+#[derive(Debug, Clone, Copy)]
+pub struct RefineCandidate<'a> {
     pub episode_wpm: f32,
     pub neighbor_gap_hz: f64,
     pub latest_word_seq: u64,
     pub track_id: u32,
     pub word_seq: u64,
     /// The occurrence's currently decoded call.
-    pub call: String,
+    pub call: &'a str,
     /// `(start_ts, end_ts)` of the occurrence, for replay range selection
     /// and span-matching the refined words back to occurrences.
     pub span: (u64, u64),
     /// The repetition count the occurrence's evaluation last saw.
     pub reps: u32,
-    /// What its pattern tier requires.
-    pub required_reps: u32,
     /// The track's latest speed, used by a seeded replay.
     pub wpm: f32,
     /// The better-supported rival that withheld it, if any.
-    pub rival: Option<String>,
+    pub rival: Option<&'a str>,
     /// How many of its characters carried unresolved decoder alternatives.
     pub alternatives: usize,
     /// Whether `wpm` is a reliable estimate: the track has decoded at
@@ -1078,10 +1100,20 @@ impl Validator {
     /// its span ends inside the last `lookback_samples` before `now_ts`.
     /// Ordered by `(track_id, word_seq)` so the caller's admission order is
     /// stable. Decides nothing and records nothing.
-    pub fn refine_candidates(&self, now_ts: u64, lookback_samples: u64) -> Vec<RefineCandidate> {
+    ///
+    /// MAN-525: neighbour gaps come from one frequency-sorted pass per
+    /// call, built on the first candidate, and each track's gap is computed
+    /// once, on its first candidate; the text is borrowed, not cloned.
+    pub fn refine_candidates(
+        &self,
+        now_ts: u64,
+        lookback_samples: u64,
+    ) -> Vec<RefineCandidate<'_>> {
         let mut out = Vec::new();
         let cutoff = now_ts.saturating_sub(lookback_samples);
+        let mut sorted: Option<Vec<(f64, u32)>> = None;
         for (&track_id, track) in &self.tracks {
+            let mut gap: Option<f64> = None;
             for word in &track.words {
                 if !word.attempted {
                     continue;
@@ -1097,23 +1129,21 @@ impl Validator {
                 if !word.refine_hint && alternatives == 0 {
                     continue;
                 }
+                let neighbor_gap_hz = *gap.get_or_insert_with(|| {
+                    let s = sorted.get_or_insert_with(|| self.sorted_track_freqs());
+                    self.neighbor_gap_hz(s, track_id, track.freq_hz)
+                });
                 out.push(RefineCandidate {
                     episode_wpm: word.decoded_wpm,
                     latest_word_seq: track.next_word_seq,
-                    neighbor_gap_hz: self
-                        .tracks
-                        .iter()
-                        .filter(|(id, _)| **id != track_id)
-                        .map(|(_, other)| (other.freq_hz - track.freq_hz).abs())
-                        .fold(f64::INFINITY, f64::min),
+                    neighbor_gap_hz,
                     track_id,
                     word_seq: word.seq,
-                    call: word.text.clone(),
+                    call: &word.text,
                     span: (word.start_ts, word.end_ts),
                     reps: word.last_reps,
-                    required_reps: self.level.required_reps(self.patterns.tier(&word.text)),
                     wpm: track.wpm,
-                    rival: word.rival.clone(),
+                    rival: word.rival.as_deref(),
                     alternatives,
                     wpm_stable: track.wpm_confirmed
                         && track.next_word_seq - track.wpm_since_word_seq >= STABLE_SPEED_WORDS,
@@ -1121,6 +1151,37 @@ impl Validator {
             }
         }
         out
+    }
+
+    /// MAN-525: every track's finite frequency with its id, sorted by
+    /// `(frequency, track_id)`: the one pass `refine_candidates` reads
+    /// neighbour gaps from. Non-finite frequencies are left out; against a
+    /// finite own frequency they only ever contribute NaN or infinity,
+    /// which the gap's `f64::min` from `INFINITY` ignores.
+    fn sorted_track_freqs(&self) -> Vec<(f64, u32)> {
+        let mut sorted: Vec<(f64, u32)> = self
+            .tracks
+            .iter()
+            .filter(|(_, t)| t.freq_hz.is_finite())
+            .map(|(&id, t)| (t.freq_hz, id))
+            .collect();
+        sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        sorted
+    }
+
+    /// MAN-208's neighbour gap: the distance to the nearest OTHER track's
+    /// frequency, `INFINITY` with no other track. Reads `sorted`
+    /// ([`Self::sorted_track_freqs`]) by binary search (MAN-525); a
+    /// non-finite own frequency falls back to the original fold over every
+    /// track, so the value is bit-identical either way.
+    fn neighbor_gap_hz(&self, sorted: &[(f64, u32)], track_id: u32, freq_hz: f64) -> f64 {
+        nearest_gap_hz(sorted, track_id, freq_hz).unwrap_or_else(|| {
+            self.tracks
+                .iter()
+                .filter(|(id, _)| **id != track_id)
+                .map(|(_, other)| (other.freq_hz - freq_hz).abs())
+                .fold(f64::INFINITY, f64::min)
+        })
     }
 
     /// MAN-208: applies one externally computed refinement of a retained
@@ -6520,5 +6581,67 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         });
         assert!(spots.is_empty(), "got {spots:?}");
         assert!(v.suppression_counts().pending_beacon_rejected_wpm >= 1);
+    }
+}
+
+#[cfg(test)]
+mod man525_tests {
+    use super::nearest_gap_hz;
+
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn nearest_gap_equals_the_fold_bit_for_bit() {
+        // MAN-525: the binary-searched gap equals main's fold over every
+        // other track, bit for bit, including NaN, +inf, -0.0 and
+        // duplicate frequencies (a non-finite own frequency falls back to
+        // the fold itself).
+        let mut compared = 0usize;
+        for seed in 0..200u64 {
+            let mut rng = seed ^ 0x5EED_0525;
+            let n = 1 + (splitmix64(&mut rng) % 80) as u32;
+            let mut tracks: Vec<(u32, f64)> = Vec::new();
+            for i in 0..n {
+                let id = i * 3 + 1;
+                let f = match splitmix64(&mut rng) % 23 {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => -0.0,
+                    3 if !tracks.is_empty() => {
+                        tracks[(splitmix64(&mut rng) % tracks.len() as u64) as usize].1
+                    }
+                    _ => 14e6 + (splitmix64(&mut rng) % 200_000) as f64 * 0.37,
+                };
+                tracks.push((id, f));
+            }
+            let mut sorted: Vec<(f64, u32)> = tracks
+                .iter()
+                .filter(|(_, f)| f.is_finite())
+                .map(|&(id, f)| (f, id))
+                .collect();
+            sorted.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            for &(id, f) in &tracks {
+                let fold = tracks
+                    .iter()
+                    .filter(|(other, _)| *other != id)
+                    .map(|(_, other)| (other - f).abs())
+                    .fold(f64::INFINITY, f64::min);
+                let gap = nearest_gap_hz(&sorted, id, f).unwrap_or(fold);
+                assert_eq!(
+                    gap.to_bits(),
+                    fold.to_bits(),
+                    "seed {seed} track {id} freq {f}: {gap} vs {fold}"
+                );
+                compared += 1;
+            }
+        }
+        println!("MAN-525 gap differential: {compared} gaps compared");
+        assert!(compared > 5_000, "only {compared} gaps compared");
     }
 }

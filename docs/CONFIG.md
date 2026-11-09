@@ -466,7 +466,7 @@ flag (`--device`, `--source`, `--kiwi-host`, `--soapy-driver`, `--hpsdr-host`,
 | `driver` | none; example `"driver=rtlsdr"`; required for soapy | live: `type = "soapy"` (needs the build feature) | SoapySDR device arguments. `--soapy-driver` overrides it. |
 | `gain_db` | none; example `30.0`; unset uses the device's automatic gain | live: `type = "soapy"` (needs the build feature) | Receiver gain, dB. `--soapy-gain` overrides it. On an SDRplay this is an attenuation scale: a higher value is less sensitive, and `0` is the most sensitive setting. On the RSP1B measured, `40` already puts the IF stage at its maximum reduction and `46` to `48` failed to start the stream ([gain record](DECISIONS/2026-09-09-soapy-gain-is-inverted-attenuation-scale.md)). |
 | `freq_hz` | none; example `7030000.0`; required for kiwi, soapy and hpsdr unless `bands` is set | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"` | Receiver centre frequency, Hz. `--kiwi-freq-hz`, `--soapy-freq-hz` or `--hpsdr-freq-hz` overrides it. |
-| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. See [Band plans: bands](#band-plans-bands) (MAN-310). |
+| `bands` | none; example `["40m"]`; set instead of `freq_hz` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | `"all"`, band names such as `"40m"`, or centre frequencies in kHz such as `"7030"` (a string, a number or a list of them). manta plans one stream per slice of each band's CW segment and runs each as an input. `"all"` is 160m to 10m, plus 6m when `tuning_range_hz` overlaps its segment (MAN-543). See [Band plans: bands](#band-plans-bands) (MAN-310). |
 | `tuning_range_hz` | `[0.0, 30000000.0]`; only with `bands` | live: `type = "kiwi"`, `"soapy"` or `"hpsdr"`; restart required | The receiver's tuning range, `[low, high]` in Hz. A band outside it is skipped and a band partly outside it is clipped, each with a note. See [Band plans: bands](#band-plans-bands). |
 | `rate_hz` | none; example `192000.0`; required for soapy and hpsdr | live: `type = "soapy"` or `"hpsdr"` | Sample rate, Hz. `--soapy-rate-hz` or `--hpsdr-rate-hz` overrides it. |
 | `receivers` | none; example `4` | live: `type = "hpsdr"` | Optional hardware capacity declaration, integer 1 to 255, on the first entry for a radio only. Shared HL2 radios report capacity at startup; other gateware needs this fallback. The smaller reported/declared count applies. This is not the active receiver count. |
@@ -590,6 +590,7 @@ type = "kiwi"
 host = "kiwi.example.net"
 bands = ["60m"]            # or "all", ["40m", "20m"], "7030", 7030
 #tuning_range_hz = [3000000.0, 30000000.0]
+#bands = ["6m"] with tuning_range_hz = [0.0, 61440000.0] (hpsdr or soapy that tunes 50 MHz)
 ```
 
 The band table below is the one manta uses (`manta_server::band_plan::CW_SEGMENTS`;
@@ -609,6 +610,16 @@ beacon. The segment limits are not configurable.
 | 15m | 21000–21070 | 21150 | 21000–21150 |
 | 12m | 24890–24915 | 24930 | 24890–24930 |
 | 10m | 28000–28070 | 28200 | 28000–28200 |
+| 6m | 50000–50100 | – | 50000–50100 |
+
+6m is the one band above 30 MHz (MAN-543). Its segment is the CW-only part
+of the 6 m band plans, and its bottom is the 6 m beacon sub-band, so beacon
+callsigns are spotted from it. NCDXF has no 6 m beacon. To skim 6m, set
+`tuning_range_hz` to reach it (the default stops at 30 MHz), and give the
+stream at least 110.5 kHz (192000 Hz in practice): at 96000 Hz it is two
+streams, which an hpsdr or soapy entry refuses. `"all"` adds 6m only when
+`tuning_range_hz` overlaps its segment. See
+[the 6m decision record](DECISIONS/2026-11-08-man543-6m-band.md).
 
 How a plan is made:
 
@@ -626,7 +637,9 @@ How a plan is made:
   the cross-input dedupe spots it once. A running track is never stopped.
 - **Tuning range.** A band outside `tuning_range_hz` is skipped, a band
   partly outside it is clipped, and a bare centre outside it is skipped,
-  each with a note. Nothing left to skim is an error.
+  each with a note. Nothing left to skim is an error. `"all"` is 160m to
+  10m, plus 6m when `tuning_range_hz` overlaps its segment, so the default
+  range never adds a 6m note.
 - **Repeats.** A band listed twice, a band `"all"` already includes, or a
   bare centre inside a listed band is refused.
 

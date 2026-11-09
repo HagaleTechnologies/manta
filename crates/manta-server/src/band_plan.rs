@@ -25,6 +25,13 @@ impl CwSegment {
                 .map_or(self.cw_hi_hz, |b| b.max(self.cw_hi_hz)),
         )
     }
+
+    /// Whether the segment is HF: its span tops out at or below
+    /// [`HF_TOP_HZ`]. `"all"` always includes HF segments, and includes
+    /// the others (6 m) only when the tuning range overlaps them (MAN-543).
+    pub fn is_hf(&self) -> bool {
+        self.span_hz().1 <= HF_TOP_HZ
+    }
 }
 
 const fn seg(band: &'static str, lo_khz: f64, hi_khz: f64, beacon_khz: Option<f64>) -> CwSegment {
@@ -42,7 +49,9 @@ const fn seg(band: &'static str, lo_khz: f64, hi_khz: f64, beacon_khz: Option<f6
 /// Ascending by frequency; the rows of docs/CONFIG.md's band table. 80 m
 /// is IARU Region 1's CW segment plus the Region 2 skimming practice; 60 m
 /// is the WRC-15 allocation; the beacons are the NCDXF/IARU frequencies
-/// (`manta_engine::calibrate::REFERENCES`' beacon rows).
+/// (`manta_engine::calibrate::REFERENCES`' beacon rows). 6 m is the
+/// 50.000 to 50.100 MHz CW segment, whose bottom is the 6 m beacon
+/// sub-band; it has no NCDXF beacon (MAN-543).
 pub const CW_SEGMENTS: &[CwSegment] = &[
     seg("160m", 1810.0, 1840.0, None),
     seg("80m", 3500.0, 3580.0, None),
@@ -54,10 +63,14 @@ pub const CW_SEGMENTS: &[CwSegment] = &[
     seg("15m", 21000.0, 21070.0, Some(21150.0)),
     seg("12m", 24890.0, 24915.0, Some(24930.0)),
     seg("10m", 28000.0, 28070.0, Some(28200.0)),
+    seg("6m", 50000.0, 50100.0, None),
 ];
 
+/// The top of HF, 30 MHz: segments at or below it are [`CwSegment::is_hf`].
+pub const HF_TOP_HZ: f64 = 30_000_000.0;
+
 /// `input.tuning_range_hz`'s default: an HF receiver, 0 to 30 MHz.
-pub const DEFAULT_TUNING_RANGE_HZ: (f64, f64) = (0.0, 30_000_000.0);
+pub const DEFAULT_TUNING_RANGE_HZ: (f64, f64) = (0.0, HF_TOP_HZ);
 
 /// One channel (`manta_dsp::channelizer::CHANNEL_SPACING_HZ`); the D6
 /// cross-input dedupe tolerance. A split stream may spawn this far past
@@ -195,6 +208,16 @@ pub fn plan(
         );
     }
     let has_all = items.contains(&BandItem::All);
+    let (r_lo, r_hi) = tuning_range_hz;
+    // What "all" means: every HF segment, plus any other segment (6 m)
+    // that the tuning range overlaps (MAN-543).
+    let all_set: Vec<&'static CwSegment> = CW_SEGMENTS
+        .iter()
+        .filter(|s| {
+            let (lo, hi) = s.span_hz();
+            s.is_hf() || hi.min(r_hi) > lo.max(r_lo)
+        })
+        .collect();
     // Expand "all" in place, refusing repeats.
     let mut bands: Vec<&'static CwSegment> = Vec::new();
     let mut centres: Vec<f64> = Vec::new();
@@ -203,7 +226,7 @@ pub fn plan(
         match item {
             BandItem::All if all_seen => return Err("input.bands lists \"all\" twice".into()),
             BandItem::All => all_seen = true,
-            BandItem::Band(s) if has_all => {
+            BandItem::Band(s) if has_all && all_set.iter().any(|a| a.band == s.band) => {
                 return Err(format!(
                     "input.bands lists {}, which \"all\" already includes",
                     s.band
@@ -220,7 +243,7 @@ pub fn plan(
         }
     }
     if has_all {
-        bands = CW_SEGMENTS.iter().collect();
+        bands.extend(all_set.iter().copied());
     }
     for c in &centres {
         if let Some(s) = bands.iter().find(|s| {
@@ -237,7 +260,6 @@ pub fn plan(
         }
     }
 
-    let (r_lo, r_hi) = tuning_range_hz;
     let range = range_text(r_lo, r_hi);
     let mut streams: Vec<PlannedStream> = Vec::new();
     let mut notes = Vec::new();
@@ -246,7 +268,7 @@ pub fn plan(
     // in the order listed relative to bands.
     for item in items {
         let segs: Vec<&'static CwSegment> = match item {
-            BandItem::All => bands.clone(),
+            BandItem::All => all_set.clone(),
             BandItem::Band(s) => vec![*s],
             BandItem::CentreHz(c) => {
                 if *c < r_lo || *c > r_hi {
@@ -391,7 +413,7 @@ mod tests {
             labels.join(" "),
             "160m 80m 60m 40m 30m 20m-1 20m-2 17m 15m-1 15m-2 12m 10m-1 10m-2 10m-3"
         );
-        for s in CW_SEGMENTS {
+        for s in CW_SEGMENTS.iter().filter(|s| s.is_hf()) {
             assert!(
                 p.streams.iter().any(|st| st.band == Some(s.band)),
                 "{} has no stream",
@@ -407,7 +429,72 @@ mod tests {
                 );
             }
         }
+        assert!(p.streams.iter().all(|st| st.band != Some("6m")));
         assert!(p.notes().is_empty());
+    }
+
+    const U192: f64 = 2.0 * 0.4526 * 192_000.0;
+    const VHF_RANGE: (f64, f64) = (0.0, 61_440_000.0);
+
+    #[test]
+    fn six_metres_plans_one_192k_stream_centred_on_50050_khz() {
+        let s6 = CW_SEGMENTS.iter().find(|s| s.band == "6m").unwrap();
+        assert_eq!(s6.span_hz(), (50_000_000.0, 50_100_000.0));
+        assert_eq!(s6.beacon_hz, None);
+        assert!(!s6.is_hf());
+        let p = plan(&items(&["6m"]), VHF_RANGE, U192).unwrap();
+        assert_eq!(centres(&p), vec![50_050_000.0]);
+        assert_eq!(p.streams[0].label, "6m");
+        assert_eq!(p.streams[0].band, Some("6m"));
+        assert!(p.notes().is_empty());
+        assert_eq!(p.summary(), "1 stream: 6m");
+    }
+
+    #[test]
+    fn six_metres_on_96k_streams_is_two_streams() {
+        let p = plan(&items(&["6m"]), VHF_RANGE, U96).unwrap();
+        assert_eq!(centres(&p), vec![50_025_000.0, 50_075_000.0]);
+        let labels: Vec<&str> = p.streams.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["6m-1", "6m-2"]);
+    }
+
+    #[test]
+    fn six_metres_on_the_default_range_leaves_nothing_to_skim() {
+        assert_eq!(
+            plan(&items(&["6m"]), DEFAULT_TUNING_RANGE_HZ, U192).unwrap_err(),
+            "input.bands leaves nothing to skim inside the receiver's tuning range, 0 to \
+             30000 kHz: 6m (50000 to 50100 kHz) is outside it"
+        );
+    }
+
+    #[test]
+    fn all_adds_6m_only_when_the_tuning_range_reaches_it() {
+        let p = plan(&items(&["all"]), DEFAULT_TUNING_RANGE_HZ, U96).unwrap();
+        assert_eq!(
+            p.summary(),
+            "14 streams: 160m, 80m, 60m, 40m, 30m, 20m (2), 17m, 15m (2), 12m, 10m (3)"
+        );
+        assert!(p.notes().is_empty());
+
+        let p = plan(&items(&["all"]), VHF_RANGE, U96).unwrap();
+        assert_eq!(p.streams.len(), 16);
+        assert_eq!(
+            p.summary(),
+            "16 streams: 160m, 80m, 60m, 40m, 30m, 20m (2), 17m, 15m (2), 12m, 10m (3), 6m (2)"
+        );
+        assert!(p.notes().is_empty());
+
+        // A range ending exactly at 50 MHz overlaps 6m by zero width.
+        let p = plan(&items(&["all"]), (0.0, 50_000_000.0), U96).unwrap();
+        assert!(p.streams.iter().all(|s| s.band != Some("6m")));
+        assert_eq!(p.streams.len(), 14);
+        assert!(p.notes().is_empty());
+
+        // A VHF-only range: 6m is planned and every HF band is noted.
+        let p = plan(&items(&["all"]), (49_000_000.0, 55_000_000.0), U192).unwrap();
+        assert_eq!(p.summary(), "1 stream: 6m");
+        assert_eq!(p.notes().len(), 10);
+        assert!(p.notes().iter().all(|n| n.contains(" skipped: ")));
     }
 
     #[test]
@@ -539,12 +626,16 @@ mod tests {
             parse_item("40M").unwrap(),
             BandItem::Band(CW_SEGMENTS.iter().find(|s| s.band == "40m").unwrap())
         );
-        for bad in ["6m", "abc", "0", "-5"] {
+        assert_eq!(
+            parse_item("6M").unwrap(),
+            BandItem::Band(CW_SEGMENTS.iter().find(|s| s.band == "6m").unwrap())
+        );
+        for bad in ["4m", "abc", "0", "-5"] {
             assert_eq!(
                 parse_item(bad).unwrap_err(),
                 format!(
                     "input.bands: \"{bad}\" is not \"all\", a band (160m, 80m, 60m, 40m, 30m, \
-                     20m, 17m, 15m, 12m or 10m) or a centre frequency in kHz such as \"7030\""
+                     20m, 17m, 15m, 12m, 10m or 6m) or a centre frequency in kHz such as \"7030\""
                 )
             );
         }
@@ -572,6 +663,27 @@ mod tests {
         assert_eq!(
             err(&["7030", "40m"]),
             "input.bands lists \"7030\", which is inside 40m (7000 to 7040 kHz), already listed"
+        );
+        // MAN-543: 6m repeats "all" only when "all" includes it, which is
+        // when the tuning range reaches it.
+        assert_eq!(
+            plan(&items(&["all", "6m"]), (0.0, 61_440_000.0), U96).unwrap_err(),
+            "input.bands lists 6m, which \"all\" already includes"
+        );
+        // A bare centre inside 6m repeats "all" on such a range, too.
+        assert_eq!(
+            plan(&items(&["all", "50050"]), (0.0, 61_440_000.0), U96).unwrap_err(),
+            "input.bands lists \"50050\", which is inside 6m (50000 to 50100 kHz), already listed"
+        );
+        let p = plan(&items(&["all", "6m"]), DEFAULT_TUNING_RANGE_HZ, U96).unwrap();
+        assert_eq!(p.streams.len(), 14);
+        assert_eq!(
+            p.notes(),
+            vec![
+                "6m skipped: 50000 to 50100 kHz is outside the receiver's tuning range, 0 to \
+                 30000 kHz"
+                    .to_string()
+            ]
         );
     }
 
