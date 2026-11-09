@@ -1,0 +1,6 @@
+#!/bin/sh
+# manta's prerm (MAN-540): debhelper 13.14 prerm-systemd-restart; stops only on remove.
+set -e
+if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	deb-systemd-invoke stop 'manta.service' >/dev/null || true
+fi

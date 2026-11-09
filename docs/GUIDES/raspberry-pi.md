@@ -51,7 +51,26 @@ module table applies to the Pi too, including SDRplay's external prerequisites.
 
 ## 2. Get manta
 
-Download a release archive. Two are built for 64-bit Raspberry Pi OS:
+For a network receiver (KiwiSDR, OpenHPSDR, ka9q-radio), install the Debian
+package `manta-linux-arm64.deb`. It puts `/usr/bin/manta`, the systemd
+service (enabled, not started) and `/etc/manta/manta.toml` in place, so step 5
+has nothing left to copy:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64.deb
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./manta-linux-arm64.deb
+manta --version
+```
+
+`/etc/manta/manta.toml` is a copy of the `manta config init` scaffold, owned by
+root at mode 0600: edit it with `sudoedit /etc/manta/manta.toml` in step 3.
+The packaged service cannot open a USB SDR, so for one use the SoapySDR
+archive below. [The service kit](../../packaging/README.md#debian-ubuntu-and-raspberry-pi-os-the-package)
+says what else the package installs.
+
+Or download a release archive. Two are built for 64-bit Raspberry Pi OS:
 
 - `manta-linux-arm64.tar.gz` for a network receiver (KiwiSDR, OpenHPSDR,
   ka9q-radio) or a sound card;
@@ -114,6 +133,10 @@ checkout for the config and service files used below.
 cp manta.example.toml manta.toml
 chmod 0600 manta.toml
 ```
+
+With the Debian package, skip the copy and edit `/etc/manta/manta.toml` with
+`sudoedit`. The file is readable only by root, so run step 4's foreground test
+as `sudo manta run --config /etc/manta/manta.toml`.
 
 Edit the copy before checking it. Set your station callsign and use the KiwiSDR
 config in [Write the config](rbn-node.md#3-write-the-config), replacing the existing
@@ -206,7 +229,16 @@ and wait for it to exit before installing the service.
 
 ## 5. Install the service
 
-Check `systemctl --version`: the kit requires systemd 247 or newer; Bookworm
+If you installed the Debian package in step 2, the service is already
+installed and enabled. Check your edited config and start it:
+
+```sh
+sudo manta config check --config /etc/manta/manta.toml
+sudo systemctl start manta
+journalctl -u manta -f
+```
+
+For an archive install, check `systemctl --version`: the kit requires systemd 247 or newer; Bookworm
 ships 252. Run the following from the source checkout or extracted release kit.
 The binary was installed in step 2, so only the edited config and unit remain:
 
@@ -265,7 +297,13 @@ they are not a Pi benchmark result. Pi hardware has not been tested for this gui
 
 ## Upgrading
 
-Stop the service, download or build the new binary, then replace it. For a
+Debian package: download the new `manta-linux-arm64.deb` as in step 2 and run
+`sudo apt install ./manta-linux-arm64.deb`. It keeps `/etc/manta/manta.toml`
+unchanged, never prompts, and restarts the service if it was running;
+`manta config init --out - | sudo diff - /etc/manta/manta.toml` shows the new
+release's settings beside yours.
+
+Archive or source install: stop the service, download or build the new binary, then replace it. For a
 release, download, verify and extract the new archive as in step 2, then run
 `sudo install -m 0755 manta /usr/local/bin/manta` from its directory in place of
 the `cargo build` and first `install` lines below. For a source build from your

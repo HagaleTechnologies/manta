@@ -132,6 +132,72 @@ confirmed spot, and its startup, status, warning and error lines to
 stderr. It does not log decoded text; add `--decoded-text` to the command
 line to include it, one line per track.
 
+## Debian, Ubuntu and Raspberry Pi OS: the package
+
+On Debian 12 (bookworm) or later, Ubuntu 24.04 and 64-bit Raspberry Pi OS
+bookworm, install the Debian package instead of the archive: it puts the
+binary, the systemd unit and a config in place, so there is nothing to copy
+by hand (MAN-540, [decision record](https://github.com/HagaleTechnologies/manta/blob/main/docs/DECISIONS/2026-11-09-man540-debian-package.md)). Use
+`manta-linux-arm64.deb` on a Pi or other arm64 board and
+`manta-linux-x86_64.deb` on a PC:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64.deb
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./manta-linux-arm64.deb
+sudoedit /etc/manta/manta.toml
+sudo manta config check --config /etc/manta/manta.toml
+sudo systemctl start manta
+journalctl -u manta -f
+```
+
+`sha256sum` prints `manta-linux-arm64.deb: OK`. The end of `apt install`
+prints:
+
+```text
+Setting up manta (0.2.0-1) ...
+manta: wrote /etc/manta/manta.toml. manta.service is enabled but not started.
+manta: set [server] station_callsign and an [input] receiver in it, then run
+manta:   sudo manta config check --config /etc/manta/manta.toml
+manta:   sudo systemctl start manta
+```
+
+If the `.deb` sits in a directory the `_apt` user cannot read, such as your
+home directory, apt also prints `N: Download is performed unsandboxed as
+root ...`. That notice is harmless: the file is already on your disk.
+
+What the package puts on disk:
+
+- `/usr/bin/manta`, the same binary as the matching `.tar.gz` archive, and
+  its man pages under `/usr/share/man/man1/`.
+- `/usr/lib/systemd/system/manta.service`, this kit's unit with one change:
+  `ExecStart=` runs `/usr/bin/manta` instead of `/usr/local/bin/manta`.
+- `/usr/share/manta/manta.toml`, this release's config scaffold, byte for
+  byte what `manta config init --out -` prints. It changes with each
+  release.
+- `/etc/manta/manta.toml`, your config. On first install the package copies
+  the scaffold there, mode 0600 and owned by root, only when no file exists.
+  It is not a dpkg conffile: no upgrade replaces it or asks about it.
+- `/var/cache/manta` appears when the service first starts: systemd's
+  `CacheDirectory=manta` creates it for the service's temporary user.
+
+The package enables `manta.service` but does not start it. The scaffold's
+`N0CALL` callsign and missing receiver stop manta at once, and
+`Restart=always` would start it again every 10 seconds until you edit the
+config (see "If `N0CALL` is left in place" above). `systemctl is-enabled
+manta` prints `enabled` and `systemctl is-active manta` prints `inactive`
+until you start it.
+
+The service runs as systemd's transient `manta` user (`DynamicUser=yes`);
+the package creates no static user. The rest of "Linux: systemd" below
+(config access, reload, absolute paths, no local devices, restarts, stopping,
+logs and what the service may do) applies unchanged, with `/usr/bin/manta`
+in place of `/usr/local/bin/manta`. Upgrading and removing the package are
+under "Upgrading or reinstalling" and "Removing a service". To move an
+existing archive install to the package, see "Moving from an archive install
+to the package".
+
 ## Linux: systemd
 
 Requires systemd 247 or newer (`systemctl --version`). Install the binary
@@ -210,6 +276,25 @@ verify` must report no errors for the unit.
   `ExecStart=` and sets it again with `-q` or `--log-format json`
   appended, or that sets `Environment=RUST_LOG=warn`; see the `## Logs`
   section of the top-level README.md.
+
+### What the service may do
+
+The unit adds no sandbox directives of its own. `DynamicUser=yes` makes
+systemd apply the ones below, for the archive install and the Debian
+package alike. The release workflow installs the package on a systemd host,
+starts it and reads these back with `systemctl show manta`
+(`scripts/check-deb.py --systemd`):
+
+| Property | What it means for manta |
+|---|---|
+| `DynamicUser=yes` | A transient user named manta, in no device group |
+| `User=manta` | The name `systemctl show -p User manta` prints |
+| `NoNewPrivileges=yes` | No privilege gain through setuid binaries or file capabilities |
+| `RestrictSUIDSGID=yes` | It cannot create setuid or setgid files |
+| `ProtectSystem=strict` | The whole file system is read-only, except `/var/cache/manta` |
+| `ProtectHome=read-only` | `/home`, `/root` and `/run/user` are read-only |
+| `PrivateTmp=yes` | A private `/tmp` and `/var/tmp` (systemd 257 and later report `PrivateTmp=disconnected`) |
+| `RemoveIPC=yes` | System V and POSIX IPC objects are removed when it stops |
 
 ## macOS: LaunchDaemon
 
@@ -518,6 +603,32 @@ before you change either address.
 For a Grafana dashboard and Prometheus alerts, see
 [monitoring](https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md).
 
+## Moving from an archive install to the package
+
+A host that runs the archive install has `/etc/systemd/system/manta.service`,
+which overrides the packaged unit and runs `/usr/local/bin/manta`, and
+`/usr/local/bin/manta`, which comes before `/usr/bin/manta` on `PATH`.
+Remove both, then install the package:
+
+```sh
+sudo systemctl disable --now manta
+sudo rm /etc/systemd/system/manta.service /usr/local/bin/manta
+sudo systemctl daemon-reload
+sudo apt install ./manta-linux-arm64.deb
+sudo manta config check --config /etc/manta/manta.toml
+sudo systemctl start manta
+```
+
+The package keeps your existing `/etc/manta/manta.toml`, which from then on
+is the package's config: `apt purge manta` deletes it. If you skip the `rm`
+line, the install names what still shadows the package:
+
+```text
+manta: /etc/systemd/system/manta.service overrides the packaged unit and runs /usr/local/bin/manta.
+manta: remove it to run this package's binary: https://github.com/HagaleTechnologies/manta/blob/main/packaging/README.md#moving-from-an-archive-install-to-the-package
+manta: /usr/local/bin/manta comes before /usr/bin/manta on PATH; remove it: https://github.com/HagaleTechnologies/manta/blob/main/packaging/README.md#moving-from-an-archive-install-to-the-package
+```
+
 ## Upgrading or reinstalling
 
 Stop the service, replace the binary and any kit files that changed, keep
@@ -535,6 +646,18 @@ sudo install -m 0644 packaging/systemd/manta.service /etc/systemd/system/manta.s
 sudo systemctl daemon-reload
 sudo /usr/local/bin/manta config check --config /etc/manta/manta.toml
 sudo systemctl start manta
+```
+
+Debian package: download the new release's `.deb` and install it over the
+old one. It never prompts, keeps `/etc/manta/manta.toml` byte for byte, and
+restarts the service if it was running (`deb-systemd-invoke try-restart`);
+a stopped service stays stopped. The `diff` line shows the settings the new
+release documents beside your edits:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64.deb
+sudo apt install ./manta-linux-arm64.deb
+manta config init --out - | sudo diff - /etc/manta/manta.toml
 ```
 
 macOS (the account script only confirms the existing account here):
@@ -558,8 +681,8 @@ updated checkout (or, once a released image exists, run
 
 ## Removing a service
 
-Removing a service does not delete its config, its binary or, on macOS,
-its account and log. Delete them yourself if you no longer need them.
+Removing a service installed from an archive does not delete its config,
+its binary or, on macOS, its account and log. Delete them yourself if you no longer need them.
 
 systemd:
 
@@ -572,6 +695,18 @@ sudo systemctl daemon-reload
 This leaves `/etc/manta/manta.toml`, `/usr/local/bin/manta` and any
 downloaded lists in `/var/cache/private/manta`. The unit's temporary user
 goes away with the service.
+
+Debian package:
+
+```sh
+sudo apt remove manta
+sudo apt purge manta
+```
+
+`apt remove` stops the service and removes the binary and the unit, and
+keeps `/etc/manta/manta.toml`. `apt purge` also deletes
+`/etc/manta/manta.toml` and the service's enable state. Both leave any
+downloaded lists in `/var/cache/private/manta`, as the archive removal does.
 
 macOS:
 

@@ -42,7 +42,12 @@ ARCHIVES = (
     "manta-macos-x86_64.tar.gz",
     "manta-windows-x86_64.zip",
 )
+# MAN-540: build's two Linux legs also upload <artifact>.deb in the same artifact, so the release
+# job publishes, checksums and attests nine files; sorted under any collation.
+DEBS = ("manta-linux-arm64.deb", "manta-linux-x86_64.deb")
+RELEASE_FILES = tuple(sorted(ARCHIVES + DEBS))
 DOWNLOADED = "manta-linux-x86_64.tar.gz"
+DOWNLOADED_DEB = "manta-linux-x86_64.deb"
 # MAN-82: the jobs whose `manta-*` uploads the release job publishes, and the jobs it must not wait for.
 ARCHIVE_PRODUCERS = ("build", "build-soapy", "build-soapy-arm64")
 IMAGE_JOBS = ("docker-publish-release", "docker-build-dispatch", "publish-latest")
@@ -191,6 +196,14 @@ class ReleaseJobTests(unittest.TestCase):
         uploads = [s for s in wf.steps(build) if uses(s).startswith("actions/upload-artifact@")]
         self.assertEqual(len(uploads), 1)
         self.assertEqual(with_field(uploads[0], "name"), "${{ matrix.artifact }}")
+        # MAN-540: the build upload's path list, so a leg's .deb reaches the release job.
+        paths = [p.strip() for p in wf.sub(wf.sub(uploads[0], "with"), "path")[1:] if p.strip()]
+        self.assertIn("${{ matrix.artifact }}.deb", paths)
+        files = []
+        for name in names:
+            files.append(name + (".zip" if "windows" in name else ".tar.gz"))
+            if name.startswith("manta-linux-"):
+                files.append(name + ".deb")
         # MAN-82, MAN-539: build-soapy and build-soapy-arm64 each upload one archive under a
         # literal name.
         for job, archive in (("build-soapy", SOAPY_ARCHIVE), ("build-soapy-arm64", SOAPY_ARM64_ARCHIVE)):
@@ -199,8 +212,9 @@ class ReleaseJobTests(unittest.TestCase):
                          if uses(s).startswith("actions/upload-artifact@")]
                 self.assertEqual(len(soapy), 1)
                 names.append(with_field(soapy[0], "name"))
+                files.append(archive)
                 self.assertEqual(with_field(soapy[0], "path"), archive)
-        self.assertEqual(sorted(n + (".zip" if "windows" in n else ".tar.gz") for n in names), list(ARCHIVES))
+        self.assertEqual(sorted(files), list(RELEASE_FILES))
         for name in names:
             self.assertTrue(fnmatch.fnmatchcase(name, "manta-*"), f"pattern manta-* drops {name}")
 
@@ -369,6 +383,19 @@ class OperatorDocsTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertIn(command, section)
 
+    def test_runbook_lists_the_debian_packages(self):
+        """MAN-540: "What each artifact contains" names both packages, the scaffold the
+        postinst copies and the release-time checker."""
+        text = self.read(RUNBOOK)
+        heading = "## What each artifact contains\n"
+        self.assertIn(heading, text)
+        start = text.index(heading)
+        end = text.find("\n## ", start + 1)
+        section = text[start:] if end == -1 else text[start:end]
+        for needle in DEBS + ("/usr/share/manta/manta.toml", "scripts/check-deb.py"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, section)
+
     def test_runbook_says_how_to_retry_only_the_image_publish(self):
         text = self.read(RUNBOOK)
         self.assertIn(RETRY_HEADING + "\n", text, f"{RUNBOOK} has no {RETRY_HEADING!r}")
@@ -458,29 +485,32 @@ class ChecksumStepExecutionTests(unittest.TestCase):
             return f.read()
 
     def test_lists_every_archive_by_bare_name(self):
-        proc = self.run_step(ARCHIVES)
+        proc = self.run_step(RELEASE_FILES)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        want = sums_text(sorted(ARCHIVES))
+        want = sums_text(sorted(RELEASE_FILES))
         self.assertEqual(self.read_sums(), want, "bare names, sorted, and never SHA256SUMS itself")
         self.assertEqual(proc.stdout, want, "the step log shows the published digests")
         check = run([gnu_sha256sum(), "-c", "--strict", "SHA256SUMS"], os.path.join(self.work, "dist"))
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
     def test_operator_check_passes_for_a_download_and_fails_once_it_changes(self):
-        proc = self.run_step(ARCHIVES)
+        proc = self.run_step(RELEASE_FILES)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        downloads = os.path.join(self._tmp.name, "my downloads")
-        os.makedirs(downloads)
-        for name in (DOWNLOADED, "SHA256SUMS"):
-            shutil.copyfile(os.path.join(self.work, "dist", name), os.path.join(downloads, name))
-        good = run(LINUX_CHECK.split(), downloads)
-        self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
-        self.assertEqual(good.stdout, f"{DOWNLOADED}: OK\n")
-        with open(os.path.join(downloads, DOWNLOADED), "ab") as f:
-            f.write(b"\x00")
-        bad = run(LINUX_CHECK.split(), downloads)
-        self.assertNotEqual(bad.returncode, 0, "an altered archive must fail the check")
-        self.assertIn(f"{DOWNLOADED}: FAILED", bad.stdout)
+        # MAN-540: the same command verifies a downloaded Debian package.
+        for downloaded in (DOWNLOADED, DOWNLOADED_DEB):
+            with self.subTest(downloaded=downloaded):
+                downloads = os.path.join(self._tmp.name, "my downloads " + downloaded)
+                os.makedirs(downloads)
+                for name in (downloaded, "SHA256SUMS"):
+                    shutil.copyfile(os.path.join(self.work, "dist", name), os.path.join(downloads, name))
+                good = run(LINUX_CHECK.split(), downloads)
+                self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+                self.assertEqual(good.stdout, f"{downloaded}: OK\n")
+                with open(os.path.join(downloads, downloaded), "ab") as f:
+                    f.write(b"\x00")
+                bad = run(LINUX_CHECK.split(), downloads)
+                self.assertNotEqual(bad.returncode, 0, "an altered download must fail the check")
+                self.assertIn(f"{downloaded}: FAILED", bad.stdout)
 
     def test_empty_dist_fails_the_step(self):
         proc = self.run_step(())
@@ -492,7 +522,7 @@ class MacosCheckTests(unittest.TestCase):
     def test_documented_macos_check_passes_and_fails_once_the_download_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
             downloads = os.path.join(tmp, "my downloads")
-            write_file(os.path.join(downloads, "SHA256SUMS"), sums_text(ARCHIVES).encode("utf-8"))
+            write_file(os.path.join(downloads, "SHA256SUMS"), sums_text(RELEASE_FILES).encode("utf-8"))
             write_file(os.path.join(downloads, DOWNLOADED), archive_bytes(DOWNLOADED))
             good = run(MACOS_CHECK.split(), downloads)
             self.assertEqual(good.returncode, 0, good.stdout + good.stderr)

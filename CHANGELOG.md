@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-540: Debian packages for x86-64 and arm64 (`manta-linux-x86_64.deb`,
+  `manta-linux-arm64.deb`). `sudo apt install ./<file>` installs
+  `/usr/bin/manta`, the systemd service (enabled, not started) and
+  `/etc/manta/manta.toml`, which upgrades never replace.
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
