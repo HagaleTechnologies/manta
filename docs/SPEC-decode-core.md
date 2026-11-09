@@ -45,8 +45,8 @@ rates by construction; nothing below depends on `fs`.
 **[DEVIATION]** `coppa-dsp::filter` provides only `RrcFilter` (root-raised
 cosine); there is no general Kaiser/windowed-sinc designer to reuse. The
 prototype designer is therefore new code in `manta-dsp::proto` (~40 lines:
-Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused as
-specified.
+Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused for
+the plan; the channelizer runs that plan in place (MAN-117).
 
 Prototype lowpass, length `L·N` with **L = 8 taps per branch**:
 
@@ -127,10 +127,11 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    multiplying bin `k` by `e^{+j2πk·m·hop/N}`; the rotation keeps every
    channel's passband centered at DC in its own output stream so the envelope
    is phase-continuous across hops.)
-3. **FFT:** `X[k, m] = FFT_N(v')[k]` via `FftProcessor::new(N)` (one instance,
-   created once; `forward()` allocates — acceptable at 375 calls/s, but the
-   engine may pre-allocate via `try_forward` into a scratch buffer if profiling
-   demands; not required for M0/M1).
+3. **FFT:** `X[k, m] = FFT_N(v')[k]` via the forward plan `FftProcessor::new(N)`
+   builds (`rustfft` `FftPlanner::new().plan_fft_forward(N)`), planned once and
+   run in place with a scratch buffer the channelizer owns, so a hop allocates
+   only its output (MAN-117); bit-identical to `FftProcessor::forward()`, which
+   allocates its output and rustfft's scratch per call.
 4. **Power:** `P[k, m] = |X[k, m]|²`. Report in dB: `PdB = 10·log10(P + ε)`,
    `ε = 1e-20`.
 

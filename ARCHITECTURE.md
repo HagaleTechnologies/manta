@@ -127,7 +127,7 @@ layout.
 
 | Capability | Source |
 |---|---|
-| FFT (`FftProcessor`) | **reuse** `coppa-dsp::fft` |
+| FFT (`FftProcessor`) | **reuse** `coppa-dsp::fft`'s forward plan, run in place with the channelizer's own scratch (MAN-117) |
 | FIR design (PFB prototype) | **new** (`manta-dsp::proto`) — `coppa-dsp::filter` ships only `RrcFilter` (SPEC §10.1) |
 | Envelope normalization | **new** — per-track fixed reference scale; `coppa-dsp::agc` not used in the decode path (SPEC §10.2) |
 | Channel impairments for tests (AWGN, freq offset, fading, **Watterson HF**) | **reuse** `coppa-channel` |
@@ -357,7 +357,8 @@ detection on channel powers, decoders attached only to active channels.**
   40 WPM a dit is 30 ms ≈ 11 samples — comfortably enough for envelope timing.
   2× (187 Hz, 5.6 samples/dit) was rejected as too marginal for QSB'd fast CW.
 - Implementation: polyphase FIR commutator + one N-point FFT per hop
-  (`coppa-dsp::fft::FftProcessor`). Frequency-domain output magnitude² feeds the
+  (the forward plan `coppa-dsp::fft::FftProcessor` builds, run in place with
+  a scratch the channelizer owns, MAN-117). Frequency-domain output magnitude² feeds the
   detector directly — the PFB *is* the spectrum analyzer; no separate FFT path.
 
 **Detector / track manager.** Per-channel noise floor by order statistics

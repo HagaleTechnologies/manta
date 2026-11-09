@@ -4,8 +4,8 @@
 use crate::condition::{ConditioningConfig, ConditioningLog, InputConditioner};
 use crate::proto::{design_prototype, TAPS_PER_BRANCH};
 use crate::sample_guard;
-use coppa_dsp::fft::FftProcessor;
 use num_complex::{Complex32, Complex64};
+use std::sync::Arc;
 
 pub const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
 /// SPEC §1.3/§1.4 power-to-dB epsilon.
@@ -119,7 +119,14 @@ pub struct Channelizer {
     n: usize,
     hop: usize,
     taps: Vec<f32>, // length L*N, L = TAPS_PER_BRANCH
-    fft: FftProcessor,
+    /// MAN-117: the forward plan `coppa_dsp::fft::FftProcessor::new(n)`
+    /// builds (`FftPlanner::new().plan_fft_forward(n)`), run in place with
+    /// `fft_scratch` so a hop allocates only its own `x` and `power`.
+    fwd: Arc<dyn rustfft::Fft<f32>>,
+    /// MAN-117: `fwd.get_inplace_scratch_len()` elements, reused every hop.
+    fft_scratch: Vec<Complex32>,
+    /// MAN-117: SPEC §1.3 step 1's N-point f64 fold, reused every hop.
+    fold: Vec<Complex64>,
     /// Sliding input window; `read` indexes the next window start. Samples
     /// before `read` are dead and get compacted away (same pattern as
     /// `single.rs::SingleChannelExtractor`).
@@ -167,11 +174,15 @@ impl Channelizer {
                 "unsupported sample rate {fs}: fs/93.75 must be a power of two"
             ));
         }
+        let fwd = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
+        let fft_scratch = vec![Complex32::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
         Ok(Channelizer {
             n,
             hop: n / 4,
             taps: design_prototype(n, TAPS_PER_BRANCH),
-            fft: FftProcessor::new(n),
+            fwd,
+            fft_scratch,
+            fold: vec![Complex64::new(0.0, 0.0); n],
             buf: Vec::new(),
             read: 0,
             m: 0,
@@ -248,28 +259,31 @@ impl Channelizer {
 
             // Step 1: window & fold. u[n] = x[n]*h[LN-1-n]; v[j] = sum_p
             // u[j + p*N]. Sequential f64 accumulation (SPEC §6.4 convention,
-            // matching single.rs's direct-FIR sum).
-            let mut v = vec![Complex64::new(0.0, 0.0); self.n];
+            // matching single.rs's direct-FIR sum), into the reused `fold`
+            // buffer (MAN-117).
+            let fold = &mut self.fold;
+            fold.fill(Complex64::new(0.0, 0.0));
             for (n_idx, &x) in window.iter().enumerate() {
                 let h = self.taps[ln - 1 - n_idx] as f64;
                 let j = n_idx % self.n;
-                v[j].re += h * x.re as f64;
-                v[j].im += h * x.im as f64;
+                fold[j].re += h * x.re as f64;
+                fold[j].im += h * x.im as f64;
             }
-            let v: Vec<Complex32> = v
-                .iter()
-                .map(|c| Complex32::new(c.re as f32, c.im as f32))
+
+            // Step 2: circular rotation left by r = (m*hop) mod N, narrowing
+            // to f32 as it goes: the same values as rotating the f32 copy.
+            let r = ((self.m.wrapping_mul(self.hop as u64)) % self.n as u64) as usize;
+            let mut x: Vec<Complex32> = (0..self.n)
+                .map(|j| {
+                    let c = fold[(j + r) % self.n];
+                    Complex32::new(c.re as f32, c.im as f32)
+                })
                 .collect();
 
-            // Step 2: circular rotation left by r = (m*hop) mod N.
-            let r = ((self.m.wrapping_mul(self.hop as u64)) % self.n as u64) as usize;
-            let mut v_rot = vec![Complex32::new(0.0, 0.0); self.n];
-            for j in 0..self.n {
-                v_rot[j] = v[(j + r) % self.n];
-            }
-
-            // Step 3: FFT. Step 4: power.
-            let x = self.fft.forward(&v_rot);
+            // Step 3: FFT, in place on the hop's own output buffer with the
+            // channelizer's scratch; bit-identical to `FftProcessor::forward`
+            // (MAN-117). Step 4: power.
+            self.fwd.process_with_scratch(&mut x, &mut self.fft_scratch);
             let power: Vec<f32> = x.iter().map(|c| c.norm_sqr()).collect();
             if let Some(c) = self.conditioner.as_mut() {
                 c.observe_hop(&x, self.m * self.hop as u64);
@@ -295,6 +309,118 @@ impl Channelizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coppa_dsp::fft::FftProcessor;
+
+    /// Deterministic LCG pseudo-noise plus two tones (MAN-117 fixtures).
+    fn noise_and_tones(fs: f64, n: usize) -> Vec<Complex32> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let a = 2.0 * std::f64::consts::PI * 1_234.5 * t;
+                let b = 2.0 * std::f64::consts::PI * -20_007.0 * t;
+                let tones = Complex32::new(
+                    (0.3 * a.cos() + 0.05 * b.cos()) as f32,
+                    (0.3 * a.sin() + 0.05 * b.sin()) as f32,
+                );
+                tones + Complex32::new(0.1 * next(), 0.1 * next())
+            })
+            .collect()
+    }
+
+    /// MAN-117: the pre-MAN-117 per-hop path, verbatim: fold into a fresh
+    /// `Vec<Complex64>`, convert to f32, rotate into a fresh `Vec`, coppa
+    /// `FftProcessor::forward`, power.
+    fn reference_hops(fs: f64, iq: &[Complex32]) -> Vec<(Vec<Complex32>, Vec<f32>)> {
+        let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+        let hop = n / 4;
+        let taps = design_prototype(n, TAPS_PER_BRANCH);
+        let ln = taps.len();
+        let fft = FftProcessor::new(n);
+        let mut out = Vec::new();
+        let mut read = 0usize;
+        let mut m = 0u64;
+        while read + ln <= iq.len() {
+            let window = &iq[read..read + ln];
+            let mut v = vec![Complex64::new(0.0, 0.0); n];
+            for (n_idx, &x) in window.iter().enumerate() {
+                let h = taps[ln - 1 - n_idx] as f64;
+                let j = n_idx % n;
+                v[j].re += h * x.re as f64;
+                v[j].im += h * x.im as f64;
+            }
+            let v: Vec<Complex32> = v
+                .iter()
+                .map(|c| Complex32::new(c.re as f32, c.im as f32))
+                .collect();
+            let r = ((m.wrapping_mul(hop as u64)) % n as u64) as usize;
+            let mut v_rot = vec![Complex32::new(0.0, 0.0); n];
+            for j in 0..n {
+                v_rot[j] = v[(j + r) % n];
+            }
+            let x = fft.forward(&v_rot);
+            let power: Vec<f32> = x.iter().map(|c| c.norm_sqr()).collect();
+            out.push((x, power));
+            m += 1;
+            read += hop;
+        }
+        out
+    }
+
+    #[test]
+    fn process_is_bit_identical_to_the_fft_processor_path() {
+        for fs in [96_000.0, 192_000.0] {
+            let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+            let hops = 400usize;
+            let len = TAPS_PER_BRANCH * n + (hops - 1) * (n / 4);
+            let iq = noise_and_tones(fs, len);
+            let reference = reference_hops(fs, &iq);
+            assert_eq!(reference.len(), hops);
+            for chunk in [4096usize, 1000] {
+                let mut ch = Channelizer::new(fs, 14e6).unwrap();
+                let got: Vec<HopOutput> = iq.chunks(chunk).flat_map(|c| ch.process(c)).collect();
+                assert_eq!(got.len(), reference.len(), "fs {fs} chunk {chunk}");
+                for (i, (h, (x, power))) in got.iter().zip(&reference).enumerate() {
+                    assert_eq!(h.m, i as u64);
+                    let bits = |v: &[Complex32]| -> Vec<(u32, u32)> {
+                        v.iter().map(|c| (c.re.to_bits(), c.im.to_bits())).collect()
+                    };
+                    assert_eq!(bits(&h.x), bits(x), "x, fs {fs} chunk {chunk} hop {i}");
+                    let pbits = |v: &[f32]| -> Vec<u32> { v.iter().map(|p| p.to_bits()).collect() };
+                    assert_eq!(
+                        pbits(&h.power),
+                        pbits(power),
+                        "power, fs {fs} chunk {chunk} hop {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_forward_matches_fft_processor_forward() {
+        for n in [64usize, 1024, 2048] {
+            let input = noise_and_tones(96_000.0, n);
+            let fwd = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
+            let mut scratch = vec![Complex32::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
+            let mut buf = input.clone();
+            fwd.process_with_scratch(&mut buf, &mut scratch);
+            let expected = FftProcessor::new(n).forward(&input);
+            for (k, (a, b)) in buf.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    (a.re.to_bits(), a.im.to_bits()),
+                    (b.re.to_bits(), b.im.to_bits()),
+                    "n {n} bin {k}"
+                );
+            }
+        }
+    }
 
     const FS: f64 = 96_000.0;
 
