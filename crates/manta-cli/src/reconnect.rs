@@ -18,10 +18,16 @@
 //! DNS lookup, TCP connect, WebSocket handshake or driver open -- ends
 //! `read()` with EOF at once and abandons the attempt, because the daemon
 //! starts draining its clients only after `listen()` returns.
+//!
+//! MAN-533: every lost connection's error is classified -- a source that
+//! kept reading without a usable sample (`manta_input::NoUsableSamples`)
+//! or any other read failure -- and reported through an optional loss sink
+//! before the unhealthy edge, so `/status` can show why the source was
+//! dropped and reopened.
 
 use manta_input::{InputHealthCounters, IqSource};
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
-use manta_server::metrics::InputHealth;
+use manta_server::metrics::{InputHealth, SourceLossReason};
 use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -84,6 +90,19 @@ impl ReconnectEnv for RealEnv {
 pub(crate) type SendSource = Box<dyn IqSource + Send>;
 pub(crate) type Opener = Box<dyn FnMut() -> anyhow::Result<SendSource> + Send>;
 pub(crate) type HealthSink = Box<dyn FnMut(bool)>;
+
+/// MAN-533: told the reason of every lost connection (D9), before the
+/// unhealthy edge. `Send` so multi-input and grouped HPSDR can share it.
+pub(crate) type LossSink = Box<dyn FnMut(SourceLossReason) + Send>;
+
+/// MAN-533: the `/status` reason for a lost connection's error.
+pub(crate) fn loss_reason(err: &anyhow::Error) -> SourceLossReason {
+    if manta_input::is_no_usable_samples(err) {
+        SourceLossReason::NoUsableSamples
+    } else {
+        SourceLossReason::ReadFailed
+    }
+}
 
 /// A reopen running on its own thread (MAN-252). The `Instant` the
 /// worker sends with its result is its entry into the open call: the
@@ -203,6 +222,9 @@ pub(crate) struct ReconnectingSource<E: ReconnectEnv = RealEnv> {
     stop: Arc<AtomicBool>,
     env: E,
     on_health: HealthSink,
+    /// MAN-533: called with the reason of every lost connection, before
+    /// `on_health(false)`; `None` (the default) records nothing.
+    on_loss: Option<LossSink>,
     reported_healthy: bool,
     fs: f64,
     center_freq_hz: f64,
@@ -308,6 +330,7 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
             stop,
             env,
             on_health,
+            on_loss: None,
             reported_healthy: initial_healthy,
             fs,
             center_freq_hz,
@@ -334,6 +357,14 @@ impl<E: ReconnectEnv> ReconnectingSource<E> {
     /// which goes stale at the next reconnect -- the bug this replaces.
     pub(crate) fn input_health(&self) -> Option<Arc<InputHealthTotals>> {
         self.input_health.clone()
+    }
+
+    /// MAN-533: report every lost connection's reason through `sink`,
+    /// called once per `source <name> lost:` line (a failed reopen attempt
+    /// is not a loss) and before the unhealthy edge.
+    pub(crate) fn with_loss_sink(mut self, sink: LossSink) -> Self {
+        self.on_loss = Some(sink);
+        self
     }
 
     fn report_health(&mut self, healthy: bool) {
@@ -630,12 +661,19 @@ impl<E: ReconnectEnv> IqSource for ReconnectingSource<E> {
                         totals.retire_current();
                     }
                     self.backoff = next_backoff(self.backoff, &outcome);
+                    let reason = loss_reason(&e);
                     crate::logging::warning(&format!(
                         "source {} lost: {}; reconnecting in {}s",
                         self.name,
                         crate::fmt::cause_text(&e),
                         self.backoff.as_secs()
                     ));
+                    // MAN-533 D9: the reason is recorded on every loss, a
+                    // never-productive source's repeats included, and
+                    // before the unhealthy edge.
+                    if let Some(on_loss) = self.on_loss.as_mut() {
+                        on_loss(reason);
+                    }
                     self.report_health(false);
                     // MAN-201: an outage delivers no hops, so report it now:
                     // the engine settles each track's last call rather than
@@ -794,6 +832,18 @@ mod tests {
         (sink, log)
     }
 
+    /// MAN-533: a `Send` loss recorder, as the daemon's sinks are.
+    fn loss_recorder() -> (LossSink, Arc<Mutex<Vec<SourceLossReason>>>) {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log_for_sink = log.clone();
+        let sink: LossSink = Box::new(move |r| log_for_sink.lock().unwrap().push(r));
+        (sink, log)
+    }
+
+    fn useless_chunk() -> anyhow::Result<Vec<Complex32>> {
+        Err(manta_input::NoUsableSamples::new("x").into())
+    }
+
     fn opener_from(
         mut sources: VecDeque<anyhow::Result<ScriptedSource>>,
     ) -> (Opener, Arc<AtomicUsize>) {
@@ -812,6 +862,219 @@ mod tests {
 
     fn buf(n: usize) -> Vec<Complex32> {
         vec![Complex32::new(0.0, 0.0); n]
+    }
+
+    /// MAN-533 scenario 1 at the wrapper: a typed no-usable-samples error
+    /// is recorded with its reason and the source reopens on the
+    /// `Disconnected` rung.
+    #[test]
+    fn a_no_usable_samples_error_reports_its_reason_and_reopens() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), useless_chunk()]);
+        let (opener, calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let (health, health_log) = health_recorder();
+        let (loss, loss_log) = loss_recorder();
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        )
+        .with_loss_sink(loss);
+
+        let mut b = buf(8);
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert_eq!(src.read(&mut b).unwrap(), 8, "reopened and resumed");
+        assert_eq!(
+            *loss_log.lock().unwrap(),
+            [SourceLossReason::NoUsableSamples]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(health_log.borrow().clone(), vec![true, false, true]);
+        assert_eq!(env_handle.sleeps_secs(), vec![1], "Disconnected rung");
+    }
+
+    /// MAN-533 D9: a source that never delivers reports every loss while
+    /// it stays unhealthy, and climbs the `NeverConnected` ladder.
+    #[test]
+    fn a_never_productive_source_reports_each_loss_and_climbs_the_ladder() {
+        let first = scripted(FS, CENTER, vec![useless_chunk()]);
+        let (opener, calls) = opener_from(VecDeque::from(vec![
+            Ok(scripted(FS, CENTER, vec![useless_chunk()])),
+            Ok(scripted(FS, CENTER, vec![ok_chunk(8)])),
+        ]));
+        let (health, health_log) = health_recorder();
+        let (loss, loss_log) = loss_recorder();
+        let env = FakeEnv::new();
+        let env_handle = env.clone();
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            env,
+        )
+        .with_loss_sink(loss);
+
+        assert_eq!(src.read(&mut buf(8)).unwrap(), 8);
+        assert_eq!(
+            *loss_log.lock().unwrap(),
+            [
+                SourceLossReason::NoUsableSamples,
+                SourceLossReason::NoUsableSamples
+            ]
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(env_handle.sleeps_secs(), vec![2, 4]);
+        assert_eq!(
+            health_log.borrow().iter().filter(|h| !**h).count(),
+            1,
+            "one unhealthy edge for the whole outage"
+        );
+    }
+
+    #[test]
+    fn any_other_read_error_reports_read_failed() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("boom")]);
+        let (opener, _calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let (health, _health_log) = health_recorder();
+        let (loss, loss_log) = loss_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        )
+        .with_loss_sink(loss);
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap();
+        assert_eq!(*loss_log.lock().unwrap(), [SourceLossReason::ReadFailed]);
+    }
+
+    #[test]
+    fn a_no_usable_samples_error_under_context_is_still_recognised() {
+        let wrapped: anyhow::Result<Vec<Complex32>> =
+            Err(anyhow::Error::from(manta_input::NoUsableSamples::new("x")).context("decimator"));
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), wrapped]);
+        let (opener, _calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let (health, _health_log) = health_recorder();
+        let (loss, loss_log) = loss_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        )
+        .with_loss_sink(loss);
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap();
+        assert_eq!(
+            *loss_log.lock().unwrap(),
+            [SourceLossReason::NoUsableSamples]
+        );
+    }
+
+    /// MAN-533 D9: the loss is recorded before the unhealthy edge, so
+    /// `/status` never shows a down source without its reason.
+    #[test]
+    fn the_loss_is_reported_before_the_unhealthy_edge() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), useless_chunk()]);
+        let (opener, _calls) = opener_from(VecDeque::from(vec![Ok(scripted(
+            FS,
+            CENTER,
+            vec![ok_chunk(8)],
+        ))]));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        let health_events = events.clone();
+        let health: HealthSink =
+            Box::new(move |h| health_events.lock().unwrap().push(format!("health({h})")));
+        let loss_events = events.clone();
+        let loss: LossSink = Box::new(move |r| {
+            loss_events
+                .lock()
+                .unwrap()
+                .push(format!("loss({})", r.label()))
+        });
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        )
+        .with_loss_sink(loss);
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        src.read(&mut b).unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "health(true)",
+                "loss(no usable samples)",
+                "health(false)",
+                "health(true)"
+            ]
+        );
+    }
+
+    /// MAN-533 D9: a failed reopen attempt is not a lost connection.
+    #[test]
+    fn a_failed_reopen_attempt_is_not_a_loss() {
+        let first = scripted(FS, CENTER, vec![ok_chunk(8), err_chunk("lost")]);
+        let (opener, calls) = opener_from(VecDeque::from(vec![
+            Err(anyhow::anyhow!("refused")),
+            Err(anyhow::anyhow!("refused")),
+            Ok(scripted(FS, CENTER, vec![ok_chunk(8)])),
+        ]));
+        let (health, _health_log) = health_recorder();
+        let (loss, loss_log) = loss_recorder();
+        let mut src = ReconnectingSource::with_env(
+            "kiwi",
+            Box::new(first),
+            opener,
+            no_stop(),
+            true,
+            health,
+            FakeEnv::new(),
+        )
+        .with_loss_sink(loss);
+
+        let mut b = buf(8);
+        src.read(&mut b).unwrap();
+        assert_eq!(src.read(&mut b).unwrap(), 8);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(*loss_log.lock().unwrap(), [SourceLossReason::ReadFailed]);
     }
 
     #[test]

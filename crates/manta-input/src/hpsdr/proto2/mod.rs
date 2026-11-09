@@ -17,7 +17,7 @@ use super::{
     GapStats, HpsdrConfig, INITIAL_BURST_REPEATS, MAX_CONSECUTIVE_MALFORMED,
     MAX_CONSECUTIVE_TIMEOUTS, READ_TIMEOUT, RECV_BUF_LEN,
 };
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
+use crate::stall::{NoUsableSamples, StallEpisode, SOFT_STALL_AFTER};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -474,12 +474,14 @@ impl Protocol2IqSource {
         self.health_counters.record_malformed();
         self.consecutive_malformed = self.consecutive_malformed.saturating_add(1);
         if self.consecutive_malformed >= self.max_consecutive_malformed {
-            bail!(
+            // MAN-533 D4: typed, so the reconnect layer reports it as
+            // `no usable samples`; the text is unchanged.
+            return Err(NoUsableSamples::new(format!(
                 "HPSDR protocol 2 radio {} stalled: {} consecutive malformed datagrams with no \
                  valid IQ datagram -- corrupt hardware or a spoofed stream",
-                self.host,
-                self.max_consecutive_malformed
-            );
+                self.host, self.max_consecutive_malformed
+            ))
+            .into());
         }
         Ok(())
     }
@@ -694,14 +696,16 @@ impl Protocol2IqSource {
                 return Ok(false);
             }
             if self.last_valid_iq.max(entered).elapsed() >= self.stall_after {
-                bail!(
+                // MAN-533 D4: typed, text unchanged.
+                return Err(NoUsableSamples::new(format!(
                     "HPSDR protocol 2 radio {host} stalled: no IQ datagram for {secs} s -- if the \
                      radio is on, allow inbound UDP from {host} in the host firewall (protocol 2 \
                      sends IQ from port {iq_port}, not a port manta sent to)",
                     host = self.host,
                     secs = self.stall_after.as_secs_f64(),
                     iq_port = u32::from(self.port) + u32::from(DDC0_PORT_OFFSET),
-                );
+                ))
+                .into());
             }
             self.send_keepalive_if_due()?;
             self.tick_attenuation()?;
@@ -1452,7 +1456,10 @@ mod tests {
         src.stall_after = Duration::from_millis(300);
         let start = Instant::now();
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
-        let err = src.read(&mut buf).unwrap_err().to_string();
+        let err = src.read(&mut buf).unwrap_err();
+        // MAN-533 D4: the stall carries the shared type.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(
             err,
@@ -1487,7 +1494,11 @@ mod tests {
         let _status = fake.stream_status(Duration::from_millis(20));
         let start = Instant::now();
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
-        let err = src.read(&mut buf).unwrap_err().to_string();
+        let err = src.read(&mut buf).unwrap_err();
+        // MAN-533 scenario 2 (protocol 2): status traffic flows, no IQ, and
+        // the stall carries the shared type the reconnect layer reopens on.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.contains("stalled: no IQ datagram"), "{err}");
     }
@@ -1811,7 +1822,10 @@ mod tests {
             fake.send_iq_bytes(&[0u8; 1443]);
         }
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
-        let err = src.read(&mut buf).unwrap_err().to_string();
+        let err = src.read(&mut buf).unwrap_err();
+        // MAN-533 D4: the malformed bound carries the shared type.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert_eq!(
             err,
             "HPSDR protocol 2 radio 127.0.0.1 stalled: 50 consecutive malformed datagrams with no \

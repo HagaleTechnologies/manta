@@ -2079,6 +2079,20 @@ fn source_health_sink(
         }
     })
 }
+
+/// MAN-533: the loss sink a one-input `ReconnectingSource` reports every
+/// lost connection's reason through, for `/status` `sources[]`.
+fn source_loss_sink(
+    name: &'static str,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+) -> reconnect::LossSink {
+    Box::new(move |reason| {
+        if let Some(metrics) = &metrics {
+            metrics.record_source_loss(name, reason);
+        }
+    })
+}
+
 /// How often the daemon copies the engine's decode-latency observer into
 /// `Metrics` (MAN-128). Same bridge shape and tuning rationale as
 /// `ACTIVE_TRACKS_POLL_INTERVAL`.

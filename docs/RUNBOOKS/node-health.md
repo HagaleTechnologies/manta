@@ -29,6 +29,11 @@ with its type, labels and when it has samples.
   lines, otherwise — e.g. `source file: unhealthy`, `listener json: down`,
   `decode: stalled 12s`, or `decode: stopped` (the daemon has exited the
   decode loop and is draining shutdown).
+  A live source that keeps reading but delivers no usable sample for 30 s
+  is dropped and reconnected ([MAN-533](../DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md)),
+  so its `source <name>:` line turns `unhealthy` instead of the node
+  reporting only `decode: stalled`; `manta status`'s Sources table shows
+  the loss as `no usable samples`.
 
 **The RBN uplink is deliberately not part of this verdict.** A dead uplink
 target does not make `/healthz` unhealthy — restarting a node that is
