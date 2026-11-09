@@ -845,3 +845,36 @@ async fn shutdown_stops_the_comparator_and_feed() {
     );
     assert_eq!(grades_total(&metrics), 0);
 }
+
+/// MAN-541: a graded spot reaches `/status`'s `rbn_compare.bands` and the
+/// `_median_ppm` family through the live comparator (the 30-minute hold
+/// is covered by `metrics.rs`'s synthetic-`Instant` tests).
+#[tokio::test]
+async fn graded_spots_reach_the_status_document() {
+    let (t, spot) = scenario_spot(0);
+    let mut h = Harness::start(&[], t - 400).await;
+    h.send(&warm_up(t - 300)).await;
+    let reports = vec![
+        report(t + 20, "K5TR", 14025.0, "W1AW", 22),
+        report(t + 35, "DL8LAS", 14025.0, "W1AW", 24),
+        report(t + 50, "W3LPL", 14024.9, "W1AW", 25),
+    ];
+    h.replay(&reports, &[(t, spot)], t + 179).await;
+    h.send(&warm_up(t + 181)).await;
+    h.wait_grades(1, Duration::from_secs(1)).await;
+
+    let doc = manta_server::status_doc::StatusDoc::from_metrics(&h.metrics);
+    let rc = doc.rbn_compare.expect("comparison is on");
+    assert_eq!(rc.bands.len(), 1, "{:?}", rc.bands);
+    assert_eq!(rc.bands[0].band, "20m");
+    assert_eq!(rc.bands[0].samples, 1);
+    assert_eq!(rc.bands[0].median_ppm, None, "one spot is under 20");
+    assert!(h
+        .metric("manta_rbn_compare_freq_offset_median_ppm{band=\"20m\"}")
+        .is_some());
+    assert_eq!(
+        h.metric("manta_rbn_compare_skew_warning{band=\"20m\"}"),
+        Some(0.0)
+    );
+    h.stop().await;
+}

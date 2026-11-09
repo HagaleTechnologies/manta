@@ -164,6 +164,7 @@ station_callsign = "N0CALL"
 #speed_tol_pct = 20.0                 # and more than this percent of RBN's median speed
 #spotters = []                        # only these RBN skimmers count, e.g. ["K5TR"]; --rbn-spotter replaces it
 #exclude_spotters = []                # never count these skimmers; your own callsign is always excluded
+#skew_warn_ppm = 2.0                  # warn when a band reads this many ppm off the RBN for 30 min; 0 = off
 
 
 # --- Relay another skimmer's spots ---------------------------------------------

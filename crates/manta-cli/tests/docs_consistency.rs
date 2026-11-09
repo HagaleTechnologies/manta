@@ -1853,12 +1853,15 @@ fn architecture_logging_bullet_is_current() {
 /// Every `manta_rbn_compare_*` family the design names (MAN-301 plan §7).
 /// The runbook test below also checks the rendered families against this
 /// list, so a stubbed or partial renderer cannot pass it vacuously.
-const RBN_COMPARE_FAMILIES: [&str; 10] = [
+const RBN_COMPARE_FAMILIES: [&str; 12] = [
     "manta_rbn_compare_grades_total",
     "manta_rbn_compare_grades_last_hour",
     "manta_rbn_compare_disagreements_last_hour",
     "manta_rbn_compare_freq_offset_median_hz",
     "manta_rbn_compare_freq_offset_samples",
+    // MAN-541
+    "manta_rbn_compare_freq_offset_median_ppm",
+    "manta_rbn_compare_skew_warning",
     "manta_rbn_compare_feed_connected",
     "manta_rbn_compare_feed_reports_total",
     "manta_rbn_compare_feed_reconnects_total",
@@ -1898,6 +1901,7 @@ fn rbn_grade(
             Grade::None | Grade::Unknown => vec![],
         },
         spotter_filter: vec![],
+        track_id: None,
     }
 }
 
@@ -2833,6 +2837,65 @@ fn config_reference_names_status_as_a_server_reader() {
     assert!(
         intro.contains("with neither it dials `127.0.0.1:7302`"),
         "{CONFIG_REF} [server] must say `status` without a config file dials the default"
+    );
+}
+
+/// MAN-541: the runbook explains the skew reading with the numbers the
+/// code uses, and no longer asks the operator to convert Hz by hand.
+#[test]
+fn rbn_comparison_runbook_explains_the_skew_reading() {
+    use manta_server::rbn_compare::skew::{
+        MAX_SAVE_ERROR_PPM, MIN_SKEW_SAMPLES, SKEW_HOLD, WARN_PRECISION_DIVISOR,
+    };
+    let runbook = squash_whitespace(&doc("docs/RUNBOOKS/rbn-comparison.md"));
+    for needle in ["skew_warn_ppm", "freq_correction_ppm", "replaces"] {
+        assert!(
+            runbook.contains(needle),
+            "rbn-comparison.md must name {needle:?}"
+        );
+    }
+    assert!(
+        !runbook.contains("+40 Hz on 20m is about +2.9 ppm"),
+        "rbn-comparison.md still tells the operator to convert Hz to ppm by hand"
+    );
+    let fraction = match WARN_PRECISION_DIVISOR as u32 {
+        2 => "half",
+        3 => "a third",
+        4 => "a quarter",
+        n => panic!("no wording for a 1/{n} precision guard"),
+    };
+    for needle in [
+        format!("needs **{MIN_SKEW_SAMPLES} spots**"),
+        format!("for {} minutes", SKEW_HOLD.as_secs() / 60),
+        format!("at most {fraction} of the limit"),
+        format!("±{MAX_SAVE_ERROR_PPM:.2} ppm or better"),
+    ] {
+        assert!(
+            runbook.contains(&needle),
+            "rbn-comparison.md must state {needle:?}"
+        );
+    }
+}
+
+/// MAN-541: both `/healthz` references say a `WARN rbn skew` line leaves
+/// the verdict alone.
+#[test]
+fn healthz_docs_say_warn_lines_keep_the_verdict() {
+    let metrics = squash_whitespace(section(&doc("docs/METRICS.md"), "/healthz"));
+    assert!(metrics.contains("WARN rbn skew"), "METRICS.md /healthz");
+    assert!(
+        metrics.contains("A warning line does not change the verdict"),
+        "METRICS.md /healthz must say a WARN line keeps the verdict"
+    );
+    assert!(
+        metrics.contains("every check line passes"),
+        "METRICS.md /healthz"
+    );
+    let node = squash_whitespace(&doc("docs/RUNBOOKS/node-health.md"));
+    assert!(node.contains("WARN rbn skew"), "node-health.md");
+    assert!(
+        node.contains("They do not change the verdict"),
+        "node-health.md must say a WARN line keeps the verdict"
     );
 }
 
