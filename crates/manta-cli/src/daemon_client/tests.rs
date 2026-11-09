@@ -331,11 +331,8 @@ fn doc_with(
             targets: vec![],
         },
         inputs: vec![],
-<<<<<<< HEAD
         sources: Vec::new(),
-=======
         rbn_compare: None,
->>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
     }
 }
 

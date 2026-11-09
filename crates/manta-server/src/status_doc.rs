@@ -64,7 +64,6 @@ pub struct StatusDoc {
     /// stays 1 and a one-input document is unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputHearingSnapshot>,
-<<<<<<< HEAD
     /// MAN-533: each live source's health and lost-connection record,
     /// sorted by name (the `manta_source_health` label set). Additive, so
     /// `schema_version` stays 1: an older CLI ignores it, and a document
@@ -74,6 +73,10 @@ pub struct StatusDoc {
     /// newer daemon's label instead of refusing the whole document.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SourceStatus>,
+    /// MAN-541: the RBN skew reading. Present only with `[rbn_compare]`
+    /// enabled (additive, so `schema_version` stays 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rbn_compare: Option<RbnCompareStatus>,
 }
 
 /// MAN-533: one live source's row in `GET /status`'s `sources`.
@@ -106,11 +109,6 @@ impl SourceStatus {
             })
             .collect()
     }
-=======
-    /// MAN-541: the RBN skew reading. Present only with `[rbn_compare]`
-    /// enabled (additive, so `schema_version` stays 1).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rbn_compare: Option<RbnCompareStatus>,
 }
 
 /// MAN-541: `GET /status`'s `rbn_compare` object.
@@ -168,7 +166,6 @@ pub struct RbnSkewEntry {
     /// The value to put in `freq_correction_ppm`: it replaces
     /// `applied_ppm`, it is not added to it.
     pub suggested_ppm: Option<f64>,
->>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
 }
 
 /// MAN-14: one input's row in `GET /status`'s `inputs`.
@@ -273,11 +270,8 @@ impl StatusDoc {
                 targets,
             },
             inputs: InputHearingSnapshot::rows(metrics, now),
-<<<<<<< HEAD
             sources: SourceStatus::rows(metrics, now),
-=======
             rbn_compare: metrics.rbn_skew_snapshot_at(now),
->>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
         }
     }
 
@@ -638,7 +632,6 @@ mod tests {
         assert!(human.lines().all(|l| l.chars().count() <= 80), "{human}");
     }
 
-<<<<<<< HEAD
     /// MAN-533: a `kiwi` lost 3 s ago for sending nothing usable and a
     /// healthy `file`, as `Metrics` holds them.
     fn sources_fixture() -> Metrics {
@@ -758,7 +751,8 @@ mod tests {
         assert!(out.contains(r"evil\u{1b}]0;pwned\u{7}\nforged"), "{out}");
         assert!(out.contains(r"3s ago, x\u{1b}[2J"), "{out}");
         assert_eq!(out.lines().count(), human.lines().count(), "{out:?}");
-=======
+    }
+
     // ---- MAN-541: the RBN skew block ----
 
     fn band(
@@ -1000,7 +994,6 @@ RBN uplink: not configured
         let out = render_human(&doc_with_rbn(Some(rc)));
         assert!(!out.contains('\x1b'), "{out:?}");
         assert!(out.contains("evil\\u{1b}[31m"), "{out}");
->>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
     }
 
     #[test]

@@ -24,7 +24,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-533: `GET /status` carries a `sources` array, one row per input
   source with `healthy`, `losses_total`, `last_loss_reason`
   (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
@@ -32,7 +31,6 @@ the git history and `docs/DECISIONS/`.
   `manta_input_malformed_packets_total{source="kiwi"}` now also counts
   unknown-tag binary frames and text frames from the receiver. See
   [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
-=======
 - MAN-541: a node running `[rbn_compare]` reads its frequency skew from the
   RBN in ppm. `manta status` (and `GET /status`'s new `rbn_compare` object)
   shows each band's median offset in Hz and skew in ppm with its precision,
@@ -44,7 +42,6 @@ the git history and `docs/DECISIONS/`.
   `manta_rbn_compare_freq_offset_median_ppm` and
   `manta_rbn_compare_skew_warning`, and a shipped `MantaRbnSkew` alert. See
   [docs/DECISIONS/2026-11-09-man541-rbn-skew.md](docs/DECISIONS/2026-11-09-man541-rbn-skew.md).
->>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
