@@ -1047,9 +1047,9 @@ the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 When you report a problem, include the output of `manta --version`. It names
-the exact commit and the compiled-in features. The Docker image is the
-exception for now: its build has no git metadata, so its commit reads
-`unknown`. A change that alters decoder
+the exact commit and the compiled-in features. The published Docker image
+names its release commit too: the release build passes it in as the
+`MANTA_GIT_SHA` build-arg. A change that alters decoder
 output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 
 ## License

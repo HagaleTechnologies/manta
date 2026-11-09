@@ -471,6 +471,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-537: the published Docker image names its release commit. Its
+  `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
+  `manta_build_info` used to read `unknown`, because the build context has
+  no `.git`; the release workflow now passes the commit as the
+  `MANTA_GIT_SHA` build-arg and checks the arm64 image reports it before
+  the push. Both base images are pinned by tag and digest, and Dependabot
+  opens a PR when either moves. A local `docker build` still reports
+  `unknown` unless given `--build-arg MANTA_GIT_SHA=...`.
 - MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
   audio, SoapySDR; ka9q already did) now reports a stopped stream through
   `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),

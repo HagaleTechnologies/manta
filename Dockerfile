@@ -23,6 +23,13 @@
 # /etc/manta/manta.toml (or MANTA_CONFIG); with arguments it runs
 # `manta <arguments>` unchanged. HEALTHCHECK asks the daemon through
 # `manta health`.
+#
+# MAN-537: both base images are pinned by tag and manifest-list digest, one
+# digest for all three platforms; Dependabot's `docker` entry
+# (.github/dependabot.yml) opens a PR when either digest moves. The builder
+# takes the commit as `--build-arg MANTA_GIT_SHA=<sha>`, which
+# release-publish.yml passes, so `manta --version`, `decoderVersion` and
+# `manta_build_info` name it; without the arg they report `unknown`.
 
 FROM rust:1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
 

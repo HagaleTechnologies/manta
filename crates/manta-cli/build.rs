@@ -4,7 +4,9 @@
 //! beneath an unrelated repository, whose HEAD is not manta's commit (MAN-83:
 //! git's top level must be this workspace's root, and an inherited
 //! `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR` is ignored). `MANTA_GIT_SHA`
-//! overrides (for release images that pass it as a build-arg).
+//! overrides: the Dockerfile's builder stage takes it as a build-arg, and
+//! release-publish.yml passes the release commit, so the published image
+//! names its commit (MAN-537).
 //!
 //! MAN-83: the same commit also feeds `manta --version` and the JSON
 //! stream's `decoderVersion` (`manta-<version>+<sha>`), so the override must

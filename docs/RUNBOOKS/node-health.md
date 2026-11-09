@@ -131,8 +131,10 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   changes(manta_start_time_seconds[1h]) > 0
   ```
   `manta_build_info{git_sha="unknown"}` means the binary was built from a
-  context with no `.git` directory (e.g. a Docker build — `.dockerignore`
-  excludes `.git` on purpose) rather than a build failure.
+  context with no `.git` directory and no `MANTA_GIT_SHA`, rather than a
+  build failure. A local `docker build` without
+  `--build-arg MANTA_GIT_SHA=...` is one (`.dockerignore` excludes `.git` on
+  purpose); the published image passes the release commit and names it.
   `manta --version` on the host prints the same commit and feature list, and
   the same `unknown` caveat applies.
 - `manta_uplink_target_*{target="host:port"}` — every uplink counter now
