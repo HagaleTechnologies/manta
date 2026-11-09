@@ -24,6 +24,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-533: `GET /status` carries a `sources` array, one row per input
   source with `healthy`, `losses_total`, `last_loss_reason`
   (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
@@ -31,6 +32,19 @@ the git history and `docs/DECISIONS/`.
   `manta_input_malformed_packets_total{source="kiwi"}` now also counts
   unknown-tag binary frames and text frames from the receiver. See
   [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
+=======
+- MAN-541: a node running `[rbn_compare]` reads its frequency skew from the
+  RBN in ppm. `manta status` (and `GET /status`'s new `rbn_compare` object)
+  shows each band's median offset in Hz and skew in ppm with its precision,
+  and the `freq_correction_ppm` each config entry should set, which replaces
+  the applied value rather than adding to it. A band whose skew stays beyond
+  the new `[rbn_compare].skew_warn_ppm` (default 2 ppm, on by default; 0
+  turns it off) for 30 minutes adds a `WARN rbn skew` line to `/healthz`;
+  the verdict, status code and `manta_healthy` are unchanged. New metrics
+  `manta_rbn_compare_freq_offset_median_ppm` and
+  `manta_rbn_compare_skew_warning`, and a shipped `MantaRbnSkew` alert. See
+  [docs/DECISIONS/2026-11-09-man541-rbn-skew.md](docs/DECISIONS/2026-11-09-man541-rbn-skew.md).
+>>>>>>> 468737aaf4c4b972eb8c1777f1c84614627ad130
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
@@ -423,6 +437,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-536: `[spot].refresh_lists` downloads cty.dat and MASTER.SCP over
+  HTTPS by default. `cty_url` and `scp_url` default to `https://` URLs,
+  verified against the CA roots built into manta. `http://` stays accepted
+  for local mirrors. Allow outbound TCP port 443 instead of 80. See
+  [docs/DECISIONS/2026-11-09-man536-https-list-downloads.md](docs/DECISIONS/2026-11-09-man536-https-list-downloads.md).
 - MAN-539: the Docker image is built with `--features soapy`, so its
   `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
   three device modules.

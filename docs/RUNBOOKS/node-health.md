@@ -35,6 +35,14 @@ with its type, labels and when it has samples.
   reporting only `decode: stalled`; `manta status`'s Sources table shows
   the loss as `no usable samples`.
 
+- `WARN rbn skew <band>: ...` lines (MAN-541) may follow the checks in
+  either case, one per band whose RBN skew has stayed beyond
+  `[rbn_compare].skew_warn_ppm` for 30 minutes. They do not change the
+  verdict: the status code, the first line and `manta_healthy` are the
+  checks' alone, so `manta health` still exits 0 on an `ok` node with a
+  warning. [rbn-comparison.md](rbn-comparison.md#the-skew-reading-and-a-suggested-correction)
+  explains the reading.
+
 **The RBN uplink is deliberately not part of this verdict.** A dead uplink
 target does not make `/healthz` unhealthy — restarting a node that is
 decoding fine just because an upstream RBN collector is unreachable would

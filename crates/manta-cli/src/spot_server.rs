@@ -593,8 +593,10 @@ pub(crate) fn start_spot_server(
             // MAN-44's reason: a scrape racing startup must already see the
             // `manta_rbn_compare_*` families of a comparator that is starting.
             let rbn_compare_cfg = rbn_compare_cfg.filter(|c| c.enabled);
-            if rbn_compare_cfg.is_some() {
+            if let Some(rc) = &rbn_compare_cfg {
                 metrics.enable_rbn_compare();
+                // MAN-541: before the endpoint spawns, for the same reason.
+                metrics.set_rbn_skew_warn_ppm(rc.skew_warn_ppm);
             }
             // MAN-320: one relay series per configured block (disabled ones
             // included, reading 0), registered before the metrics endpoint

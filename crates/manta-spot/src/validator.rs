@@ -450,7 +450,19 @@ impl std::error::Error for InvalidCalibration {}
 /// `f64::MAX`) would otherwise produce once multiplied against a real RF
 /// frequency -- a factor merely being finite and positive isn't enough
 /// (MAN-29 review round 2).
-const MAX_ABS_PPM: f64 = 1_000.0;
+pub const MAX_ABS_PPM: f64 = 1_000.0;
+
+/// A `freq_correction_ppm` as it is saved and suggested: rounded to
+/// 0.01 ppm, never `-0.0`. `manta calibrate` and the live RBN skew
+/// suggestion (MAN-541) both use it, so they print the same value.
+pub fn round_ppm(ppm: f64) -> f64 {
+    let r = (ppm * 100.0).round() / 100.0;
+    if r == 0.0 {
+        0.0
+    } else {
+        r
+    }
+}
 
 /// Converts a ppm frequency-correction setting (config key
 /// `input.freq_correction_ppm`, SPEC-decode-core.md §1.4) into the
@@ -6091,6 +6103,17 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
 
         assert_eq!(spots.len(), 1);
         assert_eq!(spots[0].freq_hz, 14_027_000.0);
+    }
+
+    #[test]
+    fn round_ppm_rounds_to_hundredths_and_never_negative_zero() {
+        assert_eq!(round_ppm(-1.41999), -1.42);
+        assert_eq!(round_ppm(2.4987), 2.5);
+        assert_eq!(round_ppm(1.005_1), 1.01);
+        let z = round_ppm(-0.001);
+        assert_eq!(z, 0.0);
+        assert!(z.is_sign_positive());
+        assert_eq!(format!("{:?}", round_ppm(-0.004)), "0.0");
     }
 
     #[test]
