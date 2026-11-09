@@ -401,7 +401,7 @@ fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &st
     };
     format!(
         "rbn_compare: enabled={} feed={}:{} login_callsign={} window_secs={} freq_tol_hz={} \
-         speed_tol={} WPM/{}% spotters={} exclude_spotters={}",
+         speed_tol={} WPM/{}% spotters={} exclude_spotters={} skew_warn_ppm={}",
         rc.enabled,
         rc.feed_host,
         rc.feed_port,
@@ -412,6 +412,7 @@ fn rbn_compare_summary(rc: &manta_server::config::RbnCompareConfig, station: &st
         rc.speed_tol_pct,
         list(&rc.spotters, "all"),
         list(&rc.exclude_spotters, "none"),
+        rc.skew_warn_ppm,
     )
 }
 
@@ -1432,7 +1433,7 @@ mod tests {
             line(&lines, "rbn_compare:"),
             "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 \
              login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% \
-             spotters=all exclude_spotters=none"
+             spotters=all exclude_spotters=none skew_warn_ppm=2"
         );
         let lines = lines_of(
             "[server]\nstation_callsign = \"W3XYZ-1\"\n[rbn_compare]\nenabled = true\n\
@@ -1443,7 +1444,7 @@ mod tests {
             line(&lines, "rbn_compare:"),
             "rbn_compare: enabled=true feed=telnet.reversebeacon.net:7001 \
              login_callsign=K1ABC window_secs=180 freq_tol_hz=250.5 speed_tol=3 WPM/20% \
-             spotters=K5TR,N0XYZ exclude_spotters=W1AW"
+             spotters=K5TR,N0XYZ exclude_spotters=W1AW skew_warn_ppm=2"
         );
         let lines = lines_of("[decode]\nengine = \"legacy\"\n");
         assert_eq!(line(&lines, "rbn_compare:"), "rbn_compare: none");

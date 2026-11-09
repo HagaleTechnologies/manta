@@ -854,6 +854,16 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                     replay_path.is_some(),
                 ),
             })?;
+            // MAN-541: the RBN skew reading attributes every graded spot
+            // to this one input and suggests a value for its entry.
+            server
+                .metrics
+                .set_rbn_skew_inputs(vec![manta_server::metrics::RbnSkewInput {
+                    name: source_name.to_string(),
+                    entry: loaded.inputs.first().and_then(|n| n.entry.clone()),
+                    applied_ppm: resolved.freq_correction_ppm,
+                    replaced_by_flag: resolved.replaced_file_source.is_some(),
+                }]);
             // MAN-45 (round-9 finding): the daemon's own copy of the
             // gauge `manta_engine::listen_with_observers` updates as
             // it runs (on the MAIN thread, outside this tokio

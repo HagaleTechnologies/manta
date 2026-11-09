@@ -97,15 +97,9 @@ pub(crate) fn confirm(out: &mut impl Write, input: &mut impl BufRead, prompt: &s
     }
 }
 
-/// The value that is saved: rounded to 0.01 ppm, never `-0.0`.
-pub(crate) fn round_ppm(ppm: f64) -> f64 {
-    let r = (ppm * 100.0).round() / 100.0;
-    if r == 0.0 {
-        0.0
-    } else {
-        r
-    }
-}
+// The value that is saved: rounded to 0.01 ppm, never `-0.0`. One copy,
+// in `manta-spot`, shared with the RBN skew suggestion (MAN-541).
+use manta_spot::round_ppm;
 
 /// Whole dB, half away from zero, never `-0`.
 fn db(v: f64) -> String {
@@ -779,17 +773,6 @@ mod tests {
             let mut out = Vec::new();
             assert!(!confirm(&mut out, &mut no.as_bytes(), "Save?"), "{no:?}");
         }
-    }
-
-    #[test]
-    fn round_ppm_rounds_to_hundredths_and_normalises_negative_zero() {
-        assert_eq!(round_ppm(-1.41999), -1.42);
-        assert_eq!(round_ppm(2.4987), 2.5);
-        assert_eq!(round_ppm(1.005_1), 1.01);
-        let z = round_ppm(-0.001);
-        assert_eq!(z, 0.0);
-        assert!(z.is_sign_positive());
-        assert_eq!(format!("{:?}", round_ppm(-0.004)), "0.0");
     }
 
     fn result(

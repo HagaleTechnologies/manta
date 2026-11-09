@@ -901,6 +901,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             // MAN-14: every input's hearing series, at 0, in config order.
             server.metrics.register_input_hearing(&names);
+            // MAN-541: the RBN skew reading attributes spots by track id
+            // the way `HearingCounters::record` does, and pools each
+            // config entry's streams.
+            server.metrics.set_rbn_skew_inputs(
+                m.inputs
+                    .iter()
+                    .map(|i| manta_server::metrics::RbnSkewInput {
+                        name: i.name.clone(),
+                        entry: i.entry.clone(),
+                        applied_ppm: i.freq_correction_ppm,
+                        replaced_by_flag: false,
+                    })
+                    .collect(),
+            );
             if let Some(window) = silent_window {
                 spawn_silent_watch(
                     &rt,
@@ -1406,6 +1420,7 @@ mod tests {
             cw_policy: Default::default(),
             conditioning: Default::default(),
             name: "b".into(),
+            entry: None,
             digital_modes: Vec::new(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,

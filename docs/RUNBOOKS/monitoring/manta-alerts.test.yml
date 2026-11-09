@@ -264,3 +264,29 @@ tests:
             value: 0
           - labels: '{instance="n:7302", job="manta", target="disabled-but-retrying:7000"}'
             value: 0
+
+  # MantaRbnSkew: node1's 20m reading is +3.1 ppm throughout; the daemon's
+  # 30-minute hold ends at minute 3. 40m reads +3.4 ppm but never warns (too
+  # few spots for a precise reading), so it stays quiet.
+  - interval: 1m
+    input_series:
+      - series: 'manta_rbn_compare_freq_offset_median_ppm{job="manta", instance="node1:7302", band="20m"}'
+        values: '3.1x10'
+      - series: 'manta_rbn_compare_skew_warning{job="manta", instance="node1:7302", band="20m"}'
+        values: '0 0 0 1x7'
+      - series: 'manta_rbn_compare_freq_offset_median_ppm{job="manta", instance="node1:7302", band="40m"}'
+        values: '3.4x10'
+      - series: 'manta_rbn_compare_skew_warning{job="manta", instance="node1:7302", band="40m"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: MantaRbnSkew
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: MantaRbnSkew
+        exp_alerts:
+          - exp_labels: {severity: warning, job: manta, instance: "node1:7302", band: "20m"}
+            exp_annotations:
+              summary: "manta node node1:7302 reads 20m +3.1 ppm off the RBN"
+              description: "The median offset of 20m spots from RBN's frequency has been beyond the node's skew_warn_ppm for 30 minutes: the receiver's frequency reference has drifted. Set the freq_correction_ppm manta status suggests, or calibrate against WWV."
+              runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantarbnskew"

@@ -28,6 +28,10 @@ pub struct HealthCheck {
 pub struct HealthReport {
     pub healthy: bool,
     pub checks: Vec<HealthCheck>,
+    /// MAN-541: `WARN ...` lines printed after the checks. They never
+    /// change `healthy`, the status code or `manta_healthy`: `/healthz`
+    /// stays a liveness probe.
+    pub warnings: Vec<String>,
 }
 
 impl HealthReport {
@@ -38,6 +42,10 @@ impl HealthReport {
         out.push_str(if self.healthy { "ok\n" } else { "unhealthy\n" });
         for check in &self.checks {
             out.push_str(&check.detail);
+            out.push('\n');
+        }
+        for warning in &self.warnings {
+            out.push_str(warning);
             out.push('\n');
         }
         out
@@ -183,11 +191,28 @@ mod tests {
                     detail: "listener json: down".to_string(),
                 },
             ],
+            warnings: vec![],
         };
         let text = report.render_text();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "unhealthy");
         assert_eq!(lines[1], "source file: healthy");
         assert_eq!(lines[2], "listener json: down");
+    }
+
+    /// MAN-541: warnings follow the checks, in order, and leave the
+    /// verdict line alone.
+    #[test]
+    fn render_text_appends_warnings_after_the_checks() {
+        let report = HealthReport {
+            healthy: true,
+            checks: vec![HealthCheck {
+                name: "decode".to_string(),
+                ok: true,
+                detail: "decode: ok".to_string(),
+            }],
+            warnings: vec!["WARN a".to_string(), "WARN b".to_string()],
+        };
+        assert_eq!(report.render_text(), "ok\ndecode: ok\nWARN a\nWARN b\n");
     }
 }

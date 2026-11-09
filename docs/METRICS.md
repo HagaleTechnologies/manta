@@ -172,6 +172,8 @@ missing series as "no loss" or "no traffic".
 | `manta_rbn_compare_disagreements_last_hour` | gauge | `band`, `kind` | Spots graded `disagree` in the last hour, by band and the tolerance that failed (`frequency` or `speed`); a spot failing both counts under each. | Only with `[rbn_compare]` enabled. |
 | `manta_rbn_compare_freq_offset_median_hz` | gauge | `band` | Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded `match` or `disagree` in the last hour. | Only with `[rbn_compare]` enabled, per band with at least one such spot. |
 | `manta_rbn_compare_freq_offset_samples` | gauge | `band` | Spots the median frequency offset is computed over. | As for `manta_rbn_compare_freq_offset_median_hz`. |
+| `manta_rbn_compare_freq_offset_median_ppm` | gauge | `band` | MAN-541: median of each of those spots' offset divided by RBN's modal frequency, in parts per million (the band's skew), rounded to 0.001. Positive: manta reads high. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_freq_offset_median_hz`. |
+| `manta_rbn_compare_skew_warning` | gauge | `band` | MAN-541: 1 while the band's skew has been beyond `[rbn_compare].skew_warn_ppm` for 30 minutes, on a reading of at least 20 spots whose error is at most a third of that limit; else 0. The same state adds a `WARN rbn skew` line to `/healthz` and fires the shipped `MantaRbnSkew` alert. | Only with `[rbn_compare]` enabled, as for `manta_rbn_compare_freq_offset_median_hz`. |
 | `manta_rbn_compare_feed_connected` | gauge | — | Whether the RBN feed is logged in and delivering lines (1) or not (0). | Only with `[rbn_compare]` enabled. |
 | `manta_rbn_compare_feed_reports_total` | counter | — | CW reports accepted from the RBN feed. | Only with `[rbn_compare]` enabled; starts at 0. |
 | `manta_rbn_compare_feed_reconnects_total` | counter | — | RBN feed connections lost or failed. | Only with `[rbn_compare]` enabled; starts at 0. |
@@ -276,8 +278,14 @@ One line per check follows, in this order:
      shutdown.
    - `decode: not monitored`: the watchdog was never armed. The daemon
      always arms it, so a running node does not show this line.
+4. Warnings (MAN-541), after the checks: one
+   `WARN rbn skew <band>: <±x.x> ppm for <N> min (median <±N> Hz, <n> spots; limit <L> ppm)`
+   line per band whose RBN skew has been beyond `[rbn_compare].skew_warn_ppm`
+   for 30 minutes (see `RUNBOOKS/rbn-comparison.md`). A warning line does not
+   change the verdict: the first line, the status code and `manta_healthy`
+   stay as the checks set them.
 
-The node is healthy only when every line passes, with one exception
+The node is healthy only when every check line passes, with one exception
 (MAN-13): with two or more inputs, the source lines need only one input
 healthy, so one dead receiver does not make a health check restart the
 daemon and interrupt the inputs still spotting. Each input keeps its own

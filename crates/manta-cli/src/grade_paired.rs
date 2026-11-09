@@ -686,6 +686,7 @@ mod tests {
                 time,
                 freq_hz,
                 wpm: Some(25),
+                track_id: None,
             },
             SpotExtra {
                 snr: Some(10),

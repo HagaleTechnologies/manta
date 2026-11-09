@@ -1326,7 +1326,26 @@ struct RbnGradeBook {
     total: BTreeMap<(&'static str, &'static str), u64>,
     recent: BTreeMap<(&'static str, &'static str), VecDeque<Instant>>,
     disagreements: BTreeMap<(&'static str, &'static str), VecDeque<Instant>>,
-    offsets: BTreeMap<&'static str, VecDeque<(Instant, i64)>>,
+    offsets: BTreeMap<&'static str, VecDeque<(Instant, OffsetSample)>>,
+}
+
+/// MAN-541: one `match`/`disagree` grade's offset, the RBN modal frequency
+/// it is measured against (for ppm), and the spot's decoder track (for
+/// attribution to an input at read time).
+#[derive(Debug, Clone, Copy)]
+struct OffsetSample {
+    offset_hz: i64,
+    modal_hz: i64,
+    track_id: Option<u32>,
+}
+
+impl OffsetSample {
+    fn sample(&self) -> crate::rbn_compare::skew::Sample {
+        crate::rbn_compare::skew::Sample {
+            offset_hz: self.offset_hz,
+            modal_hz: self.modal_hz,
+        }
+    }
 }
 
 impl RbnGradeBook {
@@ -1351,7 +1370,6 @@ impl RbnGradeBook {
 /// MAN-301: the `manta_rbn_compare_*` families. Present on `Metrics` only
 /// once `enable_rbn_compare` has run, so a node without `[rbn_compare]`
 /// renders none of them.
-#[derive(Default)]
 struct RbnCompareMetrics {
     grades: Mutex<RbnGradeBook>,
     feed_connected: AtomicBool,
@@ -1359,16 +1377,61 @@ struct RbnCompareMetrics {
     feed_reconnects_total: AtomicU64,
     pending: AtomicU64,
     ungraded_total: AtomicU64,
+    /// MAN-541: `[rbn_compare].skew_warn_ppm`, as `f64::to_bits`.
+    skew_warn_ppm_bits: AtomicU64,
+    /// MAN-541: the daemon's inputs, in track-ownership order.
+    skew_inputs: RwLock<Vec<RbnSkewInput>>,
+    /// MAN-541: since when each band has been over the skew limit.
+    skew: Mutex<crate::rbn_compare::skew::SkewTracker>,
 }
 
-fn median_of(values: &mut [i64]) -> f64 {
-    values.sort_unstable();
-    let n = values.len();
-    if n % 2 == 1 {
-        values[n / 2] as f64
-    } else {
-        (values[n / 2 - 1] as f64 + values[n / 2] as f64) / 2.0
+impl Default for RbnCompareMetrics {
+    fn default() -> Self {
+        Self {
+            grades: Mutex::default(),
+            feed_connected: AtomicBool::default(),
+            feed_reports_total: AtomicU64::default(),
+            feed_reconnects_total: AtomicU64::default(),
+            pending: AtomicU64::default(),
+            ungraded_total: AtomicU64::default(),
+            skew_warn_ppm_bits: AtomicU64::new(
+                crate::rbn_compare::skew::DEFAULT_SKEW_WARN_PPM.to_bits(),
+            ),
+            skew_inputs: RwLock::default(),
+            skew: Mutex::default(),
+        }
     }
+}
+
+impl RbnCompareMetrics {
+    fn skew_warn_ppm(&self) -> f64 {
+        f64::from_bits(self.skew_warn_ppm_bits.load(Ordering::Relaxed))
+    }
+}
+
+pub use crate::rbn_compare::skew::RbnSkewInput;
+
+fn median_of(values: &mut [i64]) -> f64 {
+    crate::rbn_compare::skew::median_i64(values)
+}
+
+/// MAN-541: per-band readings over the pruned offset rings, in band order
+/// (lowest frequency first).
+fn rbn_band_readings(
+    book: &RbnGradeBook,
+) -> Vec<(&'static str, crate::rbn_compare::skew::BandReading)> {
+    let mut rows: Vec<(&'static str, crate::rbn_compare::skew::BandReading)> = book
+        .offsets
+        .iter()
+        .filter(|(_, ring)| !ring.is_empty())
+        .map(|(band, ring)| {
+            let samples: Vec<crate::rbn_compare::skew::Sample> =
+                ring.iter().map(|(_, s)| s.sample()).collect();
+            (*band, crate::rbn_compare::skew::band_reading(&samples))
+        })
+        .collect();
+    rows.sort_by_key(|(band, _)| crate::rbn_compare::grade::band_rank(band));
+    rows
 }
 
 /// MAN-301: the live comparator's metrics. Every method is a no-op until
@@ -1405,8 +1468,22 @@ impl Metrics {
             }
         }
         if matches!(grade.grade, Grade::Match | Grade::Disagree) {
-            if let Some(offset) = grade.freq_offset_hz {
-                push_bounded(book.offsets.entry(band).or_default(), (now, offset));
+            // Set together by the grader (`grade.rs`), so a grade with an
+            // offset always has its modal frequency.
+            if let (Some(offset_hz), Some(modal_hz)) =
+                (grade.freq_offset_hz, grade.rbn_modal_freq_hz)
+            {
+                push_bounded(
+                    book.offsets.entry(band).or_default(),
+                    (
+                        now,
+                        OffsetSample {
+                            offset_hz,
+                            modal_hz,
+                            track_id: grade.track_id,
+                        },
+                    ),
+                );
             }
         }
     }
@@ -1439,6 +1516,169 @@ impl Metrics {
         if let Some(rc) = self.rbn_compare.get() {
             rc.ungraded_total.fetch_add(n, Ordering::Relaxed);
         }
+    }
+
+    /// MAN-541: `[rbn_compare].skew_warn_ppm`; 0 turns the warning off.
+    pub fn set_rbn_skew_warn_ppm(&self, ppm: f64) {
+        if let Some(rc) = self.rbn_compare.get() {
+            rc.skew_warn_ppm_bits
+                .store(ppm.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// MAN-541: the daemon's inputs in track-ownership order (input `i`
+    /// of `n` owns tracks `1+i, 1+i+n, …`), so `/status` can attribute
+    /// each graded spot to its config entry. Grades recorded before this
+    /// call are attributed too: the rings keep raw track ids.
+    pub fn set_rbn_skew_inputs(&self, inputs: Vec<RbnSkewInput>) {
+        if let Some(rc) = self.rbn_compare.get() {
+            *rc.skew_inputs
+                .write()
+                .expect("rbn skew inputs lock poisoned") = inputs;
+        }
+    }
+
+    /// MAN-541: evaluates every band's skew against the limit and updates
+    /// the held over-limit state. Called on the comparator's tick.
+    pub fn evaluate_rbn_skew(&self) {
+        self.evaluate_rbn_skew_at(Instant::now());
+    }
+
+    pub fn evaluate_rbn_skew_at(&self, now: Instant) {
+        let Some(rc) = self.rbn_compare.get() else {
+            return;
+        };
+        let readings = {
+            let mut book = rc.grades.lock().expect("rbn_compare grades lock poisoned");
+            book.prune(now);
+            rbn_band_readings(&book)
+        };
+        let limit = rc.skew_warn_ppm();
+        let mut tracker = rc.skew.lock().expect("rbn skew lock poisoned");
+        for (band, r) in &readings {
+            tracker.observe(band, crate::rbn_compare::skew::is_over(r, limit), now);
+        }
+        tracker.retain_bands(|b| readings.iter().any(|(band, _)| *band == b));
+    }
+
+    /// MAN-541: the skew reading `/status` carries, at `now`. `None` when
+    /// comparison is off.
+    pub fn rbn_skew_snapshot_at(
+        &self,
+        now: Instant,
+    ) -> Option<crate::status_doc::RbnCompareStatus> {
+        use crate::rbn_compare::skew::{self, input_of_track, round3, Sample};
+        use crate::status_doc::{RbnCompareStatus, RbnSkewBand, RbnSkewEntry, RbnSkewReading};
+        let rc = self.rbn_compare.get()?;
+        let inputs = rc
+            .skew_inputs
+            .read()
+            .expect("rbn skew inputs lock poisoned")
+            .clone();
+        // Group the inputs by config entry, in first-appearance order.
+        let mut entries: Vec<(Option<String>, Vec<usize>)> = Vec::new();
+        for (i, input) in inputs.iter().enumerate() {
+            match entries.iter_mut().find(|(e, _)| *e == input.entry) {
+                Some((_, members)) => members.push(i),
+                None => entries.push((input.entry.clone(), vec![i])),
+            }
+        }
+        let entry_of_input: Vec<usize> = (0..inputs.len())
+            .map(|i| {
+                entries
+                    .iter()
+                    .position(|(_, members)| members.contains(&i))
+                    .expect("every input is in an entry")
+            })
+            .collect();
+
+        let (node_rows, per_entry) = {
+            let mut book = rc.grades.lock().expect("rbn_compare grades lock poisoned");
+            book.prune(now);
+            let node_rows = rbn_band_readings(&book);
+            let mut per_entry: Vec<BTreeMap<&'static str, Vec<Sample>>> =
+                vec![BTreeMap::new(); entries.len()];
+            for (band, ring) in book.offsets.iter() {
+                for (_, s) in ring {
+                    let Some(input) = s.track_id.and_then(|t| input_of_track(t, inputs.len()))
+                    else {
+                        continue;
+                    };
+                    per_entry[entry_of_input[input]]
+                        .entry(band)
+                        .or_default()
+                        .push(s.sample());
+                }
+            }
+            (node_rows, per_entry)
+        };
+        let limit = rc.skew_warn_ppm();
+        let tracker = rc.skew.lock().expect("rbn skew lock poisoned");
+        // The held state counts only while the reading served now is still
+        // over: a band whose spots aged out since the last tick (or a
+        // stopped tick) never shows a stale warning.
+        let bands = node_rows
+            .iter()
+            .map(|(band, r)| {
+                let over_now = skew::is_over(r, limit);
+                RbnSkewBand {
+                    band: (*band).to_string(),
+                    median_offset_hz: r.median_offset_hz,
+                    samples: r.samples,
+                    median_ppm: r.median_ppm.map(round3),
+                    ppm_error: r.ppm_error.map(round3),
+                    over_limit_seconds: tracker
+                        .over_for(band, now)
+                        .filter(|_| over_now)
+                        .map(|d| d.as_secs()),
+                    warning: over_now && tracker.warning(band, now),
+                }
+            })
+            .collect();
+        drop(tracker);
+
+        let inputs_rows = entries
+            .iter()
+            .zip(per_entry)
+            .map(|((entry, members), by_band)| {
+                let mut readings: Vec<(&'static str, skew::BandReading)> = by_band
+                    .into_iter()
+                    .map(|(band, samples)| (band, skew::band_reading(&samples)))
+                    .collect();
+                readings.sort_by_key(|(band, _)| crate::rbn_compare::grade::band_rank(band));
+                let pooled = skew::pooled(&readings.iter().map(|(_, r)| *r).collect::<Vec<_>>());
+                let applied_ppm = inputs[members[0]].applied_ppm;
+                RbnSkewEntry {
+                    entry: entry.clone(),
+                    names: members.iter().map(|i| inputs[*i].name.clone()).collect(),
+                    applied_ppm,
+                    replaced_by_flag: members.iter().any(|i| inputs[*i].replaced_by_flag),
+                    bands: readings
+                        .iter()
+                        .map(|(band, r)| RbnSkewReading {
+                            band: (*band).to_string(),
+                            median_offset_hz: r.median_offset_hz,
+                            samples: r.samples,
+                            median_ppm: r.median_ppm.map(round3),
+                            ppm_error: r.ppm_error.map(round3),
+                        })
+                        .collect(),
+                    observed_ppm: pooled.map(|(p, _)| round3(p)),
+                    ppm_error: pooled.map(|(_, e)| round3(e)),
+                    suggested_ppm: pooled
+                        .map(|(p, _)| skew::suggested_correction_ppm(applied_ppm, p)),
+                }
+            })
+            .collect();
+
+        Some(RbnCompareStatus {
+            window_seconds: GRADE_WINDOW.as_secs(),
+            min_samples: skew::MIN_SKEW_SAMPLES,
+            skew_warn_ppm: limit,
+            skew_hold_seconds: skew::SKEW_HOLD.as_secs(),
+            bands,
+            inputs: inputs_rows,
+        })
     }
 
     fn render_rbn_compare_at(&self, out: &mut String, now: Instant) {
@@ -1487,11 +1727,41 @@ impl Metrics {
             .iter()
             .filter(|(_, ring)| !ring.is_empty())
             .map(|(band, ring)| {
-                let mut values: Vec<i64> = ring.iter().map(|(_, o)| *o).collect();
+                let mut values: Vec<i64> = ring.iter().map(|(_, o)| o.offset_hz).collect();
                 (*band, median_of(&mut values), values.len())
             })
             .collect();
+        // MAN-541: each band's median per-spot ppm, for the same bands.
+        let ppms: Vec<(&'static str, Option<f64>)> = book
+            .offsets
+            .iter()
+            .filter(|(_, ring)| !ring.is_empty())
+            .map(|(band, ring)| {
+                let mut values: Vec<f64> = ring
+                    .iter()
+                    .filter_map(|(_, s)| crate::rbn_compare::skew::sample_ppm(&s.sample()))
+                    .collect();
+                let median = crate::rbn_compare::skew::median_f64(&mut values);
+                (*band, median.map(crate::rbn_compare::skew::round3))
+            })
+            .collect();
+        // The warning gauge agrees with `/status` and `/healthz`: held, and
+        // still over on the reading served now.
+        let readings = rbn_band_readings(&book);
         drop(book);
+        let limit = rc.skew_warn_ppm();
+        let warnings: Vec<bool> = {
+            let tracker = rc.skew.lock().expect("rbn skew lock poisoned");
+            medians
+                .iter()
+                .map(|(band, _, _)| {
+                    readings
+                        .iter()
+                        .any(|(b, r)| b == band && crate::rbn_compare::skew::is_over(r, limit))
+                        && tracker.warning(band, now)
+                })
+                .collect()
+        };
 
         out.push_str(&format!(
             "# HELP manta_rbn_compare_freq_offset_median_hz Median of manta's frequency minus RBN's modal frequency, in Hz, over spots graded match or disagree in the last {} s.\n",
@@ -1511,6 +1781,31 @@ impl Metrics {
         for (band, _, samples) in medians.iter() {
             out.push_str(&format!(
                 "manta_rbn_compare_freq_offset_samples{{band=\"{band}\"}} {samples}\n"
+            ));
+        }
+
+        out.push_str(
+            "# HELP manta_rbn_compare_freq_offset_median_ppm Median of each spot's offset from RBN's modal frequency, in parts per million of that frequency, over the spots manta_rbn_compare_freq_offset_median_hz covers. Positive: manta reads high.\n",
+        );
+        out.push_str("# TYPE manta_rbn_compare_freq_offset_median_ppm gauge\n");
+        for (band, ppm) in ppms.iter() {
+            if let Some(ppm) = ppm {
+                out.push_str(&format!(
+                    "manta_rbn_compare_freq_offset_median_ppm{{band=\"{band}\"}} {ppm}\n"
+                ));
+            }
+        }
+
+        out.push_str(&format!(
+            "# HELP manta_rbn_compare_skew_warning 1 while the band's skew has been past [rbn_compare].skew_warn_ppm for {} minutes on a reading at least {} spots strong and precise to a third of that limit, else 0.\n",
+            crate::rbn_compare::skew::SKEW_HOLD.as_secs() / 60,
+            crate::rbn_compare::skew::MIN_SKEW_SAMPLES,
+        ));
+        out.push_str("# TYPE manta_rbn_compare_skew_warning gauge\n");
+        for ((band, _, _), warning) in medians.iter().zip(&warnings) {
+            out.push_str(&format!(
+                "manta_rbn_compare_skew_warning{{band=\"{band}\"}} {}\n",
+                u8::from(*warning)
             ));
         }
 
@@ -2429,7 +2724,35 @@ impl Metrics {
         } else {
             checks.iter().all(|c| c.ok)
         };
-        HealthReport { healthy, checks }
+        HealthReport {
+            healthy,
+            checks,
+            warnings: self.rbn_skew_warnings_at(now),
+        }
+    }
+
+    /// MAN-541: one `/healthz` line per band whose skew warning is held,
+    /// in band order. Takes the comparator's locks itself.
+    fn rbn_skew_warnings_at(&self, now: Instant) -> Vec<String> {
+        let Some(snapshot) = self.rbn_skew_snapshot_at(now) else {
+            return Vec::new();
+        };
+        snapshot
+            .bands
+            .iter()
+            .filter(|b| b.warning)
+            .filter_map(|b| {
+                Some(format!(
+                    "WARN rbn skew {}: {:+.1} ppm for {} min (median {}, {} spots; limit {} ppm)",
+                    b.band,
+                    b.median_ppm?,
+                    b.over_limit_seconds? / 60,
+                    crate::rbn_compare::skew::offset_text(b.median_offset_hz),
+                    b.samples,
+                    snapshot.skew_warn_ppm,
+                ))
+            })
+            .collect()
     }
 
     pub fn render_prometheus_text(&self) -> String {
@@ -4975,6 +5298,7 @@ mod tests {
             freq_offset_hz: offset,
             rbn_bands: Vec::new(),
             spotter_filter: Vec::new(),
+            track_id: None,
         }
     }
 
@@ -4984,6 +5308,240 @@ mod tests {
                 .strip_prefix(' ')
                 .map(str::to_string)
         })
+    }
+
+    // ---- MAN-541: RBN skew ----
+
+    fn tracked(band: &'static str, offset: i64, track: u32) -> SpotGrade {
+        SpotGrade {
+            track_id: Some(track),
+            ..spot_grade(band, Grade::Match, Some(offset))
+        }
+    }
+
+    fn skew_metrics(n: usize, offset: i64, t0: Instant) -> Metrics {
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        m.set_rbn_skew_warn_ppm(2.0);
+        for _ in 0..n {
+            m.record_rbn_grade_at(&spot_grade("20m", Grade::Match, Some(offset)), t0);
+        }
+        m
+    }
+
+    /// Evaluates every 5 s from `t0` through `t0 + until`.
+    fn tick_skew(m: &Metrics, t0: Instant, until: Duration) {
+        let mut s = Duration::ZERO;
+        while s <= until {
+            m.evaluate_rbn_skew_at(t0 + s);
+            s += Duration::from_secs(5);
+        }
+    }
+
+    fn input(name: &str, entry: Option<&str>, applied_ppm: f64) -> RbnSkewInput {
+        RbnSkewInput {
+            name: name.to_string(),
+            entry: entry.map(str::to_string),
+            applied_ppm,
+            replaced_by_flag: false,
+        }
+    }
+
+    #[test]
+    fn the_ppm_gauge_is_the_median_of_per_spot_ppm() {
+        let t0 = Instant::now();
+        let m = skew_metrics(25, 42, t0);
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0);
+        assert_eq!(
+            rbn_line_value(
+                &out,
+                "manta_rbn_compare_freq_offset_median_ppm{band=\"20m\"}"
+            )
+            .as_deref(),
+            Some("2.995"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_existing_offset_gauges_render_the_same_bytes() {
+        let t0 = Instant::now();
+        let m = skew_metrics(25, 42, t0);
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0);
+        assert!(out.contains("manta_rbn_compare_freq_offset_median_hz{band=\"20m\"} 42\n"));
+        assert!(out.contains("manta_rbn_compare_freq_offset_samples{band=\"20m\"} 25\n"));
+    }
+
+    #[test]
+    fn the_skew_warning_gauge_turns_on_after_the_hold() {
+        let t0 = Instant::now();
+        let m = skew_metrics(40, 42, t0);
+        let gauge = |at: Instant| {
+            let mut out = String::new();
+            m.render_rbn_compare_at(&mut out, at);
+            rbn_line_value(&out, "manta_rbn_compare_skew_warning{band=\"20m\"}")
+        };
+        tick_skew(&m, t0, Duration::from_secs(1795));
+        assert_eq!(gauge(t0 + Duration::from_secs(1795)).as_deref(), Some("0"));
+        tick_skew(&m, t0 + Duration::from_secs(1800), Duration::ZERO);
+        assert_eq!(gauge(t0 + Duration::from_secs(1800)).as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn the_skew_warning_clears_when_spots_age_out() {
+        let t0 = Instant::now();
+        let m = skew_metrics(40, 42, t0);
+        tick_skew(&m, t0, Duration::from_secs(1800));
+        let later = t0 + GRADE_WINDOW + Duration::from_secs(1);
+        m.evaluate_rbn_skew_at(later);
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, later);
+        assert!(
+            !out.contains("manta_rbn_compare_skew_warning{"),
+            "no band left: {out}"
+        );
+        let rc = m.rbn_compare.get().unwrap();
+        assert_eq!(rc.skew.lock().unwrap().over_for("20m", later), None);
+    }
+
+    /// Review fix: the held state counts only while the reading served
+    /// now is still over, so a stopped tick cannot leave a stale warning.
+    #[test]
+    fn a_held_warning_needs_the_reading_to_still_be_over() {
+        let t0 = Instant::now();
+        let m = skew_metrics(40, 42, t0);
+        tick_skew(&m, t0, Duration::from_secs(1800));
+        let at = t0 + Duration::from_secs(1800);
+        assert!(m.rbn_skew_snapshot_at(at).unwrap().bands[0].warning);
+        // No tick after this: +3 ppm is no longer past a 5 ppm limit.
+        m.set_rbn_skew_warn_ppm(5.0);
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, at);
+        assert_eq!(
+            rbn_line_value(&out, "manta_rbn_compare_skew_warning{band=\"20m\"}").as_deref(),
+            Some("0")
+        );
+        let band = &m.rbn_skew_snapshot_at(at).unwrap().bands[0];
+        assert!(!band.warning);
+        assert_eq!(band.over_limit_seconds, None);
+        assert!(m.rbn_skew_warnings_at(at).is_empty());
+    }
+
+    #[test]
+    fn a_zero_limit_renders_warning_0() {
+        let t0 = Instant::now();
+        let m = skew_metrics(400, 420, t0);
+        m.set_rbn_skew_warn_ppm(0.0);
+        tick_skew(&m, t0, Duration::from_secs(1800));
+        let mut out = String::new();
+        m.render_rbn_compare_at(&mut out, t0 + Duration::from_secs(1800));
+        assert_eq!(
+            rbn_line_value(&out, "manta_rbn_compare_skew_warning{band=\"20m\"}").as_deref(),
+            Some("0")
+        );
+    }
+
+    #[test]
+    fn skew_attribution_follows_track_ids() {
+        let t0 = Instant::now();
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        m.set_rbn_skew_inputs(vec![input("a", Some("a"), 0.0), input("b", Some("b"), 1.5)]);
+        for _ in 0..10 {
+            for (track, offset) in [(1, 42), (3, 42), (2, -14), (4, -14)] {
+                m.record_rbn_grade_at(&tracked("20m", offset, track), t0);
+            }
+        }
+        let snap = m.rbn_skew_snapshot_at(t0).unwrap();
+        assert_eq!(snap.inputs.len(), 2);
+        let (a, b) = (&snap.inputs[0], &snap.inputs[1]);
+        assert_eq!(a.entry.as_deref(), Some("a"));
+        assert_eq!(
+            (a.bands[0].samples, a.bands[0].median_offset_hz),
+            (20, 42.0)
+        );
+        assert_eq!(b.entry.as_deref(), Some("b"));
+        assert_eq!(
+            (b.bands[0].samples, b.bands[0].median_offset_hz),
+            (20, -14.0)
+        );
+        assert_eq!(b.applied_ppm, 1.5);
+        // a reads +2.995 ppm with nothing applied: set -2.99.
+        assert_eq!(a.suggested_ppm, Some(-2.99));
+        // Node-wide, the band blends both.
+        assert_eq!(snap.bands[0].samples, 40);
+    }
+
+    #[test]
+    fn a_band_plan_pools_its_streams() {
+        let t0 = Instant::now();
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        m.set_rbn_skew_inputs(vec![
+            input("kiwi-20m", Some("kiwi"), 0.0),
+            input("kiwi-15m", Some("kiwi"), 0.0),
+        ]);
+        for _ in 0..20 {
+            m.record_rbn_grade_at(&tracked("20m", 42, 1), t0);
+            m.record_rbn_grade_at(&tracked("15m", 63, 2), t0);
+        }
+        let snap = m.rbn_skew_snapshot_at(t0).unwrap();
+        assert_eq!(snap.inputs.len(), 1);
+        let e = &snap.inputs[0];
+        assert_eq!(
+            e.names,
+            vec!["kiwi-20m".to_string(), "kiwi-15m".to_string()]
+        );
+        let bands: Vec<&str> = e.bands.iter().map(|b| b.band.as_str()).collect();
+        assert_eq!(bands, vec!["20m", "15m"], "band order, lowest first");
+        assert!(e.observed_ppm.is_some());
+    }
+
+    #[test]
+    fn grades_recorded_before_registration_are_attributed() {
+        let t0 = Instant::now();
+        let m = Metrics::new();
+        m.enable_rbn_compare();
+        for _ in 0..20 {
+            m.record_rbn_grade_at(&tracked("20m", 42, 1), t0);
+        }
+        m.set_rbn_skew_inputs(vec![input("kiwi", None, 0.0)]);
+        let snap = m.rbn_skew_snapshot_at(t0).unwrap();
+        assert_eq!(snap.inputs[0].bands[0].samples, 20);
+        assert_eq!(snap.inputs[0].entry, None);
+    }
+
+    #[test]
+    fn the_snapshot_has_no_inputs_until_registered() {
+        let t0 = Instant::now();
+        let m = Metrics::new();
+        assert!(m.rbn_skew_snapshot_at(t0).is_none(), "off: no snapshot");
+        m.enable_rbn_compare();
+        m.record_rbn_grade_at(&tracked("20m", 42, 1), t0);
+        let snap = m.rbn_skew_snapshot_at(t0).unwrap();
+        assert!(snap.inputs.is_empty());
+        assert_eq!(snap.bands.len(), 1);
+        assert_eq!(snap.bands[0].median_ppm, None, "under 20 spots");
+    }
+
+    #[test]
+    fn a_held_skew_warning_is_a_warn_line_not_unhealthy() {
+        let t0 = Instant::now();
+        let m = skew_metrics(40, 42, t0);
+        m.set_source_health("kiwi", true);
+        m.set_listener_up("json", true);
+        tick_skew(&m, t0, Duration::from_secs(1800));
+        let at = t0 + Duration::from_secs(1800);
+        let report = m.health_at(at);
+        assert!(report.healthy, "{report:?}");
+        let text = report.render_text();
+        assert!(text.starts_with("ok\n"), "{text}");
+        assert_eq!(
+            text.lines().last().unwrap(),
+            "WARN rbn skew 20m: +3.0 ppm for 30 min (median +42 Hz, 40 spots; limit 2 ppm)"
+        );
     }
 
     #[test]
@@ -5008,6 +5566,8 @@ mod tests {
             "manta_rbn_compare_disagreements_last_hour",
             "manta_rbn_compare_freq_offset_median_hz",
             "manta_rbn_compare_freq_offset_samples",
+            "manta_rbn_compare_freq_offset_median_ppm",
+            "manta_rbn_compare_skew_warning",
             "manta_rbn_compare_feed_connected",
             "manta_rbn_compare_feed_reports_total",
             "manta_rbn_compare_feed_reconnects_total",
