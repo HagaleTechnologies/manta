@@ -6,7 +6,8 @@
 // config_edit.rs. See docs/DECISIONS/2026-10-11-man127-calibrate-command.md.
 
 use crate::{
-    config, config_edit, prepare_source, CliOverrides, LiveSourceSpec, Resolved, SourcePrepared,
+    config, config_edit, prepare_source, resolve::CliOverrides, resolve::Resolved,
+    source_spec::LiveSourceSpec, SourcePrepared,
 };
 use anyhow::{bail, ensure, Result};
 use manta_engine::calibrate::{
@@ -120,7 +121,8 @@ pub(crate) fn apply_tune_hz(resolved: &mut Resolved, tune_hz: f64) -> Result<()>
         LiveSourceSpec::Soapy(soapy) => soapy.freq = Some(tune_hz),
         LiveSourceSpec::Hpsdr(hpsdr) => {
             hpsdr.freq = Some(
-                crate::check_hpsdr_freq_hz("--tune-hz", tune_hz).map_err(|e| anyhow::anyhow!(e))?,
+                crate::cli_parse::check_hpsdr_freq_hz("--tune-hz", tune_hz)
+                    .map_err(|e| anyhow::anyhow!(e))?,
             )
         }
         // MAN-140 D17: manta joins a radiod channel, it never retunes one.
@@ -462,7 +464,7 @@ pub(crate) fn run(args: CalibrateArgs) -> Result<()> {
         },
     )?;
     // MAN-309: only `run` records; say so rather than ignore it silently.
-    if let Some(note) = crate::record_iq_ignored_note("calibrate", &loaded) {
+    if let Some(note) = crate::resolve::record_iq_ignored_note("calibrate", &loaded) {
         crate::logging::note(&note);
     }
     // MAN-310: a stream of a band plan saves into the entry it came from.
@@ -739,7 +741,7 @@ mod tests {
             let path = dir.path().join("m.toml");
             std::fs::write(&path, text).unwrap();
             let mut loaded = crate::config::load(Some(&path), crate::config::Env::Ignore).unwrap();
-            crate::select_input(&mut loaded, Some(stream), "calibrate").unwrap();
+            crate::resolve::select_input(&mut loaded, Some(stream), "calibrate").unwrap();
             let target = super::save_entry_name(&loaded.inputs, Some(stream));
             assert_eq!(target.as_deref(), want);
             assert_eq!(super::entry_stream_count(&path, want), 2);
@@ -976,7 +978,7 @@ mod tests {
             dial_freq_hz: Some(7_000_000.0),
             capture_rate_hz: None,
             replay_epoch: None,
-            spot: crate::resolve_spot(
+            spot: crate::resolve::resolve_spot(
                 Vec::new(),
                 None,
                 None,
@@ -989,14 +991,14 @@ mod tests {
             callsign_lookup: None,
             notes: Vec::new(),
             replaced_file_source: None,
-            replay: crate::ReplayMode::default(),
+            replay: crate::resolve::ReplayMode::default(),
             inputs: Vec::new(),
         }
     }
 
     #[test]
     fn tune_hz_applies_to_kiwi_soapy_hpsdr_and_refuses_audio_and_file() {
-        let mut r = resolved_with(LiveSourceSpec::Kiwi(crate::KiwiOpts {
+        let mut r = resolved_with(LiveSourceSpec::Kiwi(crate::source_spec::KiwiOpts {
             host: Some("h".into()),
             port: 8073,
             freq: Some(7_030_000.0),
@@ -1009,7 +1011,7 @@ mod tests {
         }
         assert_eq!(r.dial_freq_hz, None);
         {
-            let mut r = resolved_with(LiveSourceSpec::Soapy(crate::SoapyOpts {
+            let mut r = resolved_with(LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
                 driver: Some("driver=rtlsdr".into()),
                 freq: Some(7_030_000.0),
                 rate: Some(240_000.0),
@@ -1022,7 +1024,7 @@ mod tests {
             }
         }
         {
-            let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::HpsdrOpts {
+            let mut r = resolved_with(LiveSourceSpec::Hpsdr(crate::source_spec::HpsdrOpts {
                 host: Some("h".into()),
                 mac: None,
                 port: Some(manta_input::hpsdr::CONTROL_PORT),
@@ -1052,12 +1054,12 @@ mod tests {
     /// MAN-140 D17: a radiod channel is retuned in radiod, never by manta.
     #[test]
     fn tune_hz_refuses_a_ka9q_source() {
-        let mut r = resolved_with(LiveSourceSpec::Ka9q(crate::Ka9qOpts {
+        let mut r = resolved_with(LiveSourceSpec::Ka9q(crate::source_spec::Ka9qOpts {
             group: Some("239.101.6.1".into()),
             port: 5004,
             ssrc: None,
             interface: None,
-            ..crate::Ka9qOpts::unset()
+            ..crate::source_spec::Ka9qOpts::unset()
         }));
         let e = apply_tune_hz(&mut r, 9_998_500.0).unwrap_err();
         assert_eq!(
@@ -1070,12 +1072,12 @@ mod tests {
         // `input_overrides` classifies the ka9q flags: --ka9q-group stands
         // for the three flags that require it.
         let cli = CliOverrides {
-            ka9q: crate::Ka9qOpts {
+            ka9q: crate::source_spec::Ka9qOpts {
                 group: Some("239.101.6.1".into()),
                 port: 5010,
                 ssrc: Some(14_100_000),
                 interface: None,
-                ..crate::Ka9qOpts::unset()
+                ..crate::source_spec::Ka9qOpts::unset()
             },
             ..CliOverrides::none()
         };

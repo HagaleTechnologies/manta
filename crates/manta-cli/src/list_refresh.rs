@@ -730,7 +730,7 @@ mod tests {
     const DAY: Duration = Duration::from_secs(86_400);
     const HOUR: Duration = Duration::from_secs(3600);
 
-    /// The test fixture already used in main.rs: a prefix the bundled
+    /// The test fixture already in src/test_support.rs: a prefix the bundled
     /// cty.dat does not allocate.
     const QQ9_ENTITY: &str = "Test DXpedition: 14: 27: EU: 50.0: -5.0: 0.0: QQ9:\n QQ9;\n";
 

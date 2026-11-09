@@ -262,7 +262,8 @@ mod tests {
     }
 
     /// MAN-550 (D8): `src` names the soapy feature fewer than 15 times, and
-    /// outside this file only once, in main.rs (its feature-off config test).
+    /// outside this file only once, in resolve/tests.rs (its feature-off
+    /// config test, which MAN-548 moved there from main.rs).
     #[test]
     fn only_soapy_opts_names_the_soapy_feature() {
         // Matched with whitespace stripped, so a gate spelled without spaces
@@ -283,7 +284,12 @@ mod tests {
         rs_files(&src, &mut files);
         let (mut total, mut outside) = (0, Vec::new());
         for file in &files {
-            let rel = file.strip_prefix(&src).unwrap().display().to_string();
+            let rel = file
+                .strip_prefix(&src)
+                .unwrap()
+                .display()
+                .to_string()
+                .replace('\\', "/");
             let text = std::fs::read_to_string(file).unwrap();
             for (n, line) in text.lines().enumerate() {
                 if line.split_whitespace().collect::<String>().contains(NEEDLE) {
@@ -296,7 +302,7 @@ mod tests {
         }
         assert!(total < 15, "{total} soapy feature gates in src");
         assert!(
-            outside.len() <= 1 && outside.iter().all(|at| at.starts_with("main.rs:")),
+            outside.len() <= 1 && outside.iter().all(|at| at.starts_with("resolve/tests.rs:")),
             "gate SoapySDR inside soapy_opts.rs, not at {outside:?}"
         );
     }

@@ -1,6 +1,18 @@
 //! Open and measure a source without starting the decoding pipeline.
 
 use super::*;
+use crate::cli_parse::parse_capture_rate_hz;
+use crate::cli_parse::parse_dial_freq_hz;
+use crate::cli_parse::parse_hpsdr_freq_hz;
+use crate::cli_parse::parse_hpsdr_mac;
+use crate::cli_parse::parse_hpsdr_rate_hz;
+use crate::cli_parse::parse_ka9q_group;
+use crate::resolve::CliOverrides;
+use crate::source_spec::HpsdrOpts;
+use crate::source_spec::HpsdrProtocolArg;
+use crate::source_spec::Ka9qOpts;
+use crate::source_spec::KiwiOpts;
+use crate::source_spec::LiveSourceSpec;
 use manta_engine::check::{check_source, CheckOptions, CheckReport, StopReason};
 
 #[derive(clap::Args)]
@@ -232,7 +244,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
         },
     )?;
     // MAN-309: only `run` records; say so rather than ignore it silently.
-    if let Some(note) = crate::record_iq_ignored_note("check", &loaded) {
+    if let Some(note) = crate::resolve::record_iq_ignored_note("check", &loaded) {
         crate::logging::note(&note);
     }
     let options = CheckOptions {
