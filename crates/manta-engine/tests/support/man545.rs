@@ -38,6 +38,8 @@ pub struct Item {
     /// Index of the source event in the engine's event stream (`None` for a
     /// separator).
     pub ev: Option<usize>,
+    /// The source event's `sample_ts` (0 for a separator).
+    pub ts: u64,
 }
 
 /// Each track's frequency: the last `TrackMeta`, else its `TrackPromoted`.
@@ -76,10 +78,10 @@ fn track_items(events: &[DecoderEvent], track: u32) -> Vec<Item> {
         match e {
             DecoderEvent::CharDecoded {
                 track_id,
+                sample_ts,
                 glyph,
                 confidence,
                 alternatives,
-                ..
             } if *track_id == track => {
                 if let Some(c) = text_char(glyph) {
                     out.push(Item {
@@ -91,13 +93,14 @@ fn track_items(events: &[DecoderEvent], track: u32) -> Vec<Item> {
                             .collect(),
                         track: Some(track),
                         ev: Some(i),
+                        ts: *sample_ts,
                     });
                 }
             }
             DecoderEvent::WordBoundary {
                 track_id,
+                sample_ts,
                 confidence,
-                ..
             } if *track_id == track && out.last().is_some_and(|it| it.c != ' ') => {
                 out.push(Item {
                     c: ' ',
@@ -105,6 +108,7 @@ fn track_items(events: &[DecoderEvent], track: u32) -> Vec<Item> {
                     alts: Vec::new(),
                     track: Some(track),
                     ev: Some(i),
+                    ts: *sample_ts,
                 });
             }
             _ => {}
@@ -135,6 +139,7 @@ pub fn station_items(events: &[DecoderEvent], freqs: &BTreeMap<u32, f64>, f_hz: 
                 alts: Vec::new(),
                 track: None,
                 ev: None,
+                ts: 0,
             });
         }
         out.extend(items);
@@ -314,9 +319,12 @@ impl Calibration {
     }
 }
 
-/// The substitution-unit policies (MAN-545 D4). Every one keeps legacy's
-/// tracks, track ids, timestamps and non-text events, and changes only the
-/// glyph and confidence of legacy characters.
+/// The pre-registered policies (MAN-545 D4). Every one keeps legacy's
+/// tracks, track ids and non-text events. The substitution policies change
+/// only the glyph and confidence of legacy characters; the span policies
+/// replace a whole disagreement region (D5). The duplicate-branch controls
+/// (`dup-sub`, `dup-span`) are `CalSub`/`CalSpan` given legacy as both
+/// branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Runs the fusion path and changes nothing.
@@ -330,6 +338,12 @@ pub enum Policy {
     /// Realizable: at a substitution column, the glyph with the highest
     /// summed calibrated probability; ties keep legacy.
     CalSub,
+    /// Ceiling: per region, HSMM's side when it brings the station's
+    /// transcript strictly closer to the truth; ties keep legacy.
+    OracleSpan,
+    /// Realizable: per region, HSMM's side when its mean calibrated log-odds
+    /// is strictly higher than legacy's; an empty side scores minus the other.
+    CalSpan,
 }
 
 /// One station's inputs to a fuser.
@@ -368,7 +382,7 @@ pub fn station_replacements(
 ) -> Vec<Replace> {
     let mut out = Vec::new();
     match policy {
-        Policy::Noop => {}
+        Policy::Noop | Policy::OracleSpan | Policy::CalSpan => {}
         Policy::OracleLegacyAlts => {
             for (op, li, ti) in align(&chars(st.legacy), st.truth) {
                 if op != Op::Sub {
@@ -501,6 +515,18 @@ pub fn fuse(
     stations: &[StationInput],
     cal: Option<&Calibration>,
 ) -> Vec<DecoderEvent> {
+    if matches!(policy, Policy::OracleSpan | Policy::CalSpan) {
+        let mut edits: Vec<SpanEdit> = Vec::new();
+        for st in stations {
+            for e in station_span_edits(policy, st, cal) {
+                let taken = |x: &SpanEdit| x.remove.iter().any(|r| e.remove.contains(r));
+                if !edits.iter().any(|x| x.at == e.at || taken(x)) {
+                    edits.push(e);
+                }
+            }
+        }
+        return apply_spans(legacy_events, &edits);
+    }
     let mut all: Vec<Replace> = Vec::new();
     for st in stations {
         for r in station_replacements(policy, st, cal) {
@@ -510,4 +536,263 @@ pub fn fuse(
         }
     }
     apply(legacy_events, &all)
+}
+
+/// One disagreement region (D5): a maximal run of non-matching columns in
+/// the legacy-vs-HSMM alignment, as item indices on each side, with the
+/// legacy items just before and just after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Region {
+    pub l: Vec<usize>,
+    pub h: Vec<usize>,
+    pub before: Option<usize>,
+    pub after: Option<usize>,
+}
+
+pub fn regions(left: &[Item], right: &[Item]) -> Vec<Region> {
+    let mut out = Vec::new();
+    let mut last_l: Option<usize> = None;
+    let mut cur: Option<Region> = None;
+    for (op, li, hi) in align(&chars(left), &chars(right)) {
+        if op == Op::Match {
+            if let Some(mut r) = cur.take() {
+                r.after = li;
+                out.push(r);
+            }
+            last_l = li;
+            continue;
+        }
+        let r = cur.get_or_insert_with(|| Region {
+            l: Vec::new(),
+            h: Vec::new(),
+            before: last_l,
+            after: None,
+        });
+        if let Some(i) = li {
+            r.l.push(i);
+        }
+        if let Some(j) = hi {
+            r.h.push(j);
+        }
+        if li.is_some() {
+            last_l = li;
+        }
+    }
+    out.extend(cur);
+    out
+}
+
+/// Replaces one region's legacy events with HSMM's items on a legacy track.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanEdit {
+    /// Legacy event indices removed.
+    pub remove: Vec<usize>,
+    /// The legacy event the insertion is anchored to.
+    pub at: usize,
+    /// Insert before `at` (else after it).
+    pub before: bool,
+    pub track: u32,
+    /// HSMM's items: (character or ' ', raw confidence, HSMM `sample_ts`).
+    pub insert: Vec<(char, f32, u64)>,
+}
+
+fn non_space(items: &[&Item]) -> usize {
+    items.iter().filter(|it| it.c != ' ').count()
+}
+
+/// The D5/D7 checks every span policy applies before any replacement: no
+/// separator on either side; HSMM's side holds no `?` and only finite
+/// positive confidences; a legacy `?` is kept unless HSMM's side has the
+/// same number of non-space characters; an empty legacy side needs a
+/// legacy anchor next to it. Returns the edit, or `None` to keep legacy.
+fn span_edit(st: &StationInput, r: &Region) -> Option<SpanEdit> {
+    let l: Vec<&Item> = r.l.iter().map(|&i| &st.legacy[i]).collect();
+    let h: Vec<&Item> = r.h.iter().map(|&j| &st.hsmm[j]).collect();
+    if l.iter().chain(&h).any(|it| it.c == SEPARATOR) {
+        return None;
+    }
+    if h.iter()
+        .any(|it| it.c == UNKNOWN || (it.c != ' ' && !(it.conf.is_finite() && it.conf > 0.0)))
+    {
+        return None;
+    }
+    if l.iter().any(|it| it.c == UNKNOWN) && non_space(&l) != non_space(&h) {
+        return None;
+    }
+    let real = |i: Option<usize>| i.map(|i| &st.legacy[i]).filter(|it| it.c != SEPARATOR);
+    let (at, before, track) = match l.first() {
+        Some(first) => (first.ev?, true, first.track?),
+        None => match (real(r.before), real(r.after)) {
+            (Some(b), _) => (b.ev?, false, b.track?),
+            (None, Some(a)) => (a.ev?, true, a.track?),
+            (None, None) => return None,
+        },
+    };
+    Some(SpanEdit {
+        remove: l.iter().filter_map(|it| it.ev).collect(),
+        at,
+        before,
+        track,
+        insert: h.iter().map(|it| (it.c, it.conf, it.ts)).collect(),
+    })
+}
+
+fn logit(p: f64) -> f64 {
+    (p / (1.0 - p)).ln()
+}
+
+/// `cal-span`'s score of one side: the mean calibrated log-odds of its
+/// items (winner tables); `None` for an empty side.
+fn side_score(cal: &Calibration, engine: Engine, items: &[&Item]) -> Option<f64> {
+    if items.is_empty() {
+        return None;
+    }
+    let sum: f64 = items.iter().map(|it| logit(cal.p_win(engine, it))).sum();
+    Some(sum / items.len() as f64)
+}
+
+/// Whether `cal-span` takes HSMM's side of a region.
+pub fn cal_span_takes_hsmm(cal: &Calibration, l: &[&Item], h: &[&Item]) -> bool {
+    match (
+        side_score(cal, Engine::Legacy, l),
+        side_score(cal, Engine::Hsmm, h),
+    ) {
+        (Some(sl), Some(sh)) => sh > sl,
+        (Some(sl), None) => -sl > sl,
+        (None, Some(sh)) => sh > -sh,
+        (None, None) => false,
+    }
+}
+
+/// The station transcript with one region's legacy side swapped for HSMM's.
+fn with_region(st: &StationInput, r: &Region) -> Vec<char> {
+    let first = r.l.first().copied().or(r.after).unwrap_or(st.legacy.len());
+    let mut out: Vec<char> = Vec::new();
+    let mut inserted = false;
+    for (i, it) in st.legacy.iter().enumerate() {
+        if !inserted && i == first {
+            out.extend(r.h.iter().map(|&j| st.hsmm[j].c));
+            inserted = true;
+        }
+        if !r.l.contains(&i) {
+            out.push(it.c);
+        }
+    }
+    if !inserted {
+        out.extend(r.h.iter().map(|&j| st.hsmm[j].c));
+    }
+    out
+}
+
+fn edit_distance(a: &[char], b: &[char]) -> usize {
+    align(a, b)
+        .iter()
+        .filter(|(op, _, _)| *op != Op::Match)
+        .count()
+}
+
+/// The region edits one station's span policy makes.
+pub fn station_span_edits(
+    policy: Policy,
+    st: &StationInput,
+    cal: Option<&Calibration>,
+) -> Vec<SpanEdit> {
+    let flat = Calibration::default();
+    let cal = cal.unwrap_or(&flat);
+    let base = edit_distance(&chars(st.legacy), st.truth);
+    let mut out = Vec::new();
+    for r in regions(st.legacy, st.hsmm) {
+        let Some(edit) = span_edit(st, &r) else {
+            continue;
+        };
+        let take = match policy {
+            Policy::OracleSpan => edit_distance(&with_region(st, &r), st.truth) < base,
+            Policy::CalSpan => {
+                let l: Vec<&Item> = r.l.iter().map(|&i| &st.legacy[i]).collect();
+                let h: Vec<&Item> = r.h.iter().map(|&j| &st.hsmm[j]).collect();
+                cal_span_takes_hsmm(cal, &l, &h)
+            }
+            _ => false,
+        };
+        if take {
+            out.push(edit);
+        }
+    }
+    out
+}
+
+/// Applies region edits to a legacy event stream. Inserted characters keep
+/// HSMM's glyph and raw confidence; inserted spaces become `WordBoundary`
+/// events with confidence 1.0. Each inserted event takes HSMM's
+/// `sample_ts` clamped between its track's neighbouring text events, so
+/// every track's text timestamps stay non-decreasing.
+pub fn apply_spans(events: &[DecoderEvent], edits: &[SpanEdit]) -> Vec<DecoderEvent> {
+    let removed: std::collections::BTreeSet<usize> = edits
+        .iter()
+        .flat_map(|e| e.remove.iter().copied())
+        .collect();
+    let mut out: Vec<(DecoderEvent, bool)> = Vec::new();
+    let insert = |out: &mut Vec<(DecoderEvent, bool)>, e: &SpanEdit| {
+        for &(c, conf, ts) in &e.insert {
+            let ev = if c == ' ' {
+                DecoderEvent::word_boundary(e.track, ts)
+            } else {
+                DecoderEvent::char_decoded(e.track, ts, Glyph::Char(c), conf)
+            };
+            out.push((ev, true));
+        }
+    };
+    for (i, ev) in events.iter().enumerate() {
+        for e in edits.iter().filter(|e| e.at == i && e.before) {
+            insert(&mut out, e);
+        }
+        if !removed.contains(&i) {
+            out.push((ev.clone(), false));
+        }
+        for e in edits.iter().filter(|e| e.at == i && !e.before) {
+            insert(&mut out, e);
+        }
+    }
+    clamp_inserted(out)
+}
+
+fn text_ts(ev: &mut DecoderEvent) -> Option<(u32, &mut u64)> {
+    match ev {
+        DecoderEvent::CharDecoded {
+            track_id,
+            sample_ts,
+            ..
+        }
+        | DecoderEvent::WordBoundary {
+            track_id,
+            sample_ts,
+            ..
+        } => Some((*track_id, sample_ts)),
+        _ => None,
+    }
+}
+
+fn clamp_inserted(mut out: Vec<(DecoderEvent, bool)>) -> Vec<DecoderEvent> {
+    // The next kept text event's timestamp on the same track, per position.
+    let mut next: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut hi = vec![u64::MAX; out.len()];
+    for (k, (ev, inserted)) in out.iter_mut().enumerate().rev() {
+        if let Some((track, ts)) = text_ts(ev) {
+            hi[k] = next.get(&track).copied().unwrap_or(u64::MAX);
+            if !*inserted {
+                next.insert(track, *ts);
+            }
+        }
+    }
+    let mut last: BTreeMap<u32, u64> = BTreeMap::new();
+    for (k, (ev, inserted)) in out.iter_mut().enumerate() {
+        if let Some((track, ts)) = text_ts(ev) {
+            let lo = last.get(&track).copied().unwrap_or(0);
+            if *inserted {
+                *ts = (*ts).clamp(lo, hi[k].max(lo));
+            }
+            last.insert(track, (*ts).max(lo));
+        }
+    }
+    out.into_iter().map(|(ev, _)| ev).collect()
 }

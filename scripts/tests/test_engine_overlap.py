@@ -3,7 +3,9 @@ Covers bench mode (`manta bench sensitivity --json` reports) and oracle mode (`m
 --jsonl` files): the 2x2 and every rate, headroom as the smaller one-sided count, the strict
 copy threshold, paired false identities, pairing and every refusal, the golden Markdown, the
 JSON numbers, the fusion gate's `>=` bar, bootstrap determinism, the committed real-format
-fixtures, and this module's CI step and CLAUDE.md pre-push entry.
+fixtures, and this module's CI step and CLAUDE.md pre-push entry. MAN-545 adds fusion mode: the
+oracle gap a fused report recovers, gains and losses by origin, regressions above +10 dB, false
+identities, the adoption gate, its bootstrap and refusals, and its golden Markdown.
 
 stdlib unittest only. Run: python3 -m unittest scripts.tests.test_engine_overlap -v
 

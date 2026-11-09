@@ -79,11 +79,22 @@ fn fused_with(
     text(&items(&fuse(policy, legacy, &[st], cal)))
 }
 
+/// The substitution-unit policies.
 const ALL: [Policy; 4] = [
     Policy::Noop,
     Policy::OracleLegacyAlts,
     Policy::OracleSub,
     Policy::CalSub,
+];
+
+/// Every policy, the span unit included.
+const EVERY: [Policy; 6] = [
+    Policy::Noop,
+    Policy::OracleLegacyAlts,
+    Policy::OracleSub,
+    Policy::CalSub,
+    Policy::OracleSpan,
+    Policy::CalSpan,
 ];
 
 #[test]
@@ -147,8 +158,9 @@ fn duplicate_branch_changes_nothing_sub() {
 fn unknown_span_is_never_erased() {
     let legacy = track(1, F_HZ, "CQ DE W1?AW W1?AW K", 0.4, &[]);
     let hsmm = track(1, F_HZ, "CQ DE W1AW W1AW K", 0.9, &[]);
-    for policy in ALL {
-        let out = fused(policy, &legacy, &hsmm, "CQ DE W1AW W1AW K");
+    let cal = tables(0.4, 0.9);
+    for policy in EVERY {
+        let out = fused_with(policy, &legacy, &hsmm, "CQ DE W1AW W1AW K", Some(&cal));
         assert_eq!(out, "CQ DE W1?AW W1?AW K", "{policy:?}");
     }
     // A `?` aligned against a real HSMM glyph is kept too.
@@ -163,8 +175,10 @@ fn unknown_span_is_never_erased() {
 fn question_mark_never_replaces_a_glyph() {
     let legacy = track(1, F_HZ, "W1AW", 0.2, &[(2, vec![('?', 0.1)])]);
     let hsmm = track(1, F_HZ, "W1?W", 0.9, &[]);
-    for policy in ALL {
-        assert_eq!(fused(policy, &legacy, &hsmm, "W1?W"), "W1AW", "{policy:?}");
+    let cal = tables(0.2, 0.9);
+    for policy in EVERY {
+        let out = fused_with(policy, &legacy, &hsmm, "W1?W", Some(&cal));
+        assert_eq!(out, "W1AW", "{policy:?}");
     }
 }
 
@@ -306,6 +320,7 @@ fn calibration_cross_fit_excludes_the_held_out_trial() {
         alts: Vec::new(),
         track: Some(1),
         ev: Some(0),
+        ts: 0,
     };
     // k = 3 of n = 4 in bin 10: (3 + 1) / (4 + 2).
     assert_eq!(cal.p_win(Engine::Legacy, &item(0.5)), 4.0 / 6.0);
@@ -365,4 +380,160 @@ fn rbn_correction_matches_the_bench_widening() {
     assert_eq!(RBN_CORR_DB, 6.989_7_f32 as f64);
     assert_ne!(RBN_CORR_DB, 6.989_7);
     assert_eq!(MATCH_HZ, 150.0);
+}
+
+#[test]
+fn regions_never_cross_a_track_separator() {
+    let mut legacy = track(1, F_HZ, "CQ", 0.1, &[]);
+    legacy.extend(track(2, F_HZ + 50.0, "DE", 0.1, &[]));
+    let hsmm = track(5, F_HZ, "CQXDE", 0.9, &[]);
+    let (l, h) = (items(&legacy), items(&hsmm));
+    assert_eq!(text(&l), "CQ\nDE");
+    let rs = regions(&l, &h);
+    assert_eq!(rs.len(), 1);
+    assert_eq!(chars(&l)[rs[0].l[0]], SEPARATOR);
+    // The region holds the separator, so no span policy replaces it.
+    let cal = tables(0.1, 0.9);
+    for policy in [Policy::OracleSpan, Policy::CalSpan] {
+        let out = fused_with(policy, &legacy, &hsmm, "CQXDE", Some(&cal));
+        assert_eq!(out, "CQ\nDE", "{policy:?}");
+    }
+}
+
+#[test]
+fn duplicate_branch_changes_nothing_span() {
+    let legacy = track(
+        1,
+        F_HZ,
+        "CQ DE W1?XW W1AW KK",
+        0.4,
+        &[(8, vec![('A', 0.1)])],
+    );
+    let (l, t) = (items(&legacy), normalize("CQ DE W1AW W1AW K"));
+    for cal in [Calibration::default(), tables(0.1, 0.4)] {
+        for policy in [Policy::OracleSpan, Policy::CalSpan] {
+            let st = StationInput {
+                legacy: &l,
+                hsmm: &l,
+                truth: &t,
+            };
+            let out = fuse(policy, &legacy, &[st], Some(&cal));
+            assert_eq!(bytes(&out), bytes(&legacy), "{policy:?}");
+        }
+    }
+}
+
+#[test]
+fn cal_span_rules() {
+    let cal = tables(0.1, 0.9);
+    // A strictly better HSMM side replaces legacy's, insertions included.
+    let legacy = track(1, F_HZ, "W1EEW K", 0.1, &[]);
+    let hsmm = track(1, F_HZ, "W1AW K", 0.9, &[]);
+    assert_eq!(
+        fused_with(Policy::CalSpan, &legacy, &hsmm, "", Some(&cal)),
+        "W1AW K"
+    );
+    // Equal scores keep legacy.
+    let legacy = track(1, F_HZ, "W1EEW K", 0.9, &[]);
+    assert_eq!(
+        fused_with(Policy::CalSpan, &legacy, &hsmm, "", Some(&cal)),
+        "W1EEW K"
+    );
+    // An empty legacy side takes HSMM's characters when they are likely right.
+    let legacy = track(1, F_HZ, "W1W K", 0.9, &[]);
+    assert_eq!(
+        fused_with(Policy::CalSpan, &legacy, &hsmm, "", Some(&cal)),
+        "W1AW K"
+    );
+    // An empty HSMM side deletes legacy's characters only when they are
+    // more likely wrong than right, and never a `?`.
+    let hsmm = track(1, F_HZ, "W1W K", 0.9, &[]);
+    let likely_wrong = track(1, F_HZ, "W1AW K", 0.1, &[]);
+    let likely_right = track(1, F_HZ, "W1AW K", 0.9, &[]);
+    let unknown = track(1, F_HZ, "W1?W K", 0.1, &[]);
+    let fuse_cal = |l: &[DecoderEvent]| fused_with(Policy::CalSpan, l, &hsmm, "", Some(&cal));
+    assert_eq!(fuse_cal(&likely_wrong), "W1W K");
+    assert_eq!(fuse_cal(&likely_right), "W1AW K");
+    assert_eq!(fuse_cal(&unknown), "W1?W K");
+}
+
+#[test]
+fn span_replacement_keeps_track_timestamps_non_decreasing() {
+    let cal = tables(0.1, 0.9);
+    let legacy = track(3, F_HZ, "CQ W1EEW K", 0.1, &[]);
+    // HSMM's timestamps run far ahead of legacy's: they must be clamped.
+    let mut hsmm = track(9, F_HZ, "CQ W1AW K", 0.9, &[]);
+    for e in &mut hsmm {
+        if let DecoderEvent::CharDecoded { sample_ts, .. } = e {
+            *sample_ts *= 50;
+        }
+    }
+    let (l, h, t) = (items(&legacy), items(&hsmm), normalize("CQ W1AW K"));
+    let st = StationInput {
+        legacy: &l,
+        hsmm: &h,
+        truth: &t,
+    };
+    for policy in [Policy::CalSpan, Policy::OracleSpan] {
+        let out = fuse(policy, &legacy, &[st_clone(&st)], Some(&cal));
+        assert_eq!(text(&items(&out)), "CQ W1AW K", "{policy:?}");
+        let ts: Vec<u64> = out
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    ..
+                }
+                | DecoderEvent::WordBoundary {
+                    track_id,
+                    sample_ts,
+                    ..
+                } => {
+                    assert_eq!(*track_id, 3, "inserted events carry the legacy track");
+                    Some(*sample_ts)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+        assert!(out.iter().all(|e| match e {
+            DecoderEvent::CharDecoded { confidence, .. } => *confidence > 0.0,
+            _ => true,
+        }));
+    }
+}
+
+fn st_clone<'a>(st: &StationInput<'a>) -> StationInput<'a> {
+    StationInput {
+        legacy: st.legacy,
+        hsmm: st.hsmm,
+        truth: st.truth,
+    }
+}
+
+#[test]
+fn oracle_span_prefers_the_closer_side_and_ties_to_legacy() {
+    let legacy = track(1, F_HZ, "W1EEW K", 0.9, &[]);
+    let hsmm = track(1, F_HZ, "W1AW K", 0.1, &[]);
+    assert_eq!(
+        fused(Policy::OracleSpan, &legacy, &hsmm, "W1AW K"),
+        "W1AW K"
+    );
+    // HSMM's side is as close (a tie) or farther: keep legacy.
+    for side in ["W1IIW K", "W1IIIW K"] {
+        let hsmm = track(1, F_HZ, side, 0.9, &[]);
+        assert_eq!(
+            fused(Policy::OracleSpan, &legacy, &hsmm, "W1AW K"),
+            "W1EEW K",
+            "{side}"
+        );
+    }
+    let hsmm = track(1, F_HZ, "W1IW K", 0.9, &[]);
+    // Legacy already right: unchanged.
+    let legacy = track(1, F_HZ, "W1AW K", 0.1, &[]);
+    assert_eq!(
+        fused(Policy::OracleSpan, &legacy, &hsmm, "W1AW K"),
+        "W1AW K"
+    );
 }
