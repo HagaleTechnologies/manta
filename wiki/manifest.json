@@ -326,7 +326,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f16a9caad035f19d9045edacdd8ca5e54febe3f7ff2719ee7b6d513e3da8c7db",
+      "hash": "sha256:01886833aad16b7c670218d5120c825166c7eaed4b330e38cc9419812c552b1d",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -346,7 +346,8 @@
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
         "docs/DECISIONS/2026-11-02-man201-callsign-roles.md",
-        "docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md"
+        "docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md",
+        "docs/DECISIONS/2026-11-09-man531-blocklisted-variant-support.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",
