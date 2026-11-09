@@ -571,3 +571,94 @@ fn span_policy_replaces_a_question_mark_only_one_for_one() {
         "W?AW"
     );
 }
+
+fn keys(v: &serde_json::Value) -> Vec<String> {
+    let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+    k.sort();
+    k
+}
+
+#[test]
+fn bench_json_has_the_cli_schema() {
+    let fixture: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/tests/fixtures/engine-overlap/bench-legacy.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let station = Station {
+        trial: 0,
+        call: "W1AW".into(),
+        offset_hz: -36_000.0,
+        freq_hz: 13_964_000.0,
+        keyed_text: "CQ CQ DE W1AW W1AW K".into(),
+    };
+    let mut point = PointResult::new(
+        manta_testkit::sensitivity::Condition::WattersonGood,
+        25,
+        12.0,
+    );
+    point.add(score_point(std::slice::from_ref(&station), None));
+    let ours: serde_json::Value = serde_json::from_str(&render_bench_json(
+        "fused:noop",
+        "cargo test",
+        60,
+        1,
+        1,
+        &[point],
+    ))
+    .unwrap();
+    assert_eq!(keys(&ours), keys(&fixture));
+    let (p, fp) = (&ours["points"][0], &fixture["points"][0]);
+    assert_eq!(keys(p), keys(fp));
+    assert_eq!(keys(&p["per_station"][0]), keys(&fp["per_station"][0]));
+    assert_eq!(ours["report"], "manta bench sensitivity");
+    assert_eq!(ours["format_version"], 1);
+    assert_eq!(ours["snr_ref_hz"], 500);
+    assert_eq!(ours["engine"], "fused:noop");
+    assert!(ours["config_file"].is_null());
+    // The bench's 500 Hz to 2500 Hz shift, widened from f32 as the bench does.
+    assert_eq!(p["snr_2500_db"], 12.0 - f64::from(6.989_7_f32));
+    // No decode: every station unspotted with CER 1, as the bench scores it.
+    assert_eq!(p["spotted"], 0);
+    assert_eq!(p["per_station"][0]["cer"], 1.0);
+}
+
+#[test]
+fn calibration_json_round_trips() {
+    let labels = [
+        (
+            0,
+            Engine::Legacy,
+            Label::WinChar {
+                conf: 0.3,
+                right: true,
+            },
+        ),
+        (
+            0,
+            Engine::Hsmm,
+            Label::Alt {
+                mass: 0.05,
+                right: false,
+            },
+        ),
+        (
+            1,
+            Engine::Hsmm,
+            Label::WinSpace {
+                conf: 1.0,
+                right: true,
+            },
+        ),
+    ];
+    let cal = Calibration::fit(&labels, None);
+    assert_eq!(calibration_from_json(&calibration_to_json(&cal)), Ok(cal));
+    assert!(calibration_from_json("{\"bins\": 10, \"engines\": {}}").is_err());
+    // Both engines are required, so a truncated file cannot silently
+    // fall back to flat tables for one of them.
+    let legacy_only = Calibration::fit(&labels[..1], None);
+    assert!(calibration_from_json(&calibration_to_json(&legacy_only)).is_err());
+}

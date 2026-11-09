@@ -806,3 +806,345 @@ fn clamp_inserted(mut out: Vec<(DecoderEvent, bool)>) -> Vec<DecoderEvent> {
     }
     out.into_iter().map(|(ev, _)| ev).collect()
 }
+
+// Bench scoring and the bench-format report, mirroring
+// `crates/manta-cli/src/bench.rs` (`score_point`, `PointResult`,
+// `render_json`). `Station`, `StationScore` and `score_point` are
+// `pub(crate)` in the bin-only `manta-cli`, so the instrument carries its
+// own copy. No CI test compares the two: the plan's Phase 3 slice parity
+// check, run by hand and quoted in the MAN-545 decision record, does.
+
+/// The bench's good-copy CER bar (`bench.rs` `GOOD_COPY_CER`).
+pub const GOOD_COPY_CER: f64 = 0.10;
+
+/// One transmitting station of one trial (`bench.rs` `Station`).
+#[derive(Debug, Clone)]
+pub struct Station {
+    pub trial: u32,
+    pub call: String,
+    pub offset_hz: f64,
+    pub freq_hz: f64,
+    /// What the keyer actually sent over the whole recording.
+    pub keyed_text: String,
+}
+
+/// One station's score at one point, serialized as the bench serializes it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct StationScore {
+    pub trial: u32,
+    pub call: String,
+    pub offset_hz: f64,
+    pub spotted: bool,
+    pub spots: usize,
+    pub first_spot_s: Option<f64>,
+    /// Mean SNR of the correct spots, in 500 Hz.
+    pub spot_snr_db: Option<f64>,
+    /// Capped at 1.
+    pub cer: f64,
+}
+
+/// One decode's score.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointScore {
+    pub stations: Vec<StationScore>,
+    pub bogus_calls: std::collections::BTreeSet<String>,
+}
+
+/// The bench's mean: a `sum / n` fold, `None` when empty.
+fn mean(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (sum, n) = values.fold((0.0, 0usize), |(s, n), v| (s + v, n + 1));
+    (n > 0).then(|| sum / n as f64)
+}
+
+fn event_track_id(e: &DecoderEvent) -> u32 {
+    match e {
+        DecoderEvent::CharDecoded { track_id, .. }
+        | DecoderEvent::WordBoundary { track_id, .. }
+        | DecoderEvent::SpeedUpdate { track_id, .. }
+        | DecoderEvent::TrackMeta { track_id, .. }
+        | DecoderEvent::ReadingsHeld { track_id, .. }
+        | DecoderEvent::TimingUpdate { track_id, .. }
+        | DecoderEvent::TrackPromoted { track_id, .. }
+        | DecoderEvent::TrackClosed { track_id, .. } => *track_id,
+    }
+}
+
+/// Scores one decode (`None`: the engine found no signal) against the
+/// stations that were sent, exactly as `bench.rs` `score_point` does.
+pub fn score_point(
+    stations: &[Station],
+    decoded: Option<(&[DecoderEvent], &[manta_spot::Spot])>,
+) -> PointScore {
+    use manta_testkit::sensitivity::SAMPLE_RATE_HZ;
+    let Some((events, spots)) = decoded else {
+        return PointScore {
+            stations: stations
+                .iter()
+                .map(|st| StationScore {
+                    trial: st.trial,
+                    call: st.call.clone(),
+                    offset_hz: st.offset_hz,
+                    spotted: false,
+                    spots: 0,
+                    first_spot_s: None,
+                    spot_snr_db: None,
+                    cer: 1.0,
+                })
+                .collect(),
+            bogus_calls: Default::default(),
+        };
+    };
+    let mut meta_freq: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut promoted_freq: BTreeMap<u32, f64> = BTreeMap::new();
+    let mut track_events: BTreeMap<u32, Vec<DecoderEvent>> = BTreeMap::new();
+    for ev in events {
+        let id = event_track_id(ev);
+        match ev {
+            DecoderEvent::TrackMeta { freq_hz, .. } => {
+                meta_freq.insert(id, *freq_hz);
+            }
+            DecoderEvent::TrackPromoted { freq_hz, .. } => {
+                promoted_freq.insert(id, *freq_hz);
+            }
+            _ => {}
+        }
+        track_events.entry(id).or_default().push(ev.clone());
+    }
+    let tracks: Vec<(u64, f64, String)> = track_events
+        .iter()
+        .filter_map(|(id, evs)| {
+            let freq = meta_freq.get(id).or_else(|| promoted_freq.get(id))?;
+            Some((
+                *id as u64,
+                *freq,
+                manta_decode::decoder::events_to_text(evs),
+            ))
+        })
+        .collect();
+    let track_refs: Vec<(u64, f64, &str)> = tracks
+        .iter()
+        .map(|(id, freq, text)| (*id, *freq, text.as_str()))
+        .collect();
+    let is_correct = |st: &Station, call: &str, freq_hz: f64| {
+        call == st.call && (freq_hz - st.freq_hz).abs() <= MATCH_HZ
+    };
+    let scores = stations
+        .iter()
+        .map(|st| {
+            let cer =
+                manta_testkit::cer::joined_cer(&st.keyed_text, &track_refs, st.freq_hz, MATCH_HZ)
+                    .min(1.0);
+            let correct: Vec<_> = spots
+                .iter()
+                .filter(|sp| is_correct(st, &sp.callsign, sp.freq_hz))
+                .collect();
+            StationScore {
+                trial: st.trial,
+                call: st.call.clone(),
+                offset_hz: st.offset_hz,
+                spotted: !correct.is_empty(),
+                spots: correct.len(),
+                first_spot_s: correct
+                    .iter()
+                    .map(|sp| sp.sample_ts)
+                    .min()
+                    .map(|ts| ts as f64 / SAMPLE_RATE_HZ),
+                spot_snr_db: mean(correct.iter().map(|sp| sp.snr_db as f64 + RBN_CORR_DB)),
+                cer,
+            }
+        })
+        .collect();
+    let bogus_calls = spots
+        .iter()
+        .filter(|sp| {
+            !stations
+                .iter()
+                .any(|st| is_correct(st, &sp.callsign, sp.freq_hz))
+        })
+        .map(|sp| sp.callsign.clone())
+        .collect();
+    PointScore {
+        stations: scores,
+        bogus_calls,
+    }
+}
+
+/// One bench point, pooled over every trial (`bench.rs` `PointResult`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PointResult {
+    pub condition: manta_testkit::sensitivity::Condition,
+    pub wpm: u32,
+    /// 500 Hz.
+    pub snr_db: f64,
+    pub stations: Vec<StationScore>,
+    /// Each trial's distinct bogus calls, pooled and sorted.
+    pub bogus_calls: Vec<String>,
+}
+
+impl PointResult {
+    pub fn new(condition: manta_testkit::sensitivity::Condition, wpm: u32, snr_db: f64) -> Self {
+        PointResult {
+            condition,
+            wpm,
+            snr_db,
+            stations: Vec::new(),
+            bogus_calls: Vec::new(),
+        }
+    }
+
+    /// Pools one trial's score into this point.
+    pub fn add(&mut self, score: PointScore) {
+        self.stations.extend(score.stations);
+        self.bogus_calls.extend(score.bogus_calls);
+        self.bogus_calls.sort();
+    }
+
+    pub fn spotted(&self) -> usize {
+        self.stations.iter().filter(|s| s.spotted).count()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct JsonReport<'a> {
+    report: &'static str,
+    format_version: u32,
+    manta_version: &'static str,
+    engine: &'a str,
+    config_file: Option<&'a str>,
+    command: &'a str,
+    snr_ref_hz: u32,
+    sample_rate_hz: u32,
+    center_freq_hz: u64,
+    stations_per_trial: usize,
+    duration_s: u32,
+    trials: u32,
+    seed: u64,
+    payload: &'static str,
+    match_hz: u32,
+    points: Vec<JsonPoint<'a>>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonPoint<'a> {
+    condition: &'static str,
+    wpm: u32,
+    snr_db: f64,
+    snr_2500_db: f64,
+    stations: usize,
+    spotted: usize,
+    bogus_calls: &'a [String],
+    cer_mean: f64,
+    good_copy: usize,
+    spot_snr_db: Option<f64>,
+    per_station: &'a [StationScore],
+}
+
+/// One `manta bench sensitivity --json` line (no trailing newline) for
+/// `engine`, with `config_file: null`. Keys and values follow
+/// `bench.rs` `render_json`.
+pub fn render_bench_json(
+    engine: &str,
+    command: &str,
+    duration_s: u32,
+    trials: u32,
+    seed: u64,
+    points: &[PointResult],
+) -> String {
+    use manta_testkit::sensitivity as s;
+    let report = JsonReport {
+        report: "manta bench sensitivity",
+        format_version: 1,
+        manta_version: env!("CARGO_PKG_VERSION"),
+        engine,
+        config_file: None,
+        command,
+        snr_ref_hz: 500,
+        sample_rate_hz: s::SAMPLE_RATE_HZ as u32,
+        center_freq_hz: s::CENTER_FREQ_HZ as u64,
+        stations_per_trial: s::STATIONS_PER_RECORDING,
+        duration_s,
+        trials,
+        seed,
+        payload: s::PAYLOAD_TEMPLATE,
+        match_hz: MATCH_HZ as u32,
+        points: points
+            .iter()
+            .map(|p| JsonPoint {
+                condition: p.condition.name(),
+                wpm: p.wpm,
+                snr_db: p.snr_db,
+                snr_2500_db: p.snr_db - RBN_CORR_DB,
+                stations: p.stations.len(),
+                spotted: p.spotted(),
+                bogus_calls: &p.bogus_calls,
+                cer_mean: mean(p.stations.iter().map(|s| s.cer)).unwrap_or(1.0),
+                good_copy: p.stations.iter().filter(|s| s.cer < GOOD_COPY_CER).count(),
+                spot_snr_db: mean(p.stations.iter().filter_map(|s| s.spot_snr_db)),
+                per_station: &p.stations,
+            })
+            .collect(),
+    };
+    serde_json::to_string(&report).expect("a bench report always serializes")
+}
+
+/// `calibration.json`: per engine, the three tables as `[k, n]` per bin.
+pub fn calibration_to_json(cal: &Calibration) -> String {
+    let engines: serde_json::Map<String, serde_json::Value> = cal
+        .tables
+        .iter()
+        .map(|(e, t)| {
+            let name = match e {
+                Engine::Legacy => "legacy",
+                Engine::Hsmm => "hsmm",
+            };
+            let table = |i: usize| {
+                serde_json::Value::from(t[i].iter().map(|&(k, n)| vec![k, n]).collect::<Vec<_>>())
+            };
+            (
+                name.to_string(),
+                serde_json::json!({"win_char": table(0), "win_space": table(1), "alt": table(2)}),
+            )
+        })
+        .collect();
+    serde_json::json!({"bins": BINS, "engines": engines}).to_string()
+}
+
+/// Reads [`calibration_to_json`]'s output back (`MAN545_CALIBRATION`).
+pub fn calibration_from_json(text: &str) -> Result<Calibration, String> {
+    let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if v["bins"].as_u64() != Some(BINS as u64) {
+        return Err(format!("calibration needs \"bins\": {BINS}"));
+    }
+    let engines = v["engines"].as_object().ok_or("no \"engines\" object")?;
+    let mut tables = BTreeMap::new();
+    for (name, t) in engines {
+        let engine = match name.as_str() {
+            "legacy" => Engine::Legacy,
+            "hsmm" => Engine::Hsmm,
+            other => return Err(format!("unknown engine {other:?}")),
+        };
+        let mut out = [[(0u64, 0u64); BINS]; 3];
+        for (i, key) in ["win_char", "win_space", "alt"].iter().enumerate() {
+            let rows = t[*key]
+                .as_array()
+                .filter(|r| r.len() == BINS)
+                .ok_or_else(|| format!("{name}.{key} needs {BINS} bins"))?;
+            for (b, row) in rows.iter().enumerate() {
+                let pair = row.as_array().filter(|r| r.len() == 2);
+                let (k, n) = match pair {
+                    Some(r) => (r[0].as_u64(), r[1].as_u64()),
+                    None => (None, None),
+                };
+                match (k, n) {
+                    (Some(k), Some(n)) if k <= n => out[i][b] = (k, n),
+                    _ => return Err(format!("{name}.{key}[{b}] needs [k, n] with k <= n")),
+                }
+            }
+        }
+        tables.insert(engine, out);
+    }
+    if tables.len() != 2 {
+        return Err("calibration needs both \"legacy\" and \"hsmm\"".to_string());
+    }
+    Ok(Calibration { tables })
+}
