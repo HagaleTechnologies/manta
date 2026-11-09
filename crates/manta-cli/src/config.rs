@@ -123,6 +123,8 @@ const STRING_TYPED_ENV_KEYS: &[(&str, &str)] = &[
     ("spot", "list_cache_dir"),
     ("spot", "cty_url"),
     ("spot", "scp_url"),
+    // MAN-542.
+    ("spot", "pattern_url"),
     ("spot", "cty_sha256"),
     ("spot", "scp_sha256"),
     ("spot", "pattern_path"),
@@ -325,6 +327,10 @@ pub(crate) struct SpotFile {
     /// `http://` URL at load. See [`SpotFile::cty_url`].
     pub cty_url: Option<String>,
     pub scp_url: Option<String>,
+    /// MAN-542: where `refresh_lists` downloads the callsign-pattern list.
+    /// No default: unset, the pattern list is never downloaded. An
+    /// `http://` URL, checked at load like `cty_url`.
+    pub pattern_url: Option<String>,
     /// MAN-316: a pinned list version, validated and lowercased by
     /// [`parse_sha256`] at load.
     pub cty_sha256: Option<String>,
@@ -361,6 +367,7 @@ struct SpotToml {
     list_cache_dir: Option<PathBuf>,
     cty_url: Option<String>,
     scp_url: Option<String>,
+    pattern_url: Option<String>,
     cty_sha256: Option<String>,
     scp_sha256: Option<String>,
     pattern_path: Option<PathBuf>,
@@ -1078,6 +1085,7 @@ pub(crate) fn load(path: Option<&Path>, env: Env<'_>) -> Result<Loaded> {
             .map(|p| resolve_path("spot", "list_cache_dir", p)),
         cty_url: check_list_url("cty_url", spot_toml.cty_url).map_err(&spot_err)?,
         scp_url: check_list_url("scp_url", spot_toml.scp_url).map_err(&spot_err)?,
+        pattern_url: check_list_url("pattern_url", spot_toml.pattern_url).map_err(&spot_err)?,
         cty_sha256: check_pin("cty_sha256", spot_toml.cty_sha256).map_err(&spot_err)?,
         scp_sha256: check_pin("scp_sha256", spot_toml.scp_sha256).map_err(&spot_err)?,
         pattern_path: spot_toml
@@ -4429,6 +4437,57 @@ mod tests {
         assert_eq!(
             loaded.raw["spot"]["list_cache_dir"],
             toml::Value::String("2026".into())
+        );
+    }
+
+    #[test]
+    fn pattern_url_has_no_default_and_parses_from_file_and_environment() {
+        assert_eq!(load_file("[spot]\n").unwrap().spot.pattern_url, None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manta.toml");
+        std::fs::write(
+            &path,
+            "[spot]\npattern_url = \"http://mirror.lan/Patt3Ch.lst\"\n",
+        )
+        .unwrap();
+        let spot = load(Some(&path), Env::Ignore).unwrap().spot;
+        assert_eq!(
+            spot.pattern_url.as_deref(),
+            Some("http://mirror.lan/Patt3Ch.lst")
+        );
+        let v = vars(&[("MANTA_SPOT_PATTERN_URL", "http://10.0.0.1:8080/patt3ch.lst")]);
+        let loaded = load(Some(&path), Env::Read(&v)).unwrap();
+        assert_eq!(
+            loaded.spot.pattern_url.as_deref(),
+            Some("http://10.0.0.1:8080/patt3ch.lst"),
+            "the environment wins over the file"
+        );
+    }
+
+    #[test]
+    fn pattern_url_must_be_http() {
+        let url = "https://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst";
+        let f = write_cfg(&format!("[spot]\npattern_url = \"{url}\"\n"));
+        let err = format!("{:#}", load(Some(f.path()), Env::Ignore).unwrap_err());
+        assert_eq!(
+            err,
+            format!(
+                "{}: [spot]: pattern_url must be an http:// URL (manta has no TLS support), got \
+                 \"{url}\"",
+                f.path().display()
+            )
+        );
+        let err = format!(
+            "{:#}",
+            load_env(None, &[("MANTA_SPOT_PATTERN_URL", url)]).unwrap_err()
+        );
+        assert!(
+            err.starts_with("environment: [spot]: pattern_url must be"),
+            "{err}"
+        );
+        assert!(
+            err.ends_with("(environment: MANTA_SPOT_PATTERN_URL)"),
+            "{err}"
         );
     }
 

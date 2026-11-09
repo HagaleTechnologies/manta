@@ -12,6 +12,7 @@ pub(crate) fn bundled_reference_lists() -> std::sync::Arc<manta_spot::reference:
     std::sync::Arc::new(manta_spot::reference::ReferenceLists::new(
         std::sync::Arc::new(manta_spot::cty::Table::bundled()),
         std::sync::Arc::new(manta_spot::scp::Set::bundled()),
+        std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
     ))
 }
 

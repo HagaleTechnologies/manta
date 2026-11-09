@@ -1694,6 +1694,13 @@ impl Validator {
         self.scp = scp;
     }
 
+    /// MAN-542: replaces the pattern table for a scheduled list refresh.
+    /// Tracks, repetition counts and `suppression_counts` are untouched; the
+    /// new tiers apply from the next evaluation.
+    pub fn replace_patterns(&mut self, patterns: Arc<pattern::Table>) {
+        self.patterns = patterns;
+    }
+
     /// Per-reason counts of operator-suppressed spots so far (MAN-31,
     /// ARCHITECTURE §8).
     pub fn suppression_counts(&self) -> SuppressionCounts {
@@ -5010,6 +5017,29 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert!(spots.is_empty(), "got {spots:?}");
         let with_qq9 = cty::Table::parse(&format!("{}{QQ9_ENTITY}", crate::CTY_DAT));
         v.replace_reference_tables(Arc::new(with_qq9), Some(scp));
+        let mut spots = run(&transmission_events(2, &words, 200_000), &mut v);
+        spots.extend(run(&transmission_events(2, &words, 300_000), &mut v));
+        assert_eq!(spots.len(), 1, "got {spots:?}");
+        assert_eq!(spots[0].callsign, "QQ9ZZZ");
+        assert_eq!(spots[0].track_id, 2);
+    }
+
+    #[test]
+    fn replaced_pattern_table_lowers_the_repetition_bar() {
+        // QQ9@@@ is unlisted in the bundled patterns: five repetitions.
+        let with_qq9 = cty::Table::parse(&format!("{}{QQ9_ENTITY}", crate::CTY_DAT));
+        let mut v =
+            Validator::from_tables(FS, Arc::new(with_qq9), Some(Arc::new(scp::Set::bundled())))
+                .with_patterns(Arc::new(pattern::Table::bundled()));
+        seed_meta(&mut v, 1);
+        seed_meta(&mut v, 2);
+        let words = ["CQ", "DE", "QQ9ZZZ", "QQ9ZZZ", "K"];
+        let mut spots = run(&transmission_events(1, &words, 0), &mut v);
+        spots.extend(run(&transmission_events(1, &words, 100_000), &mut v));
+        assert!(spots.is_empty(), "got {spots:?}");
+        let before = v.suppression_counts();
+        v.replace_patterns(Arc::new(pattern::Table::parse("+QQ9@@@\n").unwrap()));
+        assert_eq!(v.suppression_counts(), before);
         let mut spots = run(&transmission_events(2, &words, 200_000), &mut v);
         spots.extend(run(&transmission_events(2, &words, 300_000), &mut v));
         assert_eq!(spots.len(), 1, "got {spots:?}");

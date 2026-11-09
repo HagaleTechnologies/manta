@@ -1440,6 +1440,7 @@ fn spec_documents_every_input_and_spot_key() {
                 "cty_sha256",
                 "scp_sha256",
                 "pattern_path",
+                "pattern_url",
                 "validation_level",
                 "repetition_fusion",
             ],

@@ -75,5 +75,8 @@
   atomically replaces `data/patterns.lst`. The
   `pattern::tests::vendored_list_is_derived_from_the_vendored_master_scp`
   consistency test fails if the two drift apart. Operators override this list
-  separately with `--patterns` or `[spot] pattern_path`; neither `--scp` nor
-  a `refresh_lists` download (MAN-316) changes it.
+  separately with `--patterns` or `[spot] pattern_path`. `--scp` does not
+  change it; with `[spot] pattern_url` set, `refresh_lists` downloads a
+  replacement every 7 days (MAN-542), used at startup only when downloaded
+  after this generation date. `PATTERNS_LST_GENERATED` in `src/vintage.rs`
+  and the date above change together; a test enforces the match.

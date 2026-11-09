@@ -105,6 +105,22 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// A valid entry is exactly the canonical shape of a plausible call.
+/// Substitution preserves the prefix-shape rule while detecting literal
+/// suffix letters, misplaced wildcards, and non-ASCII input.
+fn is_canonical(pattern: &str) -> bool {
+    let call = pattern.replace('@', "A").replace('#', "0");
+    crate::grammar::is_plausible(&call) && pattern_of(&call) == pattern
+}
+
+/// MAN-542: a downloaded list, and how many of its lines no admitted call
+/// can match.
+#[derive(Debug)]
+pub struct Downloaded {
+    pub table: Table,
+    pub skipped_lines: usize,
+}
+
 /// A reference list in `[+]PATTERN` format. `+` marks common patterns.
 pub struct Table {
     patterns: HashMap<String, bool>,
@@ -135,11 +151,7 @@ impl Table {
                 Some(pattern) => (true, pattern.trim_start()),
                 None => (false, line),
             };
-            // A valid entry is exactly the canonical shape of a plausible call.
-            // Substitution preserves the prefix-shape rule while detecting literal
-            // suffix letters, misplaced wildcards, and non-ASCII input.
-            let call = pattern.replace('@', "A").replace('#', "0");
-            if !crate::grammar::is_plausible(&call) || pattern_of(&call) != pattern {
+            if !is_canonical(pattern) {
                 return Err(ParseError::InvalidLine {
                     line: index + 1,
                     text: line.to_owned(),
@@ -155,6 +167,55 @@ impl Table {
             Err(ParseError::Empty)
         } else {
             Ok(table)
+        }
+    }
+
+    /// MAN-542 D4: manta's `[+]PATTERN` files and RBN's Skimmer-format
+    /// `Patt3Ch.lst`, for list refresh only; `pattern_path` uses
+    /// [`Table::parse`]. Lines are uppercased and may put spaces after `+`.
+    /// A line that is pattern-shaped (`[A-Z0-9@#]` only) but that no call
+    /// manta admits can match (over-length, or a shape [`pattern_of`] never
+    /// produces) is skipped and counted; anything else fails the parse.
+    pub fn parse_download(text: &str) -> Result<Downloaded, ParseError> {
+        let mut patterns = HashMap::new();
+        let mut skipped_lines = 0;
+        for (index, line) in text.trim_start_matches('\u{feff}').lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (common, pattern) = match line.strip_prefix('+') {
+                Some(pattern) => (true, pattern.trim_start()),
+                None => (false, line),
+            };
+            let pattern = pattern.to_ascii_uppercase();
+            let shaped = !pattern.is_empty()
+                && pattern.bytes().all(|b| {
+                    b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'@' || b == b'#'
+                });
+            if !shaped {
+                return Err(ParseError::InvalidLine {
+                    line: index + 1,
+                    text: line.to_owned(),
+                });
+            }
+            if !is_canonical(&pattern) {
+                skipped_lines += 1;
+                continue;
+            }
+            patterns
+                .entry(pattern)
+                .and_modify(|value| *value |= common)
+                .or_insert(common);
+        }
+        let table = Self { patterns };
+        if table.is_empty() {
+            Err(ParseError::Empty)
+        } else {
+            Ok(Downloaded {
+                table,
+                skipped_lines,
+            })
         }
     }
 
@@ -210,6 +271,59 @@ pub fn derive_list(master_scp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_download_takes_the_skimmer_dialect() {
+        let dl =
+            Table::parse_download("+  MM1@\r\n  OH2@@@\r\n+ OH2@@\r\n  OH3###@\r\n+ 8n6@@\r\n")
+                .unwrap();
+        let strict = Table::parse("+MM1@\nOH2@@@\n+OH2@@\nOH3###@\n+8N6@@\n").unwrap();
+        assert_eq!(dl.skipped_lines, 0);
+        assert_eq!(dl.table.len(), strict.len());
+        assert_eq!(dl.table.common_len(), strict.common_len());
+        for call in ["MM1A", "OH2ABC", "OH2AB", "OH3000A", "8N6AA"] {
+            assert_eq!(dl.table.tier(call), strict.tier(call), "{call}");
+        }
+    }
+
+    #[test]
+    fn parse_download_skips_unreachable_lines_and_counts_them() {
+        let dl = Table::parse_download("+K5@@@\n  3E5##@@@\n  A2#@\n+ A4###@@@@\nN8@\n").unwrap();
+        assert_eq!(dl.table.len(), 2);
+        assert_eq!(dl.skipped_lines, 3);
+    }
+
+    #[test]
+    fn parse_download_rejects_a_line_that_is_not_pattern_shaped() {
+        for bad in ["K5@@@;", "+", "<html>", "!!Order,1,1", "K5 @@@", "é@@"] {
+            let err = Table::parse_download(&format!("+K5@@@\n{bad}\n")).unwrap_err();
+            assert!(
+                matches!(err, ParseError::InvalidLine { line: 2, .. }),
+                "{bad}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_download_accepts_everything_parse_accepts() {
+        let dl = Table::parse_download(crate::PATTERNS_LST).unwrap();
+        assert_eq!(dl.table.len(), 6036);
+        assert_eq!(dl.table.common_len(), 4018);
+        assert_eq!(dl.skipped_lines, 0);
+        let dl = Table::parse_download("\u{feff}# header\r\n\r\nK5@@@\r\n+ K5@@@\r\n").unwrap();
+        assert_eq!((dl.table.len(), dl.table.common_len()), (1, 1));
+    }
+
+    #[test]
+    fn parse_download_refuses_an_empty_or_comment_only_file() {
+        for text in ["", "\n# c\n"] {
+            assert_eq!(
+                Table::parse_download(text).unwrap_err(),
+                ParseError::Empty,
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn pattern_of_documented_examples() {
