@@ -36,7 +36,7 @@ pub use pattern::{PatternTier, ValidationLevel};
 pub use support::Support;
 pub use validator::{
     calibration_factor_from_ppm, EmissionState, InvalidCalibration, RefineCandidate, RefinedWord,
-    Spot, SpotMode, SuppressionCounts, Validator, STABLE_SPEED_WORDS,
+    RefinementOutcome, Spot, SpotMode, SuppressionCounts, Validator, STABLE_SPEED_WORDS,
 };
 
 /// AD1C's `cty.dat` country/prefix table, vendored under `data/` -- see

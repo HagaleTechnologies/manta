@@ -28,7 +28,7 @@ pub const RAIL_RATIO_BUCKETS: [f64; 10] = [2.0, 2.5, 3.0, 4.0, 6.0, 10.0, 16.0, 
 /// non-cumulative, with a final `+Inf` overflow slot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeQualitySnapshot {
-    pub refine: [u64; 5],
+    pub refine: [u64; 8],
     pub chars_total: u64,
     pub garbles_total: u64,
     /// Length `RAIL_RATIO_BUCKETS.len() + 1`.
@@ -47,7 +47,7 @@ pub struct DecodeQualitySnapshot {
 }
 
 pub struct DecodeQualityObserver {
-    refine: [AtomicU64; 5],
+    refine: [AtomicU64; 8],
     chars: AtomicU64,
     garbles: AtomicU64,
     rail_buckets: [AtomicU64; RAIL_RATIO_BUCKETS.len() + 1],
@@ -139,7 +139,7 @@ impl DecodeQualityObserver {
 
     /// Adds scheduler deltas, so reconnects and independent inputs cannot
     /// reset another segment's cumulative metrics.
-    pub fn add_refinements(&self, counts: [u64; 5]) {
+    pub fn add_refinements(&self, counts: [u64; 8]) {
         for (slot, n) in self.refine.iter().zip(counts) {
             slot.fetch_add(n, Ordering::Relaxed);
         }

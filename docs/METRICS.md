@@ -437,7 +437,7 @@ For what each uplink state means and what to do about it, see
 
 ### Delayed refinement
 
-The decode-quality observer exports five counters without labels:
+The decode-quality observer exports eight counters without labels:
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -446,7 +446,13 @@ The decode-quality observer exports five counters without labels:
 | `manta_refine_rescues_total` | counter | Spots emitted by refinement. |
 | `manta_refine_budget_exhausted_total` | counter | Batches that paused an unfinished replay. |
 | `manta_refine_orphaned_revisions_total` | counter | Revisions whose observation expired. |
+| `manta_refine_replays_total` | counter | Replays that ran to the end of their preserved inputs, with or without a reading. |
+| `manta_refine_changed_total` | counter | Replays whose reading replaced the word's decoded text. `changed / replays` is the share of replays that change a word. |
+| `manta_refine_rejected_total` | counter | Replays whose reading would have turned a spottable callsign into a string that can never be spotted; the decoded word was kept. |
 
 Counters accumulate deltas across input segments, including reconnects. The
 scheduler also counts backlog overflow, buffer misses and replays without a
 reading internally. A rescue counter is an emission count, not a truth score.
+The share of replays that change a word is
+`rate(manta_refine_changed_total[1h]) / rate(manta_refine_replays_total[1h])`
+([MAN-515](DECISIONS/2026-11-09-man515-refine-replay-gate.md)).

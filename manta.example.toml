@@ -545,7 +545,7 @@ station_callsign = "N0CALL"
 # documented defaults):
 #    enabled = true                   # false: no retention, no replay
 #    lookback_secs = 10.0             # per-track retained hops; 0 (off) or 4.0..=10.0 s
-#    max_refinements_per_episode = 2  # hypothesis cap per episode, 1 through 4
+#    max_refinements_per_episode = 2  # attempt cap per episode, 1 through 4
 #    replay_hops_per_batch = 1500     # re-decode work per input batch, in hops
 #    backlog = 16                     # queued episodes, 1 through 256
 #refine = { enabled = true, lookback_secs = 10.0, max_refinements_per_episode = 2, replay_hops_per_batch = 1500, backlog = 16 }
