@@ -21,7 +21,7 @@ in main.rs". Eight modules hold the rest:
 
 | File | Holds |
 | --- | --- |
-| `src/source_spec.rs` | `KiwiOpts`, `SoapyOpts`, `HpsdrOpts`, `Ka9qOpts`, `LiveSourceSpec` and its `impl`, `transform_source`, the `open_*` functions, `FixedCenterFreqSource`, the source warning texts, decimation and raw-IQ helpers |
+| `src/source_spec.rs` | `KiwiOpts`, `HpsdrOpts`, `Ka9qOpts` (and a re-export of MAN-550's `soapy_opts::SoapyOpts`), `LiveSourceSpec` and its `impl`, `transform_source`, the `open_*` functions, `FixedCenterFreqSource`, the source warning texts, decimation and raw-IQ helpers |
 | `src/recording.rs` | `--record-iq` destination checks, start, finish budget and report |
 | `src/cli_parse.rs` | every clap `value_parser` function and its range constants |
 | `src/session_epoch.rs` | the session epoch and nonce for replays (`resolve_epoch`, `session_nonce_for_replay_path`, `fnv1a_*`) |
@@ -32,11 +32,15 @@ in main.rs". Eight modules hold the rest:
 
 - **`Run` is a newtype variant.** The variant is now
   `Command::Run(run_cmd::RunArgs)`. Its 37 fields moved in order into a
-  `#[derive(clap::Args)]` struct. The variant keeps its doc comment and its
-  `#[command(visible_alias = "listen", group(...))]` attribute. clap orders
-  arguments by declaration, so `--help`, `-h`, the completions and the man
-  pages stay byte-identical, with and without the `soapy` feature. The arm is
-  `Command::Run(args) => return run_cmd::run(args),`.
+  `#[derive(clap::Args)]` struct. Merging main after MAN-550 folded the four
+  `--soapy-*` fields into one `#[command(flatten)] soapy: SoapyArgs`, so
+  `RunArgs` has 34. MAN-550's `only_soapy_opts_names_the_soapy_feature`
+  guard now expects its one outside gate in `resolve/tests.rs`, where the
+  feature-off config test moved, not in `main.rs`. The variant keeps its
+  doc comment and its `#[command(visible_alias = "listen", group(...))]`
+  attribute. clap orders arguments by declaration, so `--help`, `-h`, the
+  completions and the man pages stay byte-identical, with and without the
+  `soapy` feature. The arm is `Command::Run(args) => return run_cmd::run(args),`.
 - **`SpotServerParams` replaces the allow.** `start_spot_server` takes one
   `SpotServerParams<'_>` with the ten former parameters as fields, in the same
   order and under the same names. The function destructures it on its first

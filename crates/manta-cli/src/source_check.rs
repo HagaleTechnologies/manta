@@ -216,17 +216,7 @@ pub(crate) fn run(args: Args) -> Result<i32> {
                 freq: args.kiwi_freq_hz,
                 password: args.kiwi_password,
             },
-<<<<<<< HEAD
-            #[cfg(feature = "soapy")]
-            soapy: crate::source_spec::SoapyOpts {
-                driver: args.soapy_driver,
-                freq: args.soapy_freq_hz,
-                rate: args.soapy_rate_hz,
-                gain: args.soapy_gain,
-            },
-=======
             soapy: args.soapy.into(),
->>>>>>> 0fa87cac13ac1265fa48c7faeb4afee4911bf477
             hpsdr: HpsdrOpts {
                 host: args.hpsdr_host,
                 mac: args.hpsdr_mac,

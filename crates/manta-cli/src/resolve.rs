@@ -31,7 +31,6 @@ pub(crate) struct CliOverrides {
     pub(crate) realtime: bool,
     pub(crate) loop_replay: bool,
     pub(crate) kiwi: KiwiOpts,
-    #[cfg(feature = "soapy")]
     pub(crate) soapy: crate::source_spec::SoapyOpts,
     pub(crate) hpsdr: HpsdrOpts,
     pub(crate) ka9q: Ka9qOpts,
@@ -69,13 +68,7 @@ impl CliOverrides {
                 freq: None,
                 password: String::new(),
             },
-            #[cfg(feature = "soapy")]
-            soapy: crate::source_spec::SoapyOpts {
-                driver: None,
-                freq: None,
-                rate: None,
-                gain: None,
-            },
+            soapy: crate::source_spec::SoapyOpts::default(),
             hpsdr: HpsdrOpts {
                 host: None,
                 mac: None,
@@ -111,7 +104,6 @@ impl CliOverrides {
         if self.hpsdr.selected() {
             return self.hpsdr.selector();
         }
-        #[cfg(feature = "soapy")]
         if self.soapy.driver.is_some() {
             return Some("--soapy-driver");
         }
@@ -140,7 +132,6 @@ impl CliOverrides {
         if self.kiwi.host.is_some() {
             return LiveSourceSpec::Kiwi(self.kiwi);
         }
-        #[cfg(feature = "soapy")]
         if self.soapy.driver.is_some() {
             return LiveSourceSpec::Soapy(self.soapy);
         }
@@ -595,22 +586,14 @@ fn spec_from_file(source: &config::SourceFromFile, cli_source_iq: bool) -> Resul
             freq: Some(*freq_hz),
             password: password.clone(),
         }),
-        #[cfg(feature = "soapy")]
         config::SourceFromFile::Soapy {
             driver,
             freq_hz,
             rate_hz,
             gain_db,
-        } => LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts {
-            driver: Some(driver.clone()),
-            freq: Some(*freq_hz),
-            rate: Some(*rate_hz),
-            gain: *gain_db,
-        }),
-        #[cfg(not(feature = "soapy"))]
-        config::SourceFromFile::Soapy { .. } => {
-            bail!("input.type = \"soapy\" needs a manta built with --features soapy")
-        }
+        } => LiveSourceSpec::Soapy(crate::source_spec::SoapyOpts::from_file(
+            driver, *freq_hz, *rate_hz, *gain_db,
+        )?),
         config::SourceFromFile::Hpsdr {
             host,
             mac,

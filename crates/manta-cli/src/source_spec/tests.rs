@@ -13,21 +13,6 @@ fn audio_silence_warning_names_the_device_the_rate_and_the_hint() {
     assert!(w.ends_with(manta_input::audio::audio_input_hint()), "{w}");
 }
 
-/// MAN-233: pins the design section's exact wording, so a future edit
-/// cannot quietly change what the operator is told to watch
-/// (`ka9q_agc_warning_is_design_section_3s_text` precedent).
-#[cfg(feature = "soapy")]
-#[test]
-fn soapy_overflow_warning_names_the_driver_the_counter_and_the_interval() {
-    assert_eq!(
-        soapy_overflow_warning("driver=rtlsdr"),
-        "warning: SoapySDR input (driver=rtlsdr) dropped samples: the driver reported a \
-             stream overflow -- the host is not keeping up; every overflow error is counted in \
-             manta_input_gaps_detected_total{source=\"soapy\"} (this warning is \
-             rate-limited to once per 60 s)"
-    );
-}
-
 #[test]
 fn recording_center_warning_covers_a_missing_and_a_non_positive_sidecar() {
     let wav = Path::new("/rec/x.wav");
@@ -290,7 +275,6 @@ fn configured_center_and_passband_mirrors_open() {
     }
 }
 
-#[cfg(feature = "soapy")]
 #[test]
 fn configured_center_and_passband_uses_the_requested_soapy_values() {
     let s = LiveSourceSpec::Soapy(SoapyOpts {
@@ -505,7 +489,6 @@ fn name_matches_today_source_names() {
         .name(),
         "file"
     );
-    #[cfg(feature = "soapy")]
     assert_eq!(
         LiveSourceSpec::Soapy(SoapyOpts {
             driver: Some("d".into()),

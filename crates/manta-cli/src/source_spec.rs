@@ -6,6 +6,7 @@ use crate::cli_parse::HPSDR_CONTROL_PORT;
 use crate::logging;
 use crate::reconnect;
 use crate::resolve::Resolved;
+pub(crate) use crate::soapy_opts::SoapyOpts;
 use anyhow::{anyhow, bail, Result};
 use manta_input::IqSource;
 use std::path::Path;
@@ -20,16 +21,6 @@ pub(crate) struct KiwiOpts {
     pub(crate) port: u16,
     pub(crate) freq: Option<f64>,
     pub(crate) password: String,
-}
-
-/// SoapySDR connection flags (feature `soapy`), grouped for the same reason.
-#[cfg(feature = "soapy")]
-#[derive(Clone)]
-pub(crate) struct SoapyOpts {
-    pub(crate) driver: Option<String>,
-    pub(crate) freq: Option<f64>,
-    pub(crate) rate: Option<f64>,
-    pub(crate) gain: Option<f64>,
 }
 
 /// HPSDR/Hermes connection flags, grouped for the same reason.
@@ -158,7 +149,6 @@ impl Ka9qOpts {
 #[derive(Clone)]
 pub(crate) enum LiveSourceSpec {
     Kiwi(KiwiOpts),
-    #[cfg(feature = "soapy")]
     Soapy(SoapyOpts),
     Hpsdr(HpsdrOpts),
     Ka9q(Ka9qOpts),
@@ -185,7 +175,6 @@ impl LiveSourceSpec {
     pub(crate) fn name(&self) -> &'static str {
         match self {
             LiveSourceSpec::Kiwi(_) => "kiwi",
-            #[cfg(feature = "soapy")]
             LiveSourceSpec::Soapy(_) => "soapy",
             LiveSourceSpec::Hpsdr(_) => "hpsdr",
             LiveSourceSpec::Ka9q(_) => "ka9q",
@@ -269,29 +258,7 @@ impl LiveSourceSpec {
                     &kiwi.password,
                 )?)
             }
-            #[cfg(feature = "soapy")]
-            LiveSourceSpec::Soapy(soapy) => {
-                let driver = soapy
-                    .driver
-                    .as_deref()
-                    .expect("LiveSourceSpec::Soapy always carries a driver");
-                let freq = soapy
-                    .freq
-                    .ok_or_else(|| anyhow!("--soapy-freq-hz is required with --soapy-driver"))?;
-                let rate = soapy
-                    .rate
-                    .ok_or_else(|| anyhow!("--soapy-rate-hz is required with --soapy-driver"))?;
-                // Each (re)open gets a fresh rate-limit state, mirroring
-                // the audio silence notice (MAN-233; the reconnect itself
-                // already logs per-attempt).
-                let warn_driver = driver.to_string();
-                Box::new(
-                    manta_input::soapy::SoapySdrIqSource::open(driver, rate, freq, soapy.gain)?
-                        .with_overflow_notice(Box::new(move || {
-                            logging::warning(&soapy_overflow_warning(&warn_driver))
-                        })),
-                )
-            }
+            LiveSourceSpec::Soapy(soapy) => crate::soapy_opts::open(soapy)?,
             LiveSourceSpec::Hpsdr(hpsdr) => {
                 let freq = hpsdr
                     .freq
@@ -389,7 +356,6 @@ impl LiveSourceSpec {
                 manta_input::kiwi::OUTPUT_RATE_HZ,
                 manta_input::kiwi::IQ_PASSBAND_HZ,
             ),
-            #[cfg(feature = "soapy")]
             LiveSourceSpec::Soapy(soapy) => {
                 let rate = soapy.rate?;
                 (soapy.freq?, rate, (-rate / 2.0, rate / 2.0))
@@ -684,21 +650,6 @@ fn audio_silence_warning(device: &str) -> String {
           (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
-    )
-}
-
-/// MAN-233: a SoapySDR stream overflow error means this chunk was dropped
-/// by a full driver ring buffer -- the host is not keeping up. Counted, and
-/// rate-limited so a sustained overflow burst logs one line per 60 s. An
-/// overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read never
-/// reaches here (see `SoapySdrIqSource::read`), hence "overflow error".
-#[cfg(feature = "soapy")]
-fn soapy_overflow_warning(driver: &str) -> String {
-    format!(
-        "warning: SoapySDR input ({driver}) dropped samples: the driver reported a \
-         stream overflow -- the host is not keeping up; every overflow error is counted in \
-         manta_input_gaps_detected_total{{source=\"soapy\"}} (this warning is \
-         rate-limited to once per 60 s)"
     )
 }
 

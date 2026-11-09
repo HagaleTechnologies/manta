@@ -75,7 +75,7 @@ use crate::RttyLogState;
 use crate::ACTIVE_TRACKS_POLL_INTERVAL;
 use crate::DECODE_LATENCY_POLL_INTERVAL;
 use crate::INPUT_HEALTH_POLL_INTERVAL;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use manta_decode::decoder::Engine;
 use manta_input::IqSource;
 use std::path::PathBuf;
@@ -109,8 +109,7 @@ pub(crate) struct RunArgs {
     source: Option<PathBuf>,
     /// KiwiSDR receiver hostname. Requires --kiwi-freq-hz.
     #[arg(help_heading = "KiwiSDR source")]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"], requires = "kiwi_freq_hz"))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"], requires = "kiwi_freq_hz"))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]), requires = "kiwi_freq_hz")]
     kiwi_host: Option<String>,
     /// KiwiSDR receiver port.
     #[arg(
@@ -137,48 +136,13 @@ pub(crate) struct RunArgs {
         help_heading = "KiwiSDR source"
     )]
     kiwi_password: String,
-    /// SoapySDR device arguments, e.g. "driver=rtlsdr".
-    ///
-    /// Requires --soapy-freq-hz and --soapy-rate-hz. Available only in
-    /// builds made with the `soapy` feature.
-    #[cfg(feature = "soapy")]
-    #[arg(help_heading = "SoapySDR source")]
-    #[arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "kiwi_host"])]
-    soapy_driver: Option<String>,
-    /// Receiver centre frequency, in Hz. Required with --soapy-driver.
-    #[cfg(feature = "soapy")]
-    #[arg(
-        long = "soapy-freq-hz",
-        alias = "soapy-freq",
-        requires = "soapy_driver",
-        help_heading = "SoapySDR source"
-    )]
-    soapy_freq_hz: Option<f64>,
-    /// Sample rate, in Hz. Required with --soapy-driver.
-    #[cfg(feature = "soapy")]
-    #[arg(
-        long = "soapy-rate-hz",
-        alias = "soapy-rate",
-        requires = "soapy_driver",
-        help_heading = "SoapySDR source"
-    )]
-    soapy_rate_hz: Option<f64>,
-    /// Receiver gain, in dB. On an SDRplay a higher value means more attenuation, not more
-    /// gain. Omit to let the device use AGC.
-    ///
-    /// SDRplay's SoapySDR driver turns this one value into IF and RF gain reduction. On the RSP1B
-    /// measured, 0 is the most sensitive setting and 48 the least, 40 already puts the IF stage at
-    /// its maximum reduction, and 46 to 48 failed to start the stream. Compare settings on a
-    /// signal you know is present.
-    #[cfg(feature = "soapy")]
-    #[arg(long, requires = "soapy_driver", help_heading = "SoapySDR source")]
-    soapy_gain: Option<f64>,
+    #[command(flatten)]
+    soapy: crate::soapy_opts::SoapyArgs,
     /// openHPSDR radio hostname or IP address (protocol 1: Hermes-Lite 2, Hermes; protocol 2: ANAN).
     ///
     /// Requires --hpsdr-freq-hz and --hpsdr-rate-hz. Included in every build.
     #[arg(help_heading = "HPSDR source")]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host", "soapy_driver"]))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "ka9q_group", "kiwi_host"]))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "ka9q_group", "kiwi_host"]))]
     #[arg(conflicts_with_all = ["device", "source"])]
     #[arg(conflicts_with = "hpsdr_mac")]
     hpsdr_host: Option<String>,
@@ -229,8 +193,7 @@ pub(crate) struct RunArgs {
     /// encoding and frequency from radiod's status packets; it does not
     /// create or retune channels.
     #[arg(help_heading = "ka9q-radio source", value_parser = parse_ka9q_group)]
-    #[cfg_attr(feature = "soapy", arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port", "soapy_driver"]))]
-    #[cfg_attr(not(feature = "soapy"), arg(long, conflicts_with_all = ["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]))]
+    #[arg(long, conflicts_with_all = crate::soapy_opts::and_driver(["device", "source", "kiwi_host", "hpsdr_host", "hpsdr_mac", "hpsdr_freq_hz", "hpsdr_rate_hz", "hpsdr_port"]))]
     pub(crate) ka9q_group: Option<String>,
     /// RTP data port of the group.
     #[arg(
@@ -401,14 +364,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
         kiwi_port,
         kiwi_freq_hz,
         kiwi_password,
-        #[cfg(feature = "soapy")]
-        soapy_driver,
-        #[cfg(feature = "soapy")]
-        soapy_freq_hz,
-        #[cfg(feature = "soapy")]
-        soapy_rate_hz,
-        #[cfg(feature = "soapy")]
-        soapy_gain,
+        soapy,
         hpsdr_host,
         hpsdr_mac,
         hpsdr_port,
@@ -464,13 +420,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             freq: kiwi_freq_hz,
             password: kiwi_password,
         },
-        #[cfg(feature = "soapy")]
-        soapy: crate::source_spec::SoapyOpts {
-            driver: soapy_driver,
-            freq: soapy_freq_hz,
-            rate: soapy_rate_hz,
-            gain: soapy_gain,
-        },
+        soapy: soapy.into(),
         hpsdr: HpsdrOpts {
             host: hpsdr_host,
             mac: hpsdr_mac,
@@ -680,7 +630,10 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
     // the run anyway.
     #[cfg(unix)]
     if loaded.server.is_some() {
-        reload::mask_sighup(libc::SIG_BLOCK).context("blocking SIGHUP on the decode thread")?;
+        anyhow::Context::context(
+            reload::mask_sighup(libc::SIG_BLOCK),
+            "blocking SIGHUP on the decode thread",
+        )?;
     }
     let opening_at = std::time::SystemTime::now();
     let first = spec.open(capture_rate_hz, dial_freq_hz)?;
