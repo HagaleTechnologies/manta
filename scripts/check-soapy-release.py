@@ -29,6 +29,12 @@ module's own open error (exit 1, `cannot open source`), never SoapySDR's
 `no match`, which is what a missing module looks like. The release workflow's
 Docker jobs run it on the arm64 image before the multi-platform push.
 
+With --expect-git-sha SHA (MAN-537, image mode only) it also checks that the
+image's `--version` names that commit, so an image built without the
+`MANTA_GIT_SHA` build-arg, which reports `git unknown`, fails before it is
+pushed. A 40- or 64-hex SHA is cut to its first 12 characters and lower-cased,
+as crates/manta-cli/build.rs does; any other value is compared as given.
+
 Release tooling only: the release workflows run it after packaging and before
 upload, and this script is not itself shipped in the archive. Linux only; the
 archive's binary is a Linux executable. Tested by
@@ -64,6 +70,9 @@ OPEN_FAILED = "cannot open source"
 MISSING_LIBRARY = "libSoapySDR.so.0.8: cannot open shared object file"
 LOADER_FAILURE = 127
 DEFAULT_TIMEOUT = 60.0
+# MAN-537: the commit in `manta --version`'s `(git <sha>; features: ...)`.
+VERSION_GIT = re.compile(r"\(git ([^;\s]+);")
+FULL_OBJECT_NAME = re.compile(r"(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})")
 
 
 class CheckFailed(Exception):
@@ -164,6 +173,24 @@ def check_version(binary, timeout):
     return proc.stdout.strip()
 
 
+def expected_commit(sha):
+    """The commit a binary built with MANTA_GIT_SHA=SHA reports, as build.rs derives it: a full
+    git object name is cut to 12 lower-case characters, anything else is kept as given."""
+    if FULL_OBJECT_NAME.fullmatch(sha):
+        return sha[:12].lower()
+    return sha
+
+
+def check_commit(version, expected):
+    m = VERSION_GIT.search(version)
+    if m is None:
+        raise CheckFailed(f"`manta --version` names no git commit, expected {expected}: {version!r}")
+    if m.group(1) != expected:
+        raise CheckFailed(f"`manta --version` names commit {m.group(1)}, expected {expected} "
+                          f"(--expect-git-sha): {version!r}")
+    return f"image commit {expected} matches --expect-git-sha"
+
+
 def check_help(binary, timeout):
     for command in HELP_COMMANDS:
         proc = run(binary, [command, "--help"], timeout)
@@ -225,15 +252,18 @@ def verify(archive, expect_missing_library=False, timeout=DEFAULT_TIMEOUT):
                 f"devices --json: Soapy enumeration ok, {devices} device(s)"]
 
 
-def verify_image(image, platform, timeout=DEFAULT_TIMEOUT):
-    """Run the image checks against IMAGE on PLATFORM; return report lines, or raise CheckFailed."""
+def verify_image(image, platform, timeout=DEFAULT_TIMEOUT, expect_git_sha=None):
+    """Run the image checks against IMAGE on PLATFORM; return report lines, or raise CheckFailed.
+    With EXPECT_GIT_SHA, `--version` must also name that commit."""
     prefix = image_prefix(image, platform)
     version = check_version(prefix, timeout)
+    commit = [] if expect_git_sha is None else [check_commit(version, expected_commit(expect_git_sha))]
     check_help(prefix, timeout)
     check_missing_driver(prefix, timeout)
     devices = check_devices(prefix, timeout)
     check_modules(prefix, timeout)
     return [version,
+            *commit,
             f"run/listen/check --help offer {', '.join(SOAPY_FLAGS)} and --hpsdr-host",
             f"nonexistent driver: exit 1, {NO_MATCH}",
             f"devices --json: Soapy enumeration ok, {devices} device(s)",
@@ -249,6 +279,8 @@ def main(argv=None):
     parser.add_argument("--docker-image", metavar="IMAGE",
                         help="check this local Docker image instead of an archive (needs --platform)")
     parser.add_argument("--platform", help="the --docker-image platform to run, e.g. linux/arm64")
+    parser.add_argument("--expect-git-sha", metavar="SHA",
+                        help="the commit the --docker-image's `--version` must name, e.g. $GITHUB_SHA")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                         help=f"seconds allowed for each manta invocation (default {DEFAULT_TIMEOUT:g})")
     args = parser.parse_args(argv)
@@ -262,9 +294,13 @@ def main(argv=None):
         parser.error("--platform goes with --docker-image")
     if args.docker_image is not None and args.expect_missing_soapy_library:
         parser.error("--expect-missing-soapy-library checks an archive, not --docker-image")
+    if args.docker_image is None and args.expect_git_sha is not None:
+        parser.error("--expect-git-sha goes with --docker-image")
+    if args.expect_git_sha is not None and not args.expect_git_sha.strip():
+        parser.error("--expect-git-sha needs a commit, not an empty value")
     try:
         if args.docker_image is not None:
-            lines = verify_image(args.docker_image, args.platform, args.timeout)
+            lines = verify_image(args.docker_image, args.platform, args.timeout, args.expect_git_sha)
         else:
             lines = verify(args.archive, args.expect_missing_soapy_library, args.timeout)
     except CheckFailed as e:

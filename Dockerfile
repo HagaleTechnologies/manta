@@ -24,7 +24,7 @@
 # `manta <arguments>` unchanged. HEALTHCHECK asks the daemon through
 # `manta health`.
 
-FROM rust:1-slim-bookworm AS builder
+FROM rust:1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
 
 # `git` is a BUILD-TIME requirement here, not a convenience: this repo's
 # own .cargo/config.toml sets `[net] git-fetch-with-cli = true`, and it is
@@ -48,9 +48,15 @@ RUN apt-get update && apt-get install --no-install-recommends -y \
 
 WORKDIR /build
 COPY . .
+# MAN-537: the release commit, from `--build-arg MANTA_GIT_SHA=<sha>`.
+# .dockerignore keeps .git out of the context, so without it
+# crates/manta-cli/build.rs reports `unknown`; an unset arg is empty, which
+# build.rs treats as no override. Only this stage sees it.
+ARG MANTA_GIT_SHA
+ENV MANTA_GIT_SHA=${MANTA_GIT_SHA}
 RUN cargo build --release -p manta-cli --features soapy
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # MAN-539: the binary links libSoapySDR, so it cannot start without
 # `libsoapysdr0.8`. The modules open RTL-SDR, Airspy R2/Mini and HackRF
