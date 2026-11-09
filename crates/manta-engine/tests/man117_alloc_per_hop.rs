@@ -137,7 +137,7 @@ fn scene(duration_s: f64) -> Vec<Complex32> {
 /// The channelizer alone: 2 s warm-up in 4096-sample chunks, then 10 s.
 fn channelizer_line(iq: &[Complex32]) {
     let mut ch = Channelizer::new(FS, CENTER_FREQ_HZ).unwrap();
-    let warm = (2.0 * FS) as usize;
+    let warm = ((2.0 * FS) as usize).min(iq.len());
     let timed = ((10.0 * FS) as usize).min(iq.len().saturating_sub(warm));
     for chunk in iq[..warm].chunks(4096) {
         std::hint::black_box(ch.process(chunk));
