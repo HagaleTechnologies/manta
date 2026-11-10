@@ -398,7 +398,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ea5bb625a75505fa8e108ffb3971e7965cc80a7e10256a3e7ee33fa169328973",
+      "hash": "sha256:f345de9c7831ff99be14b2fdc033b8732cef2e65ba68e2dc08e261da7d2a2e5d",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [

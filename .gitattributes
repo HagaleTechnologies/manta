@@ -1,3 +1,8 @@
+# Every text file checks out with LF on every platform, Windows included
+# (MAN-519). Git for Windows defaults to core.autocrlf=true; this attribute
+# overrides it. Keep this rule first: the last matching line wins.
+* text=auto eol=lf
+
 # Byte-exact test fixtures: Windows checkouts must not rewrite them to CRLF
 # (manta grade writes LF; grade_cmd.rs compares byte for byte).
 crates/manta-cli/tests/fixtures/rbn_grade/** text eol=lf
@@ -6,3 +11,16 @@ crates/manta-cli/tests/fixtures/skimsrv_pair/** text eol=lf
 # Generated file a unit test compares byte for byte against derive_list()'s
 # LF output; a CRLF checkout on Windows would fail that test.
 crates/manta-spot/data/patterns.lst text eol=lf
+
+# Vendored upstream lists, committed with upstream's CRLF bytes (SOURCES.md:
+# refresh by replacing the file). No conversion, so every platform sees the
+# same bytes; the parsers accept either ending.
+crates/manta-spot/data/cty.dat -text
+crates/manta-spot/data/master.scp -text
+
+# Binary fixtures and assets: never convert, never text-diff.
+*.wav binary
+*.cf32 binary
+*.ci16 binary
+*.png binary
+*.der binary
