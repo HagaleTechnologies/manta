@@ -205,6 +205,7 @@ one TCP connection to `feed_host:feed_port`, sending nothing. See
 | `speed_tol_pct` | `20.0` | live: `run` with `[server]`; `grade` | ... and more than this percent of RBN's median speed. |
 | `spotters` | `[]` | live: `run` with `[server]`; `grade` | Only these RBN skimmers count. `--rbn-spotter` replaces it. |
 | `exclude_spotters` | `[]` | live: `run` with `[server]`; `grade` | Never count these skimmers. This station's own callsign is always excluded. |
+| `skew_warn_ppm` | `2.0` | live: `run` with `[server]` | 0 to 1000; 0 turns the warning off. A band warns after 30 minutes past it (see RUNBOOKS/rbn-comparison.md). |
 
 ## [[skimmer_relay]]
 

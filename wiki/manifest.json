@@ -3,7 +3,7 @@
   "head_commit": "212fa51",
   "pages": [
     {
-      "hash": "sha256:0a57259f7a323117b090e4391c0bcb3186f19dd7b5da19b23be7b5a19f192d46",
+      "hash": "sha256:a77216f2c07a8f129b8b188dd6425862dd2838e26a245539efdbc07cf7b866fe",
       "id": "coppa-reuse",
       "kind": "interface",
       "links": [
@@ -225,7 +225,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:bf2494e0e0424df3107484cc288a649eae3e4eb1522a5de4f073d53644e42d71",
+      "hash": "sha256:2667999bda38f710e513025e6bd9ce33e03a4a7401bcae1bfa88c1dfc98cd66f",
       "id": "pfb-channelizer",
       "kind": "subsystem",
       "links": [
@@ -326,7 +326,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f16a9caad035f19d9045edacdd8ca5e54febe3f7ff2719ee7b6d513e3da8c7db",
+      "hash": "sha256:01886833aad16b7c670218d5120c825166c7eaed4b330e38cc9419812c552b1d",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [
@@ -346,7 +346,8 @@
         "docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md",
         "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
         "docs/DECISIONS/2026-11-02-man201-callsign-roles.md",
-        "docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md"
+        "docs/DECISIONS/2026-11-03-man200-repetition-evidence-fusion.md",
+        "docs/DECISIONS/2026-11-09-man531-blocklisted-variant-support.md"
       ],
       "status": "current",
       "title": "How does manta decide a decoded call is trustworthy enough to spot?",

@@ -34,6 +34,9 @@ manta-server = { path = "crates/manta-server" }
 coppa-dsp = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-audio = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
 coppa-channel = { git = "https://github.com/HagaleTechnologies/coppa.git", rev = "f8a4d16df7e5776a0756943c05712038774e6c70" }
+# MAN-117: the channelizer runs coppa's forward plan in place with its own
+# scratch; already in the graph at 6.4.1 through coppa-dsp.
+rustfft = "6.4"
 
 # MAN-323: the FT8/FT4 cycle decoder (PAN-176), behind manta's optional `ftx`
 # feature. The contract is pancetta's docs/decoder-crate.md at the pinned commit

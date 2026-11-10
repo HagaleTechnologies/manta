@@ -590,7 +590,33 @@ receiver is still a separate, manual check.
   builds the `linux/arm64` image alone and runs
   `scripts/check-soapy-release.py --docker-image` on it before the
   multi-platform push. A USB receiver needs `--device /dev/bus/usb` and
-  host group access (`packaging/README.md`).
+  host group access (`packaging/README.md`). Since MAN-537 both builds
+  pass `MANTA_GIT_SHA=${{ github.sha }}`, so the image names the release
+  commit in `--version`, `decoderVersion` and `manta_build_info`, and the
+  check runs with `--expect-git-sha "$GITHUB_SHA"`: an image that reports
+  another commit or `unknown` fails before the push.
+
+## Reviewing a Dependabot base-image bump
+
+The `Dockerfile` pins `rust:1-slim-bookworm` and `debian:bookworm-slim` by
+tag and manifest-list digest, and Dependabot's `docker` entry opens a PR
+when either digest or tag moves (MAN-537). Such a PR never auto-merges:
+`scripts/verify-dependabot-diff-safe.py` accepts only Cargo manifests and
+the lockfile, so `dependabot-auto-merge.yml` labels it `needs-review`, as it
+does every Actions bump. `/Dockerfile` is a CODEOWNERS path, so the owner
+approves it.
+
+No PR job builds the image, so build it before approving:
+
+```sh
+gh workflow run release-publish.yml --repo HagaleTechnologies/manta \
+    --ref <dependabot-branch> -f publish=false
+```
+
+Approve only when `docker-build-dispatch` passes. Its arm64 check prints
+`OK: image commit <12 hex of the branch head> matches --expect-git-sha`.
+A pinned digest freezes the base OS layer, so a Debian security fix reaches
+the image only when such a PR merges: review these PRs promptly.
 
 ## Verifying a downloaded release
 

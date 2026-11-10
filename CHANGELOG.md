@@ -24,6 +24,24 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-533: `GET /status` carries a `sources` array, one row per input
+  source with `healthy`, `losses_total`, `last_loss_reason`
+  (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
+  `manta status` prints it as a Sources table. `schema_version` stays 1.
+  `manta_input_malformed_packets_total{source="kiwi"}` now also counts
+  unknown-tag binary frames and text frames from the receiver. See
+  [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
+- MAN-541: a node running `[rbn_compare]` reads its frequency skew from the
+  RBN in ppm. `manta status` (and `GET /status`'s new `rbn_compare` object)
+  shows each band's median offset in Hz and skew in ppm with its precision,
+  and the `freq_correction_ppm` each config entry should set, which replaces
+  the applied value rather than adding to it. A band whose skew stays beyond
+  the new `[rbn_compare].skew_warn_ppm` (default 2 ppm, on by default; 0
+  turns it off) for 30 minutes adds a `WARN rbn skew` line to `/healthz`;
+  the verdict, status code and `manta_healthy` are unchanged. New metrics
+  `manta_rbn_compare_freq_offset_median_ppm` and
+  `manta_rbn_compare_skew_warning`, and a shipped `MantaRbnSkew` alert. See
+  [docs/DECISIONS/2026-11-09-man541-rbn-skew.md](docs/DECISIONS/2026-11-09-man541-rbn-skew.md).
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
@@ -481,6 +499,7 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+<<<<<<< HEAD
 - MAN-530: a live audio input whose decode thread falls behind no longer
   loses samples silently. Every frame the 8192-frame (~170 ms) capture ring
   rejects is counted in `manta_input_queue_dropped_samples_total`, and each
@@ -495,6 +514,24 @@ the git history and `docs/DECISIONS/`.
   segment, so audio is never spliced across it. coppa stays pinned at
   `f8a4d16d`. File input is unchanged. See
   docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md.
+=======
+- MAN-537: the published Docker image names its release commit. Its
+  `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
+  `manta_build_info` used to read `unknown`, because the build context has
+  no `.git`; the release workflow now passes the commit as the
+  `MANTA_GIT_SHA` build-arg and checks the arm64 image reports it before
+  the push. Both base images are pinned by tag and digest, and Dependabot
+  opens a PR when either moves. A local `docker build` still reports
+  `unknown` unless given `--build-arg MANTA_GIT_SHA=...`.
+- MAN-533: a live input that keeps its connection open but sends nothing
+  usable (a KiwiSDR sending only unknown-tag frames, pings or one-sample
+  `SND` frames, an HPSDR radio sending only malformed datagrams) no longer
+  holds the decode forever while the source reads healthy. After 30 s of
+  reading with no usable sample manta logs
+  `source <name> lost: ... no usable samples ...`, reconnects on the usual
+  backoff, and `manta_source_health` drops to 0, so `MantaInputDown` fires.
+  See [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
+>>>>>>> d0f42f14c270b7168d60521b4e2d04c6503cde81
 - MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
   audio, SoapySDR; ka9q already did) now reports a stopped stream through
   `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),

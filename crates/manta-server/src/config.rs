@@ -910,6 +910,13 @@ pub struct RbnCompareConfig {
     /// (`grade_config`), so a node never confirms itself.
     #[serde(deserialize_with = "deserialize_callsign_list_exclude")]
     pub exclude_spotters: Vec<String>,
+    /// MAN-541: a band whose median skew from the RBN stays beyond this
+    /// many ppm for 30 minutes, on a reading of at least 20 spots precise
+    /// to a third of it, adds a `WARN rbn skew` line to `/healthz` and
+    /// sets `manta_rbn_compare_skew_warning`. Default 2 ppm, the
+    /// good-citizen line SM7IUN's rbnskew uses; 0 turns the warning off.
+    /// Bounded 0 to 1000 (`manta_spot::MAX_ABS_PPM`) by `validate`.
+    pub skew_warn_ppm: f64,
 }
 
 impl Default for RbnCompareConfig {
@@ -925,6 +932,7 @@ impl Default for RbnCompareConfig {
             speed_tol_pct: 20.0,
             spotters: Vec::new(),
             exclude_spotters: Vec::new(),
+            skew_warn_ppm: crate::rbn_compare::skew::DEFAULT_SKEW_WARN_PPM,
         }
     }
 }
@@ -1023,6 +1031,7 @@ impl RbnCompareConfig {
             self.speed_tol_pct,
             RBN_COMPARE_MAX_SPEED_TOL_PCT,
         )?;
+        check_tolerance("skew_warn_ppm", self.skew_warn_ppm, manta_spot::MAX_ABS_PPM)?;
         if self.feed_port == 0 {
             return Err("[rbn_compare].feed_port must be between 1 and 65535, got 0".into());
         }
@@ -2504,6 +2513,34 @@ mod tests {
         assert_eq!(cfg, RbnCompareConfig::default());
         assert_eq!(cfg.validate(), Ok(()));
         assert_eq!(cfg.effective_login_callsign("W3XYZ-1"), "W3XYZ-1");
+    }
+
+    #[test]
+    fn rbn_compare_skew_warn_ppm_defaults_to_2() {
+        assert_eq!(rbn_compare("").unwrap().skew_warn_ppm, 2.0);
+        assert_eq!(
+            rbn_compare("skew_warn_ppm = 3.5\n").unwrap().skew_warn_ppm,
+            3.5
+        );
+    }
+
+    #[test]
+    fn rbn_compare_rejects_a_bad_skew_warn_ppm() {
+        for (body, got) in [
+            ("skew_warn_ppm = -1.0", "-1"),
+            ("skew_warn_ppm = nan", "NaN"),
+            ("skew_warn_ppm = 1000.5", "1000.5"),
+        ] {
+            let err = rbn_compare(body).unwrap().validate().unwrap_err();
+            assert_eq!(
+                err,
+                format!("[rbn_compare].skew_warn_ppm must be a number from 0 to 1000, got {got}"),
+                "{body}"
+            );
+        }
+        for body in ["skew_warn_ppm = 0.0", "skew_warn_ppm = 1000.0"] {
+            assert_eq!(rbn_compare(body).unwrap().validate(), Ok(()), "{body}");
+        }
     }
 
     #[test]

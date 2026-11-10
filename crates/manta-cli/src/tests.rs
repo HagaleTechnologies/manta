@@ -2052,6 +2052,32 @@ fn source_health_sink_counts_a_source_outage() {
     );
 }
 
+/// MAN-533: the one-input loss sink records each lost connection's
+/// reason, and only the reason: health edges stay the health sink's.
+#[test]
+fn source_loss_sink_records_the_reason_in_metrics() {
+    use manta_server::metrics::SourceLossReason;
+    use std::sync::Arc;
+
+    let metrics = Arc::new(manta_server::metrics::Metrics::new());
+    let mut health = source_health_sink("kiwi", Some(metrics.clone()), None);
+    let mut loss = source_loss_sink("kiwi", Some(metrics.clone()));
+    health(true);
+    loss(SourceLossReason::NoUsableSamples);
+    let rows = metrics.source_snapshot_at(std::time::Instant::now());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].name, "kiwi");
+    assert!(rows[0].healthy, "a loss alone moves no health edge");
+    assert_eq!(rows[0].losses_total, 1);
+    assert_eq!(
+        rows[0].last_loss.map(|(reason, _)| reason),
+        Some(SourceLossReason::NoUsableSamples)
+    );
+    // With no metrics (no `[server]`), the sink is a no-op.
+    let mut silent = source_loss_sink("kiwi", None);
+    silent(SourceLossReason::ReadFailed);
+}
+
 #[test]
 fn input_attenuation_of_translates_a_snapshot() {
     assert_eq!(

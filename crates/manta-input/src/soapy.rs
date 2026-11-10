@@ -15,7 +15,7 @@
 //! flags private.
 
 use crate::overflow::{account_overflow, UnknownGapLatch};
-use crate::stall::StallEpisode;
+use crate::stall::{NoUsableSamples, StallEpisode};
 use crate::InputHealthCounters;
 use crate::IqSource;
 use anyhow::Result;
@@ -150,15 +150,21 @@ impl RetryState {
     /// Count one no-sample attempt -- a native read timeout or a native
     /// `Ok(0)` -- against the silence budget, erroring at the bound so
     /// neither can keep the loop alive forever (MAN-489 review).
+    ///
+    /// MAN-533 D4: the bound's error is [`NoUsableSamples`], so the
+    /// reconnect layer reports it as `no usable samples`; the text is
+    /// unchanged. The overflow bound below is not: there the host is too
+    /// slow, not the stream useless.
     fn spend_silence_budget(&mut self) -> anyhow::Result<()> {
         self.timeout_retries += 1;
         if self.timeout_retries >= MAX_TIMEOUT_RETRIES {
-            anyhow::bail!(
+            return Err(NoUsableSamples::new(format!(
                 "SoapySDR read timed out after {} consecutive no-sample attempts (~{}s of \
                  silence)",
                 MAX_TIMEOUT_RETRIES,
                 (MAX_TIMEOUT_RETRIES as i64 * TIMEOUT_US) / 1_000_000
-            );
+            ))
+            .into());
         }
         Ok(())
     }
@@ -548,9 +554,55 @@ mod tests {
                 &mut last_warn,
                 &mut unknown,
             )
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        // MAN-533 D4: the silence budget's error carries the shared type.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(err.contains("timed out after"), "{err}");
+    }
+
+    /// MAN-533 scenario 2 (SoapySDR): native reads that succeed with zero
+    /// samples, alone, end at the retry limit in the shared type the
+    /// reconnect layer reopens on.
+    #[test]
+    fn native_zero_reads_alone_end_in_no_usable_samples() {
+        let mut state = RetryState::new();
+        let (health, notice, mut last_warn, mut unknown) = retry_parts();
+        let mut attempts = 0u32;
+        let err = state
+            .run(
+                &mut |_| {
+                    attempts += 1;
+                    ReadAttempt::Samples(0)
+                },
+                &health,
+                &notice,
+                &mut last_warn,
+                &mut unknown,
+            )
+            .unwrap_err();
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        assert!(err.to_string().contains("timed out after"), "{err}");
+        assert_eq!(attempts, MAX_TIMEOUT_RETRIES);
+    }
+
+    /// MAN-533 D4: the overflow bound means the host cannot keep up, not
+    /// that the stream is useless, so its error is not `NoUsableSamples`.
+    #[test]
+    fn an_overflow_flood_is_not_no_usable_samples() {
+        let mut state = RetryState::new();
+        let (health, notice, mut last_warn, mut unknown) = retry_parts();
+        let err = state
+            .run(
+                &mut |_| ReadAttempt::Overflow,
+                &health,
+                &notice,
+                &mut last_warn,
+                &mut unknown,
+            )
+            .unwrap_err();
+        assert!(!crate::is_no_usable_samples(&err), "{err:#}");
+        assert!(err.to_string().contains("overflowed"), "{err}");
     }
 
     /// MAN-489: delivery re-arms the episode, so a second outage reports

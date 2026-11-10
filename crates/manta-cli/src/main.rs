@@ -2082,6 +2082,20 @@ fn source_health_sink(
         }
     })
 }
+
+/// MAN-533: the loss sink a one-input `ReconnectingSource` reports every
+/// lost connection's reason through, for `/status` `sources[]`.
+fn source_loss_sink(
+    name: &'static str,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+) -> reconnect::LossSink {
+    Box::new(move |reason| {
+        if let Some(metrics) = &metrics {
+            metrics.record_source_loss(name, reason);
+        }
+    })
+}
+
 /// How often the daemon copies the engine's decode-latency observer into
 /// `Metrics` (MAN-128). Same bridge shape and tuning rationale as
 /// `ACTIVE_TRACKS_POLL_INTERVAL`.
@@ -2417,8 +2431,9 @@ fn spawn_attenuation_poller(
 }
 
 /// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
-/// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
-/// context, which `.dockerignore` excludes it from). MAN-83: the values are
+/// (`MANTA_GIT_SHA`, "unknown" with neither it nor `.git` -- e.g. a local
+/// Docker build without the build-arg, as `.dockerignore` excludes `.git`;
+/// the release image passes it, MAN-537). MAN-83: the values are
 /// `build_info`'s constants, the same ones `--version` and the JSON
 /// stream's `decoderVersion` read, so the gauge, the version line and the
 /// spots always name the same build.
