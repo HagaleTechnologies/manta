@@ -331,9 +331,11 @@ impl Channelizer {
 }
 
 /// MAN-527: recycled hops `process_into` keeps beyond what a call used. 32
-/// covers the lead-in padding call (`filter_len / hop` = 32 hops) and four
-/// offline 8-hop batches; a larger one-off read's surplus is released. At
-/// N = 2048 a hop's buffers are 24 KB, so the pool holds at most 768 KB.
+/// is four times the largest steady batch on the decode paths (8 hops per
+/// offline 4,096-sample chunk at 192 kS/s; a live 2,048-sample read is 4), so
+/// a call somewhat larger than the last one still allocates nothing, while a
+/// larger one-off read's surplus is released. At N = 2048 a hop's buffers
+/// are 24 KB, so the pool holds at most 768 KB.
 const SPARE_RETAIN_HOPS: usize = 32;
 
 /// SPEC §1.3 steps 1-2 for one hop, into `fold` (length N): window and fold,

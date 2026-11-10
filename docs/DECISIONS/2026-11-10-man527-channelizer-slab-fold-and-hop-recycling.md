@@ -71,9 +71,11 @@ moves `out`'s hops into a channelizer-owned `spare` pool, then builds each
 new hop from `spare.pop()` (or allocates one with capacity N when the pool
 is empty), clearing and refilling `x` and `power`. On return `out` holds
 exactly this call's hops. After the hop loop the pool is truncated to
-`SPARE_RETAIN_HOPS = 32` surplus hops: that covers the lead-in padding call
-(`filter_len / hop` = 32 hops) and four offline 8-hop batches, and holds at
-most 768 KB at N = 2048. The bound applies to surplus only: a call that
+`SPARE_RETAIN_HOPS = 32` surplus hops: four times the largest steady batch on
+the decode paths (8 hops per offline 4,096-sample chunk at 192 kS/s; a live
+2,048-sample read is 4, and the lead-in padding call of `filter_len` zeros is
+1), so a call somewhat larger than the last one still allocates nothing. The
+pool holds at most 768 KB at N = 2048. The bound applies to surplus only: a call that
 needs 72 hops recycles 72. `process` is a wrapper that passes a fresh `Vec`,
 so its callers (checks, diagnostics, tests, testkit) see the same hops and
 the same allocation profile as before.
