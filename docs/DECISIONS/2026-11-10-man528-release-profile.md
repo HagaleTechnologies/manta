@@ -65,7 +65,8 @@ it still means "no profile" after this pin.
 **D4. The decision rule, fixed in advance and implemented as `choose()`.**
 The rule reads the single-thread run (`RAYON_NUM_THREADS=1`, plus `taskset`
 on Linux), which matches the Pi 4 budget of one core and was the least noisy
-in research. The multi-thread run is reported for information only.
+in research. The multi-thread run's timings are reported for information
+only; its output digests still count under step 1.
 
 1. Drop any variant whose decode output digest differs from base on any run.
 2. Drop any variant with `panic = "abort"` (D2). It is still reported.

@@ -9,7 +9,9 @@ Run: python3 -m unittest scripts.tests.test_release_profile_ab -v
 import contextlib
 import importlib.util
 import io
+import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -247,6 +249,25 @@ class ChooseTests(unittest.TestCase):
         self.assertEqual(winner, "cu1")
         self.assertEqual(dict(ineligible)["fat"], "decode output differs from base")
 
+    def test_output_mismatch_in_any_collected_mode_is_excluded(self):
+        # D4 rule 1 reads "any run": with --threads 1,all, a multi-thread digest that differs from
+        # base drops the variant even though only the single-thread mode is timed for the verdict.
+        results = {
+            "base": record("base", 100, 300, 10.0, 10.2),
+            "fat": record("fat", 60, 300, 8.0, 8.1),
+            "cu1": record("cu1", 90, 300, 10.0, 10.2),
+        }
+        for rec in results.values():
+            rec["runs"]["all"] = [{"cpu_s": 5.0, "wall_s": 2.0, "sha256": REF} for _ in range(5)]
+        results["fat"]["runs"]["all"][2]["sha256"] = OTHER  # one multi-thread run differs
+        winner, _, ineligible = ab.choose(results, "1")
+        self.assertEqual(winner, "cu1")
+        self.assertEqual(dict(ineligible)["fat"], "decode output differs from base")
+        # Base must agree with itself across modes too, or there is no single reference digest.
+        results["base"]["runs"]["all"] = [{"cpu_s": 5.0, "wall_s": 2.0, "sha256": OTHER}] * 5
+        with self.assertRaisesRegex(ValueError, "base decode output differs"):
+            ab.choose(results, "1")
+
     def test_nondeterministic_base_raises(self):
         results = {"base": record("base", 100, 300, 10.0, 10.2)}
         results["base"]["runs"]["1"][0]["sha256"] = OTHER
@@ -324,6 +345,36 @@ class CliTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "ab")))
         self.assertEqual(code, 2)
         self.assertIn("cpu_budget.wav", err.getvalue())
+
+    def test_choose_error_keeps_the_timings(self):
+        # A base whose multi-thread output differs from its single-thread output makes choose()
+        # raise; main must still save what it measured instead of losing the whole session.
+        def fake_run(argv, env, stdout=None, stderr=None, cwd=None):
+            if "decode" in argv:
+                stdout.write(b"one" if env.get("RAYON_NUM_THREADS") == "1" else b"all")
+            return {"wall_s": 1.0, "cpu_s": 1.0, "maxrss": 0, "exit": 0}
+
+        def fake_copy(src, dst):
+            with open(dst, "wb") as f:
+                f.write(b"binary")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, "cpu_budget.wav"), "wb").close()
+            out = os.path.join(tmp, "ab")
+            with mock.patch.object(ab, "run_measured", fake_run), \
+                    mock.patch.object(ab, "host_facts", lambda cpu: {}), \
+                    mock.patch.object(ab, "wav_duration_s", lambda path: 60.0), \
+                    mock.patch.object(shutil, "copy2", fake_copy), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()) as err:
+                code = ab.main(["--out", out, "--scene", tmp, "--variants", "base",
+                                "--threads", "1,all", "--reps", "1"])
+            self.assertEqual(code, 1)
+            with open(os.path.join(out, "results.partial.json")) as f:
+                saved = json.load(f)
+        self.assertIn("differs", saved["error"])
+        self.assertEqual(sorted(saved["results"]["base"]["runs"]), ["1", "all"])
+        self.assertIn("results.partial.json", err.getvalue())
 
     def test_variants_flag_always_adds_base(self):
         args = ab.parse_args(["--out", "x", "--variants", "fat_cu1"])

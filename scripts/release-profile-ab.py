@@ -17,9 +17,9 @@ docs/DECISIONS/2026-11-10-man528-release-profile.md):
 4. Otherwise, among the remaining variants (base included) whose clean-build CPU seconds stay
    within +50% of base, pick the smallest binary; ties go to variant order.
 
-The rule reads the single-thread mode (`RAYON_NUM_THREADS=1`, plus `taskset -c N` on Linux with
-`--cpu N`), which matches the Pi 4 budget of one core. The multi-thread mode is informational and
-is never pinned to one CPU.
+The rule times the single-thread mode (`RAYON_NUM_THREADS=1`, plus `taskset -c N` on Linux with
+`--cpu N`), which matches the Pi 4 budget of one core. The multi-thread mode's timings are
+informational and it is never pinned to one CPU, but its output digests still count under step 1.
 
 Unix only (it uses os.wait4 for child CPU time). Run from the repo root, e.g. on a Pi 4:
 
@@ -196,7 +196,8 @@ def _ineligible_reason(record):
 
 def choose(results, mode="1"):
     """Decision D4. `results` maps variant name -> record with `panic`, `size_bytes`,
-    `build_cpu_s` and `runs[mode]` (a list of {"cpu_s", "sha256"}). Returns
+    `build_cpu_s` and `runs[mode]` (a list of {"cpu_s", "sha256"}). Output digests are compared
+    against base across every mode in `runs`; CPU times are read from `mode` only. Returns
     (winner, reason, ineligible), where ineligible is a list of (name, why)."""
     if "base" not in results:
         raise ValueError("results have no base variant")
@@ -208,16 +209,22 @@ def choose(results, mode="1"):
             raise ValueError(f"{name} has no runs in mode {mode!r}")
         return r
 
-    base_digests = {run["sha256"] for run in runs("base")}
+    def all_runs(name):
+        """Every run of `name` in every collected mode. Rule 1 checks output digests on any run;
+        only the timing in rules 3 and 4 is limited to `mode`."""
+        runs(name)  # the verdict mode must still be present
+        return [run for mode_runs in results[name]["runs"].values() for run in mode_runs]
+
+    base_digests = {run["sha256"] for run in all_runs("base")}
     if len(base_digests) != 1:
-        raise ValueError("base decode output differs between its own runs")
+        raise ValueError("base decode output differs between its own runs or thread modes")
     ref = next(iter(base_digests))
 
     ineligible = []
     eligible = []
     for name in order:
         rec = results[name]
-        if any(run["sha256"] != ref for run in runs(name)):
+        if any(run["sha256"] != ref for run in all_runs(name)):
             ineligible.append((name, "decode output differs from base"))
             continue
         why = _ineligible_reason(rec)
@@ -494,6 +501,14 @@ def main(argv=None):
                 {"cpu_s": r["cpu_s"], "wall_s": r["wall_s"], "sha256": h.hexdigest()}
             )
 
+    def save_partial(error):
+        partial = os.path.join(out, "results.partial.json")
+        with open(partial, "w") as f:
+            json.dump({"host": host, "audio_s": audio_s, "results": results, "error": str(error)},
+                      f, indent=2)
+        print(f"{error}; timings so far are in {partial}", file=sys.stderr)
+        return 1
+
     try:
         for mode in args.modes:
             for n in args.variants:
@@ -507,18 +522,16 @@ def main(argv=None):
                     decode(n, mode, timed=True)
             print(f"round {rnd + 1}/{args.reps} done", flush=True)
     except RuntimeError as e:
-        partial = os.path.join(out, "results.partial.json")
-        with open(partial, "w") as f:
-            json.dump({"host": host, "audio_s": audio_s, "results": results, "error": str(e)},
-                      f, indent=2)
-        print(f"{e}; timings so far are in {partial}", file=sys.stderr)
-        return 1
+        return save_partial(e)
 
     host["load_end"] = "/".join(f"{x:.2f}" for x in os.getloadavg())
     if shutil.which("vcgencmd"):
         host["throttled_end"] = _capture(["vcgencmd", "get_throttled"])
         host["arm_clock_end"] = _capture(["vcgencmd", "measure_clock", "arm"])
-    verdict = choose(results, verdict_mode)
+    try:
+        verdict = choose(results, verdict_mode)
+    except ValueError as e:  # e.g. base output differs between runs or thread modes
+        return save_partial(e)
     md = render_markdown(host, results, verdict, audio_s)
     if verdict_mode != "1":
         md += "note: no single-thread mode was run, so this verdict is informational only\n"
