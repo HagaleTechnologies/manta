@@ -266,6 +266,12 @@ numbers, and `manta_input_gaps_detected_total{source="ka9q"}`:
 curl -s 127.0.0.1:7302/metrics | grep 'source="ka9q"'
 ```
 
+A lost packet is not only a metric. manta also moves its spot clock on by the
+packet's samples, counted from the RTP timestamp, so spots after the loss keep
+their true time. A loss of 0.5 s or more also closes the tracks in progress,
+and decoding starts again after it
+([MAN-529](../DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md)).
+
 A dropped-packet count that keeps rising means the buffer, the CPU or the
 network cannot keep up. `manta_source_health{source="ka9q"}` reads 0 until the
 first packet of the channel arrives, then 1. How many packets a Raspberry Pi 4

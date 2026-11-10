@@ -24,10 +24,19 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-540: Debian packages for x86-64 and arm64 (`manta-linux-x86_64.deb`,
   `manta-linux-arm64.deb`). `sudo apt install ./<file>` installs
   `/usr/bin/manta`, the systemd service (enabled, not started) and
   `/etc/manta/manta.toml`, which upgrades never replace.
+=======
+- MAN-546: a telnet client can send `set/dx/filter cq`, `band <list>` and
+  `snr <n>` (combinable) to receive only matching spots on its own
+  connection, live and from `sh/dx`; `set/dx/filter off` clears it, and
+  `SKIMMER/SETT` reports `CQ` for a connection with the CQ filter. The SNR
+  is the 500 Hz figure the row prints. See
+  [docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
+>>>>>>> 785119b6d108493adaf3ab3bb4bfae8139f35f77
 - MAN-533: `GET /status` carries a `sources` array, one row per input
   source with `healthy`, `losses_total`, `last_loss_reason`
   (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
@@ -438,6 +447,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-528: release binaries are built with `lto = "fat"` and
+  `codegen-units = 1`, about 32% smaller (25,486,488 to 17,229,944 bytes on
+  x86_64 Linux), with byte-identical decode output and no measurable speed
+  change on x86_64. A Pi 4 has not been measured. `panic` stays `unwind`.
+  A clean release build uses about 23% more CPU and its final link needs
+  about 1.5 GB. See
+  [docs/DECISIONS/2026-11-10-man528-release-profile.md](docs/DECISIONS/2026-11-10-man528-release-profile.md).
+
 - MAN-536: `[spot].refresh_lists` downloads cty.dat and MASTER.SCP over
   HTTPS by default. `cty_url` and `scp_url` default to `https://` URLs,
   verified against the CA roots built into manta. `http://` stays accepted
@@ -503,6 +520,28 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-530: a live audio input whose decode thread falls behind no longer
+  loses samples silently. Every frame the 8192-frame (~170 ms) capture ring
+  rejects is counted in `manta_input_queue_dropped_samples_total`, and each
+  contiguous run of rejected frames in `manta_input_gaps_detected_total`
+  (`source="audio"`, or the `[[input]]` name; the packet and malformed
+  families read 0). A warning names the device, at most once per 60 s.
+  `manta doctor` prints an `input:` line, and its JSON gains
+  `queueDroppedSamples` and `inputGapsDetected`, when its own run lost
+  input. The engine receives the hole at the exact sample where it falls:
+  a hole shorter than 0.5 s advances the sample clock and invalidates
+  continuity-dependent decode state, and a longer one starts a new
+  segment, so audio is never spliced across it. coppa stays pinned at
+  `f8a4d16d`. File input is unchanged. See
+  docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md.
+- MAN-537: the published Docker image names its release commit. Its
+  `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
+  `manta_build_info` used to read `unknown`, because the build context has
+  no `.git`; the release workflow now passes the commit as the
+  `MANTA_GIT_SHA` build-arg and checks the arm64 image reports it before
+  the push. Both base images are pinned by tag and digest, and Dependabot
+  opens a PR when either moves. A local `docker build` still reports
+  `unknown` unless given `--build-arg MANTA_GIT_SHA=...`.
 - MAN-533: a live input that keeps its connection open but sends nothing
   usable (a KiwiSDR sending only unknown-tag frames, pings or one-sample
   `SND` frames, an HPSDR radio sending only malformed datagrams) no longer

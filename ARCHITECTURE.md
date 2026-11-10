@@ -185,9 +185,17 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
   them. Pure std plus `socket2`, in every build. The wire facts are pinned
   against ka9q-radio's documentation and headers, not yet a live radiod
   ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
+  Its RTP packets are numbered, so a short loss is counted from the RTP
+  timestamp and reported through `IqSource::take_missing_samples()`, and a
+  loss of 0.5 s or more goes through `take_discontinuity()`; a read ends at
+  the loss
+  ([docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md](docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
-  low-budget nodes contribute spots.
+  low-budget nodes contribute spots. Its SND frames are numbered, so a short
+  loss is converted to output samples at the negotiated rate and reported
+  through `IqSource::take_missing_samples()`, and a loss of 0.5 s or more goes
+  through `take_discontinuity()` (MAN-529).
 - **File playback**: WAV (via `hound`, matching coppa): Float32 or
   16/24/32-bit integer PCM, streamed from disk, so memory does not grow with
   the recording
@@ -259,15 +267,20 @@ All sources normalize to `Complex32` at the native rate. The decode loop
 pulls them with a blocking `IqSource::read()` (§10); no manta crate puts a
 ring or an input thread between source and channelizer, so a slow batch
 delays the next read, and samples a device cannot buffer meanwhile are lost
-before manta sees them. The one ring on the input path is coppa-audio's `rtrb`
-ring behind `CpalSource`'s audio callback, and counting its overruns is still
-aspirational (`manta-engine::soak`'s module doc tracks the blocker:
-`coppa-audio::CpalSource` doesn't expose its ring's `overflow_count()`
-publicly). Distinct and already shipped (MAN-56): HPSDR's wire-level UDP
-packet loss/malformed-datagram counters (`manta_input::InputHealthCounters`,
-§8) reach the Prometheus `/metrics` endpoint today — a different layer
-(lost/rejected datagrams before demux, not ring backpressure after it), not a
-partial implementation of the ring gauge above.
+before manta sees them. The one ring on the input path is live audio's
+8192-frame (~170 ms) capture ring: since MAN-530 manta owns the cpal stream
+on a dedicated owner thread and its callback pushes index-tagged frames into
+a private `rtrb` ring (coppa stays pinned at `f8a4d16d`; its `CpalSource` is
+no longer on the live path). Every frame the full ring rejects is counted in
+`InputHealthCounters` (`manta_input_queue_dropped_samples_total`, and one
+`manta_input_gaps_detected_total` per contiguous loss), and the read that
+starts after the hole reports it to the engine at that exact sample (see
+"Unknown-length gap" below and
+`docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md`).
+Distinct and shipped earlier (MAN-56): HPSDR's wire-level UDP packet
+loss/malformed-datagram counters (`manta_input::InputHealthCounters`, §8) —
+a different layer (lost/rejected datagrams before demux, not ring
+backpressure after it).
 
 **Reconnect (MAN-73).** A live source's `IqSource::read()` can fail -- a
 stalled Kiwi socket, an HPSDR stall-escalation, a dropped audio device.
@@ -303,6 +316,11 @@ the sample clock nor rebuilds the segment: `TrackManager::note_input_gap`
 invalidates each track's run-level decode state at the first hop holding
 a post-gap sample, so the character the gap cut is dropped rather than
 misread. See `docs/DECISIONS/2026-11-01-man202-unknown-length-input-gaps.md`.
+Live audio (MAN-530) reports a capture-ring hole of `k` frames on the first
+read that starts after it, never earlier, so buffered pre-hole audio is
+decoded first: `k` below 24000 (0.5 s) is `take_missing_samples(Some(k))`
+plus `take_unknown_gap()`, and 24000 or more is `take_discontinuity(Some(k))`
+alone. No returned buffer straddles a hole.
 
 **Paced and looping replay (MAN-269).** File replay normally runs as fast
 as the machine decodes. `run --realtime` (`input.realtime`) wraps the file
@@ -358,7 +376,9 @@ detection on channel powers, decoders attached only to active channels.**
   2× (187 Hz, 5.6 samples/dit) was rejected as too marginal for QSB'd fast CW.
 - Implementation: polyphase FIR commutator + one N-point FFT per hop
   (the forward plan `coppa-dsp::fft::FftProcessor` builds, run in place with
-  a scratch the channelizer owns, MAN-117). Frequency-domain output magnitude² feeds the
+  a scratch the channelizer owns, MAN-117; folded slab by slab with the
+  rotation as the write index, and `process_into` recycles the hop buffers,
+  MAN-527). Frequency-domain output magnitude² feeds the
   detector directly — the PFB *is* the spectrum analyzer; no separate FFT path.
 
 **Detector / track manager.** Per-channel noise floor by order statistics
@@ -682,6 +702,15 @@ sample time. See
   restart. See [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)
   for retention and `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`
   for query semantics.
+  `set/dx/filter cq`, `band <list>` and `snr <n>` (combinable, e.g.
+  `set/dx/filter cq band 40m,20m snr 10`) set a per-connection filter that
+  governs the live stream, the shutdown drain and `sh/dx`, where it selects
+  before the count is applied. A new `set/dx/filter` replaces the previous
+  one; `set/dx/filter off` or a bare `set/dx/filter` clears every filter on
+  the connection, `unique` included. `snr` compares the 500 Hz whole-dB
+  figure the row prints, and a connection with `cq` set gets
+  `SETT: vlNormal CQ ...`. Other connections are unaffected. See
+  [MAN-546](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).
@@ -1025,8 +1054,10 @@ sample time. See
   calibration — its `_count` rate is spots-pipeline throughput, closing
   the "decode rate" gap noted below); `manta_start_time_seconds`/
   `manta_uptime_seconds`/`manta_build_info{version,git_sha,features}`
-  (process uptime and build metadata — `git_sha` is `"unknown"` in a
-  Docker build, since `.dockerignore` excludes `.git`);
+  (process uptime and build metadata — `git_sha` is `"unknown"` for a
+  build with no `.git` and no `MANTA_GIT_SHA`, such as a local Docker
+  build without the build-arg, since `.dockerignore` excludes `.git`; the
+  release image passes its commit, MAN-537);
   `manta_uplink_target_*{target="host:port"}` (per-target labels for every
   uplink counter, derived-sum aggregates preserved under their old
   unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`
@@ -1048,18 +1079,18 @@ sample time. See
   healthy (with one input: that input), with the `MantaInputDown` alert
   reporting a dead input — see
   [MAN-13](docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md).
-  What's still genuinely missing: per-stage queue depths, spots/min,
-  spot-confidence histogram, and **ring**-overrun counting for live audio
-  (§3 — blocked on a `coppa-audio` API addition, `manta-engine::soak`'s documented
-  deviation, a different gap from MAN-56's wire-level packet counters).
-  The three `manta_input_*` series are published only for sources that
-  actually count wire-level packet loss or driver overflow (HPSDR, KiwiSDR
-  (MAN-128's SND `seq` tracking), ka9q-radio (MAN-140) and SoapySDR, whose
-  driver overflow read errors each count one gap event — MAN-233; an
-  overflow flagged `SOAPY_SDR_END_ABRUPT` on a successful read is not
-  seen, and SoapySDR's `dropped_packets` stays 0 because an overflow
-  carries no lost-sample count) and are **absent**, not a frozen zero, for every other source
-  (audio) — "absent means not measured", so an operator never
+  What's still genuinely missing: per-stage queue depths, spots/min and a
+  spot-confidence histogram.
+  The `manta_input_*` loss series are published only for sources that
+  actually count input loss (HPSDR, KiwiSDR (MAN-128's SND `seq`
+  tracking), ka9q-radio (MAN-140), SoapySDR, whose driver overflow read
+  errors each count one gap event — MAN-233; an overflow flagged
+  `SOAPY_SDR_END_ABRUPT` on a successful read is not seen, and SoapySDR's
+  `dropped_packets` stays 0 because an overflow carries no lost-sample
+  count — and live audio, whose capture-ring overruns count exact
+  rejected frames and one gap per contiguous loss, with packet families
+  at 0 — MAN-530) and are **absent**, not a frozen zero, for file
+  sources — "absent means not measured", so an operator never
   reads a placeholder as live data; the same distinction that motivated
   the `manta_active_tracks` caveat before it was populated.
 - **RBN comparison (MAN-301)**: `[rbn_compare]` is opt-in and disabled by
@@ -1308,19 +1339,20 @@ non-blocking send plus shared atomics and short locks between them.
   decode thread reads it.
 - **Live-audio capture callback.** The one exception to "only the decode
   thread carries samples": live audio input (`AudioIqSource::from_device`)
-  wraps `coppa_audio::CpalSource`, whose capture callback runs on cpal's
-  audio thread and pushes samples into coppa-audio's internal `rtrb` SPSC
-  ring; the decode thread's `read()` pops them (§3). That is a real
-  producer/consumer boundary, and when the decode thread falls behind the
-  ring overruns where manta cannot count it (`CpalSource` does not expose
-  its `overflow_count()`). Every other source is read on the decode thread
-  itself, and no thread other than these two carries samples, and none but
-  the decode thread carries decoder events.
+  builds its cpal stream on a dedicated owner thread, which only holds the
+  stream's lifetime; the capture callback runs on cpal's audio thread and
+  pushes index-tagged frames into a private `rtrb` SPSC ring, and the
+  decode thread's `read()` pops them (§3). That is a real producer/consumer
+  boundary, and when the decode thread falls behind the ring overruns:
+  since MAN-530 the callback counts every rejected frame with atomics only
+  and the reader reports the hole at its exact sample. Every other source
+  is read on the decode thread itself, and no thread other than these
+  carries samples, and none but the decode thread carries decoder events.
 
 A batch that takes longer than its own audio delays the next `read()`, and
 whatever the source cannot buffer meanwhile is lost before manta sees it —
-for live audio, in coppa-audio's ring, uncounted. No manta per-stage queue
-exists to measure.
+for live audio, in its capture ring, counted since MAN-530. No manta
+per-stage queue exists to measure.
 
 **Target, not built:** `rtrb` SPSC rings and crossbeam channels between
 dedicated threads: SDR/input thread → ring → **channelizer thread** (owns
@@ -1334,7 +1366,10 @@ input and overruns are counted where they happen.
 behind, during a run at 192 kS/s on a Raspberry Pi 4 (ROADMAP M2's
 CPU-budget target). For SoapySDR the direct measure is the series MAN-233
 adds, `manta_input_gaps_detected_total{source="soapy"}`, which counts driver
-stream overflows: samples the host did not read in time. For HPSDR, KiwiSDR
+stream overflows: samples the host did not read in time. For live audio it
+is `manta_input_queue_dropped_samples_total{source="audio"}` (MAN-530),
+which counts capture-ring frames the decode thread did not read in time.
+For HPSDR, KiwiSDR
 and ka9q the same series (docs/METRICS.md) counts packet-sequence gaps, which
 network or receiver loss causes as readily as a slow loop, so a gap there is
 a candidate signal only: it counts toward the trigger when it is absent from

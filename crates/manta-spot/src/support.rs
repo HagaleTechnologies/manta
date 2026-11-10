@@ -274,13 +274,26 @@ impl SupportLedger {
         now: u64,
         ignored: &[String],
     ) -> Option<(String, Support)> {
+        self.better_supported_rival_where(track_id, candidate, now, ignored, |_| true)
+    }
+
+    /// Selects among eligible texts inside the scan so an excluded winner
+    /// cannot hide an eligible runner-up.
+    pub(crate) fn better_supported_rival_where(
+        &self,
+        track_id: u32,
+        candidate: &str,
+        now: u64,
+        ignored: &[String],
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<(String, Support)> {
         let mine = self.support(track_id, candidate, now);
         let mut best: Option<(String, Support)> = None;
         for ((tid, text), obs) in self.seen.range((track_id, String::new())..) {
             if *tid != track_id {
                 break;
             }
-            if text == candidate || ignored.contains(text) {
+            if text == candidate || ignored.contains(text) || !eligible(text) {
                 continue;
             }
             let Some(rel) = variant::relation(candidate, text) else {
@@ -384,6 +397,11 @@ impl SupportLedger {
         out
     }
 
+    /// Retains only eligible texts, across all tracks.
+    pub(crate) fn retain_texts(&mut self, eligible: impl Fn(&str) -> bool) {
+        self.seen.retain(|(_, text), _| eligible(text));
+    }
+
     /// Drops every recorded observation for `track_id`. Mirrors
     /// `RepetitionGate::forget_track` (MAN-19) -- without this, `seen`'s
     /// key space grows forever under sustained track churn.
@@ -403,6 +421,49 @@ impl SupportLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn man531_retention_preserves_other_support_and_order() {
+        let mut ledger = SupportLedger::new(FS);
+        for track in [1, 2] {
+            for call in ["K5ARH", "K5ARG", "K5ARX"] {
+                ledger.observe(track, call, 1, 100, 0.9);
+            }
+        }
+        let expected: Vec<_> = ledger
+            .seen
+            .keys()
+            .filter(|(_, text)| text != "K5ARH")
+            .cloned()
+            .collect();
+        let kept = ledger.support(1, "K5ARG", 100);
+        ledger.retain_texts(|text| text != "K5ARH");
+        assert_eq!(ledger.seen.keys().cloned().collect::<Vec<_>>(), expected);
+        for track in [1, 2] {
+            assert_eq!(ledger.support(track, "K5ARH", 100).reps, 0);
+            assert_eq!(ledger.support(track, "K5ARG", 100), kept);
+            assert_eq!(ledger.support(track, "K5ARX", 100), kept);
+        }
+    }
+
+    #[test]
+    fn man531_filter_selects_runner_up_and_combines_exclusions() {
+        let mut ledger = SupportLedger::new(FS);
+        for (call, reps) in [("K5ARG", 2), ("K5ARH", 4), ("K5ARX", 3)] {
+            for i in 0..reps {
+                ledger.observe(1, call, i * 10, i * 10_000, 0.9);
+            }
+        }
+        let eligible = |text: &str| text != "K5ARH";
+        let rival = ledger
+            .better_supported_rival_where(1, "K5ARG", 40_000, &[], eligible)
+            .unwrap();
+        assert_eq!(rival.0, "K5ARX");
+        assert_eq!(rival.1.reps, 3);
+        assert!(ledger
+            .better_supported_rival_where(1, "K5ARG", 40_000, &["K5ARX".into()], eligible)
+            .is_none());
+    }
 
     #[test]
     fn an_overlapping_same_track_observation_adds_no_support() {

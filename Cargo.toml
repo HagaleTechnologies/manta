@@ -49,6 +49,8 @@ rustfft = "6.4"
 pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "7f8078b19d759e24f50adb1efd0b3fd75371a39d" }
 
 cpal = "0.18"
+# MAN-530: manta-owned tagged capture ring (already locked through coppa-audio).
+rtrb = "0.3.5"
 ctrlc = "3"
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 libc = "0.2"
@@ -96,3 +98,24 @@ debug = "line-tables-only"
 incremental = false
 [profile.dev.package."*"]
 opt-level = 2
+
+# MAN-528: the shipped profile, chosen by measurement; see
+# docs/DECISIONS/2026-11-10-man528-release-profile.md and rerun with
+# scripts/release-profile-ab.py. On an AMD Ryzen 9 5950X, x86_64 Linux, from
+# main de39a71 (research run, all eight variants):
+#   manta binary 25,486,488 -> 17,229,944 bytes (-32%); single-thread decode
+#   of the MAN-49 cpu_budget scene 654 -> 663 us/hop median (best-of-6
+#   14.27 -> 14.28 CPU-s), inside run-to-run spread; clean
+#   `cargo build --release -p manta-cli` CPU 307 -> 379 s (+23%). Decode
+#   output is byte-identical (46/46 decode_fingerprints lines). This PR's
+#   rerun of the tool picked the same variant at the same sizes.
+#   Pi 4 and M-series Mac are not measured yet (MAN-49).
+# panic stays "unwind": per-input catch_unwind (manta-engine multi.rs,
+# manta-cli hpsdr_group.rs), listener tasks and the soak report catch panics,
+# and abort would end the process instead. Cargo cannot set panic per package.
+# Faster local release builds with the same decode output:
+#   CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

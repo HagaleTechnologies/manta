@@ -810,6 +810,10 @@ the live-state stream only if it sets `[server].live_port`.
   `sh/dx 30m`; `[server].history_minutes` sets retained history depth
   (default 30). A bare `sh/dx` shows the last 10. See
   [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
+  A client can ask for CQ spots only, a band list or a minimum SNR on its
+  own connection, for example `set/dx/filter cq band 40m,20m snr 10`; the
+  SNR is the figure the row shows. See
+  [MAN-546](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.
@@ -1075,9 +1079,9 @@ the golden-vector determinism tests are the bar every decoder change has to
 clear. See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
 When you report a problem, include the output of `manta --version`. It names
-the exact commit and the compiled-in features. The Docker image is the
-exception for now: its build has no git metadata, so its commit reads
-`unknown`. A change that alters decoder
+the exact commit and the compiled-in features. The published Docker image
+names its release commit too: the release build passes it in as the
+`MANTA_GIT_SHA` build-arg. A change that alters decoder
 output adds a `### Decoder output` entry to [CHANGELOG.md](CHANGELOG.md).
 
 ## License

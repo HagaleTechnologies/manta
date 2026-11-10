@@ -552,6 +552,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
@@ -1056,6 +1059,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.

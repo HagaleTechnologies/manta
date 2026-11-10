@@ -34,7 +34,9 @@ impl fmt::Display for ValidationLevel {
 pub struct SettSettings {
     pub validation_level: ValidationLevel,
     /// The optional `CQ` token -- CW Skimmer manual: "the CQ filter, IF
-    /// ENABLED". Always false today; manta spots CQ, DE and beacon types.
+    /// ENABLED". False in the station profile, which spots CQ, DE and
+    /// beacon types; a telnet connection that sent `set/dx/filter cq` gets a
+    /// per-connection copy with it set (MAN-546).
     pub cq_only: bool,
     /// Decodable segments as `(lo_hz, hi_hz)`, ascending. Rendered in kHz
     /// to one decimal, comma-separated with no spaces, rounded outward

@@ -123,8 +123,9 @@ impl FakeRadiod {
     }
 
     /// Sends `samples` as RTP to `group:port`, `speed` times real time,
-    /// skipping packet index `skip`; loops when `looping`. Signals `done`
-    /// after the first pass.
+    /// skipping the packet indices in `skip` (their sequence numbers and
+    /// timestamps still advance, as a lost packet's do); loops when
+    /// `looping`. Signals `done` after the first pass.
     #[allow(clippy::too_many_arguments)]
     pub fn stream(
         &mut self,
@@ -132,7 +133,7 @@ impl FakeRadiod {
         port: u16,
         samples: Arc<Vec<Complex32>>,
         speed: f64,
-        skip: Option<usize>,
+        skip: Option<std::ops::Range<usize>>,
         looping: bool,
         done: mpsc::Sender<()>,
     ) {
@@ -162,7 +163,7 @@ impl FakeRadiod {
                     };
                     seq = seq.wrapping_add(1);
                     ts = ts.wrapping_add(chunk.len() as u32);
-                    if skip == Some(i) {
+                    if skip.as_ref().is_some_and(|r| r.contains(&i)) {
                         continue;
                     }
                     let pkt = wire::encode_rtp(&h, &wire::encode_iq(Encoding::F32Le, chunk));

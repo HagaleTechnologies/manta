@@ -8,6 +8,8 @@
 //! space-separated (`sh dx`, `set dx filter`) forms, case-insensitively --
 //! real AK1A-descended cluster clients use both conventions.
 
+use crate::client_filter::SpotFilter;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `sh/dx [N | Nm] [BAND band] [CW | RTTY]` -- replay retained spot
@@ -17,6 +19,15 @@ pub enum Command {
     /// `set dx filter unique > <n>` -- suppress spots for a callsign
     /// until it's been seen more than `min` times on this bus.
     SetFilterUnique { min: u32 },
+    /// `set dx filter [cq] [band <b>,<b>...] [snr <n>]`, clauses in any
+    /// order, each at most once (MAN-546; see
+    /// docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md). Replaces
+    /// the connection's whole cq/band/snr filter; leaves `unique` alone.
+    SetSpotFilter(SpotFilter),
+    /// `set dx filter off`, or a bare `set dx filter` (AR-Cluster's clear
+    /// form): clears every filter on the connection, `unique` included
+    /// (MAN-546).
+    ClearFilters,
     /// `SKIMMER/SETT` (or bare `SETT`) -- Aggregator's handshake probe.
     /// Per Aggregator manual v6.0 §9.2, a source that never answers this
     /// has its spots dropped entirely, so this is the gate on manta being
@@ -98,6 +109,10 @@ pub fn parse(line: &str) -> Command {
             Ok(min) => Command::SetFilterUnique { min },
             Err(_) => Command::Unknown,
         },
+        ["SET", "DX", "FILTER"] | ["SET", "DX", "FILTER", "OFF"] => Command::ClearFilters,
+        ["SET", "DX", "FILTER", rest @ ..] => {
+            parse_spot_filter(rest).map_or(Command::Unknown, Command::SetSpotFilter)
+        }
         ["SKIMMER", "SETT"] | ["SETT"] => Command::Sett,
         ["BYE"] => Command::Bye,
         _ => Command::Unknown,
@@ -145,12 +160,49 @@ fn parse_selection(token: &str) -> Option<HistorySelection> {
     }
 }
 
+/// `[CQ] [BAND b,b...] [SNR n]` in any order, each clause at most once,
+/// every token consumed (MAN-546). A band list is one comma-separated
+/// token; an empty element, an unknown band, a duplicate clause, a missing
+/// or non-integer SNR or trailing junk makes the whole line `None`, never
+/// a partial match.
+fn parse_spot_filter(mut rest: &[&str]) -> Option<SpotFilter> {
+    let mut filter = SpotFilter::default();
+    while let [clause, tail @ ..] = rest {
+        rest = match (*clause, tail) {
+            ("CQ", tail) if !filter.cq_only => {
+                filter.cq_only = true;
+                tail
+            }
+            ("BAND", [list, tail @ ..]) if filter.bands.is_empty() => {
+                for name in list.split(',') {
+                    filter.bands.insert(parse_band_index(name)?);
+                }
+                tail
+            }
+            ("SNR", [n, tail @ ..]) if filter.min_snr_db.is_none() => {
+                filter.min_snr_db = Some(n.parse().ok()?);
+                tail
+            }
+            _ => return None,
+        };
+    }
+    Some(filter)
+}
+
 /// `20m` or `20` (tokens arrive upper-cased) to the allocation's own name.
 fn parse_band(token: &str) -> Option<&'static str> {
-    crate::band::allocations()
-        .iter()
-        .map(|(name, _, _)| *name)
-        .find(|name| name.eq_ignore_ascii_case(token) || name.strip_suffix('m') == Some(token))
+    parse_band_index(token).map(|i| crate::band::allocations()[i].0)
+}
+
+/// `20m` or `20` to the allocation's index in `band::allocations()`. An
+/// empty token matches nothing.
+fn parse_band_index(token: &str) -> Option<usize> {
+    if token.is_empty() {
+        return None;
+    }
+    crate::band::allocations().iter().position(|(name, _, _)| {
+        name.eq_ignore_ascii_case(token) || name.strip_suffix('m') == Some(token)
+    })
 }
 
 #[cfg(test)]
@@ -391,6 +443,89 @@ mod tests {
             // Representable as minutes, overflows as seconds.
             "sh/dx 153722867280912931m",
             "sh/dx 18446744073709551615m",
+        ] {
+            assert_eq!(parse(line), Command::Unknown, "{line:?}");
+        }
+    }
+
+    fn spot_filter(cq_only: bool, bands: &[&str], min_snr_db: Option<i32>) -> Command {
+        let mut filter = SpotFilter {
+            cq_only,
+            min_snr_db,
+            ..SpotFilter::default()
+        };
+        for band in bands {
+            filter
+                .bands
+                .insert(parse_band_index(band).expect("band name"));
+        }
+        Command::SetSpotFilter(filter)
+    }
+
+    #[test]
+    fn parses_every_spot_filter_form() {
+        let cq = spot_filter(true, &[], None);
+        let forty_twenty_snr10 = spot_filter(false, &["40m", "20m"], Some(10));
+        let cases: &[(&str, Command)] = &[
+            ("set/dx/filter cq", cq.clone()),
+            ("set dx filter CQ", cq.clone()),
+            ("set/dx/filter cq\r\u{0}", cq.clone()),
+            (
+                "set/dx/filter band 40m,20m snr 10",
+                forty_twenty_snr10.clone(),
+            ),
+            (
+                "SET/DX/FILTER/BAND/40M,20M/SNR/10",
+                forty_twenty_snr10.clone(),
+            ),
+            (
+                "set dx filter snr 10 band 20,40m cq",
+                spot_filter(true, &["40m", "20m"], Some(10)),
+            ),
+            ("set dx filter band 40", spot_filter(false, &["40m"], None)),
+            (
+                "set dx filter band 40m,40m",
+                spot_filter(false, &["40m"], None),
+            ),
+            (
+                "set dx filter band 2200m,630,6m",
+                spot_filter(false, &["2200m", "630m", "6m"], None),
+            ),
+            ("set dx filter snr +5", spot_filter(false, &[], Some(5))),
+            ("set dx filter snr -3", spot_filter(false, &[], Some(-3))),
+            ("set/dx/filter", Command::ClearFilters),
+            ("set dx filter", Command::ClearFilters),
+            ("set dx filter off", Command::ClearFilters),
+            ("SET/DX/FILTER/OFF", Command::ClearFilters),
+        ];
+        for (line, expected) in cases {
+            assert_eq!(&parse(line), expected, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_spot_filters_are_unknown_not_a_partial_match() {
+        for line in [
+            "set dx filter cq cq",
+            "set dx filter band 40m band 20m",
+            "set dx filter snr 10 snr 12",
+            "set dx filter band",
+            "set dx filter snr",
+            "set dx filter snr ten",
+            "set dx filter snr 10dB",
+            "set dx filter snr 99999999999",
+            "set dx filter band 40m,",
+            "set dx filter band ,40m",
+            "set dx filter band 40m,,20m",
+            "set dx filter band 40m, 20m",
+            "set dx filter band 21m",
+            "set dx filter band banana",
+            "set dx filter off cq",
+            "set dx filter cq off",
+            "set dx filter nocq",
+            "set dx filter cq junk",
+            "set dx filter unique > banana",
+            "set dx filter unique > 1 cq",
         ] {
             assert_eq!(parse(line), Command::Unknown, "{line:?}");
         }
