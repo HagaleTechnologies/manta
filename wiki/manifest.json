@@ -225,7 +225,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:2667999bda38f710e513025e6bd9ce33e03a4a7401bcae1bfa88c1dfc98cd66f",
+      "hash": "sha256:2f40d93014f00317af641b48c2e6b1dfea81698224aa4e1957277fe2a5d51861",
       "id": "pfb-channelizer",
       "kind": "subsystem",
       "links": [
