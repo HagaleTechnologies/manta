@@ -17,7 +17,7 @@
 //! and the FT8/FT4 digital line (C13) are open MAN-90 claims.
 
 use crate::backoff::{next_backoff, AttemptOutcome as ConnectAttemptError, INITIAL_BACKOFF};
-use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout};
+use crate::bounded_io::{read_line_bounded, read_line_bounded_with_timeout, Utf8Tail};
 use crate::bus::SpotBus;
 use crate::config::{RbnUplinkConfig, UplinkSpotTypes};
 use crate::metrics::UplinkTarget;
@@ -445,9 +445,10 @@ async fn connect_and_forward(
     // `*shutdown.borrow() == false` resumes the same line rather than
     // losing progress.
     let mut prompt_line = String::new();
+    let mut prompt_tail = Utf8Tail::default();
     loop {
         tokio::select! {
-            result = read_line_bounded_with_timeout(&mut reader, &mut prompt_line) => {
+            result = read_line_bounded_with_timeout(&mut reader, &mut prompt_line, &mut prompt_tail) => {
                 if result.is_err() {
                     // Counted before propagating (PR #80 review, round
                     // 7): `rx` was already subscribed above (subscribe-
@@ -701,6 +702,7 @@ async fn forward_loop(
     shutdown: &mut watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let mut discard = String::new();
+    let mut discard_tail = Utf8Tail::default();
     let mut response_limiter =
         RateLimiter::new(MAX_TARGET_RESPONSE_LINES, TARGET_RESPONSE_RATE_WINDOW);
     loop {
@@ -768,7 +770,7 @@ async fn forward_loop(
             // request/response protocol), matching telnet.rs's own
             // established/logged-in-client read (round-5 review finding
             // there against reusing the timed variant post-login).
-            read_result = read_line_bounded(reader, &mut discard) => {
+            read_result = read_line_bounded(reader, &mut discard, &mut discard_tail) => {
                 match read_result {
                     Ok(0) => {
                         record_disconnect_loss(target, rx, 0, spot_types);

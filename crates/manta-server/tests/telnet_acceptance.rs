@@ -1208,6 +1208,46 @@ async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recogniz
     assert_eq!(line.trim_end(), expected);
 }
 
+/// MAN-538: a valid multi-byte character whose bytes arrive in two TCP
+/// writes is read as one line (here an unknown command), not rejected as
+/// invalid UTF-8 with the connection dropped.
+#[tokio::test]
+async fn a_command_with_a_character_split_across_tcp_writes_is_read_whole() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    wr.write_all(b"W5AU\r\n").await.unwrap();
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("login must complete")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+
+    // `€` is E2 82 AC: the first two bytes in one segment, the last in the
+    // next.
+    wr.write_all(b"caf\xE2\x82").await.unwrap();
+    wr.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wr.write_all(b"\xAC\r\n").await.unwrap();
+
+    let lines = read_lines_until(&mut reader, "the unknown-command reply", |line| {
+        line.contains("Unknown command")
+    })
+    .await;
+    assert!(!lines.is_empty());
+}
+
 #[tokio::test]
 async fn a_connecting_client_gets_the_cw_skimmer_shaped_banner_and_callsign_prompt() {
     // MAN-86 scenario 2. Byte-level, because the exact wording is the

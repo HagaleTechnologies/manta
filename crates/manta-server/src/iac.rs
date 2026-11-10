@@ -71,6 +71,9 @@ pub struct IacFilter {
     /// now-reverted fix, which fully released the shared budget on any
     /// framing-only read and made that exact flood unbounded.
     pub framing_bytes: usize,
+    /// MAN-538: the incomplete UTF-8 character the last chunk ended inside;
+    /// cleared by `reset_line` with the per-line budget.
+    pub(crate) utf8: crate::bounded_io::Utf8Tail,
 }
 
 impl IacFilter {
@@ -165,6 +168,7 @@ impl IacFilter {
     /// connection-lifetime budget, never released (see its doc comment).
     pub fn reset_line(&mut self) {
         self.raw_line_bytes = 0;
+        self.utf8.clear();
     }
 }
 

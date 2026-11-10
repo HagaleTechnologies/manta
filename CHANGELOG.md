@@ -499,6 +499,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-538: a telnet client, RBN uplink target, skimmer relay or RBN feed
+  that sends a valid multi-byte UTF-8 character split across two reads is
+  no longer disconnected with `line contains invalid UTF-8`; invalid bytes
+  still are. List-cache writes under `[spot].list_cache_dir` go through a
+  fresh, randomly named temporary created exclusively, so a file or symlink
+  planted at a guessed temporary name is never followed or overwritten.
+  `Debug` output of a parsed `[input]` reads `password: <redacted>`. See
+  docs/DECISIONS/2026-11-10-man538-cache-temp-debug-redaction-utf8-carry.md.
 - MAN-530: a live audio input whose decode thread falls behind no longer
   loses samples silently. Every frame the 8192-frame (~170 ms) capture ring
   rejects is counted in `manta_input_queue_dropped_samples_total`, and each
