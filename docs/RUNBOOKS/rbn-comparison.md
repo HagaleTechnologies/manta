@@ -36,7 +36,7 @@ comparison will use:
 ```console
 $ manta config check --config manta.toml
 ...
-rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% spotters=all exclude_spotters=none
+rbn_compare: enabled=true feed=telnet.reversebeacon.net:7000 login_callsign=W3XYZ-1 window_secs=180 freq_tol_hz=500 speed_tol=3 WPM/20% spotters=all exclude_spotters=none skew_warn_ppm=2
 ```
 
 Every key, with its default:
@@ -53,6 +53,7 @@ Every key, with its default:
 | `speed_tol_pct` | `20.0` | and more than this percent of RBN's median speed |
 | `spotters` | `[]` | Only these RBN skimmers count; empty means all. `--rbn-spotter` replaces it |
 | `exclude_spotters` | `[]` | Never count these skimmers. Your own callsign, with and without SSID, is always excluded |
+| `skew_warn_ppm` | `2.0` | 0 to 1000; 0 turns the warning off. A band whose skew stays past it for 30 minutes warns on `/healthz` (see [The skew reading](#the-skew-reading-and-a-suggested-correction)) |
 
 `MANTA_RBN_COMPARE_<KEY>` overrides any key. Every key needs a restart: a
 SIGHUP reload names a changed `rbn_compare` key in its restart warning and
@@ -155,6 +156,8 @@ None of these families appear on `/metrics` unless comparison is enabled.
 | `manta_rbn_compare_disagreements_last_hour{band,kind}` | gauge | `disagree` grades in the last 3600 s naming `kind` (`frequency` or `speed`). A spot with both counts once under each |
 | `manta_rbn_compare_freq_offset_median_hz{band}` | gauge | Median `freqOffsetHz` over `match` and `disagree` grades in the last 3600 s. Absent for a band with none |
 | `manta_rbn_compare_freq_offset_samples{band}` | gauge | How many grades that median is over |
+| `manta_rbn_compare_freq_offset_median_ppm{band}` | gauge | Median of each of those grades' offset over RBN's modal frequency, in ppm (the band's skew; positive means manta reads high), rounded to 0.001 |
+| `manta_rbn_compare_skew_warning{band}` | gauge | 1 while the band's skew has been past `skew_warn_ppm` for 30 minutes on a reading of at least 20 spots precise to a third of the limit, else 0 (see [The skew reading](#the-skew-reading-and-a-suggested-correction)) |
 | `manta_rbn_compare_feed_connected` | gauge | 1 while the feed is logged in and delivering lines, else 0 |
 | `manta_rbn_compare_feed_reports_total` | counter | CW reports accepted from the feed |
 | `manta_rbn_compare_feed_reconnects_total` | counter | Feed connections lost or failed |
@@ -200,16 +203,69 @@ The `_last_hour` gauges reset when the daemon restarts; use
 `increase(manta_rbn_compare_grades_total[...])` for anything longer than
 an hour or across restarts.
 
-### The median offset is a calibration signal
+### The skew reading and a suggested correction
 
 `manta_rbn_compare_freq_offset_median_hz` is manta's frequency minus RBN's,
 over the spots both heard. RBN's own skimmers are calibrated against each
 other, so a steady offset of the same sign on every band points at your
-receiver's frequency reference, not at RBN. Correct it with
-`input.freq_correction_ppm` (MAN-127). A ppm error grows with frequency:
-+40 Hz on 20m is about +2.9 ppm, and would show as about +20 Hz on 40m.
-Check `freq_offset_samples` before acting: a median over a handful of
-grades is noise.
+receiver's frequency reference, not at RBN. A ppm error grows with
+frequency, so manta reads it in ppm for you (MAN-541): each spot's offset
+is divided by RBN's modal frequency, and a band's **skew** is the median
+of those, in `manta_rbn_compare_freq_offset_median_ppm`. A positive skew
+means manta reads high, as a CW Skimmer `FreqCalibration` above 1 does.
+
+**Precision.** RBN reports frequencies to 100 Hz, so a band's reading is
+good to about `50 Hz / √n / f`, its `±` figure. A band needs **20 spots**
+in the last hour before it shows a ppm at all. The low bands need many
+more for a usable reading: at the default limit, a band warns only when
+its error is at most a third of the limit, which takes about 29 spots an
+hour on 20m, 114 on 40m and 447 on 80m (20 from 17m up).
+
+**The suggestion replaces the current value.** The offsets are measured
+after the `freq_correction_ppm` the daemon already applies, so the value
+to save is not just the skew with its sign flipped. `manta status` works
+it out: with `-2.00` applied and a skew of `+1.0 ppm`, the receiver's own
+error is +3 ppm and the suggestion is `-3.00`, not `-1.00`. Each config
+entry gets its own suggestion, pooling its bands by precision (bands with
+at least 20 of its spots). Save the suggested value as the entry's
+`freq_correction_ppm` and restart manta to apply it.
+
+`manta status` shows both:
+
+```text
+RBN skew, last hour (+ means manta reads high; warns past 2 ppm for 30 min)
+  BAND    OFFSET  SPOTS  SKEW            STATE
+  80m     +14 Hz     41  +3.8 ±2.2 ppm   too few spots to warn
+  40m     +21 Hz      8  -               needs 20 spots
+  20m     +42 Hz     40  +3.0 ±0.6 ppm   WARN for 35 min
+  15m     +63 Hz     24  +3.0 ±0.5 ppm   over 2 ppm for 12 min
+Suggested freq_correction_ppm (replaces the current value; restart to apply)
+  INPUT                               NOW     SET  ±PPM  NOTE
+  [input]                            0.00   -3.02  0.36
+```
+
+`GET /status` carries the same numbers in its `rbn_compare` object.
+
+**The warning.** A band is over the limit when it has at least 20 spots,
+`skew_warn_ppm` is above 0, its error is at most a third of the limit,
+and its skew is beyond the limit. After 30 minutes over without a break,
+`/healthz` adds a line such as
+`WARN rbn skew 20m: +3.0 ppm for 35 min (median +42 Hz, 40 spots; limit 2 ppm)`,
+`manta_rbn_compare_skew_warning{band}` reads 1, and the shipped
+[`MantaRbnSkew`](monitoring.md#mantarbnskew) alert fires. The probe itself
+stays `ok` and 200: a drifted oscillator is no reason to restart a node.
+
+**Save it.** Copy the `SET` value into the entry's `freq_correction_ppm`
+and restart manta. Save only a reading good to ±1.00 ppm or better:
+`manta status` marks a coarser one `too coarse to save`, and marks a daemon
+whose receiver came from a command-line source flag `source set by a flag`,
+since that receiver is not the config entry's.
+
+The reading is relative to the RBN skimmers that heard the same stations
+over the last hour. SM7IUN's
+[rbnskew](https://github.com/bjornekelund/rbnskew) compares against
+GPS-locked anchor skimmers over a day, so expect the two to agree to
+about a ppm, not exactly. A restart empties the reading.
 
 ## Co-located-spotter mode
 

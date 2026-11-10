@@ -67,7 +67,9 @@
 
 pub mod discovery;
 
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
+use crate::stall::{
+    NoUsableSamples, StallEpisode, UsableSampleBudget, NO_USABLE_SAMPLES_AFTER, SOFT_STALL_AFTER,
+};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -825,6 +827,14 @@ struct Inner {
     /// MAN-489: hard stall bound (test knob; `HARD_STALL_AFTER` in
     /// production) of actively waited silence (`silent_waited`).
     hard_stall_after: Duration,
+    /// MAN-533: active pump time spent since the last valid Metis packet,
+    /// timeouts and malformed datagrams alike; a valid packet refills it.
+    /// Lives on `Inner`, as `silent_waited` does, so sibling DDCs and
+    /// bounded pump windows share one budget and a parked consumer spends
+    /// none of it. Spent at `NO_USABLE_SAMPLES_AFTER` in production (a
+    /// test knob here): the bound that ends a malformed-only stream the
+    /// silence bound above deliberately tolerates.
+    usable: UsableSampleBudget,
     /// The socket read timeout currently installed, so clamping a receive
     /// window only touches the socket when the value actually changes.
     read_timeout: Duration,
@@ -888,11 +898,14 @@ impl Inner {
             // actively waited receive time counts (`silent_waited`), as
             // the timeout count did: an unread, parked consumer is not
             // radio silence.
+            // MAN-533 D4: typed, so the reconnect layer reports it as
+            // `no usable samples`; the text is unchanged.
             if self.silent_waited >= self.hard_stall_after {
-                bail!(
+                return Err(NoUsableSamples::new(format!(
                     "HPSDR device stalled: no data for {} s",
                     self.hard_stall_after.as_secs_f64()
-                );
+                ))
+                .into());
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Ok(false);
@@ -960,6 +973,8 @@ impl Inner {
                             // malformed bound resets on.
                             self.last_valid_packet = Instant::now();
                             self.consecutive_malformed = 0;
+                            // MAN-533: a valid packet always carries IQ.
+                            self.usable.note_delivery();
                             return Ok(true);
                         }
                         Err(_) => {
@@ -970,6 +985,9 @@ impl Inner {
                             // packet.
                             self.gap.record_malformed();
                             self.consecutive_malformed += 1;
+                            if self.usable.spend(waiting.elapsed()) {
+                                return Err(self.no_usable_samples());
+                            }
                         }
                     }
                 }
@@ -981,25 +999,45 @@ impl Inner {
                     self.silent_waited = Duration::ZERO;
                     self.gap.record_malformed();
                     self.consecutive_malformed += 1;
+                    if self.usable.spend(waiting.elapsed()) {
+                        return Err(self.no_usable_samples());
+                    }
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    self.silent_waited += waiting.elapsed();
+                    let waited = waiting.elapsed();
+                    self.silent_waited += waited;
+                    if self.usable.spend(waited) {
+                        return Err(self.no_usable_samples());
+                    }
                     continue;
                 }
                 Err(e) => return Err(e).context("HPSDR UDP read"),
             }
 
             if self.consecutive_malformed >= MAX_CONSECUTIVE_MALFORMED {
-                bail!(
+                // MAN-533 D4: typed, text unchanged.
+                return Err(NoUsableSamples::new(format!(
                     "HPSDR device stalled: {} consecutive malformed datagrams with no valid \
                      Metis packet -- corrupt hardware or a spoofed/non-Metis stream",
                     MAX_CONSECUTIVE_MALFORMED
-                );
+                ))
+                .into());
             }
         }
+    }
+
+    /// MAN-533: the error that ends a pump which kept receiving -- timeouts
+    /// and malformed datagrams -- for the whole usable-sample budget
+    /// without one valid Metis packet.
+    fn no_usable_samples(&self) -> anyhow::Error {
+        NoUsableSamples::new(format!(
+            "HPSDR device delivered no usable samples for {} s: no valid Metis packet arrived",
+            self.usable.limit().as_secs()
+        ))
+        .into()
     }
 
     fn send_keepalive_if_due(&mut self) -> Result<()> {
@@ -1113,6 +1151,7 @@ impl HpsdrDevice {
             silent_waited: Duration::ZERO,
             consecutive_malformed: 0,
             hard_stall_after: HARD_STALL_AFTER,
+            usable: UsableSampleBudget::new(NO_USABLE_SAMPLES_AFTER),
             read_timeout: READ_TIMEOUT,
         }));
 
@@ -2277,6 +2316,120 @@ mod tests {
         assert!((buf[0].re - 0.25).abs() < 1e-4);
     }
 
+    /// Open a one-DDC session against a loopback "device" socket and
+    /// return the source, the device socket and the client's address.
+    fn open_single_ddc_for_usable_tests() -> (HpsdrIqSource, StdUdpSocket, std::net::SocketAddr) {
+        let device_socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let device_addr = device_socket.local_addr().unwrap();
+        device_socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let cfg = HpsdrConfig {
+            host: device_addr.ip().to_string(),
+            port: device_addr.port(),
+            ddc_count: 1,
+            sample_rate_hz: 192_000.0,
+            center_freq_hz: vec![14_025_000.0],
+            auto_attenuation: None,
+        };
+        let mut sources = HpsdrDevice::open(cfg).unwrap();
+        let src = sources.remove(0);
+        let client_addr = drain_initial_open_packets(&device_socket, 1);
+        (src, device_socket, client_addr)
+    }
+
+    /// MAN-533: a stream that only ever sends malformed datagrams keeps
+    /// the silence bound from firing (any datagram resets it) and, before
+    /// MAN-533, held `read()` until 10,000 had arrived. The usable-sample
+    /// budget now ends it after the window of pumping.
+    #[test]
+    fn a_malformed_only_stream_ends_in_no_usable_samples_after_the_window() {
+        let (mut src, device_socket, client_addr) = open_single_ddc_for_usable_tests();
+        let budget = Duration::from_millis(600);
+        src.inner.lock().unwrap().usable = UsableSampleBudget::new(budget);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_sender = stop.clone();
+        let sender = std::thread::spawn(move || {
+            let mut index = 0usize;
+            while !stop_sender.load(Ordering::Relaxed) {
+                let packet = [0xFFu8; METIS_PACKET_LEN];
+                let len = if index.is_multiple_of(2) {
+                    packet.len()
+                } else {
+                    1
+                };
+                let _ = device_socket.send_to(&packet[..len], client_addr);
+                index += 1;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let started = Instant::now();
+        let err = src
+            .read(&mut buf)
+            .expect_err("a malformed-only stream must end in an error");
+        let took = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+
+        assert!(
+            crate::is_no_usable_samples(&err),
+            "expected NoUsableSamples, got: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("no usable samples"),
+            "unexpected text: {err}"
+        );
+        assert!(took >= budget, "ended before the window: {took:?}");
+        assert!(
+            took < Duration::from_millis(1_500),
+            "ended too late: {took:?}"
+        );
+        assert!(src.gap_stats().malformed_packets > 0);
+    }
+
+    /// MAN-533 D1: time nobody spent reading is not spent from the usable
+    /// budget either -- the twin of
+    /// `a_parked_consumer_does_not_spend_the_hard_stall_budget`.
+    #[test]
+    fn a_parked_consumer_does_not_spend_the_usable_sample_budget() {
+        let (mut src, device_socket, client_addr) = open_single_ddc_for_usable_tests();
+        let budget = Duration::from_millis(400);
+        src.inner.lock().unwrap().usable = UsableSampleBudget::new(budget);
+        let pkt = synth_metis_packet(1, |_| Complex32::new(0.25, 0.0));
+        device_socket.send_to(&pkt, client_addr).unwrap();
+        // Nobody reads for longer than the budget.
+        std::thread::sleep(budget * 2);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let n = src
+            .read(&mut buf)
+            .expect("a parked consumer is not a useless stream");
+        assert!(n > 0);
+    }
+
+    /// MAN-533 D4: the existing silence bound's error carries the shared
+    /// type, with its text unchanged.
+    #[test]
+    fn the_silence_bound_error_is_no_usable_samples() {
+        let (mut src, _device_socket, _client_addr) = open_single_ddc_for_usable_tests();
+        src.inner.lock().unwrap().hard_stall_after = Duration::from_millis(500);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 4096];
+        let err = src
+            .read(&mut buf)
+            .expect_err("a silent device must hit the silence bound");
+        assert!(
+            err.to_string()
+                .contains("HPSDR device stalled: no data for"),
+            "unexpected text: {err}"
+        );
+        assert!(
+            crate::is_no_usable_samples(&err),
+            "the silence bound must be NoUsableSamples, got: {err:#}"
+        );
+    }
+
     #[test]
     fn build_general_cc_never_sets_the_disputed_duplex_bit_at_the_new_8_receiver_ceiling() {
         let cc = build_general_cc(48_000.0, 8).unwrap();
@@ -2714,6 +2867,11 @@ mod tests {
         assert!(
             err.to_string().contains("malformed"),
             "expected a malformed-flood stall error, got: {err}"
+        );
+        // MAN-533 D4: the malformed bound carries the shared type.
+        assert!(
+            crate::is_no_usable_samples(&err),
+            "the malformed bound must be NoUsableSamples, got: {err:#}"
         );
         assert_eq!(
             sources[0].gap_stats().malformed_packets,

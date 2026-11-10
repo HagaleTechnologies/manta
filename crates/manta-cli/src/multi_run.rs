@@ -9,7 +9,7 @@
 //! the live-state stream (MAN-324, one `bandState` per input) work as with
 //! one input.
 
-use crate::reconnect::{InputHealthTotals, ReconnectingSource};
+use crate::reconnect::{InputHealthTotals, LossSink, ReconnectingSource};
 use crate::stdio::errln;
 use crate::{
     fmt, logging, resolve::wrap_file_replay, resolve::ReplayMode, resolve::ResolvedInput,
@@ -257,6 +257,17 @@ fn input_health_sink(
     })
 }
 
+/// MAN-533 per input: the loss sink of the input named `name`, recording
+/// each lost connection's reason for `/status` `sources[]` once the
+/// daemon's `Metrics` exists (as `input_health_sink` does).
+fn input_loss_sink(name: String, metrics: Arc<OnceLock<Arc<Metrics>>>) -> LossSink {
+    Box::new(move |reason| {
+        if let Some(metrics) = metrics.get() {
+            metrics.record_source_loss(&name, reason);
+        }
+    })
+}
+
 /// `{decoding} of {configured} inputs decoding`.
 fn decoding_line(healthy: &[AtomicBool]) -> String {
     let decoding = healthy.iter().filter(|h| h.load(Ordering::Relaxed)).count();
@@ -493,8 +504,11 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
         .iter()
         .map(|b| b.as_ref().map(|_| Arc::default()))
         .collect();
-    let grouped =
-        crate::hpsdr_group::prepare(m.hpsdr_allocations, m.inputs, stop.clone(), |index| {
+    let grouped = crate::hpsdr_group::prepare(
+        m.hpsdr_allocations,
+        m.inputs,
+        stop.clone(),
+        |index| {
             input_health_sink(
                 index,
                 m.inputs[index].name.clone(),
@@ -505,7 +519,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                     metrics: metrics_slot.clone(),
                 },
             )
-        });
+        },
+        |index| input_loss_sink(m.inputs[index].name.clone(), metrics_slot.clone()),
+    );
     let ftx = m
         .inputs
         .iter()
@@ -544,6 +560,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 rtty: rtty_marks.clone(),
                 metrics: metrics_slot.clone(),
             };
+            let on_loss = input_loss_sink(input.name.clone(), metrics_slot.clone());
             let input_counters = input_counters.clone();
             let bad = bad[index].clone();
             let iq_cfg = input.conditioning.clone();
@@ -621,7 +638,8 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                                 stop,
                                 initial_healthy,
                                 on_health,
-                            );
+                            )
+                            .with_loss_sink(on_loss);
                             if let Ok(mut slot) = input_counters.lock() {
                                 slot[index] = wrapped.input_health();
                             }
@@ -901,6 +919,20 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             }
             // MAN-14: every input's hearing series, at 0, in config order.
             server.metrics.register_input_hearing(&names);
+            // MAN-541: the RBN skew reading attributes spots by track id
+            // the way `HearingCounters::record` does, and pools each
+            // config entry's streams.
+            server.metrics.set_rbn_skew_inputs(
+                m.inputs
+                    .iter()
+                    .map(|i| manta_server::metrics::RbnSkewInput {
+                        name: i.name.clone(),
+                        entry: i.entry.clone(),
+                        applied_ppm: i.freq_correction_ppm,
+                        replaced_by_flag: false,
+                    })
+                    .collect(),
+            );
             if let Some(window) = silent_window {
                 spawn_silent_watch(
                     &rt,
@@ -1316,6 +1348,33 @@ mod tests {
         assert_eq!(metrics.source_health_counts(), (1, 1));
     }
 
+    /// MAN-533: an input's loss sink records its reason against its own
+    /// name only, once the daemon's `Metrics` is in the slot.
+    #[test]
+    fn input_loss_sink_records_only_its_own_input() {
+        use manta_server::metrics::SourceLossReason;
+        let metrics = Arc::new(Metrics::new());
+        let slot = Arc::new(OnceLock::new());
+        let mut early = input_loss_sink("a".into(), slot.clone());
+        // Before the daemon's metrics exist the report is dropped.
+        early(SourceLossReason::ReadFailed);
+        let _ = slot.set(metrics.clone());
+        metrics.set_source_health("a", true);
+        metrics.set_source_health("b", true);
+        let mut sink = input_loss_sink("b".into(), slot);
+        sink(SourceLossReason::NoUsableSamples);
+        let rows = metrics.source_snapshot_at(Instant::now());
+        let a = rows.iter().find(|r| r.name == "a").unwrap();
+        let b = rows.iter().find(|r| r.name == "b").unwrap();
+        assert_eq!(a.losses_total, 0);
+        assert_eq!(a.last_loss, None);
+        assert_eq!(b.losses_total, 1);
+        assert_eq!(
+            b.last_loss.map(|(reason, _)| reason),
+            Some(SourceLossReason::NoUsableSamples)
+        );
+    }
+
     #[test]
     fn rtty_marks_publish_the_union_and_a_lost_input_clears_only_its_own() {
         let marks = RttyMarks::new(2);
@@ -1406,6 +1465,7 @@ mod tests {
             cw_policy: Default::default(),
             conditioning: Default::default(),
             name: "b".into(),
+            entry: None,
             digital_modes: Vec::new(),
             spec: LiveSourceSpec::AudioDevice(None),
             freq_correction_ppm: 0.0,

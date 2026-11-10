@@ -72,3 +72,19 @@ groups:
           summary: "RBN uplink {{ $labels.target }} on {{ $labels.instance }} is not connected"
           description: "{{ $labels.target }} has been down or flapping for 10 minutes."
           runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantauplinkdisconnected"
+
+      # MAN-541: a band's median offset from the RBN has been beyond the node's
+      # [rbn_compare].skew_warn_ppm for 30 minutes. The daemon applies the
+      # threshold, the precision guard and the 30 minutes, and publishes the
+      # result as manta_rbn_compare_skew_warning, so this rule follows each
+      # node's own setting and needs no `for`.
+      - alert: MantaRbnSkew
+        expr: |
+          manta_rbn_compare_freq_offset_median_ppm
+          and on(instance, job, band) manta_rbn_compare_skew_warning == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "manta node {{ $labels.instance }} reads {{ $labels.band }} {{ printf \"%+.1f\" $value }} ppm off the RBN"
+          description: "The median offset of {{ $labels.band }} spots from RBN's frequency has been beyond the node's skew_warn_ppm for 30 minutes: the receiver's frequency reference has drifted. Set the freq_correction_ppm manta status suggests, or calibrate against WWV."
+          runbook_url: "https://github.com/HagaleTechnologies/manta/blob/main/docs/RUNBOOKS/monitoring.md#mantarbnskew"
