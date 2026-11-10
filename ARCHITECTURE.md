@@ -185,9 +185,17 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
   them. Pure std plus `socket2`, in every build. The wire facts are pinned
   against ka9q-radio's documentation and headers, not yet a live radiod
   ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
+  Its RTP packets are numbered, so a short loss is counted from the RTP
+  timestamp and reported through `IqSource::take_missing_samples()`, and a
+  loss of 0.5 s or more goes through `take_discontinuity()`; a read ends at
+  the loss
+  ([docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md](docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
-  low-budget nodes contribute spots.
+  low-budget nodes contribute spots. Its SND frames are numbered, so a short
+  loss is converted to output samples at the negotiated rate and reported
+  through `IqSource::take_missing_samples()`, and a loss of 0.5 s or more goes
+  through `take_discontinuity()` (MAN-529).
 - **File playback**: WAV (via `hound`, matching coppa): Float32 or
   16/24/32-bit integer PCM, streamed from disk, so memory does not grow with
   the recording

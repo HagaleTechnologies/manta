@@ -23,8 +23,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// The single spot of `manta run --source <wav> --source-iq --json`.
-fn file_replay_spot(wav: &Path) -> (String, f64) {
+/// The single spot of `manta run --source <wav> --source-iq --json`: its
+/// call, frequency and `sampleTs`.
+fn file_replay_spot(wav: &Path) -> (String, f64, u64) {
     let out = manta()
         .args(["run", "--source"])
         .arg(wav)
@@ -45,6 +46,7 @@ fn file_replay_spot(wav: &Path) -> (String, f64) {
     (
         spots[0]["dxCall"].as_str().unwrap().to_string(),
         spots[0]["frequency"].as_f64().unwrap(),
+        spots[0]["sampleTs"].as_u64().unwrap(),
     )
 }
 
@@ -55,9 +57,100 @@ fn file_replay_spot(wav: &Path) -> (String, f64) {
 ///   any other IqSource
 #[test]
 fn ka9q_stream_spots_w1aw_like_the_file_replay() {
+    // Drop the packet at 25.0 s (after the spot).
+    let skip = (25.0 * RATE as f64 / PER_PACKET as f64) as usize;
+    let run = run_against_fake(skip..skip + 1);
+    assert_eq!(run.spot["dxCall"].as_str(), Some(run.file_call.as_str()));
+    assert_eq!(run.file_call, "W1AW");
+    let freq = run.spot["frequency"].as_f64().unwrap();
+    assert!(
+        (freq - run.file_freq).abs() <= 1.0,
+        "ka9q spot at {freq} Hz, file replay at {} Hz",
+        run.file_freq
+    );
+    assert_eq!(
+        metric_value(&run.metrics, r#"manta_source_health{source="ka9q"}"#),
+        Some(1),
+        "{}",
+        run.metrics
+    );
+    assert!(
+        metric_value(
+            &run.metrics,
+            r#"manta_input_dropped_packets_total{source="ka9q"}"#
+        )
+        .unwrap_or(0)
+            >= 1,
+        "{}",
+        run.metrics
+    );
+    assert!(
+        metric_value(
+            &run.metrics,
+            r#"manta_input_gaps_detected_total{source="ka9q"}"#
+        )
+        .unwrap_or(0)
+            >= 1,
+        "{}",
+        run.metrics
+    );
+    assert!(!run.stderr.contains("source ka9q lost:"), "{}", run.stderr);
+}
+
+/// Gherkin (MAN-529):
+///   Given a ka9q-radio multicast source
+///   When RTP sequence numbers skip
+///   Then the lost samples are reported through the same interface and the
+///   spot after the loss keeps its gap-free time
+///
+/// 33 packets (5,940 samples, about 62 ms) are dropped from 3.0 s, the span
+/// protocol 2's acceptance test drops. Before MAN-529 the spot came out
+/// 5,888 samples early (measured).
+#[test]
+fn ka9q_lost_packets_keep_the_spot_clock_true() {
+    let run = run_against_fake(1600..1633);
+    assert_eq!(run.spot["dxCall"].as_str(), Some("W1AW"), "{}", run.stderr);
+    assert_eq!(run.file_call, "W1AW");
+    let live_ts = run.spot["sampleTs"].as_u64().unwrap();
+    assert!(
+        live_ts.abs_diff(run.file_ts) <= 256,
+        "live sampleTs {live_ts}, file replay {} (one hop is 256)",
+        run.file_ts
+    );
+    let freq = run.spot["frequency"].as_f64().unwrap();
+    assert!(
+        (freq - run.file_freq).abs() <= 25.0,
+        "ka9q spot at {freq} Hz, file replay at {} Hz",
+        run.file_freq
+    );
+    assert!(
+        metric_value(
+            &run.metrics,
+            r#"manta_input_dropped_packets_total{source="ka9q"}"#
+        )
+        .unwrap_or(0)
+            >= 33,
+        "{}",
+        run.metrics
+    );
+    assert!(!run.stderr.contains("source ka9q lost:"), "{}", run.stderr);
+}
+
+/// One `manta run --ka9q-group ... --json` against the fake streaming V1 at
+/// 2x real time with the packets in `skip` dropped, beside the file replay.
+struct FakeRun {
+    file_call: String,
+    file_freq: f64,
+    file_ts: u64,
+    spot: serde_json::Value,
+    metrics: String,
+    stderr: String,
+}
+
+fn run_against_fake(skip: std::ops::Range<usize>) -> FakeRun {
     let dir = tempfile::tempdir().unwrap();
     let wav = v1_fixture(dir.path());
-    let (file_call, file_freq) = file_replay_spot(&wav);
+    let (file_call, file_freq, file_ts) = file_replay_spot(&wav);
     let samples = Arc::new(wav_samples(&wav));
 
     let group = unique_group();
@@ -120,8 +213,7 @@ fn ka9q_stream_spots_w1aw_like_the_file_replay() {
         });
 
     // The source has joined and accepted the status: start RTP from sample
-    // 0 at 2x real time, dropping the packet at 25.0 s (after the spot).
-    let skip = (25.0 * RATE as f64 / PER_PACKET as f64) as usize;
+    // 0 at 2x real time, dropping the packets in `skip`.
     let (done_tx, done_rx) = mpsc::channel();
     fake.stream(group, data_port, samples, 2.0, Some(skip), false, done_tx);
 
@@ -133,13 +225,6 @@ fn ka9q_stream_spots_w1aw_like_the_file_replay() {
                 err_lines.lock().unwrap().join("\n")
             )
         });
-    assert_eq!(spot["dxCall"].as_str(), Some(file_call.as_str()));
-    assert_eq!(file_call, "W1AW");
-    let freq = spot["frequency"].as_f64().unwrap();
-    assert!(
-        (freq - file_freq).abs() <= 1.0,
-        "ka9q spot at {freq} Hz, file replay at {file_freq} Hz"
-    );
 
     done_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     // Let the last packets and a metrics tick land.
@@ -158,22 +243,15 @@ fn ka9q_stream_spots_w1aw_like_the_file_replay() {
         }
         thread::sleep(Duration::from_millis(200));
     };
-    assert_eq!(
-        metric_value(&body, r#"manta_source_health{source="ka9q"}"#),
-        Some(1),
-        "{body}"
-    );
-    assert!(
-        metric_value(&body, r#"manta_input_dropped_packets_total{source="ka9q"}"#).unwrap_or(0)
-            >= 1,
-        "{body}"
-    );
-    assert!(
-        metric_value(&body, r#"manta_input_gaps_detected_total{source="ka9q"}"#).unwrap_or(0) >= 1,
-        "{body}"
-    );
-    let err = err_lines.lock().unwrap().join("\n");
-    assert!(!err.contains("source ka9q lost:"), "{err}");
+    let stderr = err_lines.lock().unwrap().join("\n");
+    FakeRun {
+        file_call,
+        file_freq,
+        file_ts,
+        spot,
+        metrics: body,
+        stderr,
+    }
 }
 
 /// Runs `manta check --ka9q-group <group> --ka9q-port <port> --duration 1`
