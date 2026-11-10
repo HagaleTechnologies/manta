@@ -794,7 +794,7 @@ async fn handle_client(
                         // that selection, before count truncation, and
                         // its non-matches are likewise uncounted.
                         //
-                        // Apply the SAME `min_unique` predicate the live
+                        // Apply the SAME `filters.min_unique` predicate the live
                         // stream uses -- a spot suppressed live must stay
                         // suppressed when replayed via `sh/dx`, not leak
                         // through unfiltered and uncounted (round-11
@@ -1144,6 +1144,11 @@ const DEFAULT_SHOW_DX_COUNT: usize = 10;
 /// entry stamped in the future is excluded. Every request is still bounded
 /// by the bus's heard-time window, newest-entry floor and `bus::MAX_HISTORY_SPOTS`
 /// ceiling (MAN-93).
+///
+/// The connection's cq/band/snr `spot_filter` (MAN-546) joins the band and
+/// mode selectors before count truncation, so `sh/dx 3` means three
+/// matching rows. `unique` still runs afterwards, in the replay loop, and
+/// rows the filter keeps out are outside the result, not counted.
 fn select_history_at(
     bus: &SpotBus,
     query: &ShowDxQuery,
