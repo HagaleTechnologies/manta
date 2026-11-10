@@ -2164,7 +2164,7 @@ VC1 and VC2 run in-crate, in `crates/manta-engine/src/static_crash_tests.rs`,
 alongside the dense-band, long-noise, level-step, silence lead-in,
 chunk-invariance and `off`-identity checks; VC3 runs end to end through
 `manta decode --json` as `vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns`
-in `crates/manta-cli/tests/golden_v8_v8w.rs`; the generator and the
+in `crates/manta-cli/tests/golden_vc3.rs`; the generator and the
 vector definitions live in `crates/manta-testkit/src/crash.rs`. VC3's
 bogus count depends on the crash draw under every `crash_filter` value
 (five train seeds gave 0, 1, 4, 1 and 1 under `full`), so its seed is

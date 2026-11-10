@@ -44,7 +44,7 @@ fn decode_report_with_engine(
 
 /// Group `report["events"]` by `trackId`, returning each track's decoded
 /// text and its last-reported TrackMeta freq_hz. Same shape as
-/// golden_v7_v9_v10.rs's/golden_v8_v8w.rs's helper of the same name.
+/// `common/decode.rs`'s helper of the same name.
 fn per_track(report: &serde_json::Value) -> std::collections::BTreeMap<u64, (String, Option<f64>)> {
     let mut texts: std::collections::BTreeMap<u64, String> = std::collections::BTreeMap::new();
     let mut freqs: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
@@ -92,7 +92,7 @@ fn track_nearest_freq(
 }
 
 /// `(callsign, track_id)` pairs from `report["spots"]` -- the real
-/// `manta-spot::Validator`'s output. Same shape as golden_v8_v8w.rs.
+/// `manta-spot::Validator`'s output. Same shape as `common/pileup.rs`'s.
 fn spotted_calls(report: &serde_json::Value) -> Vec<(String, u64)> {
     report["spots"]
         .as_array()
