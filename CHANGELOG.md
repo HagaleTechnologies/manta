@@ -499,7 +499,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
-<<<<<<< HEAD
 - MAN-537: the published Docker image names its release commit. Its
   `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
   `manta_build_info` used to read `unknown`, because the build context has
@@ -508,7 +507,6 @@ the git history and `docs/DECISIONS/`.
   the push. Both base images are pinned by tag and digest, and Dependabot
   opens a PR when either moves. A local `docker build` still reports
   `unknown` unless given `--build-arg MANTA_GIT_SHA=...`.
-=======
 - MAN-533: a live input that keeps its connection open but sends nothing
   usable (a KiwiSDR sending only unknown-tag frames, pings or one-sample
   `SND` frames, an HPSDR radio sending only malformed datagrams) no longer
@@ -517,7 +515,6 @@ the git history and `docs/DECISIONS/`.
   `source <name> lost: ... no usable samples ...`, reconnects on the usual
   backoff, and `manta_source_health` drops to 0, so `MantaInputDown` fires.
   See [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
->>>>>>> de39a7150f4f60af9533a9bfb6fcacd7793762a9
 - MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
   audio, SoapySDR; ka9q already did) now reports a stopped stream through
   `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),
