@@ -1441,7 +1441,16 @@ jobs:
           env-vars: SOAPYSDR_BREW_VERSION
       # --locked: see the MAN-219 note in the test job above.
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
-      - run: cargo test -p manta-input -p manta-cli --features soapy --locked
+      # MAN-520: only the tests the soapy feature can change; clippy above still compiles every
+      # target with it. scripts/tests/test_ci_gates.py (SoapyTestSelectionTests) keeps this list
+      # equal to the manta-cli tests/*.rs files that mention soapy, plus completions_and_man_pages.
+      - run: cargo test -p manta-input --features soapy --locked --lib soapy
+      - run: |
+          cargo test -p manta-cli --features soapy --locked --no-fail-fast --bin manta \
+            --test build_identity --test cli --test completions_and_man_pages \
+            --test config_command --test docker_image --test docs_consistency \
+            --test field_node_runbook --test operator_guides --test output_style_guard \
+            --test packaging_examples --test source_check
 
   # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
   # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of
