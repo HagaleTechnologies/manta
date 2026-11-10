@@ -105,7 +105,9 @@ while the producer runs. The boundary has to travel with the samples.
 6. **Hilbert state is kept across short gaps.** Resetting the 511-tap
    filter would add its own startup transient; MAN-202 already accepts a
    filter transient at a gap because the unknown-gap invalidation drops the
-   character the gap cut. A long gap starts a new segment anyway.
+   character the gap cut. A long gap (a discontinuity) starts a new
+   segment, so there the source restarts the filter: the fresh segment's
+   first analytic samples carry no audio from before the hole.
 7. **Metric definitions.** No new family, label, port or option.
    `manta_input_queue_dropped_samples_total` is the exact number of frames
    rejected from the full ring (one mono frame is one input sample).

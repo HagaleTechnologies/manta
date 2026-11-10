@@ -30,8 +30,9 @@
 //! it: a hole shorter than `AUDIO_DISCONTINUITY_FRAMES` as
 //! `take_missing_samples` plus `take_unknown_gap`, a longer one as
 //! `take_discontinuity`. A read never returns frames from both sides of a
-//! hole. The Hilbert state is kept across a short hole: its filter
-//! transient is the same tolerance MAN-202 accepts for unknown gaps.
+//! hole. The Hilbert state is kept across a short hole (its filter
+//! transient is the same tolerance MAN-202 accepts for unknown gaps) and
+//! restarted at a long one, which begins a fresh segment.
 
 use crate::audio_capture::{CaptureRing, CAPTURE_RING_FRAMES};
 use crate::devices::quoted_name;
@@ -205,24 +206,30 @@ struct PendingGap {
     discontinuity: Option<u64>,
     missing: Option<u64>,
     unknown: bool,
+    /// The current read starts a fresh segment: restart the Hilbert
+    /// filter so no pre-hole audio leaks into it. Drained by `read`.
+    restart_filter: bool,
 }
 
 impl PendingGap {
     /// Record a hole of `missing` frames immediately before the samples
     /// the current read returns. Below the threshold: known count plus an
     /// unknown-gap continuity reset (MAN-202 decision 7); at or above it: a
-    /// discontinuity only.
+    /// discontinuity only. A hole an earlier read left untaken is added in,
+    /// so a caller that skips a take never loses clock time.
     fn note_hole(&mut self, missing: u64) {
         if missing == 0 {
             return;
         }
-        if missing >= AUDIO_DISCONTINUITY_FRAMES {
-            self.discontinuity = Some(missing);
-            self.missing = None;
+        let total = missing
+            .saturating_add(self.missing.take().unwrap_or(0))
+            .saturating_add(self.discontinuity.take().unwrap_or(0));
+        if total >= AUDIO_DISCONTINUITY_FRAMES {
+            self.discontinuity = Some(total);
             self.unknown = false;
+            self.restart_filter = true;
         } else {
-            self.discontinuity = None;
-            self.missing = Some(missing);
+            self.missing = Some(total);
             self.unknown = true;
         }
     }
@@ -538,6 +545,12 @@ impl IqSource for AudioIqSource {
             return Ok(0);
         }
         if let Some(live) = &mut self.live {
+            // MAN-530: a long hole starts a fresh segment; its first
+            // analytic samples must not mix in audio from before it. A
+            // short hole keeps the filter (MAN-202's transient tolerance).
+            if std::mem::take(&mut live.gap.restart_filter) {
+                self.hilbert = HilbertTransformer::new();
+            }
             live.watch_for_silence(&real[..got]);
         }
         let analytic = self.hilbert.process(&real[..got]);
@@ -1054,8 +1067,15 @@ mod tests {
     /// A live source over the production tagged ring, plus the producer a
     /// test drives as the capture callback and the shared counters.
     fn tagged_live(stall: Duration) -> (AudioIqSource, CaptureProducer, Arc<InputHealthCounters>) {
+        tagged_live_with(CAPTURE_RING_FRAMES, stall)
+    }
+
+    fn tagged_live_with(
+        capacity: usize,
+        stall: Duration,
+    ) -> (AudioIqSource, CaptureProducer, Arc<InputHealthCounters>) {
         let health = Arc::new(InputHealthCounters::new());
-        let (producer, consumer) = capture_ring(CAPTURE_RING_FRAMES, 0, Arc::clone(&health));
+        let (producer, consumer) = capture_ring(capacity, 0, Arc::clone(&health));
         let aiq = AudioIqSource::live(
             Box::new(consumer),
             "\"USB \\\"Audio\\\"\"".to_string(),
@@ -1319,5 +1339,39 @@ mod tests {
         assert_eq!(aiq.take_missing_samples(), None);
         assert!(!aiq.take_unknown_gap());
         assert_eq!(aiq.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn untaken_holes_accumulate_instead_of_being_overwritten() {
+        let (mut aiq, mut p, _health) = tagged_live_with(4, Duration::from_secs(1));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 8];
+        capture(&mut p, 0, 4 + 10); // 10 lost
+        assert_eq!(aiq.read(&mut buf).unwrap(), 4);
+        capture(&mut p, 14, 4 + 20); // 4 accepted, 20 lost
+        assert_eq!(aiq.read(&mut buf).unwrap(), 4); // after the 10-frame hole, not taken
+        capture(&mut p, 38, 1);
+        assert_eq!(aiq.read(&mut buf).unwrap(), 1); // after the 20-frame hole
+        assert_eq!(aiq.take_missing_samples(), Some(30));
+        assert!(aiq.take_unknown_gap());
+        assert_eq!(aiq.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn a_long_hole_restarts_the_hilbert_filter_but_a_short_one_does_not() {
+        let value = |i: usize| (i % 1000) as f32 / 1000.0 + 0.001;
+        for (hole, restarted) in [(24_000usize, true), (100, false)] {
+            let (mut aiq, mut p, _health) = tagged_live(Duration::from_secs(1));
+            capture(&mut p, 0, CAPTURE_RING_FRAMES + hole);
+            let mut buf = vec![Complex32::new(0.0, 0.0); CAPTURE_RING_FRAMES];
+            assert_eq!(aiq.read(&mut buf).unwrap(), CAPTURE_RING_FRAMES);
+            let resume = CAPTURE_RING_FRAMES + hole;
+            capture(&mut p, resume, 480);
+            let mut post = vec![Complex32::new(0.0, 0.0); 480];
+            assert_eq!(aiq.read(&mut post).unwrap(), 480);
+            let real: Vec<f32> = (resume..resume + 480).map(value).collect();
+            let fresh = HilbertTransformer::new().process(&real);
+            let same = post.iter().zip(&fresh).all(|(a, b)| (a - b).norm() < 1e-6);
+            assert_eq!(same, restarted, "hole {hole}");
+        }
     }
 }
