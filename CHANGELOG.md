@@ -499,6 +499,20 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-530: a live audio input whose decode thread falls behind no longer
+  loses samples silently. Every frame the 8192-frame (~170 ms) capture ring
+  rejects is counted in `manta_input_queue_dropped_samples_total`, and each
+  contiguous run of rejected frames in `manta_input_gaps_detected_total`
+  (`source="audio"`, or the `[[input]]` name; the packet and malformed
+  families read 0). A warning names the device, at most once per 60 s.
+  `manta doctor` prints an `input:` line, and its JSON gains
+  `queueDroppedSamples` and `inputGapsDetected`, when its own run lost
+  input. The engine receives the hole at the exact sample where it falls:
+  a hole shorter than 0.5 s advances the sample clock and invalidates
+  continuity-dependent decode state, and a longer one starts a new
+  segment, so audio is never spliced across it. coppa stays pinned at
+  `f8a4d16d`. File input is unchanged. See
+  docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md.
 - MAN-537: the published Docker image names its release commit. Its
   `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
   `manta_build_info` used to read `unknown`, because the build context has

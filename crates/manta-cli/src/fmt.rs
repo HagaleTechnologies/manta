@@ -118,6 +118,23 @@ fn bad_samples_report_line(n: u64) -> String {
     }
 }
 
+/// MAN-530: doctor's capture-loss line, printed just before `verdict:`
+/// when this run's source counted any queue-dropped sample or input gap
+/// (`DoctorReport::queue_dropped_samples`/`input_gaps_detected`). Worded
+/// source-generically: a gap may be a SoapySDR overflow or a packet loss,
+/// not only a rig-audio capture-ring overrun. Empty when both are 0.
+fn input_loss_report_line(queue_dropped_samples: u64, input_gaps_detected: u64) -> String {
+    if queue_dropped_samples == 0 && input_gaps_detected == 0 {
+        return String::new();
+    }
+    format!(
+        "input: {queue_dropped_samples} sample{} dropped from the capture queue; \
+         {input_gaps_detected} input gap{} detected\n",
+        if queue_dropped_samples == 1 { "" } else { "s" },
+        if input_gaps_detected == 1 { "" } else { "s" },
+    )
+}
+
 /// A DC offset below this over the channel noise is indistinguishable from
 /// the floor, so naming it would be noise itself (MAN-495 D4; MAN-203 set
 /// no number and its fixture case reports >= 12 dB).
@@ -208,7 +225,7 @@ pub fn doctor_report(report: &manta_engine::DoctorReport) -> String {
 tracks: {} promoted, {} TrackMeta updates, {} closed, {} detector confirmations\n\
 SNR (2500 Hz reference): {}\n\
 decode: {} chars ({} distinct), {} confirmed spots\n\
-{}{}verdict: {}\n",
+{}{}{}verdict: {}\n",
         report.sample_rate_hz,
         khz(report.center_freq_hz),
         report.duration.as_secs_f64(),
@@ -226,6 +243,7 @@ decode: {} chars ({} distinct), {} confirmed spots\n\
             .as_ref()
             .map(|cond| conditioning_report_lines(cond, report.sample_rate_hz))
             .unwrap_or_default(),
+        input_loss_report_line(report.queue_dropped_samples, report.input_gaps_detected),
         report.verdict().summary()
     )
 }
@@ -433,6 +451,70 @@ mod tests {
         assert!(soak_report(&r).starts_with("soak: failed\n"));
     }
 
+    /// MAN-530: the plan's illustrative `--device "USB Audio" --duration 3`
+    /// report with one measured capture-ring overrun, pinned whole: the
+    /// loss line sits immediately before `verdict:` and the verdict is the
+    /// one the existing rules give.
+    #[test]
+    fn doctor_report_prints_the_input_loss_line_just_before_the_verdict() {
+        let r = manta_engine::DoctorReport {
+            sample_rate_hz: 48000.0,
+            center_freq_hz: 14_030_000.0,
+            duration: std::time::Duration::from_secs(3),
+            tracks_promoted: 0,
+            detector_confirmations: 0,
+            track_meta_count: 0,
+            tracks_closed: 0,
+            snr_db_min: None,
+            snr_db_median: None,
+            snr_db_max: None,
+            chars_decoded: 0,
+            distinct_chars: 0,
+            spots_confirmed: 0,
+            bad_samples: 0,
+            input_conditioning: None,
+            queue_dropped_samples: 15_808,
+            input_gaps_detected: 1,
+        };
+        assert_eq!(r.verdict(), manta_engine::Verdict::NoSignal);
+        assert_eq!(
+            doctor_report(&r),
+            format!(
+                "source: 48000 Hz sample rate, 14030.0 kHz center, observed for 3.0s\n\
+                 tracks: 0 promoted, 0 TrackMeta updates, 0 closed, 0 detector confirmations\n\
+                 SNR (2500 Hz reference): no TrackMeta events -- no track ever promoted\n\
+                 decode: 0 chars (0 distinct), 0 confirmed spots\n\
+                 input: 15808 samples dropped from the capture queue; 1 input gap detected\n\
+                 verdict: {}\n",
+                r.verdict().summary()
+            )
+        );
+    }
+
+    /// MAN-530: `sample` and `gap` pluralize by their own counts, a
+    /// gap-only source (SoapySDR overflow, no count) still prints, and a
+    /// clean run prints no line at all.
+    #[test]
+    fn input_loss_line_pluralizes_each_count_and_is_omitted_at_zero() {
+        assert_eq!(
+            input_loss_report_line(15_808, 1),
+            "input: 15808 samples dropped from the capture queue; 1 input gap detected\n"
+        );
+        assert_eq!(
+            input_loss_report_line(0, 2),
+            "input: 0 samples dropped from the capture queue; 2 input gaps detected\n"
+        );
+        assert_eq!(
+            input_loss_report_line(1, 1),
+            "input: 1 sample dropped from the capture queue; 1 input gap detected\n"
+        );
+        assert_eq!(
+            input_loss_report_line(7, 0),
+            "input: 7 samples dropped from the capture queue; 0 input gaps detected\n"
+        );
+        assert_eq!(input_loss_report_line(0, 0), "");
+    }
+
     #[test]
     fn doctor_reports_populated_and_both_absent_snr_states() {
         let mut r = manta_engine::DoctorReport {
@@ -451,6 +533,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(doctor_report(&r), format!("source: 48000 Hz sample rate, 14000.0 kHz center, observed for 10.0s\ntracks: 61 promoted, 64 TrackMeta updates, 36 closed, 70 detector confirmations\nSNR (2500 Hz reference): min=20 dB median=59 dB max=68 dB\ndecode: 42 chars (15 distinct), 0 confirmed spots\nverdict: {}\n", r.verdict().summary()));
         r.snr_db_min = None;
@@ -483,6 +567,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(r.verdict(), Verdict::WeakNoDecode);
         let hint = doctor_rerun_hint(&r, ten).expect("a 10 s WEAK_NO_DECODE run hints");
@@ -562,6 +648,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert!(!doctor_report(&r).contains("input:"));
         r.bad_samples = 1;
@@ -593,6 +681,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: Some(observed_clean()),
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(
             doctor_report(&r),
@@ -787,6 +877,8 @@ second looked like impulses, so they are probably signal\n"
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         }
     }
 
@@ -826,6 +918,8 @@ second looked like impulses, so they are probably signal\n"
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         let out = doctor_report(&r);
         assert!(
