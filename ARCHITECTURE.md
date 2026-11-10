@@ -358,7 +358,9 @@ detection on channel powers, decoders attached only to active channels.**
   2× (187 Hz, 5.6 samples/dit) was rejected as too marginal for QSB'd fast CW.
 - Implementation: polyphase FIR commutator + one N-point FFT per hop
   (the forward plan `coppa-dsp::fft::FftProcessor` builds, run in place with
-  a scratch the channelizer owns, MAN-117). Frequency-domain output magnitude² feeds the
+  a scratch the channelizer owns, MAN-117; folded slab by slab with the
+  rotation as the write index, and `process_into` recycles the hop buffers,
+  MAN-527). Frequency-domain output magnitude² feeds the
   detector directly — the PFB *is* the spectrum analyzer; no separate FFT path.
 
 **Detector / track manager.** Per-channel noise floor by order statistics
