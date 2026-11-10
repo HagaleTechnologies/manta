@@ -385,6 +385,10 @@ that release archives lack:
 docker build -t manta:local .
 ```
 
+That image reports its commit as `unknown`, because the build context
+leaves out `.git`. To have it name the checkout's commit, pass it in:
+`docker build --build-arg MANTA_GIT_SHA="$(git rev-parse HEAD)" -t manta:local .`
+
 Then change the `image:` line in `docker-compose.yml` to
 `image: manta:local`.
 

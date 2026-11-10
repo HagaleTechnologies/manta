@@ -29,11 +29,16 @@ pub fn allocations() -> &'static [(&'static str, f64, f64)] {
 /// rather than panicking or guessing -- manta may be tuned to a segment
 /// that doesn't map cleanly (e.g. a receiver test tone).
 pub fn band_for_freq_hz(freq_hz: f64) -> &'static str {
+    allocation_index_for_freq_hz(freq_hz).map_or("unknown", |i| BANDS_HZ[i].0)
+}
+
+/// The index in `allocations()` of the allocation holding `freq_hz`, edges
+/// inclusive; `None` where `band_for_freq_hz` says `"unknown"`. MAN-546's
+/// per-connection band filter and the JSON `band` field share this lookup.
+pub fn allocation_index_for_freq_hz(freq_hz: f64) -> Option<usize> {
     BANDS_HZ
         .iter()
-        .find(|(_, lo, hi)| freq_hz >= *lo && freq_hz <= *hi)
-        .map(|(name, _, _)| *name)
-        .unwrap_or("unknown")
+        .position(|(_, lo, hi)| freq_hz >= *lo && freq_hz <= *hi)
 }
 
 #[cfg(test)]
@@ -60,5 +65,23 @@ mod tests {
     fn frequency_outside_any_band_is_unknown() {
         assert_eq!(band_for_freq_hz(1_000.0), "unknown");
         assert_eq!(band_for_freq_hz(15_000_000.0), "unknown");
+    }
+
+    #[test]
+    fn allocation_index_matches_band_for_freq_hz() {
+        for (i, (name, lo, hi)) in allocations().iter().enumerate() {
+            for freq in [*lo, *hi, (lo + hi) / 2.0] {
+                assert_eq!(allocation_index_for_freq_hz(freq), Some(i), "{name} {freq}");
+                assert_eq!(band_for_freq_hz(freq), *name, "{freq}");
+            }
+        }
+    }
+
+    #[test]
+    fn allocation_index_is_none_outside_every_allocation() {
+        for freq in [100_000.0, 7_300_001.0, 0.0] {
+            assert_eq!(allocation_index_for_freq_hz(freq), None, "{freq}");
+            assert_eq!(band_for_freq_hz(freq), "unknown", "{freq}");
+        }
     }
 }

@@ -592,6 +592,15 @@ disposable container or VM. The decisions behind the package are in
 
 ## What each artifact contains
 
+Every binary below is built with `[profile.release]` from the root
+`Cargo.toml` (MAN-528: fat LTO, one codegen unit, `panic = "unwind"`), since
+every route runs plain `cargo build --release` or `cross build --release`.
+A change to that profile is re-measured with
+`scripts/release-profile-ab.py` and checked with
+`gh workflow run release-publish.yml --repo HagaleTechnologies/manta --ref <branch> -f publish=false`
+before approval, so the Windows static-CRT, soapy and QEMU image builds run
+under it. See [the MAN-528 record](../DECISIONS/2026-11-10-man528-release-profile.md).
+
 - **Windows** (`manta-windows-x86_64.zip`): `manta.exe`, `README.md`,
   the two license files, and the unattended-service kit listed below. The
   binary links the MSVC C runtime **statically** (MAN-65 finding 2), so it
@@ -656,7 +665,33 @@ disposable container or VM. The decisions behind the package are in
   builds the `linux/arm64` image alone and runs
   `scripts/check-soapy-release.py --docker-image` on it before the
   multi-platform push. A USB receiver needs `--device /dev/bus/usb` and
-  host group access (`packaging/README.md`).
+  host group access (`packaging/README.md`). Since MAN-537 both builds
+  pass `MANTA_GIT_SHA=${{ github.sha }}`, so the image names the release
+  commit in `--version`, `decoderVersion` and `manta_build_info`, and the
+  check runs with `--expect-git-sha "$GITHUB_SHA"`: an image that reports
+  another commit or `unknown` fails before the push.
+
+## Reviewing a Dependabot base-image bump
+
+The `Dockerfile` pins `rust:1-slim-bookworm` and `debian:bookworm-slim` by
+tag and manifest-list digest, and Dependabot's `docker` entry opens a PR
+when either digest or tag moves (MAN-537). Such a PR never auto-merges:
+`scripts/verify-dependabot-diff-safe.py` accepts only Cargo manifests and
+the lockfile, so `dependabot-auto-merge.yml` labels it `needs-review`, as it
+does every Actions bump. `/Dockerfile` is a CODEOWNERS path, so the owner
+approves it.
+
+No PR job builds the image, so build it before approving:
+
+```sh
+gh workflow run release-publish.yml --repo HagaleTechnologies/manta \
+    --ref <dependabot-branch> -f publish=false
+```
+
+Approve only when `docker-build-dispatch` passes. Its arm64 check prints
+`OK: image commit <12 hex of the branch head> matches --expect-git-sha`.
+A pinned digest freezes the base OS layer, so a Debian security fix reaches
+the image only when such a PR merges: review these PRs promptly.
 
 ## Verifying a downloaded release
 

@@ -49,9 +49,9 @@ build.rs             @thagale
 /.dockerignore       @thagale
 
 # .gitattributes decides the bytes every checkout writes, CI's and release builds' included. The
-# root file pins two byte-compared test fixtures to LF; an unowned edit, or a nested
-# .gitattributes (hence no leading slash), could rewrite them or the vendored CRLF cty.dat and
-# master.scp without touching those files.
+# root file checks every text file out with LF (MAN-519) and leaves the vendored CRLF cty.dat and
+# master.scp unconverted; an unowned edit, or a nested .gitattributes (hence no leading slash),
+# could rewrite byte-compared fixtures or those two files without touching any of them.
 .gitattributes       @thagale
 
 /AGENTS.md           @thagale

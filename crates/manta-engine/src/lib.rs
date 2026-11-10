@@ -789,6 +789,8 @@ pub fn decode_source_observed(
         }
     };
     let mut any_hops = false;
+    // MAN-527: the channelizer recycles these hop buffers on every call.
+    let mut hops = Vec::new();
     let mut chunk = vec![Complex32::new(0.0, 0.0); CHUNK_SAMPLES];
     // Samples read after a gap, held for the next segment while the
     // previous one processes its partial chunk (MAN-309).
@@ -855,7 +857,7 @@ pub fn decode_source_observed(
             consumed += n as u64;
         }
         if filled > 0 {
-            let hops = seg.ch.process(&chunk[..filled]);
+            seg.ch.process_into(&chunk[..filled], &mut hops);
             any_hops |= !hops.is_empty();
             let (base, pad_hops, hop) = (seg.base, seg.pad_hops, seg.hop);
             let batch = seg

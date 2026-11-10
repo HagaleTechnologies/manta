@@ -6,6 +6,7 @@ pub mod band;
 pub mod band_plan;
 pub mod bounded_io;
 pub mod bus;
+pub mod client_filter;
 pub mod command;
 pub mod config;
 pub mod health;

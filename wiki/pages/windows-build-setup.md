@@ -136,9 +136,11 @@ reliability comparison against the macOS baseline in issues #166/#167/
   resolution joins it onto the config dir (`C:/x/v1.wav`) -- build
   absolute test paths from `std::env::temp_dir()` and write them as TOML
   literal strings (`'...'`), and split `path: msg` lines on `": "`, not
-  `':'`; (2) the runners check text out with CRLF, and `include_str!`
-  embeds those bytes, so normalise `\r\n` before matching `\n`-delimited
-  text; (3) when a test file mixes cross-platform tests with a
+  `':'`; (2) `.gitattributes` checks every text file out with LF on
+  every runner (MAN-519), except the vendored `cty.dat` and `master.scp`,
+  which keep upstream's CRLF; `include_str!` embeds the checked-out bytes,
+  so a test that reads either of those must still normalise `\r\n`; (3)
+  when a test file mixes cross-platform tests with a
   `#[cfg(unix)]` test, gate the unix-only imports and helpers per item
   (not `#![cfg(unix)]` on the file, which drops the cross-platform tests
   too), or `cargo clippy --all-targets -- -D warnings` fails on Windows

@@ -7,6 +7,7 @@ pub mod devices;
 pub mod local_bind;
 
 pub mod audio;
+mod audio_capture;
 pub use audio::{AudioIqSource, AUDIO_PASSBAND_HI_HZ, AUDIO_PASSBAND_LO_HZ, TARGET_RATE_HZ};
 
 pub mod kiwi;
@@ -37,6 +38,8 @@ pub use recording::{
 
 mod overflow;
 
+mod loss_marks;
+
 mod stall;
 pub use stall::{is_no_usable_samples, NoUsableSamples, NO_USABLE_SAMPLES_AFTER};
 
@@ -59,7 +62,9 @@ use std::path::{Path, PathBuf};
 /// Transport atomics can be shared across receivers while each receiver
 /// retains its own bounded-queue loss counter. Shared by packet-based
 /// sources, including HPSDR and KiwiSDR, through
-/// `IqSource::health_counters`.
+/// `IqSource::health_counters`. MAN-530: live audio reuses the
+/// queue-dropped and gap counters for frames its capture ring rejects (one
+/// gap per contiguous loss episode); its packet counters stay zero.
 ///
 /// Atomic rather than mutex-guarded for the same reason
 /// `HpsdrIqSource::confirmed_live` is (MAN-55): a metrics reader must
@@ -243,6 +248,12 @@ pub trait IqSource {
     /// packet stream. Returns the value once, then `None` until the next loss.
     /// `manta_engine::listen` advances its sample clock by this many samples
     /// without closing tracks, so spot timestamps stay wall-clock-true.
+    /// Three sources report it: HPSDR protocol 2 (lost datagrams, MAN-305),
+    /// KiwiSDR (lost SND frames) and ka9q-radio (lost RTP packets, MAN-529);
+    /// each reports a loss of 0.5 s or more through
+    /// [`IqSource::take_discontinuity`] instead. A source that buffers ahead
+    /// of its reader must end `read()` at the loss, so the report describes
+    /// the first sample of the read that carries it (MAN-529).
     /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
     fn take_missing_samples(&mut self) -> Option<u64> {
         None
@@ -252,7 +263,11 @@ pub trait IqSource {
     /// before the samples returned by the most recent `read()` -- a SoapySDR
     /// driver overflow reports that its ring dropped data, not how much.
     /// Returns `true` once, then `false` until the next such loss. Default
-    /// `false`. There is no count, so the engine neither moves its sample clock
+    /// `false`. A source may report it together with
+    /// `take_missing_samples` for the same hole (MAN-202 decision 7; live
+    /// audio's short capture-ring holes, MAN-530): the count advances the
+    /// clock and this flag resets continuity-dependent state. Alone, there
+    /// is no count, so the engine neither moves its sample clock
     /// (spot timestamps after the loss run early by the lost time) nor rebuilds
     /// the segment: it invalidates every track's continuity-dependent decode
     /// state at the gap (`manta_engine::track::TrackManager::note_input_gap`).
@@ -308,8 +323,10 @@ pub trait IqSource {
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
     /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
-    /// SoapySDR counts driver overflow read errors (MAN-233); audio
-    /// currently counts nothing of the kind. A caller with
+    /// ka9q-radio counts RTP sequence gaps and malformed datagrams (MAN-140);
+    /// SoapySDR counts driver overflow read errors (MAN-233); a live audio
+    /// device counts frames its capture ring drops as queue-dropped samples
+    /// and loss episodes as gaps (MAN-530). A caller with
     /// `Some(handle)` may keep polling it after the
     /// source itself has been moved into `manta_engine::listen`, which is
     /// the whole reason this is a shared handle rather than a `&self`
@@ -1097,7 +1114,8 @@ mod tests {
     #[test]
     fn a_source_with_no_packet_loss_model_reports_no_health_counters() {
         // The trait's default: only sources that actually count something
-        // override it (MAN-56 D1), so file/audio/kiwi/soapy stay untouched.
+        // override it (MAN-56 D1), so files stay untouched (live audio
+        // counts capture-ring loss since MAN-530).
         let dir = tempfile::tempdir().unwrap();
         let wav = dir.path().join("fix.wav");
         write_f32_wav(&wav, &samples(), 96_000);
