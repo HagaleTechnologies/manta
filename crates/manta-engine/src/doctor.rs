@@ -189,6 +189,22 @@ pub struct DoctorReport {
     /// config), absent in checks-only output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_conditioning: Option<ConditioningReport>,
+    /// MAN-530: samples the source's capture queue dropped during THIS run
+    /// (startup calibration included), read from
+    /// `IqSource::health_counters` after the run ends -- live rig audio's
+    /// capture-ring overruns, or another receiver's queue evictions.
+    /// `queueDroppedSamples` in `doctor --json`, omitted when 0; a source
+    /// with no health counters reads as 0. Not a daemon's historical
+    /// total, and not an input to `verdict()`.
+    #[serde(skip_serializing_if = "crate::is_zero")]
+    pub queue_dropped_samples: u64,
+    /// MAN-530: input gap events the source counted during this run
+    /// (`InputHealthCounters::gaps_detected`): a contiguous audio overrun,
+    /// a SoapySDR overflow or a packet-stream loss. Source-generic, so not
+    /// labelled an audio overrun. `inputGapsDetected` in `doctor --json`,
+    /// omitted when 0.
+    #[serde(skip_serializing_if = "crate::is_zero")]
+    pub input_gaps_detected: u64,
 }
 
 /// `DoctorReport::duration` as a number of seconds (MAN-139), the value the
@@ -605,6 +621,10 @@ pub fn doctor(
     // exceed real-time delivery in the first place), so this is a no-op
     // safety net there and the actual fix for file replay.
     let max_samples = (sample_rate_hz * duration.as_secs_f64()).round() as u64;
+    // MAN-530: held before the wrappers below take the source, so the
+    // report can read this run's final loss totals after `listen` returns
+    // (the wrappers need not forward `health_counters` for doctor's sake).
+    let health = src.health_counters();
     let samples_read = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let src: Box<dyn IqSource> = Box::new(SampleBoundedSource {
         inner: src,
@@ -742,6 +762,8 @@ pub fn doctor(
         spots_confirmed,
         bad_samples: bad_samples.load(Ordering::Relaxed),
         input_conditioning,
+        queue_dropped_samples: health.as_ref().map_or(0, |h| h.queue_dropped_samples()),
+        input_gaps_detected: health.as_ref().map_or(0, |h| h.gaps_detected()),
     })
 }
 
@@ -1011,6 +1033,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::NoisyNoDecode);
     }
@@ -1033,6 +1057,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -1059,6 +1085,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::WeakNoDecode);
     }
@@ -1085,6 +1113,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -1111,6 +1141,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -1141,6 +1173,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         };
         assert_eq!(report.verdict(), Verdict::ActivityNoSnr);
     }
@@ -1255,6 +1289,8 @@ mod tests {
             spots_confirmed: 0,
             bad_samples: 0,
             input_conditioning: None,
+            queue_dropped_samples: 0,
+            input_gaps_detected: 0,
         }
     }
 
@@ -1618,5 +1654,137 @@ mod tests {
         assert!(!serde_json::to_string(&report)
             .unwrap()
             .contains("inputConditioning"));
+    }
+    /// MAN-530: digital silence at 48 kHz from a source whose shared health
+    /// counters grow WHILE doctor reads it, the way a live receiver's
+    /// capture thread counts losses: `gaps_per_read` gap events and
+    /// `packets_per_read` lost packets (HPSDR-style) land on every read, so
+    /// a snapshot taken at doctor's entry would read 0 and only the final
+    /// one matches the counter after the run.
+    struct GrowingHealthSource {
+        health: Option<Arc<manta_input::InputHealthCounters>>,
+        gaps_per_read: u64,
+        packets_per_read: u64,
+    }
+
+    impl IqSource for GrowingHealthSource {
+        fn sample_rate(&self) -> f64 {
+            48_000.0
+        }
+        fn center_freq_hz(&self) -> f64 {
+            0.0
+        }
+        fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+            if let Some(h) = &self.health {
+                for _ in 0..self.gaps_per_read {
+                    h.record_gap();
+                }
+                if self.packets_per_read > 0 {
+                    h.record_dropped(self.packets_per_read);
+                }
+            }
+            buf.fill(Complex32::new(0.0, 0.0));
+            Ok(buf.len())
+        }
+        fn health_counters(&self) -> Option<Arc<manta_input::InputHealthCounters>> {
+            self.health.clone()
+        }
+    }
+
+    fn growing_health_report(
+        health: Option<Arc<manta_input::InputHealthCounters>>,
+        gaps_per_read: u64,
+        packets_per_read: u64,
+    ) -> DoctorReport {
+        doctor(
+            Box::new(GrowingHealthSource {
+                health,
+                gaps_per_read,
+                packets_per_read,
+            }),
+            &PipelineConfig::default(),
+            MIN_DURATION,
+        )
+        .unwrap()
+    }
+
+    /// MAN-530: a gap-only source (a SoapySDR overflow carries no count)
+    /// reports this run's FINAL gap total, counted during the run --
+    /// startup calibration included -- and the verdict stays what the
+    /// existing rules give digital silence.
+    #[test]
+    fn doctor_reports_the_final_gap_count_of_a_source_whose_counters_grow() {
+        let health = Arc::new(manta_input::InputHealthCounters::new());
+        let report = growing_health_report(Some(health.clone()), 1, 0);
+        assert!(health.gaps_detected() > 0, "the source counted gaps");
+        assert_eq!(report.input_gaps_detected, health.gaps_detected());
+        assert_eq!(report.queue_dropped_samples, 0);
+        assert_eq!(report.verdict(), Verdict::NoSignal);
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["inputGapsDetected"], health.gaps_detected());
+        assert!(v.get("queueDroppedSamples").is_none());
+    }
+
+    /// MAN-530: HPSDR-style packet loss (dropped packets plus a gap event)
+    /// reaches the report as gaps only: dropped packets are a separate
+    /// metric family, not capture-queue samples.
+    #[test]
+    fn doctor_reports_packet_loss_gaps_but_not_packets_as_queue_drops() {
+        let health = Arc::new(manta_input::InputHealthCounters::new());
+        let report = growing_health_report(Some(health.clone()), 1, 3);
+        assert!(health.dropped_packets() > 0);
+        assert_eq!(report.input_gaps_detected, health.gaps_detected());
+        assert_eq!(report.queue_dropped_samples, health.queue_dropped_samples());
+        assert_eq!(report.queue_dropped_samples, 0);
+        assert_eq!(report.verdict(), Verdict::NoSignal);
+    }
+
+    /// MAN-530: a clean source and a source with no health counters at all
+    /// (a file) report zero loss, and the JSON keeps its pre-MAN-530 shape.
+    #[test]
+    fn doctor_reports_no_loss_for_clean_and_counterless_sources() {
+        for health in [
+            Some(Arc::new(manta_input::InputHealthCounters::new())),
+            None,
+        ] {
+            let report = growing_health_report(health, 0, 0);
+            assert_eq!(report.queue_dropped_samples, 0);
+            assert_eq!(report.input_gaps_detected, 0);
+            assert_eq!(report.verdict(), Verdict::NoSignal);
+            let s = serde_json::to_string(&report).unwrap();
+            assert!(!s.contains("queueDroppedSamples"), "{s}");
+            assert!(!s.contains("inputGapsDetected"), "{s}");
+        }
+    }
+
+    /// MAN-530: `queueDroppedSamples` and `inputGapsDetected` are top-level
+    /// camelCase members after `inputConditioning`, each omitted on its own
+    /// when zero.
+    #[test]
+    fn doctor_json_carries_each_input_loss_member_only_when_nonzero() {
+        let mut report = no_promotion_report(0);
+        let keys = |r: &DoctorReport| {
+            let s = serde_json::to_string(r).unwrap();
+            crate::json_keys_in_order(&s)
+                .into_iter()
+                .filter(|k| k == "queueDroppedSamples" || k == "inputGapsDetected")
+                .collect::<Vec<_>>()
+        };
+        assert!(keys(&report).is_empty());
+        report.queue_dropped_samples = 15_808;
+        assert_eq!(keys(&report), ["queueDroppedSamples"]);
+        report.input_gaps_detected = 1;
+        assert_eq!(keys(&report), ["queueDroppedSamples", "inputGapsDetected"]);
+        report.queue_dropped_samples = 0;
+        assert_eq!(keys(&report), ["inputGapsDetected"]);
+        report.queue_dropped_samples = 15_808;
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["queueDroppedSamples"], 15_808);
+        assert_eq!(v["inputGapsDetected"], 1);
+        let all = crate::json_keys_in_order(&serde_json::to_string(&report).unwrap());
+        assert_eq!(
+            &all[all.len() - 2..],
+            ["queueDroppedSamples", "inputGapsDetected"]
+        );
     }
 }

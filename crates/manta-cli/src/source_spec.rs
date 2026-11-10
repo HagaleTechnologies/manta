@@ -304,11 +304,16 @@ impl LiveSourceSpec {
                 retune_hz = src.center_freq_hz() - first_hz;
                 Box::new(src)
             }
-            // Each (re)open gets its own one-shot silence notice (MAN-131).
+            // Each (re)open gets its own one-shot silence notice (MAN-131)
+            // and its own rate-limited capture-overrun notice (MAN-530).
             LiveSourceSpec::AudioDevice(device) => Box::new(
-                manta_input::AudioIqSource::from_device(device.as_deref())?.with_silence_notice(
-                    Box::new(|device| logging::warning(&audio_silence_warning(device))),
-                ),
+                manta_input::AudioIqSource::from_device(device.as_deref())?
+                    .with_silence_notice(Box::new(|device| {
+                        logging::warning(&audio_silence_warning(device))
+                    }))
+                    .with_overrun_notice(Box::new(|device| {
+                        logging::warning(&audio_overrun_warning(device))
+                    })),
             ),
             LiveSourceSpec::File {
                 path,
@@ -650,6 +655,19 @@ fn audio_silence_warning(device: &str) -> String {
           (every sample is exactly zero) -- {}",
         manta_input::TARGET_RATE_HZ,
         manta_input::audio::audio_input_hint()
+    )
+}
+
+/// MAN-530: the audio capture ring dropped frames because the decode
+/// thread fell behind. `device` is already safely quoted by manta-input.
+/// Rate-limited there to the first loss and then once per 60 s per opened
+/// source; the counters carry the exact numbers.
+fn audio_overrun_warning(device: &str) -> String {
+    format!(
+        "warning: audio input {device} capture ring overran because the decode thread \
+         fell behind; lost samples are counted in manta_input_queue_dropped_samples_total \
+         and gaps in manta_input_gaps_detected_total for this input (warning limited to \
+         once per 60 s)"
     )
 }
 

@@ -540,6 +540,10 @@ const REPORT_KEYS: &[&str] = &[
     "verdict",
 ];
 
+/// MAN-530: the doctor members present only when this run's source
+/// counted capture-queue drops or input gaps.
+const LOSS_KEYS: &[&str] = &["queueDroppedSamples", "inputGapsDetected"];
+
 fn json_object(stdout: &str) -> serde_json::Map<String, serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|e| panic!("doctor --json not one JSON object ({e}): {stdout}"));
@@ -566,6 +570,11 @@ fn json_adds_checks_and_keeps_every_existing_key() {
     // on top of the pre-MAN-495 keys; `verdict` is in REPORT_KEYS, so the
     // only additions beyond it remain `checks` and `checksStatus`.
     assert_eq!(map.len(), REPORT_KEYS.len() + 2, "{stdout}");
+    // MAN-530: a clean file run lost nothing, so the input-loss members
+    // are omitted and the report keeps its pre-MAN-530 shape.
+    for key in LOSS_KEYS {
+        assert!(!map.contains_key(*key), "{key} on a clean run: {stdout}");
+    }
     let checks = map["checks"].as_array().unwrap();
     assert!(!checks.is_empty());
     for check in checks {
@@ -619,6 +628,10 @@ fn json_without_a_receiver_has_only_checks() {
     keys.sort_unstable();
     assert_eq!(keys, ["checks", "checksStatus"], "{stdout}");
     assert_eq!(map["checksStatus"], "FAIL");
+    // MAN-530: no receiver ran, so there is no input-loss measurement.
+    for key in LOSS_KEYS {
+        assert!(!map.contains_key(*key), "{key} in checks-only: {stdout}");
+    }
 }
 
 #[test]
