@@ -20,7 +20,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestry.test.sh
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
 packaging,package_release,score_against_rbn_replay,corpus,score_transcript,ci_gates,\
-verify_dependabot_diff_safe,decisions_index,field_node,engine_overlap,ci_shards,release_profile_ab}
+verify_dependabot_diff_safe,decisions_index,field_node,engine_overlap,ci_shards,release_profile_ab,package_deb}
 # MAN-323 (Linux/macOS only): the FT8/FT4 decoder behind the `ftx` feature
 cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
 cargo test -p manta-engine --features ftx --locked --lib ftx

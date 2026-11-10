@@ -151,6 +151,8 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      one native Linux build, with the same default features as every
      standard build leg, after the tag checks and before the matrix starts) → `build` (builds and packages all five
      targets — macOS x86_64/arm64, Windows x86_64, Linux x86_64/arm64 —
+     and, in the two Linux legs, the Debian packages `manta-linux-x86_64.deb`
+     and `manta-linux-arm64.deb` (MAN-540; see "The Debian packages" below),
      and needs only `validate-tag`) and, beside it, `build-soapy` (the
      sixth archive, `manta-linux-x86_64-soapy.tar.gz`, MAN-82) and
      `build-soapy-arm64` (the seventh, `manta-linux-arm64-soapy.tar.gz`,
@@ -162,9 +164,10 @@ this change. See [the MAN-244 decision](../DECISIONS/2026-10-10-man244-release-g
      `ghcr.io/hagaletechnologies/manta:X.Y.Z`, then `publish-latest` runs
      after it; see below) and `release` (needs `build`, `build-soapy`
      and `build-soapy-arm64`, so a failed or skipped Soapy build publishes
-     no Release; writes `SHA256SUMS` over the seven archives, attests their
+     no Release; writes `SHA256SUMS` over the seven archives and two Debian
+     packages, attests their
      build provenance, then creates the
-     GitHub Release from the archives and `SHA256SUMS`; MAN-80, see
+     GitHub Release from those files and `SHA256SUMS`; MAN-80, see
      "Verifying a downloaded release" below). The Release notes open with
      the pre-stability label above GitHub's generated list of merged pull
      requests. `release` does not wait for the image; see "If the image
@@ -204,7 +207,8 @@ The GitHub Release does not wait for the Docker image (MAN-298). Once the
 owner approves `ghcr-publish`, `docker-publish-release` and `release` run
 side by side, so a failed image push leaves the Release in place. The run
 then shows `docker-publish-release` failed, `publish-latest` skipped and
-`release` succeeded: the Release has its seven archives and `SHA256SUMS`,
+`release` succeeded: the Release has its seven archives, two Debian packages
+and `SHA256SUMS`,
 and GHCR has no `:X.Y.Z` image.
 
 Do not delete or re-push the tag. The binaries are published and attested,
@@ -535,6 +539,57 @@ prerequisites and the other failure messages are in README's
 None of these checks attach a receiver: a hardware run with a real
 receiver is still a separate, manual check.
 
+## The Debian packages
+
+`build`'s two Linux legs (MAN-540) package the binary each leg's
+`.tar.gz` ships as a Debian package, `manta-linux-x86_64.deb` (amd64) and
+`manta-linux-arm64.deb` (arm64), and upload it in the same `manta-linux-*`
+artifact, so `release` checksums, attests and publishes it with no step of
+its own. Four steps run after the archive's Package step and before the
+upload:
+
+- **Package (.deb)**, both legs: `scripts/package-deb.py` stages the binary,
+  the kit unit with `ExecStart=` changed to `/usr/bin/manta`, the config
+  scaffold at `/usr/share/manta/manta.toml`, the man pages and the
+  maintainer scripts in `packaging/deb/`, then runs `dpkg-deb --build`. The
+  package version comes from the tag: `v0.2.0` gives `0.2.0-1`,
+  `v0.2.0-rc.1` gives `0.2.0~rc.1-1`, and a dispatch rehearsal gives
+  `0~dispatch.<run_id>-1`, which sorts below every release.
+- **Set up QEMU for the arm64 package check**, arm64 leg only.
+- **Verify the .deb in a clean Debian bookworm**, both legs:
+  `scripts/check-deb.py` in a `debian:bookworm` container that sees only
+  the package and the checker, read-only. It installs the package with
+  `apt-get`, checks the layout, modes and owners, that
+  `/etc/manta/manta.toml` is 0600 and equals `manta config init --out -`,
+  that the package has no conffiles, that `manta config check` passes and
+  that the service is enabled; then reinstalls over an edited config (the
+  edit is kept and no `manta.toml.dpkg-*` file appears) and purges.
+- **Verify the .deb under systemd on this runner**, x86_64 leg only:
+  `sudo python3 scripts/check-deb.py --systemd` on the GitHub-hosted
+  runner, whose PID 1 is systemd. Beyond the container checks it confirms
+  the service is enabled but not started after install, runs
+  `systemd-analyze verify`, starts the service on a looping IQ recording
+  until `manta health` answers, reads back the sandbox `packaging/README.md`
+  documents under "What the service may do" with `systemctl show`, checks
+  that a reinstall restarts the running service and keeps the config, and
+  purges.
+
+A failed check fails its leg, so `release` publishes nothing. To rerun the
+container check on a Debian or Ubuntu host, build the package as the step
+does and run the checker as root in a disposable container:
+
+```sh
+cargo build --release --locked -p manta-cli
+target/release/manta man-pages --out man-pages
+python3 scripts/package-deb.py --binary target/release/manta --target x86_64-unknown-linux-gnu --version 0.1.0 --artifact manta-linux-x86_64 --man-dir man-pages --out-dir .
+docker run --rm -v "$PWD/manta-linux-x86_64.deb:/release/manta-linux-x86_64.deb:ro" -v "$PWD/scripts/check-deb.py:/release/check-deb.py:ro" debian:bookworm bash -c 'apt-get update && apt-get install -y --no-install-recommends python3 && python3 /release/check-deb.py /release/manta-linux-x86_64.deb'
+```
+
+The checker changes the system it runs on: run
+`sudo python3 scripts/check-deb.py ./manta-linux-x86_64.deb` only inside a
+disposable container or VM. The decisions behind the package are in
+[docs/DECISIONS/2026-11-09-man540-debian-package.md](../DECISIONS/2026-11-09-man540-debian-package.md).
+
 ## What each artifact contains
 
 Every binary below is built with `[profile.release]` from the root
@@ -577,14 +632,25 @@ under it. See [the MAN-528 record](../DECISIONS/2026-11-10-man528-release-profil
   bookworm and later. It needs `libasound2`, `libsoapysdr0.8` and the
   receiver's SoapySDR module installed, and bundles none of them. See "The
   SoapySDR archives" above.
+- **Debian packages** (`manta-linux-x86_64.deb`, `manta-linux-arm64.deb`,
+  MAN-540): the Linux archive's binary as `/usr/bin/manta`, the man pages,
+  `/usr/lib/systemd/system/manta.service` (the kit unit running
+  `/usr/bin/manta`), the config scaffold `/usr/share/manta/manta.toml` and
+  the licence in `/usr/share/doc/manta/copyright`. `Depends: libasound2
+  (>= 1.0.16) | libasound2t64` and `Breaks: systemd (<< 247)`. The postinst
+  copies the scaffold to `/etc/manta/manta.toml` (0600) only when no file
+  exists, and enables but does not start the service; the config is not a
+  conffile, so upgrades never replace it, and purge deletes it. Built by
+  `scripts/package-deb.py` in `build`'s Linux legs and checked by
+  `scripts/check-deb.py`; see "The Debian packages" above.
 - **Man pages** (MAN-133, every archive): `man/man1/manta.1` and one page
   per command, rendered by the `validate-tag` job's man-page steps running
   `manta man-pages` (the Soapy archives' by `build-soapy` and
   `build-soapy-arm64` from their own binaries, so they document the Soapy
   flags); `scripts/package-release.py --man-dir` refuses to
   build an archive without them.
-- **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <archive>` line
-  per archive above, bare file names, in `sha256sum` format. The same
+- **`SHA256SUMS`** (MAN-80, every Release): one `<sha256>  <file>` line
+  per archive and package above, bare file names, in `sha256sum` format. The same
   digests are the subjects of the Release's build-provenance attestation.
   See "Verifying a downloaded release" below.
 - **Docker image** (`ghcr.io/hagaletechnologies/manta`): multi-arch
@@ -629,9 +695,12 @@ the image only when such a PR merges: review these PRs promptly.
 
 ## Verifying a downloaded release
 
-Every GitHub Release carries a `SHA256SUMS` file next to its six
-archives, and a GitHub build-provenance attestation covers each archive
-(MAN-80). Run both checks before you run a downloaded binary:
+Every GitHub Release carries a `SHA256SUMS` file next to its seven
+archives and two Debian packages, and a GitHub build-provenance attestation
+covers each of them (MAN-80). Both checks below work unchanged on a `.deb`:
+`sha256sum -c --ignore-missing SHA256SUMS` prints `manta-linux-arm64.deb: OK`,
+and `gh attestation verify manta-linux-arm64.deb` takes the same flags as
+for an archive. Run both checks before you run a downloaded binary:
 
 - **The checksum** catches a corrupted or swapped download: the file you
   have is byte-for-byte the file the Release published.

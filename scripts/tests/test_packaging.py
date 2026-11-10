@@ -681,12 +681,19 @@ class CreateServiceAccountTests(unittest.TestCase):
 GUIDE = os.path.join(ROOT, "packaging", "README.md")
 UNIT = os.path.join(ROOT, "packaging", "systemd", "manta.service")
 PACKAGE_RELEASE = os.path.join(ROOT, "scripts", "package-release.py")
+# MAN-540: the release-time checker whose HARDENING table the sandbox subsection documents.
+CHECK_DEB = os.path.join(ROOT, "scripts", "check-deb.py")
+PACKAGE_INSTALL = ["sudo", "apt", "install", "./manta-linux-arm64.deb"]
 
 
 def sh_blocks(path):
     """Each ```sh fence in `path` as a list of argv lists; comment and blank lines dropped."""
     with open(path, encoding="utf-8") as f:
-        text = f.read().replace("\r\n", "\n")
+        return sh_blocks_in(f.read().replace("\r\n", "\n"))
+
+
+def sh_blocks_in(text):
+    """sh_blocks for Markdown text already read."""
     blocks = []
     for body in re.findall(r"^```sh\n(.*?)^```$", text, flags=re.S | re.M):
         argvs = []
@@ -750,6 +757,36 @@ def unit_values(path):
     return values
 
 
+def guide_section(text, heading):
+    """The lines from `heading` to the next heading of the same or a higher level, outside
+    fences (a `# comment` inside a ```sh block is not a heading)."""
+    level = len(heading.split(" ", 1)[0])
+    lines = text.split("\n")
+    start = lines.index(heading)
+    fenced, end = False, len(lines)
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and re.match(r"#{1,%d} " % level, line):
+            end = i
+            break
+    return "\n".join(lines[start:end]) + "\n"
+
+
+def read_guide():
+    with open(GUIDE, encoding="utf-8") as f:
+        return f.read().replace("\r\n", "\n")
+
+
+def load_check_deb():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("check_deb", CHECK_DEB)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def block_with(blocks, *words):
     found = [b for b in blocks if any(all(w in a for w in words) for a in b)]
     if not found:
@@ -783,6 +820,44 @@ class InstallGuideTests(unittest.TestCase):
         self.assertIn(["sudo", exec_start[0], "config", "check", "--config", credential_path], block)
         self.assertIn(["sudo", "systemd-analyze", "verify", unit_dest], block)
         self.assertIn(["sudo", "systemctl", "stop", "manta"], block)
+
+    def test_debian_package_section_installs_without_hand_copies(self):
+        """MAN-540: the package block installs nothing by hand and starts the service only
+        after the config check, never with `enable --now`."""
+        section = guide_section(read_guide(), "## Debian, Ubuntu and Raspberry Pi OS: the package")
+        found = [b for b in sh_blocks_in(section) if PACKAGE_INSTALL in b]
+        self.assertEqual(len(found), 1, "one ```sh block in the package section runs %r" % (PACKAGE_INSTALL,))
+        block = found[0]
+        self.assertEqual(installs(block), [], "the package needs no `install` command")
+        self.assertFalse([a for a in block if a[:1] == ["cp"] or a[:2] == ["sudo", "cp"]])
+        check = ["sudo", "manta", "config", "check", "--config", "/etc/manta/manta.toml"]
+        start = ["sudo", "systemctl", "start", "manta"]
+        self.assertIn(check, block)
+        self.assertLess(block.index(PACKAGE_INSTALL), block.index(check))
+        self.assertLess(block.index(check), block.index(start))
+        self.assertFalse([a for a in block if "enable" in a and "--now" in a])
+
+    def test_migration_block_removes_both_shadows_before_installing(self):
+        section = guide_section(read_guide(), "## Moving from an archive install to the package")
+        found = [b for b in sh_blocks_in(section) if PACKAGE_INSTALL in b]
+        self.assertEqual(len(found), 1, "one ```sh block in the migration section installs the package")
+        block = found[0]
+        rm = ["sudo", "rm", "/etc/systemd/system/manta.service", "/usr/local/bin/manta"]
+        reload_ = ["sudo", "systemctl", "daemon-reload"]
+        for argv in (rm, reload_):
+            with self.subTest(argv=argv):
+                self.assertIn(argv, block)
+                self.assertLess(block.index(argv), block.index(PACKAGE_INSTALL))
+
+    def test_sandbox_subsection_names_every_property_check_deb_asserts(self):
+        systemd = guide_section(read_guide(), "## Linux: systemd")
+        sub = guide_section(systemd, "### What the service may do")
+        hardening = load_check_deb().HARDENING
+        self.assertTrue(hardening)
+        for key, accepted in sorted(hardening.items()):
+            with self.subTest(key=key):
+                self.assertTrue(any("%s=%s" % (key, value) in sub for value in accepted),
+                                "%s documents none of %s=%s" % (GUIDE, key, sorted(accepted)))
 
     def test_macos_install_paths_match_the_plists(self):
         block = block_with(self.blocks, "bootstrap")
