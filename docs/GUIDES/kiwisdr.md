@@ -62,7 +62,9 @@ a publicly listed receiver does not imply permission for a permanent service.
    for connection by non-Kiwi apps"), is not yours to use.
 4. Respect time limits. manta can't present a time-limit exemption password and
    doesn't recognise being refused or kicked. It reconnects after 1 s, backing off
-   to 60 s, forever, and the systemd service restarts it too. Never install the
+   to 60 s, forever, and the systemd service restarts it too. A receiver that keeps
+   the connection open without sending usable samples is reconnected after 30 s, on
+   the same backoff. Never install the
    service against a public receiver without the owner's agreement, and stop
    manta if the owner asks.
 

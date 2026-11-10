@@ -1,14 +1,12 @@
-//! MAN-120 (#28, lens-3 row 28): the NCDXF `<call> T` power-step Beacon
-//! heuristic under Watterson fading, at IQ level. Beacon is the one spot
-//! type exempt from the repetition gate (`validator.rs`), and its
-//! emission is deferred to `TrackClosed` against confirmed WPM
-//! (docs/DECISIONS/2026-09-09-beacon-emission-deferred-to-track-close.md)
-//! -- both behave differently under fading, yet until now every test
-//! covering the heuristic was clean-text (golden_v11_v15's V11/V18/V30
-//! and the `context.rs` unit tests). This is the missing regression.
+//! MAN-120: the NCDXF `<call> T` power-step Beacon heuristic under
+//! Watterson fading at IQ level. MAN-201 D8 now requires the decoded
+//! call itself to be allowlisted for this shape, and listed IDs spot
+//! immediately. Unlisted `V V V <call>` beacons retain the separate
+//! repetition-exempt path deferred to TrackClosed.
+//!
 //!
 //! Scene + control follow the V34 pattern
-//! (golden_v34_fade_reacquire.rs): one 120 s signal keyed "K5ARH T" in a
+//! (golden_v34_fade_reacquire.rs): one 40 s signal keyed "K5ARH T" in a
 //! loop under Watterson CCIR-poor fading, plus an identical-scene AWGN
 //! control (same noise seed) as the detectability floor, and a
 //! fading-is-real check proving the scene stresses the decode rather than
@@ -36,22 +34,10 @@ const EXPECTED_HZ: f64 = 14_009_100.0;
 /// a scene's tracks in the CER comparison.
 const NEAR_HZ: f64 = 300.0;
 
-/// Scene SNR (2500 Hz-referenced) and duration, calibrated per the house
-/// rule (bound = measured, rounded out). +10 dB Watterson-poor held on
-/// the first try, so it stays; the plan's 120 s did not, and that is a
-/// finding, not a calibration miss: a continuously-looped ID gives ~50
-/// `<call> T` windows under CCIR-poor fading, and across every measured
-/// SNR (10/13/16/19 dB) at least two deep-fade repeats garbled the call
-/// into a *distinct but valid* callsign (e.g. NE5ARH at 94.6 s, V5ARH at
-/// 110.4 s -- timing-split/merged elements, SNR-independent) that
-/// dedupe's callsign key cannot join and no repetition gate stops. The
-/// real NCDXF frame keys its ID a handful of times per slot, not 50; 40 s
-/// (~13 cycles) is the measured realistic-duty scene where the heuristic
-/// holds: K5ARH spots exactly once as Beacon at 7.46 s (control: 11.42 s)
-/// with zero bogus, fading CER 0.3038 vs AWGN 0.0127. The 120 s garble
-/// finding is recorded as an open claim in the MAN-120 decision record's
-/// D2 section. 30 s fails too, differently: the WPM-bootstrap transient's
-/// first-cycle garble (U5ARH at 3.5 s) resolves at EOF in both scenes.
+/// Historical 40-second scene at +10 dB, SNR referenced to 2500 Hz.
+/// MAN-120 measured garbles beyond this duration before MAN-201 D8.
+/// MAN-532 now pins the full 120-second scene separately at +6/+10 dB.
+/// See docs/DECISIONS/2026-11-09-man532-beacon-fading-regression.md.
 const BEACON_SNR_DB: f32 = 10.0;
 const BEACON_DURATION_S: f64 = 40.0;
 
@@ -217,13 +203,10 @@ fn joined_track_text(report: &serde_json::Value) -> String {
         .join(" ")
 }
 
-/// The ticket's assertion: under Watterson-poor fading the real call
-/// spots exactly once as `Beacon`, and nothing else spots at all --
-/// zero bogus callsigns of any type (a garbled half-word plus a lone `T`
-/// is exactly the false-`Beacon` shape fading could produce, with no
-/// repetition gate to catch it).
+/// A listed call survives fading without emitting a call outside the scene.
+/// Type changes can legitimately emit more than one Beacon.
 #[test]
-fn beacon_spots_exactly_once_under_watterson_poor() {
+fn faded_allowlisted_beacon_emits_only_the_scene_call() {
     let (fade, _, _) = fixtures();
     let report = decode(fade);
     let spots = spots(&report);

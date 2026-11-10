@@ -24,10 +24,31 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+<<<<<<< HEAD
 - MAN-540: Debian packages for x86-64 and arm64 (`manta-linux-x86_64.deb`,
   `manta-linux-arm64.deb`). `sudo apt install ./<file>` installs
   `/usr/bin/manta`, the systemd service (enabled, not started) and
   `/etc/manta/manta.toml`, which upgrades never replace.
+=======
+- MAN-533: `GET /status` carries a `sources` array, one row per input
+  source with `healthy`, `losses_total`, `last_loss_reason`
+  (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
+  `manta status` prints it as a Sources table. `schema_version` stays 1.
+  `manta_input_malformed_packets_total{source="kiwi"}` now also counts
+  unknown-tag binary frames and text frames from the receiver. See
+  [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
+- MAN-541: a node running `[rbn_compare]` reads its frequency skew from the
+  RBN in ppm. `manta status` (and `GET /status`'s new `rbn_compare` object)
+  shows each band's median offset in Hz and skew in ppm with its precision,
+  and the `freq_correction_ppm` each config entry should set, which replaces
+  the applied value rather than adding to it. A band whose skew stays beyond
+  the new `[rbn_compare].skew_warn_ppm` (default 2 ppm, on by default; 0
+  turns it off) for 30 minutes adds a `WARN rbn skew` line to `/healthz`;
+  the verdict, status code and `manta_healthy` are unchanged. New metrics
+  `manta_rbn_compare_freq_offset_median_ppm` and
+  `manta_rbn_compare_skew_warning`, and a shipped `MantaRbnSkew` alert. See
+  [docs/DECISIONS/2026-11-09-man541-rbn-skew.md](docs/DECISIONS/2026-11-09-man541-rbn-skew.md).
+>>>>>>> de39a7150f4f60af9533a9bfb6fcacd7793762a9
 - MAN-543: `[input] bands` accepts `"6m"`, the 50000 to 50100 kHz CW
   segment (one stream at 50050 kHz at 192 kS/s). Set `tuning_range_hz` to
   reach it; the default range stops at 30 MHz. `"all"` adds 6m only when
@@ -57,8 +78,13 @@ the git history and `docs/DECISIONS/`.
   between callsigns (in the repetition gate and the rival ledger) without adding
   repetitions, and spots retain the later supporting RF timestamp. A speed
   change triggers a replay only once it has held across two words.
-  `[decode.refine]` controls the budget; five `manta_refine_*` counters report
+  `[decode.refine]` controls the budget; eight `manta_refine_*` counters report
   activity. RF recall remains unmeasured.
+- MAN-515: Refinement no longer flips a legacy or edge-legacy base to HSMM,
+  replays a seeded timing hypothesis once per speed, and never moves a
+  callsign's support to a reading that cannot be spotted.
+  `manta_refine_replays_total`, `manta_refine_changed_total` and
+  `manta_refine_rejected_total` report how many replays changed a word.
 - MAN-494: optional per-input IQ correction uses a controlled-tone calibration
   to remove receiver images. It defaults to off. Observe and a centre mismatch
   preserve samples; mirror evidence never enables correction by itself.
@@ -415,6 +441,11 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-536: `[spot].refresh_lists` downloads cty.dat and MASTER.SCP over
+  HTTPS by default. `cty_url` and `scp_url` default to `https://` URLs,
+  verified against the CA roots built into manta. `http://` stays accepted
+  for local mirrors. Allow outbound TCP port 443 instead of 80. See
+  [docs/DECISIONS/2026-11-09-man536-https-list-downloads.md](docs/DECISIONS/2026-11-09-man536-https-list-downloads.md).
 - MAN-539: the Docker image is built with `--features soapy`, so its
   `--version` lists `features: soapy` and it installs `libsoapysdr0.8` and
   three device modules.
@@ -475,6 +506,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
+- MAN-533: a live input that keeps its connection open but sends nothing
+  usable (a KiwiSDR sending only unknown-tag frames, pings or one-sample
+  `SND` frames, an HPSDR radio sending only malformed datagrams) no longer
+  holds the decode forever while the source reads healthy. After 30 s of
+  reading with no usable sample manta logs
+  `source <name> lost: ... no usable samples ...`, reconnects on the usual
+  backoff, and `manta_source_health` drops to 0, so `MantaInputDown` fires.
+  See [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
 - MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
   audio, SoapySDR; ka9q already did) now reports a stopped stream through
   `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),

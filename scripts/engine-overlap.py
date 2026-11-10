@@ -8,7 +8,7 @@ character-local beam (SPEC v1 §4) and the HSMM token-passing decoder (SPEC v2
 This tool measures that from two runs, one per engine, of the same corpus. It
 records the comparison; it does not pass or fail anything.
 
-Two modes, one report shape:
+Three modes. bench and oracle share one report shape; fusion has its own:
 
   bench   `manta bench sensitivity --json` reports (format_version 1), one or
           more per side: `--a` files from engine A, `--b` files from engine B.
@@ -82,6 +82,46 @@ point on one side only is counted and printed, not fatal. Oracle mode refuses
 malformed lines, a reference spot twice in one file, and two files that do
 not hold the same reference spots.
 
+fusion mode (MAN-545) reads three sides of bench reports: `--a` the baseline
+engine (legacy), `--b` the other engine (hsmm) and `--f` a fused report of the
+same recordings (the MAN-545 instrument's `fused:<policy>` output). The truth
+identities are the points present on all three sides; a point missing from a
+side is counted and printed, not fatal. Every A/B or A/F pairing check and
+refusal of bench mode applies. Per level (identity, copy), over those
+identities:
+
+  Oracle gap       A only + B only: the identities exactly one of the two
+                   engines got (the MAN-545 ticket's gap).
+  Gap held         identities of the oracle gap that F recovers, divided by
+                   the oracle gap (the ticket's literal reading; A alone
+                   already holds its A-only share).
+  Headroom         B only: identities B recovers and A misses, the most a
+                   per-identity selector adds over A (MAN-205 D3).
+  Gains            identities F recovers that A misses, split into gained
+                   from B only and gained from neither.
+  Losses           identities A recovers that F misses, split into lost from
+                   both and lost from A only.
+  Net              gains minus losses.
+  Recovered of headroom
+                   net / headroom, in percent; n/a when headroom is 0. It can
+                   exceed 100% because fusion can recover identities neither
+                   engine got.
+  Regression above +10 dB
+                   a point (condition, speed, SNR) with snr_db strictly above
+                   --above-db (default 10, the bench's 500 Hz reference) where
+                   F spots fewer stations than A, pooled over trials.
+  95% interval     net / n, resampling whole signal sets as bench mode does
+                   (same seed and bounds).
+
+Adoption gate (identity level only), read by a person; the exit code never
+depends on it. F meets the adoption bar only if all four conditions hold:
+  1. recovered of headroom: net >= --bar-frac (default 0.25) x headroom
+     (net >= 0 when the headroom is 0);
+  2. net gain: net >= --min-gain-pp (default 0.25) pp of n, and the lower end
+     of its 95% interval is above 0 (no interval with --bootstrap 0 fails it);
+  3. no regression above +10 dB;
+  4. false identities: F's are not more than A's.
+
 Output: Markdown on stdout, byte-identical for identical inputs (no paths,
 clock or host); `--json OUT` writes the same numbers as JSON.
 
@@ -93,6 +133,9 @@ Usage:
                           [--bar-pp 1.0] [--bootstrap 2000] [--json OUT]
   engine-overlap.py oracle --a A.jsonl --b B.jsonl [--a-name A] [--b-name B]
                           [--bar-pp 1.0] [--bootstrap 2000] [--json OUT]
+  engine-overlap.py fusion --a A.json ... --b B.json ... --f F.json ...
+                          [--bar-frac 0.25] [--min-gain-pp 0.25] [--above-db 10]
+                          [--bootstrap 2000] [--json OUT]
 """
 import argparse
 import json
@@ -112,6 +155,9 @@ CONDITION_ORDER = ("awgn", "good", "poor")
 BOOTSTRAP_SEED = 205
 DEFAULT_RESAMPLES = 2000
 DEFAULT_BAR_PP = 1.0
+DEFAULT_BAR_FRAC = 0.25  # MAN-545: the ticket's 25% of the gap
+DEFAULT_MIN_GAIN_PP = 0.25  # MAN-545 D3: 25% of MAN-205's 1 pp floor
+DEFAULT_ABOVE_DB = 10.0  # MAN-545: "no regression above +10 dB"
 BENCH_LEVELS = ("identity", "copy")
 ORACLE_LEVELS = ("as_word", "framed")
 # (strata key, JSON key, section heading, column header, value formatter)
@@ -637,6 +683,286 @@ def render_json(rep):
     return out
 
 
+# --------------------------------------------------------------------- fusion
+
+
+@dataclass(frozen=True)
+class Triple:
+    """One truth identity and three outcomes (A, B, F), one bool per level."""
+    cluster: tuple  # (seed, condition, wpm, trial), one signal set
+    strata: dict  # condition, wpm, snr_db, trial
+    a: tuple
+    b: tuple
+    f: tuple
+
+
+def triple_bench(a, b, f):
+    """(triples, {side: points missing from it}, common point keys)."""
+    check_meta(a["meta"], b["meta"], "side B")
+    check_meta(a["meta"], f["meta"], "side F")
+    sides = (("A", a), ("B", b), ("F", f))
+    union = set(a["points"]) | set(b["points"]) | set(f["points"])
+    common = sorted(set(a["points"]) & set(b["points"]) & set(f["points"]), key=point_order)
+    if not common:
+        raise InputError("no point appears in all of the A, B and F reports")
+    triples = []
+    for key in common:
+        st = {tag: _stations_by_key(side["points"][key], key, tag) for tag, side in sides}
+        for tag in ("B", "F"):
+            if set(st[tag]) != set(st["A"]):
+                raise InputError(f"point {describe_point(key)}: the A and {tag} stations differ"
+                                 " (not the same recordings)")
+        seed, condition, wpm, snr_db = key
+        for skey, st_a in st["A"].items():
+            trial = skey[0]
+            triples.append(Triple(
+                cluster=(seed, condition, wpm, trial),
+                strata={"condition": condition, "wpm": wpm, "snr_db": snr_db, "trial": trial},
+                a=station_outcome(st_a), b=station_outcome(st["B"][skey]),
+                f=station_outcome(st["F"][skey])))
+    if not triples:
+        raise InputError("the common points hold no stations")
+    missing = {tag: len(union - set(side["points"])) for tag, side in sides}
+    return triples, missing, common
+
+
+FUSION_COUNTS = ("n", "a_recall_n", "f_recall_n", "both", "a_only", "b_only", "neither",
+                 "gap_held_n", "gained_b_only", "gained_neither", "lost_both", "lost_a_only")
+
+
+def fusion_tally(triples, li):
+    """MAN-545 D2 counts at one level (li indexes the outcome tuples)."""
+    c = dict.fromkeys(FUSION_COUNTS, 0)
+    for t in triples:
+        x, y, z = t.a[li], t.b[li], t.f[li]
+        c["n"] += 1
+        c["a_recall_n"] += x
+        c["f_recall_n"] += z
+        if x and y:
+            c["both"] += 1
+            c["lost_both"] += not z
+        elif x:
+            c["a_only"] += 1
+            c["gap_held_n"] += z
+            c["lost_a_only"] += not z
+        elif y:
+            c["b_only"] += 1
+            c["gap_held_n"] += z
+            c["gained_b_only"] += z
+        else:
+            c["neither"] += 1
+            c["gained_neither"] += z
+    return fusion_derived(c)
+
+
+def fusion_derived(c):
+    out = dict(c)
+    out["oracle_gap"] = c["a_only"] + c["b_only"]
+    out["headroom"] = c["b_only"]
+    out["gains"] = c["gained_b_only"] + c["gained_neither"]
+    out["losses"] = c["lost_both"] + c["lost_a_only"]
+    out["net"] = out["gains"] - out["losses"]
+    out["a_recall"] = c["a_recall_n"] / c["n"]
+    out["f_recall"] = c["f_recall_n"] / c["n"]
+    out["gap_held"] = c["gap_held_n"] / out["oracle_gap"] if out["oracle_gap"] else None
+    out["recovered_of_headroom"] = out["net"] / out["headroom"] if out["headroom"] else None
+    out["net_pp"] = 100 * out["net"] / c["n"]
+    return out
+
+
+def fusion_bootstrap(triples, levels, resamples, seed=BOOTSTRAP_SEED):
+    """{level: (lo, hi)} of net / n, resampling whole clusters; {} when resamples is 0."""
+    if resamples <= 0:
+        return {}
+    clusters = {}
+    for t in triples:
+        row = clusters.setdefault(t.cluster, [0] * (1 + len(levels)))
+        row[0] += 1
+        for li in range(len(levels)):
+            row[1 + li] += int(t.f[li]) - int(t.a[li])
+    rows = list(clusters.values())
+    k = len(rows)
+    width = len(rows[0])
+    rng = random.Random(seed)
+    vals = {lv: [] for lv in levels}
+    for _ in range(resamples):
+        acc = [0] * width
+        for _ in range(k):
+            row = rows[int(rng.random() * k)]
+            for j in range(width):
+                acc[j] += row[j]
+        for li, lv in enumerate(levels):
+            vals[lv].append(acc[1 + li] / acc[0])
+    lo_i = int(0.025 * resamples)
+    hi_i = max(lo_i, int(0.975 * resamples) - 1)
+    out = {}
+    for lv, v in vals.items():
+        v.sort()
+        out[lv] = (v[lo_i], v[hi_i])
+    return out
+
+
+def above_db_regressions(triples, above_db):
+    """[(point key, A spotted, F spotted)] where snr_db > above_db and F < A, pooled over trials."""
+    per_point = {}
+    for t in triples:
+        s = t.strata
+        key = (t.cluster[0], s["condition"], s["wpm"], s["snr_db"])
+        row = per_point.setdefault(key, [0, 0])
+        row[0] += t.a[0]
+        row[1] += t.f[0]
+    return [(key, row[0], row[1]) for key, row in sorted(per_point.items(),
+                                                         key=lambda kv: point_order(kv[0]))
+            if key[3] > above_db and row[1] < row[0]]
+
+
+def fusion_gate(identity, ci, regressions, false_ids, bar_frac, min_gain_pp, above_db):
+    """The failed adoption-gate conditions, in order; empty when F meets the bar."""
+    failed = []
+    if identity["net"] < bar_frac * identity["headroom"]:
+        failed.append(f"recovered of headroom below {100 * bar_frac:g}%")
+    lo = ci.get("identity", (None, None))[0]
+    if identity["net_pp"] < min_gain_pp or lo is None or lo <= 0:
+        failed.append(f"net gain below {min_gain_pp:.2f} pp or its interval not above 0")
+    if regressions:
+        failed.append(f"fewer spots above +{fmt_db(above_db)} dB at"
+                      f" {plural(len(regressions), 'point', 'points')}")
+    if false_ids["f"] > false_ids["a"]:
+        failed.append("more false identities")
+    return failed
+
+
+def fusion_false_identities(a, f, common):
+    ta = tf = 0
+    for key in common:
+        ta += len(a["points"][key]["bogus_calls"])
+        tf += len(f["points"][key]["bogus_calls"])
+    return {"a": ta, "f": tf}
+
+
+def run_fusion(args):
+    a = load_bench(args.a, "A")
+    b = load_bench(args.b, "B")
+    f = load_bench(args.f, "F")
+    triples, missing, common = triple_bench(a, b, f)
+    overall = {lv: fusion_tally(triples, li) for li, lv in enumerate(BENCH_LEVELS)}
+    ci = fusion_bootstrap(triples, BENCH_LEVELS, args.bootstrap)
+    regressions = above_db_regressions(triples, args.above_db)
+    false_ids = fusion_false_identities(a, f, common)
+    failed = fusion_gate(overall["identity"], ci, regressions, false_ids, args.bar_frac,
+                         args.min_gain_pp, args.above_db)
+    return {
+        "names": (a["engine"], b["engine"], f["engine"]),
+        "meta": a["meta"],
+        "seeds": sorted(set(a["seeds"]) | set(b["seeds"]) | set(f["seeds"])),
+        "common": common,
+        "missing": missing,
+        "overall": overall,
+        "ci95": ci,
+        "resamples": args.bootstrap,
+        "regressions": regressions,
+        "false_identities": false_ids,
+        "failed": failed,
+        "bar_frac": args.bar_frac,
+        "min_gain_pp": args.min_gain_pp,
+        "above_db": args.above_db,
+        "files": {"a": a["files"], "b": b["files"], "f": f["files"]},
+    }
+
+
+def _opt_pct(x):
+    return "n/a" if x is None else pct(x)
+
+
+def render_fusion_markdown(rep):
+    na, nb, nf = rep["names"]
+    meta = rep["meta"]
+    lines = [f"### Evidence fusion: {nf} (F) against {na} (A) and {nb} (B)", ""]
+    seeds = rep["seeds"]
+    seed_text = ("seed " if len(seeds) == 1 else "seeds ") + ", ".join(str(s) for s in seeds)
+    lines.append(
+        f"{rep['overall']['identity']['n']} paired truth identities:"
+        f" {plural(len(rep['common']), 'point', 'points')},"
+        f" {plural(meta['trials'], 'trial', 'trials')} of {meta['stations_per_trial']} stations,"
+        f" {seed_text}, {meta['duration_s']} s recordings.")
+    m = rep["missing"]
+    lines.append(f"Points missing from a side: {na} {m['A']}, {nb} {m['B']}, {nf} {m['F']}.")
+    lines.append("")
+    rows = []
+    for lv in BENCH_LEVELS:
+        c = rep["overall"][lv]
+        rows.append([lv.capitalize(), c["n"], pct(c["a_recall"]), pct(c["f_recall"]),
+                     c["oracle_gap"], _opt_pct(c["gap_held"]), c["headroom"],
+                     c["gained_b_only"], c["gained_neither"], c["lost_both"], c["lost_a_only"],
+                     f"{c['net']:+d}", _opt_pct(c["recovered_of_headroom"])])
+    lines += table(["Level", "n", "A recall", "F recall", "Oracle gap", "Gap held",
+                    "Headroom (B only)", "Gained from B only", "Gained from neither",
+                    "Lost from both", "Lost from A only", "Net", "Recovered of headroom"], rows)
+    ci = rep["ci95"]
+    if ci:
+        def span(v):
+            return f"{100 * v[0]:.2f} to {100 * v[1]:.2f} pp"
+
+        lines.append("")
+        lines.append(f"95% intervals, {rep['resamples']} signal-set resamples:"
+                     f" net (identity) {span(ci['identity'])}; net (copy) {span(ci['copy'])}.")
+    lines.append("")
+    lines.append(f"#### Points above +{fmt_db(rep['above_db'])} dB where F spots fewer than A")
+    lines.append("")
+    if rep["regressions"]:
+        lines += table(["Point", f"{na} spotted", f"{nf} spotted"],
+                       [[describe_point(k), x, z] for k, x, z in rep["regressions"]])
+    else:
+        lines.append("None.")
+    lines.append("")
+    lines.append("#### False identities")
+    lines.append("")
+    fi = rep["false_identities"]
+    lines += table(["", na, nf], [["Calls spotted that no station sent", fi["a"], fi["f"]]])
+    lines.append("")
+    lines.append("#### Adoption gate (identity)")
+    lines.append("")
+    ident = rep["overall"]["identity"]
+    lo_hi = (f"95% interval {100 * ci['identity'][0]:.2f} to {100 * ci['identity'][1]:.2f} pp"
+             if ci else "no interval (--bootstrap 0)")
+    lines.append(
+        f"Recovered of headroom: {_opt_pct(ident['recovered_of_headroom'])}"
+        f" (bar {100 * rep['bar_frac']:g}%)."
+        f" Net: {ident['net_pp']:.2f} pp, {lo_hi}"
+        f" (bar: at least {rep['min_gain_pp']:.2f} pp, interval above 0)."
+        f" Points above +{fmt_db(rep['above_db'])} dB with fewer spots:"
+        f" {len(rep['regressions'])}."
+        f" False identities: {fi['f']} against {fi['a']}.")
+    if rep["failed"]:
+        lines.append(f"Reading: below the adoption bar: {', '.join(rep['failed'])}.")
+    else:
+        lines.append("Reading: meets the adoption bar.")
+    return "\n".join(lines) + "\n"
+
+
+def render_fusion_json(rep):
+    na, nb, nf = rep["names"]
+    return {
+        "mode": "fusion",
+        "levels": list(BENCH_LEVELS),
+        "a": {"name": na, "files": rep["files"]["a"]},
+        "b": {"name": nb, "files": rep["files"]["b"]},
+        "f": {"name": nf, "files": rep["files"]["f"]},
+        "missing_points": {"a": rep["missing"]["A"], "b": rep["missing"]["B"],
+                           "f": rep["missing"]["F"]},
+        "bootstrap": {"resamples": rep["resamples"], "seed": BOOTSTRAP_SEED},
+        "overall": rep["overall"],
+        "ci95_net": {lv: list(span) for lv, span in rep["ci95"].items()},
+        "regressions_above_db": [
+            {"seed": k[0], "condition": k[1], "wpm": k[2], "snr_db": k[3],
+             "a_spotted": x, "f_spotted": z} for k, x, z in rep["regressions"]],
+        "false_identities": rep["false_identities"],
+        "gate": {"bar_frac": rep["bar_frac"], "min_gain_pp": rep["min_gain_pp"],
+                 "above_db": rep["above_db"], "meets_bar": not rep["failed"],
+                 "failed": list(rep["failed"])},
+    }
+
+
 # ----------------------------------------------------------------------- main
 
 
@@ -683,9 +1009,25 @@ def parser():
     oracle.add_argument("--b", required=True, metavar="PATH", help="engine B's JSONL")
     oracle.add_argument("--a-name", default="A", help="engine A's label (default A)")
     oracle.add_argument("--b-name", default="B", help="engine B's label (default B)")
+    fusion = sub.add_parser("fusion", help="score a fused bench report against A and B"
+                                           " (MAN-545)")
+    fusion.add_argument("--a", nargs="+", action="extend", required=True, metavar="PATH",
+                        help="baseline engine A's reports")
+    fusion.add_argument("--b", nargs="+", action="extend", required=True, metavar="PATH",
+                        help="other engine B's reports")
+    fusion.add_argument("--f", nargs="+", action="extend", required=True, metavar="PATH",
+                        help="the fused reports")
+    fusion.add_argument("--bar-frac", type=float, default=DEFAULT_BAR_FRAC,
+                        help="share of the headroom net must recover (default 0.25)")
+    fusion.add_argument("--min-gain-pp", type=float, default=DEFAULT_MIN_GAIN_PP,
+                        help="smallest net gain in percentage points (default 0.25)")
+    fusion.add_argument("--above-db", type=float, default=DEFAULT_ABOVE_DB,
+                        help="SNR (500 Hz) strictly above which F may not lose spots"
+                             " (default 10)")
     for p in (bench, oracle):
         p.add_argument("--bar-pp", type=float, default=DEFAULT_BAR_PP,
                        help="fusion-gate headroom bar in percentage points (default 1.0)")
+    for p in (bench, oracle, fusion):
         p.add_argument("--bootstrap", type=int, default=DEFAULT_RESAMPLES, metavar="N",
                        help="bootstrap resamples for the 95%% intervals (default 2000, 0 off)")
         p.add_argument("--json", metavar="OUT", help="also write the numbers as JSON")
@@ -695,16 +1037,29 @@ def parser():
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
-        if not (math.isfinite(args.bar_pp) and args.bar_pp > 0):
+        if args.mode == "fusion":
+            for flag, value in (("--bar-frac", args.bar_frac),
+                                ("--min-gain-pp", args.min_gain_pp)):
+                if not (math.isfinite(value) and value >= 0):
+                    raise InputError(f"{flag} must be finite and not negative, got {value}")
+            if not math.isfinite(args.above_db):
+                raise InputError(f"--above-db must be finite, got {args.above_db}")
+        elif not (math.isfinite(args.bar_pp) and args.bar_pp > 0):
             raise InputError(f"--bar-pp must be finite and positive, got {args.bar_pp}")
         if args.bootstrap < 0:
             raise InputError(f"--bootstrap must be 0 or more, got {args.bootstrap}")
-        rep = run_bench(args) if args.mode == "bench" else run_oracle(args)
-        text = render_markdown(rep)
+        if args.mode == "fusion":
+            rep = run_fusion(args)
+            text = render_fusion_markdown(rep)
+            as_json = render_fusion_json
+        else:
+            rep = run_bench(args) if args.mode == "bench" else run_oracle(args)
+            text = render_markdown(rep)
+            as_json = render_json
         if args.json:
             try:
                 with open(args.json, "w", encoding="utf-8") as f:
-                    json.dump(render_json(rep), f, indent=2)
+                    json.dump(as_json(rep), f, indent=2)
                     f.write("\n")
             except OSError as e:
                 raise InputError(f"{args.json}: cannot write: {e.strerror}")

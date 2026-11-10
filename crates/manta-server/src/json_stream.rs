@@ -1411,6 +1411,7 @@ mod tests {
         let lists = Arc::new(ReferenceLists::new(
             Arc::new(cty::Table::bundled()),
             Arc::new(scp::Set::bundled()),
+            std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
         ));
         let (_shutdown_tx, shutdown) = watch::channel(false);
         let ctx = ClientCtx {

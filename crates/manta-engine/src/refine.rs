@@ -15,7 +15,7 @@
 
 use manta_decode::decoder::{DecodeConfig, Engine as DecodeEngine, RefineConfig, TrackDecoder};
 use manta_decode::events::DecoderEvent;
-use manta_spot::{RefineCandidate, Spot, Validator};
+use manta_spot::{RefineCandidate, RefinementOutcome, Spot, Validator};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// One preserved decoder input for replay: the `DecoderInputEntry` tuple
@@ -86,6 +86,9 @@ pub(crate) fn publish_refine_deltas(
             after.rescues_total - before.rescues_total,
             after.budget_exhausted_total - before.budget_exhausted_total,
             after.orphaned_revisions_total - before.orphaned_revisions_total,
+            after.replays_total - before.replays_total,
+            after.changed_total - before.changed_total,
+            after.rejected_total - before.rejected_total,
         ]);
     }
 }
@@ -399,9 +402,20 @@ pub fn separability_trigger(prev_gap_hz: f64, now_gap_hz: f64) -> bool {
     prev_gap_hz < SAME_SIGNAL_MAX_HZ && now_gap_hz >= SAME_SIGNAL_MAX_HZ
 }
 
+/// MAN-515: whether a refinement replay may flip the decode engine away
+/// from `base`. Only an HSMM base flips (to legacy): on the MAN-515
+/// corpus the HSMM-to-legacy flip corrected readings and rescued spots,
+/// while the legacy-to-HSMM flip corrected none and turned correct calls
+/// into garbage (docs/DECISIONS/2026-11-09-man515-refine-replay-gate.md).
+/// A legacy or edge-legacy base replays seeded timing only.
+pub fn engine_flip_allowed(base: DecodeEngine) -> bool {
+    matches!(base, DecodeEngine::Hsmm)
+}
+
 /// Cumulative scheduler activity, for `/metrics` and the decision record
-/// (five families: admitted, replayed hops, rescues, budget exhaustion,
-/// losses). Static labels only, matching the MAN-207 counter style.
+/// (eight exported families: admitted, replayed hops, rescues, budget
+/// exhaustion, losses, and MAN-515's replays, changed and rejected).
+/// Static labels only, matching the MAN-207 counter style.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RefineCounters {
     pub admitted_total: u64,
@@ -416,6 +430,21 @@ pub struct RefineCounters {
     /// Refinements whose occurrence was no longer retained (the
     /// validator's orphaned-revision counter, mirrored here).
     pub orphaned_revisions_total: u64,
+    /// MAN-515: replays that ran to the end of their preserved inputs,
+    /// with or without a reading. Never a buffer miss.
+    pub replays_total: u64,
+    /// MAN-515: replays whose reading replaced the word's decoded text.
+    /// `changed_total / replays_total` is the share of replays that
+    /// change a word.
+    pub changed_total: u64,
+    /// MAN-515: replays whose reading the validator refused because it
+    /// would turn a spottable callsign into a string that can never be
+    /// spotted. Disjoint from `changed_total`.
+    pub rejected_total: u64,
+    /// MAN-515: replays started under the flipped engine (a later buffer
+    /// miss can still end one before it completes). Internal, for tests
+    /// and the decision record; not exported.
+    pub engine_flips_total: u64,
 }
 
 /// MAN-525: the plain fields of a [`RefineCandidate`] the scheduler keeps
@@ -453,6 +482,8 @@ struct ActiveReplay {
     decoder: TrackDecoder,
     events: Vec<DecoderEvent>,
     hypothesis: &'static str,
+    /// MAN-515: the replay runs under the flipped engine.
+    flipped: bool,
 }
 
 pub struct RefineScheduler {
@@ -549,7 +580,13 @@ impl RefineScheduler {
                 speed_trigger(&candidate, previous.map_or(candidate.episode_wpm, |c| c.1));
             let separated =
                 previous.is_some_and(|c| separability_trigger(c.2, candidate.neighbor_gap_hz));
-            let later_word = previous.is_some_and(|c| candidate.latest_word_seq > c.0);
+            // MAN-515: a later word re-admits only an episode whose next
+            // rung can differ. Without the engine flip (a legacy or
+            // edge-legacy base) the next rung is the same seeded replay,
+            // which repeats itself deterministically, so only a new
+            // stable speed or a separation re-admits it.
+            let later_word = previous.is_some_and(|c| candidate.latest_word_seq > c.0)
+                && engine_flip_allowed(decode_cfg.engine);
             if (!already_refined && !ambiguity_trigger(&candidate) && !speed_changed && !separated)
                 || (already_refined && !speed_changed && !separated && !later_word)
             {
@@ -593,7 +630,11 @@ impl RefineScheduler {
                     );
                     continue;
                 };
-                self.active = Some(self.start_replay(decode_cfg, candidate, entries));
+                let active = self.start_replay(decode_cfg, candidate, entries);
+                if active.flipped {
+                    self.counters.engine_flips_total += 1;
+                }
+                self.active = Some(active);
             }
             let active = self.active.as_mut().expect("initialized above");
             let remaining = active.entries.len() - active.offset;
@@ -627,14 +668,24 @@ impl RefineScheduler {
                 .entry((candidate.track_id, candidate.word_seq))
                 .or_insert((0, candidate.span.1))
                 .0 += 1;
+            self.counters.replays_total += 1;
             let Some(refined) = Self::read_word(&candidate, active.events, active.hypothesis)
             else {
                 self.counters.no_reading_total += 1;
                 continue;
             };
             let before = validator.observations().losses().orphaned_revisions;
-            let rescued =
-                validator.apply_refinement(candidate.track_id, candidate.word_seq, refined, now_ts);
+            let (rescued, outcome) = validator.apply_refinement_with_outcome(
+                candidate.track_id,
+                candidate.word_seq,
+                refined,
+                now_ts,
+            );
+            match outcome {
+                RefinementOutcome::Changed => self.counters.changed_total += 1,
+                RefinementOutcome::Rejected => self.counters.rejected_total += 1,
+                RefinementOutcome::Unchanged | RefinementOutcome::Orphaned => {}
+            }
             self.counters.rescues_total += rescued.len() as u64;
             self.counters.orphaned_revisions_total += validator
                 .observations()
@@ -647,11 +698,12 @@ impl RefineScheduler {
     }
 
     /// Replays one episode's preserved inputs under the next alternate
-    /// configuration for it: first the engine flip (`legacy <-> hsmm`),
-    /// then the same engine with the triggering speed estimate seeded
-    /// (`TrackDecoder::set_initial_wpm`), alternating for further
-    /// refinements. Deterministic: the configuration follows from the
-    /// episode's refinement count and the base config, nothing else.
+    /// configuration for it. An HSMM base alternates the legacy flip and
+    /// seeded timing (the same engine with the episode's speed estimate
+    /// seeded, `TrackDecoder::set_initial_wpm`); a legacy or edge-legacy
+    /// base replays seeded timing only ([`engine_flip_allowed`], MAN-515).
+    /// Deterministic: the configuration follows from the episode's
+    /// refinement count and the base config, nothing else.
     fn start_replay(
         &self,
         decode_cfg: &DecodeConfig,
@@ -665,16 +717,11 @@ impl RefineScheduler {
         let mut alt_cfg = decode_cfg.clone();
         let mut seed_wpm = None;
         let hypothesis: &'static str;
-        if n.is_multiple_of(2) {
-            alt_cfg.engine = match decode_cfg.engine {
-                DecodeEngine::Legacy | DecodeEngine::EdgeLegacy => DecodeEngine::Hsmm,
-                DecodeEngine::Hsmm => DecodeEngine::Legacy,
-            };
-            hypothesis = match alt_cfg.engine {
-                DecodeEngine::Hsmm => "engine:hsmm",
-                DecodeEngine::EdgeLegacy => "engine:edge-legacy",
-                DecodeEngine::Legacy => "engine:legacy",
-            };
+        let flipped = n.is_multiple_of(2) && engine_flip_allowed(decode_cfg.engine);
+        if flipped {
+            // Only an HSMM base flips, and it flips to legacy.
+            alt_cfg.engine = DecodeEngine::Legacy;
+            hypothesis = "engine:legacy";
         } else {
             // The timing variant: the episode's own decoded speed seeded
             // before the first hop, so the replay's timing hypotheses
@@ -694,6 +741,7 @@ impl RefineScheduler {
             decoder,
             events: Vec::new(),
             hypothesis,
+            flipped,
         }
     }
 
@@ -760,6 +808,14 @@ fn overlaps(a: (u64, u64), b: (u64, u64)) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MAN-515: only an HSMM base flips the engine.
+    #[test]
+    fn engine_flip_allowed_only_from_an_hsmm_base() {
+        assert!(engine_flip_allowed(DecodeEngine::Hsmm));
+        assert!(!engine_flip_allowed(DecodeEngine::Legacy));
+        assert!(!engine_flip_allowed(DecodeEngine::EdgeLegacy));
+    }
 
     /// main's `RefineBuffers` at 915db0e, kept as the MAN-525 oracle: the
     /// summing, scanning `enforce_budget` the running count and front

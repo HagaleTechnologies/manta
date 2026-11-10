@@ -21,8 +21,9 @@ Prometheus metrics endpoint; an opt-in, loopback-by-default live-state
 stream; and an outbound RBN uplink that is dry-run by default. Relevant
 reports include memory-safety issues, panics/DoS reachable from untrusted
 input (malformed WAV/IQ files, malformed telnet/JSON client input, hostile
-network peers on the SDR inputs, the `[rbn_compare]` feed or the plain-HTTP
-cty.dat/MASTER.SCP refresh), and dependency vulnerabilities affecting this
+network peers on the SDR inputs, the `[rbn_compare]` feed or the
+cty.dat/MASTER.SCP refresh (HTTPS by default, plain HTTP only to an
+operator-chosen mirror)), and dependency vulnerabilities affecting this
 project's usage. Recorded threat models:
 `docs/DECISIONS/2026-09-02-man23-threat-model.md` (HPSDR Protocol 1 input;
 telnet, JSON/WebSocket and metrics servers; RBN uplink) and

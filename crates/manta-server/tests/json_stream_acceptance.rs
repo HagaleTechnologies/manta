@@ -32,6 +32,7 @@ fn fixture_lists() -> Arc<ReferenceLists> {
     Arc::new(ReferenceLists::new(
         Arc::new(Table::parse(CTY_FIXTURE)),
         Arc::new(scp::Set::bundled()),
+        std::sync::Arc::new(manta_spot::pattern::Table::bundled()),
     ))
 }
 
@@ -1503,6 +1504,7 @@ fn publish_grade(bus: &SpotBus) {
             freq_offset_hz: Some(100),
             rbn_bands: vec!["20m"],
             spotter_filter: vec![],
+            track_id: None,
         })
         .unwrap()
         .into()

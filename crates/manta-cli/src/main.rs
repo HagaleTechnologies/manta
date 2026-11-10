@@ -1173,17 +1173,6 @@ fn strip_bom(text: &str) -> &str {
     text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
-/// Loads a reference table once, with consistent path context and BOM handling.
-fn read_reference<T>(
-    path: &Path,
-    label: &str,
-    parse: impl FnOnce(&str) -> Result<T>,
-) -> Result<std::sync::Arc<T>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {label} {}", path.display()))?;
-    parse(strip_bom(&text)).map(std::sync::Arc::new)
-}
-
 /// Builds a `PipelineConfig` from the CLI's shared flags: the MAN-29
 /// frequency-calibration correction, the MAN-28 operator Watch List, and
 /// the MAN-31 operator suppression lists. Each is optional/repeatable; an
@@ -1195,7 +1184,7 @@ fn build_pipeline_config(
     spot: &SpotResolved,
     detector: manta_engine::DetectorConfig,
     engine: Engine,
-) -> Result<(PipelineConfig, [list_refresh::InUse; 2])> {
+) -> Result<(PipelineConfig, [list_refresh::InUse; 3])> {
     let mut cfg = PipelineConfig {
         freq_correction_ppm,
         allowlist: spot.allowlist.clone(),
@@ -1253,17 +1242,32 @@ fn build_pipeline_config(
             in_use
         }
     };
-    if let Some(path) = &spot.patterns {
-        cfg.patterns = Some(read_reference(path, "the pattern list", |text| {
-            manta_spot::pattern::Table::parse(text).map_err(|error| match error {
-                manta_spot::pattern::ParseError::Empty => {
-                    anyhow!("the pattern list {} contains no patterns", path.display())
-                }
-                _ => anyhow!("reading the pattern list {}: {error}", path.display()),
-            })
-        })?);
-    }
-    Ok((cfg, [cty_in_use, scp_in_use]))
+    let patterns_in_use = match &spot.patterns {
+        None => list_refresh::InUse::bundled(ListKind::Patterns),
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading the pattern list {}", path.display()))?;
+            // MAN-542: the hash of the file's bytes, BOM included, as for
+            // `cty_path`.
+            let sha = list_cache::sha256_hex(text.as_bytes());
+            let table =
+                manta_spot::pattern::Table::parse(strip_bom(&text)).map_err(
+                    |error| match error {
+                        manta_spot::pattern::ParseError::Empty => {
+                            anyhow!("the pattern list {} contains no patterns", path.display())
+                        }
+                        _ => anyhow!("reading the pattern list {}: {error}", path.display()),
+                    },
+                )?;
+            cfg.patterns = Some(std::sync::Arc::new(table));
+            list_refresh::InUse::new(
+                ListKind::Patterns,
+                sha,
+                list_refresh::Origin::File(path.clone()),
+            )
+        }
+    };
+    Ok((cfg, [cty_in_use, scp_in_use, patterns_in_use]))
 }
 
 /// Shares live country/SCP cells with the running validator. No list generates text.
@@ -1284,6 +1288,7 @@ fn attach_language_prior(
         std::sync::Arc::new(manta_engine::ReferenceLists::new(
             cfg.cty_table(),
             cfg.scp_set(),
+            cfg.pattern_table(),
         ))
     });
     cfg.decode.prior = Some(std::sync::Arc::new(manta_spot::prior::LanguagePrior::new(
@@ -1310,6 +1315,7 @@ fn resolve_list_bytes(
     let (file_name, flag, path_flag, label) = match kind {
         ListKind::Cty => ("cty.dat", "--cty-sha256", "--cty", "cty.dat"),
         ListKind::Scp => ("MASTER.SCP", "--scp-sha256", "--scp", "master.scp"),
+        ListKind::Patterns => bail!("the pattern list has no SHA-256 pin (MAN-542 D9)"),
     };
     let utf8 = |bytes: Vec<u8>, what: &std::path::Path| -> Result<String> {
         String::from_utf8(bytes).map_err(|_| {
@@ -1344,10 +1350,7 @@ fn resolve_list_bytes(
             bundled,
             list_refresh::Origin::Pinned(list_refresh::PinSource::Bundled),
         );
-        let text = match kind {
-            ListKind::Cty => manta_spot::CTY_DAT,
-            ListKind::Scp => manta_spot::MASTER_SCP,
-        };
+        let text = list_refresh::bundled_text(kind);
         return Ok(Some((text.to_string(), in_use)));
     }
     let Some(cache) = cache else {
@@ -1380,9 +1383,9 @@ fn resolve_list_bytes(
 
 /// MAN-316 Design §5: every validating command names the lists it uses on
 /// stderr when a pin is set (`run` with refresh on prints its own line).
-fn note_pinned_lists(spot: &SpotResolved, in_use: &[list_refresh::InUse; 2]) {
+fn note_pinned_lists(spot: &SpotResolved, in_use: &[list_refresh::InUse; 3]) {
     if spot.cty_sha256.is_some() || spot.scp_sha256.is_some() {
-        logging::note(&list_refresh::lists_line(&in_use[0], &in_use[1]));
+        logging::note(&list_refresh::lists_line(in_use));
     }
 }
 
@@ -2079,6 +2082,20 @@ fn source_health_sink(
         }
     })
 }
+
+/// MAN-533: the loss sink a one-input `ReconnectingSource` reports every
+/// lost connection's reason through, for `/status` `sources[]`.
+fn source_loss_sink(
+    name: &'static str,
+    metrics: Option<std::sync::Arc<manta_server::metrics::Metrics>>,
+) -> reconnect::LossSink {
+    Box::new(move |reason| {
+        if let Some(metrics) = &metrics {
+            metrics.record_source_loss(name, reason);
+        }
+    })
+}
+
 /// How often the daemon copies the engine's decode-latency observer into
 /// `Metrics` (MAN-128). Same bridge shape and tuning rationale as
 /// `ACTIVE_TRACKS_POLL_INTERVAL`.
@@ -2513,8 +2530,8 @@ fn spot_bus_for(
 /// spot servers, and the refresher to start once the servers are up.
 struct RunLists {
     lists: std::sync::Arc<manta_engine::ReferenceLists>,
-    /// cty first, then scp.
-    in_use: [list_refresh::InUse; 2],
+    /// In `ListKind::ALL` order: cty, scp, patterns.
+    in_use: [list_refresh::InUse; 3],
     /// `Some` only for a live source with `refresh_lists` on (D2).
     refresh: Option<list_refresh::RefreshSetup>,
 }
@@ -2523,11 +2540,12 @@ struct RunLists {
 /// `refresh_lists` on, a list no pin or path chose may start from the cache
 /// (D3) and is handed to the refresher, and the stale built-in cty.dat
 /// warning is printed here, judged on the copy chosen; otherwise the tables
-/// are `cfg`'s, and file replay never reads the cache (D4).
+/// are `cfg`'s, and file replay never reads the cache (D4). MAN-542: the
+/// pattern list is managed only with `pattern_url` set (D3, D11).
 fn prepare_run_lists(
     live: bool,
     spot: &SpotResolved,
-    in_use: [list_refresh::InUse; 2],
+    in_use: [list_refresh::InUse; 3],
     cfg: &PipelineConfig,
 ) -> Result<RunLists> {
     if !(live && spot.refresh_lists) {
@@ -2535,26 +2553,40 @@ fn prepare_run_lists(
             lists: std::sync::Arc::new(manta_engine::ReferenceLists::new(
                 cfg.cty_table(),
                 cfg.scp_set(),
+                cfg.pattern_table(),
             )),
             in_use,
             refresh: None,
         });
     }
     let cache = spot.list_cache_dir.clone().map(list_cache::Cache::new);
-    let [cty_in_use, scp_in_use] = in_use;
+    let mut candidates = vec![ListKind::Cty, ListKind::Scp];
+    if spot.pattern_url.is_some() {
+        candidates.push(ListKind::Patterns);
+    }
     let (lists, in_use) = list_refresh::resolve_startup(
-        cfg.cty_table(),
-        cty_in_use,
-        cfg.scp_set(),
-        scp_in_use,
-        true,
+        list_refresh::StartupTables {
+            cty: cfg.cty_table(),
+            scp: cfg.scp_set(),
+            patterns: cfg.pattern_table(),
+        },
+        in_use,
+        &candidates,
         cache.as_ref(),
     );
     if let Some(warning) = stale_cty_warning(&in_use[0], std::time::SystemTime::now()) {
         logging::warning(&warning);
     }
     let mut managed = Vec::new();
-    for (list, url) in in_use.iter().zip([&spot.cty_url, &spot.scp_url]) {
+    let urls = [
+        Some(&spot.cty_url),
+        Some(&spot.scp_url),
+        spot.pattern_url.as_ref(),
+    ];
+    for (list, url) in in_use.iter().zip(urls) {
+        let Some(url) = url else {
+            continue;
+        };
         if !list.is_operator_choice() {
             managed.push(list_refresh::ListSetting {
                 url: list_http::HttpUrl::parse(url).map_err(|e| anyhow!("[spot]: {e}"))?,
@@ -2571,6 +2603,17 @@ fn prepare_run_lists(
             limits: list_http::FetchLimits::default(),
         }),
     })
+}
+
+/// MAN-542: with refresh on, `cfg` takes the shared lists' tables, so a
+/// list the cache supplied at startup is also the one the decode loop
+/// starts from; with refresh off, `cfg` already holds them.
+fn adopt_run_lists(cfg: &mut PipelineConfig, run_lists: &RunLists) {
+    if run_lists.refresh.is_some() {
+        cfg.cty = Some(run_lists.lists.cty.load());
+        cfg.scp = Some(run_lists.lists.scp.load());
+        cfg.patterns = Some(run_lists.lists.patterns.load());
+    }
 }
 
 /// MAN-316: publishes the lists in use to `manta_list_info` (every daemon),
@@ -2617,17 +2660,21 @@ fn start_list_refresh(
     }
     let Some(setup) = refresh else {
         if spot.refresh_lists && !live {
-            logging::note(&list_refresh::file_replay_note(&in_use[0], &in_use[1]));
+            logging::note(&list_refresh::file_replay_note(&in_use));
         } else {
             note_pinned_lists(spot, &in_use);
         }
         return Ok(None);
     };
-    logging::note(&list_refresh::lists_line(&in_use[0], &in_use[1]));
+    logging::note(&list_refresh::lists_line(&in_use));
     if !setup.lists.is_empty() {
         logging::note(&setup.startup_line());
     }
     for list in &in_use {
+        // MAN-542 D13: without `pattern_url` there is no refresh to skip.
+        if list.kind == ListKind::Patterns && spot.pattern_url.is_none() {
+            continue;
+        }
         if let Some(note) = list_refresh::left_alone_note(list) {
             logging::note(&note);
         }
@@ -2716,7 +2763,7 @@ struct Prepared {
     resolved: Resolved,
     pipeline: PipelineConfig,
     /// MAN-316: the version of cty.dat and MASTER.SCP `pipeline` holds.
-    lists_in_use: [list_refresh::InUse; 2],
+    lists_in_use: [list_refresh::InUse; 3],
 }
 
 /// MAN-79 scenario 2: one stderr line when the built-in cty.dat is in use
@@ -3547,10 +3594,7 @@ fn run_command() -> Result<std::process::ExitCode> {
             note_pinned_lists(&resolved.spot, &lists_in_use);
             // MAN-316: soak never refreshes; for a file it says so, as `run` does.
             if resolved.spot.refresh_lists && !resolved.spec.is_reconnectable() {
-                logging::note(&list_refresh::file_replay_note(
-                    &lists_in_use[0],
-                    &lists_in_use[1],
-                ));
+                logging::note(&list_refresh::file_replay_note(&lists_in_use));
             }
             let spec = &resolved.spec;
             warn_if_audio_source_has_no_rf_reference(spec.is_rf_aware(), resolved.dial_freq_hz);

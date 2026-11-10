@@ -111,7 +111,7 @@ Effort is a rough engineering estimate: **S** 2–5 working days, **M** 1–2 we
 | 13 | RF health, image suppression, and robust interference conditioning | Make real input resemble the assumptions of the decoder | Medium–high | M–L |
 | 14 | Joint nearby-signal fitting and cautious cancellation | Recover weak stations beside strong ones | Medium | XL |
 | 15 | Bounded delayed re-decoding from preserved observations | Use later evidence to rescue earlier copy | Medium–high | M–L |
-| 16 | Diverse classical hypotheses with evidence-level fusion | Exploit complementary decoder errors | Medium | M |
+| 16 | Diverse classical hypotheses with evidence-level fusion | Exploit complementary decoder errors **Closed (MAN-545):** evidence-level fusion of legacy and HSMM loses identities over legacy on the bench (realizable fusers net -34 and -48 of 2430, -1.40 and -1.98 pp), below the adoption bar; see [MAN-545](2026-11-09-man545-evidence-fusion-oracle-gap.md). | Medium | M |
 | 17 | A realism-driven corpus and independent synthesis | Generalize beyond repeated golden phrases | High | L, ongoing |
 | 18 | Durable observation records and reporting provenance | Keep useful data even when public spotting abstains | High | M |
 | 19 | Receiver/antenna diversity with local provenance | Escape fading and collisions one receiver cannot resolve | Medium | XL |
@@ -313,6 +313,8 @@ Align hypotheses by sample spans and edit operations, retaining erasures and bou
 **Implementation plan.** Define an internal `DecoderHypothesis` carrying sequence alternatives, spans, score semantics, and frontend/model version. Implement alignment as a bounded library in `manta-decode`, with a simple best-calibrated-branch selector as the baseline. Cross-fit any selector/calibrator on held-out recordings. Add invariants that duplicating an identical branch changes neither the selected call nor evidence strength, and that alignment cannot erase an unknown span to construct a valid-looking call. Never use the branch's claimed confidence as its correctness label.
 
 **First experiment and gate.** Produce branch-error overlap matrices and an oracle ceiling on the fixed corpus. Require meaningful complementary correct identities before implementing fusion; proposed promotion bar is recovering ≥25% of that oracle gap without exceeding the false-identity budget or the declared compute envelope. **Dependencies:** ranks 1/3/11, optionally 2/6. **Reject** permanently running extra branches that agree on nearly everything or using percentile-normalized confidence as a probability of correctness.
+
+**Closed by [MAN-545](2026-11-09-man545-evidence-fusion-oracle-gap.md).** With HSMM's headroom over legacy at 3 of 2430 bench identities, the calibrated substitution and span fusers recover none and 2 of them while losing 35 and 53 identities legacy spots (net -1.40 and -1.98 pp, against a bar of +25% of the headroom and +0.25 pp), and even truth-aware ceilings add at most 0.33 pp. The oracle union was measured by MAN-205; evidence-level fusion was measured by MAN-545.
 
 ## 17. Build a corpus that can falsify the decoder's assumptions
 

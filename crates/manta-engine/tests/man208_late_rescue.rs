@@ -660,6 +660,10 @@ fn a_crowded_node_under_the_global_bound_refines_exactly_as_before() {
             buffer_miss_total: 15,
             no_reading_total: 0,
             orphaned_revisions_total: 0,
+            replays_total: 9,
+            changed_total: 9,
+            rejected_total: 0,
+            engine_flips_total: 9,
         }
     );
     assert_eq!(a.rescued, (16..=24).map(crowded_rescue).collect::<Vec<_>>());
@@ -680,6 +684,10 @@ fn a_crowded_node_under_the_global_bound_refines_exactly_as_before() {
             buffer_miss_total: 0,
             no_reading_total: 0,
             orphaned_revisions_total: 0,
+            replays_total: 24,
+            changed_total: 23,
+            rejected_total: 1,
+            engine_flips_total: 24,
         }
     );
     let order = [

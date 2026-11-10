@@ -75,6 +75,17 @@ pub struct DecodeConfig {
     /// MAN-112 experimental Rust-only decoder frontend. Not a TOML option;
     /// promotion requires the carrier-offset and neighboring-signal gates.
     pub steered_frontend: bool,
+    /// MAN-545 research switch: when `true`, the legacy beam engines
+    /// (`legacy`, `edge-legacy`) emit their beam runner-ups as
+    /// `CharDecoded::alternatives` (glyph, softmax mass times `q`), on the
+    /// prior-off path only. Rust-only and default off: no TOML key or CLI
+    /// flag reaches it, and off is byte-identical to the historical stream.
+    /// On, winners, confidences and timestamps are unchanged, but every
+    /// consumer of `alternatives` sees the runner-ups (MAN-208's refinement
+    /// trigger, MAN-200 repetition fusion, the observation trace), so spots
+    /// match the switch-off run only with refinement and repetition fusion
+    /// off, as the MAN-545 measurement runs them.
+    pub legacy_alternatives: bool,
     /// MAN-208: the `[decode.refine]` table -- the deterministic,
     /// budget-bounded delayed-refinement scheduler's tunables. Carried on
     /// `DecodeConfig` so every consumer of a decoded `[decode]` table (the
@@ -179,6 +190,7 @@ impl Default for DecodeConfig {
             hsmm: HsmmConfig::default(),
             refine_bw_hz: 0.0,
             steered_frontend: false,
+            legacy_alternatives: false,
             refine: RefineConfig::default(),
             speed_bank: SpeedBankConfig::default(),
         }
@@ -306,6 +318,9 @@ pub struct TrackDecoder {
     /// MAN-199: set only inside `push_lead_in_hop`, so `tick_meta` neither
     /// counts the hop nor moves the SPEC §5 report cadence.
     lead_in: bool,
+    /// MAN-117: the `Legacy` chain's per-hop run buffer, reused across hops
+    /// so `Demod::push_into` does not allocate. Empty between hops.
+    runs: Vec<Run>,
     /// MAN-199: a mark run has reached `on_run`. A space before it is a
     /// truncation (the decoder started inside it) and teaches nothing.
     mark_seen: bool,
@@ -374,6 +389,7 @@ impl TrackDecoder {
             after_gap: false,
             continuity_epoch: 0,
             lead_in: false,
+            runs: Vec::new(),
             mark_seen: false,
             warmup_min_mark_ms: None,
             post_gap_mark_seen: false,
@@ -631,10 +647,24 @@ impl TrackDecoder {
         spectral_ref_power: Option<f32>,
         sample_ts: u64,
     ) -> Vec<DecoderEvent> {
-        self.lead_in = true;
-        let events = self.push_hop(amp, power, spectral_ref_power, sample_ts);
-        self.lead_in = false;
+        let mut events = Vec::new();
+        self.push_lead_in_hop_into(amp, power, spectral_ref_power, sample_ts, &mut events);
         events
+    }
+
+    /// [`TrackDecoder::push_lead_in_hop`], appending its events to `out`.
+    /// Appends; never reads or clears `out` (MAN-117).
+    pub fn push_lead_in_hop_into(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+        out: &mut Vec<DecoderEvent>,
+    ) {
+        self.lead_in = true;
+        self.push_hop_into(amp, power, spectral_ref_power, sample_ts, out);
+        self.lead_in = false;
     }
 
     /// One hop: linear amplitude, linear power, optional spectral noise
@@ -646,12 +676,27 @@ impl TrackDecoder {
         spectral_ref_power: Option<f32>,
         sample_ts: u64,
     ) -> Vec<DecoderEvent> {
+        let mut events = Vec::new();
+        self.push_hop_into(amp, power, spectral_ref_power, sample_ts, &mut events);
+        events
+    }
+
+    /// [`TrackDecoder::push_hop`], appending its events to `out` so the
+    /// engine's decoder pool can reuse one buffer (MAN-117). Appends; never
+    /// reads or clears `out`.
+    pub fn push_hop_into(
+        &mut self,
+        amp: f32,
+        power: f32,
+        spectral_ref_power: Option<f32>,
+        sample_ts: u64,
+        out: &mut Vec<DecoderEvent>,
+    ) {
         self.last_ts = sample_ts;
         match self.cfg.engine {
-            Engine::Legacy => self.push_envelope_legacy(amp, sample_ts),
+            Engine::Legacy => self.push_envelope_legacy(amp, sample_ts, out),
             Engine::EdgeLegacy => {
                 let n = self.noise.push(power, spectral_ref_power).max(1e-18).sqrt();
-                let mut events = Vec::new();
                 // Codex review, PR #161 round 9: `push` can now return more
                 // than one eligible center per input sample (a shrinking
                 // hold window draining its backlog) -- see
@@ -659,14 +704,16 @@ impl TrackDecoder {
                 for ev in self.evidence.push(amp, n, sample_ts) {
                     self.snr_from_evidence(&ev);
                     for run in self.edge.push(&ev) {
-                        self.on_run(run, &mut events);
+                        self.on_run(run, out);
                     }
-                    self.check_flush_edge(&mut events);
+                    self.check_flush_edge(out);
                 }
-                self.tick_meta(&mut events);
-                events
+                self.tick_meta(out);
             }
-            Engine::Hsmm => self.push_hop_hsmm(amp, power, spectral_ref_power, sample_ts), // Task 8
+            Engine::Hsmm => {
+                // Task 8
+                out.extend(self.push_hop_hsmm(amp, power, spectral_ref_power, sample_ts));
+            }
         }
     }
 
@@ -675,17 +722,19 @@ impl TrackDecoder {
         self.push_hop(a, a * a, None, sample_ts)
     }
 
-    /// The `Legacy` engine's demod -> timing -> beam chain. SPEC §3–§5.
-    fn push_envelope_legacy(&mut self, a: f32, sample_ts: u64) -> Vec<DecoderEvent> {
-        let mut events = Vec::new();
+    /// The `Legacy` engine's demod -> timing -> beam chain, appending to
+    /// `events`. SPEC §3–§5. The runs go through the reused `self.runs`
+    /// buffer (MAN-117).
+    fn push_envelope_legacy(&mut self, a: f32, sample_ts: u64, events: &mut Vec<DecoderEvent>) {
         self.last_ts = sample_ts;
-        let runs = self.demod.push(a, sample_ts);
-        for run in runs {
-            self.on_run(run, &mut events);
+        let mut runs = std::mem::take(&mut self.runs);
+        self.demod.push_into(a, sample_ts, &mut runs);
+        for run in runs.drain(..) {
+            self.on_run(run, events);
         }
-        self.check_flush(&mut events);
-        self.tick_meta(&mut events);
-        events
+        self.runs = runs;
+        self.check_flush(events);
+        self.tick_meta(events);
     }
 
     /// The `Hsmm` engine's evidence -> token-passing -> commit chain. SPEC v2 §4.
@@ -1648,6 +1697,39 @@ impl TrackDecoder {
             }
             return;
         }
+        if self.cfg.legacy_alternatives {
+            // MAN-545: `decode_char` is `decode_char_readings(.., None,
+            // None, ..)` plus `readings[0]`, so the winner, its confidence
+            // and every timestamp match the switch-off path by construction;
+            // only `alternatives` gains the beam's runner-ups.
+            match decode_char_readings(
+                &marks,
+                self.tracker.mu_dit_ms(),
+                self.tracker.mu_dah_ms(),
+                None,
+                None,
+                q,
+                &self.cfg.beam,
+            ) {
+                Some(readings) => {
+                    let cd = readings[0];
+                    self.word_decoded = self.word_decoded.saturating_add(1);
+                    self.observe_marks(cd.glyph, &marks);
+                    events.push(DecoderEvent::CharDecoded {
+                        track_id: self.track_id,
+                        sample_ts,
+                        glyph: cd.glyph,
+                        confidence: cd.confidence,
+                        alternatives: readings[1..]
+                            .iter()
+                            .map(|r| (r.glyph, r.confidence))
+                            .collect(),
+                    });
+                }
+                None => self.garble_count += 1,
+            }
+            return;
+        }
         match decode_char(
             &marks,
             self.tracker.mu_dit_ms(),
@@ -1912,6 +1994,130 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, DecoderEvent::ReadingsHeld { .. })));
+    }
+
+    fn alternatives_events(text: &str, dit_hops: u32, cfg: DecodeConfig) -> Vec<DecoderEvent> {
+        let mut decoder = TrackDecoder::new(7, cfg);
+        let mut events = Vec::new();
+        for (i, value) in rect_envelope(text, dit_hops).into_iter().enumerate() {
+            events.extend(decoder.push_envelope(value, i as u64 * 256));
+        }
+        events.extend(decoder.finish());
+        events
+    }
+
+    fn legacy_alternatives_cfg(on: bool) -> DecodeConfig {
+        DecodeConfig {
+            legacy_alternatives: on,
+            ..DecodeConfig::default()
+        }
+    }
+
+    fn strip_alternatives(events: &[DecoderEvent]) -> Vec<DecoderEvent> {
+        events
+            .iter()
+            .cloned()
+            .map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    track_id,
+                    sample_ts,
+                    glyph,
+                    confidence,
+                    ..
+                } => DecoderEvent::char_decoded(track_id, sample_ts, glyph, confidence),
+                other => other,
+            })
+            .collect()
+    }
+
+    fn alternatives_of(events: &[DecoderEvent]) -> Vec<(f32, Vec<(Glyph, f32)>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                DecoderEvent::CharDecoded {
+                    confidence,
+                    alternatives,
+                    ..
+                } => Some((*confidence, alternatives.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn legacy_alternatives_defaults_off() {
+        assert!(!DecodeConfig::default().legacy_alternatives);
+    }
+
+    #[test]
+    fn legacy_alternatives_off_stream_is_byte_identical() {
+        let explicit = alternatives_events("CQ W1AW", 23, legacy_alternatives_cfg(false));
+        let default = alternatives_events("CQ W1AW", 23, DecodeConfig::default());
+        assert_eq!(
+            serde_json::to_vec(&explicit).unwrap(),
+            serde_json::to_vec(&default).unwrap()
+        );
+        assert!(alternatives_of(&explicit)
+            .iter()
+            .all(|(_, alts)| alts.is_empty()));
+    }
+
+    #[test]
+    fn legacy_alternatives_on_keeps_winners_and_timestamps() {
+        let off = alternatives_events("CQ W1AW", 23, legacy_alternatives_cfg(false));
+        let on = alternatives_events("CQ W1AW", 23, legacy_alternatives_cfg(true));
+        assert_eq!(
+            serde_json::to_vec(&strip_alternatives(&on)).unwrap(),
+            serde_json::to_vec(&off).unwrap()
+        );
+        assert_eq!(events_to_text(&on), "CQ W1AW");
+    }
+
+    #[test]
+    fn legacy_alternatives_on_emits_beam_runner_ups() {
+        // A longer text at a dit length that is not a whole number of
+        // hops gives the beam survivors beside the winner.
+        let text = "CQ CQ DE W1AW W1AW K 5NN TU";
+        let on = alternatives_events(text, 7, legacy_alternatives_cfg(true));
+        let off = alternatives_events(text, 7, legacy_alternatives_cfg(false));
+        assert_eq!(
+            serde_json::to_vec(&strip_alternatives(&on)).unwrap(),
+            serde_json::to_vec(&off).unwrap()
+        );
+        let chars = alternatives_of(&on);
+        assert!(!chars.is_empty());
+        assert!(
+            chars.iter().any(|(_, alts)| !alts.is_empty()),
+            "no character carried a beam runner-up"
+        );
+        let max_alts = BeamConfig::default().width - 1;
+        for (confidence, alts) in &chars {
+            assert!(alts.len() <= max_alts, "{alts:?}");
+            for (_, mass) in alts {
+                assert!(mass.is_finite() && *mass >= 0.0, "{alts:?}");
+                assert!(*mass <= *confidence, "{confidence} {alts:?}");
+            }
+            assert!(alts.windows(2).all(|w| w[0].1 >= w[1].1), "{alts:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_alternatives_ignored_on_prior_path() {
+        let prior = |on: bool| {
+            alternatives_events(
+                "CQ W1AW",
+                23,
+                DecodeConfig {
+                    prior_enabled: true,
+                    legacy_alternatives: on,
+                    ..DecodeConfig::default()
+                },
+            )
+        };
+        assert_eq!(
+            serde_json::to_vec(&prior(true)).unwrap(),
+            serde_json::to_vec(&prior(false)).unwrap()
+        );
     }
 
     #[test]

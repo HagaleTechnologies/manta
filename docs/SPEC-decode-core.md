@@ -45,8 +45,8 @@ rates by construction; nothing below depends on `fs`.
 **[DEVIATION]** `coppa-dsp::filter` provides only `RrcFilter` (root-raised
 cosine); there is no general Kaiser/windowed-sinc designer to reuse. The
 prototype designer is therefore new code in `manta-dsp::proto` (~40 lines:
-Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused as
-specified.
+Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused for
+the plan; the channelizer runs that plan in place (MAN-117).
 
 Prototype lowpass, length `L·N` with **L = 8 taps per branch**:
 
@@ -127,10 +127,11 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    multiplying bin `k` by `e^{+j2πk·m·hop/N}`; the rotation keeps every
    channel's passband centered at DC in its own output stream so the envelope
    is phase-continuous across hops.)
-3. **FFT:** `X[k, m] = FFT_N(v')[k]` via `FftProcessor::new(N)` (one instance,
-   created once; `forward()` allocates — acceptable at 375 calls/s, but the
-   engine may pre-allocate via `try_forward` into a scratch buffer if profiling
-   demands; not required for M0/M1).
+3. **FFT:** `X[k, m] = FFT_N(v')[k]` via the forward plan `FftProcessor::new(N)`
+   builds (`rustfft` `FftPlanner::new().plan_fft_forward(N)`), planned once and
+   run in place with a scratch buffer the channelizer owns, so a hop allocates
+   only its output (MAN-117); bit-identical to `FftProcessor::forward()`, which
+   allocates its output and rustfft's scratch per call.
 4. **Power:** `P[k, m] = |X[k, m]|²`. Report in dB: `PdB = 10·log10(P + ε)`,
    `ε = 1e-20`.
 
@@ -2393,19 +2394,21 @@ allowlist = []
 # Same path rule. Unset: bundled. --scp overrides it.
 # scp_path = "MASTER.SCP"
 # Scheduled list refresh (MAN-316). Opt-in; only `run` from a live
-# receiver downloads. cty.dat is checked every 7 days and MASTER.SCP every
-# day (If-Modified-Since); a download replaces the table in use only after
+# receiver downloads. cty.dat is checked every 7 days, MASTER.SCP every
+# day and, with pattern_url set (MAN-542), the pattern list every 7 days
+# (If-Modified-Since); a download replaces the table in use only after
 # it parses and passes the acceptance checks, and a failure keeps the
 # current table and retries in 1 hour. File replay never downloads and
 # never reads the cache's latest copy. Skipped for a list that a path or
 # a SHA-256 pin below sets.
 # refresh_lists = false
 # Accepted downloads, content-addressed (cty/<sha256>.dat,
-# scp/<sha256>.scp, state.json). Same path rule. Unset: memory only.
+# scp/<sha256>.scp, patterns/<sha256>.lst, state.json). Same path rule.
+# Unset: memory only.
 # list_cache_dir = "/var/cache/manta"
-# http:// only (no TLS); https:// is refused at load.
-# cty_url = "http://www.country-files.com/cty/cty.dat"
-# scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+# https:// (checked against built-in CA roots) or http:// for a local mirror.
+# cty_url = "https://www.country-files.com/cty/cty.dat"
+# scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 # Pin a list by the SHA-256 of its bytes (64 hex digits), for every
 # validating command: a set cty_path/scp_path must match it; otherwise it
 # is looked up in the bundled copy, then list_cache_dir. No match stops
@@ -2422,6 +2425,10 @@ repetition_fusion = false
 # Leading # comments; @ for later letters, # for later digits. Same path rule.
 # Unset: bundled. --patterns overrides it.
 # pattern_path = "patterns.lst"
+# MAN-542: where refresh_lists downloads the pattern list ([+]PATTERN or
+# RBN's Patt3Ch.lst). No default: unset, nothing is fetched. http:// only;
+# not used when pattern_path is set.
+# pattern_url = "http://data.reversebeacon.net/downloads/patt3ch/patt3ch.lst"
 
 # [server] key line_format (MAN-88), set inside your real [server] table:
 # Which fixed-column wire layout the INBOUND telnet cluster server renders
