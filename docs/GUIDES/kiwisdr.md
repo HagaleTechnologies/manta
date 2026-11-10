@@ -17,6 +17,15 @@ The Kiwi's native IQ stream is about 12 kHz. manta resamples it to 96 kS/s for
 its channelizer; that does not widen the 10 kHz of RF it requested. See the
 [KiwiSDR input notes](../DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md).
 
+Lost SND frames show on manta's [metrics endpoint](../METRICS.md) as
+`manta_input_dropped_packets_total{source="kiwi"}` and
+`manta_input_gaps_detected_total{source="kiwi"}`. manta also moves its spot
+clock on by each lost frame's samples, counted from the frame sequence numbers
+and the receiver's sample rate, so spots after the loss keep their true time.
+A loss of 0.5 s or more also closes the tracks in progress, and decoding
+starts again after it
+([MAN-529](../DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md)).
+
 ## Several CW segments from one Kiwi: `bands`
 
 `bands` plans one Kiwi channel per slice of a band's CW segment, instead of

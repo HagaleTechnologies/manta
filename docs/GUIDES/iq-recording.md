@@ -189,10 +189,13 @@ not filled with zeros. A loss the input reports without a sample count
 live engine, which drops the character the loss cut instead of decoding
 through it, but not the recording: a replay runs the samples on either
 side of it together. A loss the input splices over and counts instead
-(MAN-305: HPSDR protocol 2's lost datagrams, `take_missing_samples`)
+(MAN-305: HPSDR protocol 2's lost datagrams; MAN-529: KiwiSDR's lost SND
+frames and ka9q-radio's lost RTP packets; `take_missing_samples`)
 moves the live engine's clock on without closing tracks, but the
 recording does not carry it: a replay runs the spliced samples together,
-so its timestamps after such a loss are early by the lost duration. A stream
+so its timestamps after such a loss are early by the lost duration. A loss
+of 0.5 s or more on these inputs is reported as a discontinuity instead, and
+the recording writes it as a `gap` record. A stream
 that stops long enough for the engine to close its tracks and then resumes
 with no reconnect (ka9q after 5 s, MAN-201) leaves a zero-length `gap` record,
 so a replay closes its tracks there too; its timestamps after the pause are

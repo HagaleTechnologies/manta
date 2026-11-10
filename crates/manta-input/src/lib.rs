@@ -37,6 +37,8 @@ pub use recording::{
 
 mod overflow;
 
+mod loss_marks;
+
 mod stall;
 pub use stall::{is_no_usable_samples, NoUsableSamples, NO_USABLE_SAMPLES_AFTER};
 
@@ -243,6 +245,12 @@ pub trait IqSource {
     /// packet stream. Returns the value once, then `None` until the next loss.
     /// `manta_engine::listen` advances its sample clock by this many samples
     /// without closing tracks, so spot timestamps stay wall-clock-true.
+    /// Three sources report it: HPSDR protocol 2 (lost datagrams, MAN-305),
+    /// KiwiSDR (lost SND frames) and ka9q-radio (lost RTP packets, MAN-529);
+    /// each reports a loss of 0.5 s or more through
+    /// [`IqSource::take_discontinuity`] instead. A source that buffers ahead
+    /// of its reader must end `read()` at the loss, so the report describes
+    /// the first sample of the read that carries it (MAN-529).
     /// **Wrapper types must forward this**, as they forward `take_discontinuity`.
     fn take_missing_samples(&mut self) -> Option<u64> {
         None
@@ -308,6 +316,7 @@ pub trait IqSource {
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
     /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
+    /// ka9q-radio counts RTP sequence gaps and malformed datagrams (MAN-140);
     /// SoapySDR counts driver overflow read errors (MAN-233); audio
     /// currently counts nothing of the kind. A caller with
     /// `Some(handle)` may keep polling it after the
