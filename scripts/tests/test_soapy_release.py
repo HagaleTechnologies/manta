@@ -42,7 +42,12 @@ SOAPY_TEST = "cargo test --release --locked -p manta-input --features soapy --li
 IMAGE_JOBS = ("docker-publish-release", "docker-build-dispatch")
 CHECK_IMAGE = "manta-soapy-check:local"
 CHECK_PLATFORM = "linux/arm64"
-IMAGE_VERIFY = f"python3 scripts/check-soapy-release.py --docker-image {CHECK_IMAGE} --platform {CHECK_PLATFORM}"
+IMAGE_VERIFY = (f"python3 scripts/check-soapy-release.py --docker-image {CHECK_IMAGE} --platform {CHECK_PLATFORM}"
+                ' --expect-git-sha "$GITHUB_SHA"')
+# MAN-537: every image build passes the release commit, the same value in the check and the push.
+IMAGE_BUILD_ARGS = "MANTA_GIT_SHA=${{ github.sha }}"
+# The commit the fake `manta --version` reports.
+FAKE_SHA = "0123456789ab"
 THREE_PLATFORMS = "linux/amd64,linux/arm64,linux/arm/v7"
 FLAGS = ("--soapy-driver", "--soapy-freq-hz", "--soapy-rate-hz", "--soapy-gain")
 HELP = "Usage: manta run [OPTIONS]\n" + "".join(f"      {f} <X>\n" for f in FLAGS + ("--hpsdr-host",))
@@ -407,6 +412,42 @@ class ImageModeTests(unittest.TestCase):
         bad = {"audio": OK_DEVICES["audio"], "soapy": {"status": "disabled", "devices": [], "error": None}}
         self.assert_fails(self.check(devices=(json.dumps(bad), 0)), "Soapy")
 
+    def check_commit(self, expected, **answers):
+        return self.check("--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM,
+                          "--expect-git-sha", expected, **answers)
+
+    def test_the_expected_commit_passes(self):
+        # MAN-537: a 12-hex value is compared verbatim.
+        proc = self.check_commit(FAKE_SHA)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines(),
+                         IMAGE_OK[:1] + [f"OK: image commit {FAKE_SHA} matches --expect-git-sha"]
+                         + IMAGE_OK[1:])
+
+    def test_a_full_commit_name_matches_its_lowercase_12_hex_prefix(self):
+        # build.rs cuts a 40- or 64-hex override to 12 lower-case characters; so does the check.
+        for full in ((FAKE_SHA + "cdef0123456789abcdef01234567").upper(),
+                     FAKE_SHA + "cd" * 26,
+                     f" {FAKE_SHA}cdef0123456789abcdef01234567\n"):
+            with self.subTest(full=full):
+                proc = self.check_commit(full)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f"OK: image commit {FAKE_SHA} matches --expect-git-sha", proc.stdout)
+
+    def test_an_image_of_another_commit_fails_naming_both(self):
+        proc = self.check_commit("fedcba987654")
+        self.assert_fails(proc, "fedcba987654")
+        self.assertIn(FAKE_SHA, proc.stderr)
+
+    def test_an_image_that_reports_unknown_fails(self):
+        proc = self.check_commit(FAKE_SHA, version="manta 0.1.0 (git unknown; features: soapy)")
+        self.assert_fails(proc, "unknown")
+        self.assertIn(FAKE_SHA, proc.stderr)
+
+    def test_a_version_line_without_a_git_field_fails(self):
+        proc = self.check_commit(FAKE_SHA, version="manta 0.1.0 (features: soapy)")
+        self.assert_fails(proc, "no git commit")
+
     def test_usage_errors_exit_2(self):
         archive = build_archive(self.tmp, fake_manta())
         cases = (
@@ -415,6 +456,9 @@ class ImageModeTests(unittest.TestCase):
             ("--docker-image", CHECK_IMAGE),
             ("--platform", CHECK_PLATFORM, archive),
             ("--expect-missing-soapy-library", "--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM),
+            # MAN-537: the commit check is image mode only, and needs a value.
+            ("--expect-git-sha", FAKE_SHA, archive),
+            ("--docker-image", CHECK_IMAGE, "--platform", CHECK_PLATFORM, "--expect-git-sha", ""),
         )
         for args in cases:
             with self.subTest(args=args):
@@ -576,6 +620,10 @@ class ImageCheckWiringTests(unittest.TestCase):
                     self.assertIsNone(with_field(steps[smoke], "push"))
                     self.assertEqual(wf.field(steps[smoke], "uses"), wf.field(steps[push], "uses"),
                                      "the check build pins the same action as the push")
+                    # MAN-537: the image reports the release commit, and identical build-args let
+                    # the push reuse the check build's arm64 layers.
+                    for i in (smoke, push):
+                        self.assertEqual(with_field(steps[i], "build-args"), IMAGE_BUILD_ARGS)
                     for i in (smoke, check):
                         # A publish=false dispatch still checks the image.
                         self.assertIsNone(wf.field(steps[i], "if"))

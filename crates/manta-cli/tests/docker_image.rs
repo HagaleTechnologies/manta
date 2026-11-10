@@ -371,6 +371,114 @@ fn dockerfile_header_no_longer_excludes_soapy() {
     );
 }
 
+/// MAN-537: both base images are pinned by tag and index digest. The tag is
+/// what Dependabot tracks and a person reads; the digest is what Docker pulls.
+#[test]
+fn dockerfile_base_images_are_pinned_by_tag_and_digest() {
+    let pinned =
+        regex::Regex::new(r"^[a-z0-9./_-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}( (?i:as) [a-z]+)?$")
+            .unwrap();
+    let froms: Vec<Directive> = directives(&doc(DOCKERFILE))
+        .into_iter()
+        .filter(|d| d.keyword == "FROM")
+        .collect();
+    assert_eq!(froms.len(), 2, "a builder and a runtime stage: {froms:?}");
+    for from in &froms {
+        assert!(
+            pinned.is_match(&from.args),
+            "`FROM {}` must name a tag and an @sha256: index digest",
+            from.args
+        );
+    }
+}
+
+/// MAN-537: Dependabot moves the `FROM` digests, as it does for Cargo and
+/// Actions.
+#[test]
+fn dependabot_watches_the_dockerfile_base_images() {
+    let config: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&doc(".github/dependabot.yml")).unwrap();
+    let docker: Vec<&serde_yaml_ng::Value> = config["updates"]
+        .as_sequence()
+        .expect("dependabot.yml has an updates list")
+        .iter()
+        .filter(|u| u["package-ecosystem"].as_str() == Some("docker"))
+        .collect();
+    assert_eq!(
+        docker.len(),
+        1,
+        "dependabot.yml needs one docker entry: {docker:?}"
+    );
+    assert_eq!(docker[0]["directory"].as_str(), Some("/"));
+    assert_eq!(docker[0]["schedule"]["interval"].as_str(), Some("weekly"));
+}
+
+/// MAN-537: the builder passes the release commit to build.rs, which takes
+/// `MANTA_GIT_SHA` over the `.git` the build context lacks. The runtime
+/// stage ships no builder environment.
+#[test]
+fn dockerfile_builder_takes_the_commit_as_a_build_arg() {
+    let builder = builder_stage();
+    let at = |keyword: &str, want: &str| {
+        let found: Vec<usize> = builder
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.keyword == keyword && d.args.contains("MANTA_GIT_SHA"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "the builder stage needs one {keyword} for MANTA_GIT_SHA"
+        );
+        assert_eq!(builder[found[0]].args, want, "{keyword}");
+        found[0]
+    };
+    let arg = at("ARG", "MANTA_GIT_SHA");
+    let env = at("ENV", "MANTA_GIT_SHA=${MANTA_GIT_SHA}");
+    let position = |what: &str, pred: &dyn Fn(&Directive) -> bool| {
+        builder
+            .iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("the builder stage has no {what}"))
+    };
+    let apt = position("apt RUN", &|d| {
+        d.keyword == "RUN" && d.args.contains("apt-get install")
+    });
+    let cargo = position("cargo build RUN", &|d| {
+        d.keyword == "RUN" && d.args.contains("cargo build")
+    });
+    for (name, i) in [("ARG", arg), ("ENV", env)] {
+        assert!(
+            apt < i,
+            "{name} MANTA_GIT_SHA must follow the apt RUN, so a new commit keeps that layer cached"
+        );
+        assert!(
+            i < cargo,
+            "{name} MANTA_GIT_SHA must come before the cargo build RUN"
+        );
+    }
+    let leaked: Vec<Directive> = final_stage()
+        .into_iter()
+        .filter(|d| d.args.contains("MANTA_GIT_SHA"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "the runtime stage must not mention MANTA_GIT_SHA: {leaked:?}"
+    );
+}
+
+/// MAN-537: the release jobs' checkout keeps a `packages: write` token in
+/// `.git/config`, so the commit reaches the build as a build-arg, never as
+/// `.git` in the context.
+#[test]
+fn dockerignore_keeps_git_metadata_out_of_the_build_context() {
+    assert!(
+        doc(".dockerignore").lines().any(|l| l.trim() == ".git"),
+        ".dockerignore must exclude .git from `COPY . .`"
+    );
+}
+
 /// The workflow step that holds line `at`: from the nearest `- ` step start
 /// above it, at the step indentation, to the next step or a dedent.
 fn step_around(lines: &[&str], at: usize) -> Vec<String> {

@@ -1033,8 +1033,10 @@ sample time. See
   calibration — its `_count` rate is spots-pipeline throughput, closing
   the "decode rate" gap noted below); `manta_start_time_seconds`/
   `manta_uptime_seconds`/`manta_build_info{version,git_sha,features}`
-  (process uptime and build metadata — `git_sha` is `"unknown"` in a
-  Docker build, since `.dockerignore` excludes `.git`);
+  (process uptime and build metadata — `git_sha` is `"unknown"` for a
+  build with no `.git` and no `MANTA_GIT_SHA`, such as a local Docker
+  build without the build-arg, since `.dockerignore` excludes `.git`; the
+  release image passes its commit, MAN-537);
   `manta_uplink_target_*{target="host:port"}` (per-target labels for every
   uplink counter, derived-sum aggregates preserved under their old
   unlabeled names); and `manta_healthy`/`manta_listener_up{listener}`

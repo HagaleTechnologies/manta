@@ -1366,8 +1366,9 @@ impl Validator {
             // revise it there too, or the rival check below compares the
             // refined call against the reading it just superseded
             // (validate round 2, PR #520). Moved, never added.
-            let plausible =
-                grammar::is_plausible(&refined.call) && self.cty.is_allocated(&refined.call);
+            let plausible = grammar::is_plausible(&refined.call)
+                && self.cty.is_allocated(&refined.call)
+                && !self.blocklist.contains(&refined.call);
             self.ledger.revise_occurrence(
                 track_id,
                 word_seq,
@@ -1516,7 +1517,9 @@ impl Validator {
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
         let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
             self.ledger
-                .better_supported_rival(track_id, &candidate, sample_ts)
+                .better_supported_rival_where(track_id, &candidate, sample_ts, &[], |text| {
+                    !self.blocklist.contains(text)
+                })
         } else {
             None
         };
@@ -1772,8 +1775,13 @@ impl Validator {
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
     /// default -- no suppression until the operator supplies one.
     pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
-        self.blocklist = blocklist;
+        self.install_blocklist(blocklist);
         self
+    }
+
+    fn install_blocklist(&mut self, blocklist: Blocklist) {
+        self.ledger.retain_texts(|text| !blocklist.contains(text));
+        self.blocklist = blocklist;
     }
 
     /// Sets the operator's notched-frequency list (MAN-31). Empty by
@@ -1784,8 +1792,9 @@ impl Validator {
     }
 
     /// MAN-78: replaces the operator's three lists as one unit, for a live
-    /// config reload. Tracks, dedupe, the repetition gate, the ledger and
-    /// `suppression_counts` are untouched; a word already attempted under the
+    /// config reload. Blocked ledger entries are pruned. Tracks, dedupe,
+    /// the repetition gate and `suppression_counts` are untouched; a word
+    /// already attempted under the
     /// old lists is not re-evaluated, so the new lists apply from the next
     /// decoder event.
     pub fn replace_operator_lists(
@@ -1795,12 +1804,12 @@ impl Validator {
         notch: NotchList,
     ) {
         self.allowlist = allowlist.iter().map(|c| c.to_ascii_uppercase()).collect();
-        self.blocklist = blocklist;
+        self.install_blocklist(blocklist);
         self.notch = notch;
     }
 
     /// MAN-316: replaces the country table and known-call set, for a
-    /// scheduled list refresh. Like `replace_operator_lists`, tracks, dedupe,
+    /// scheduled list refresh. Tracks, dedupe,
     /// the repetition gate, the ledger and `suppression_counts` are
     /// untouched; the new tables apply from the next decoder event.
     pub fn replace_reference_tables(&mut self, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) {
@@ -1934,15 +1943,14 @@ impl Validator {
                     }
                 }
                 track.last_sample_ts = *sample_ts;
-                // MAN-100 Scenario 1: the ledger records every observed
-                // word that is ITSELF spottable-shaped (grammar + cty) --
-                // a form that could never be spotted must not be able to
-                // veto one that could. Gated on the same two checks
-                // `evaluate_candidate` runs for a non-allowlisted
-                // candidate below, so the ledger's population is never
-                // wider than what could plausibly spot.
+                // MAN-100/MAN-531: only grammar/cty-plausible, unblocked
+                // words may supply variant support. A blocked reading
+                // must not veto an eligible call.
                 if let Some((text, seq, start_ts, geo)) = newly_completed {
-                    if grammar::is_plausible(&text) && self.cty.is_allocated(&text) {
+                    if grammar::is_plausible(&text)
+                        && self.cty.is_allocated(&text)
+                        && !self.blocklist.contains(&text)
+                    {
                         self.ledger.observe_span(
                             *track_id,
                             &text,
@@ -3011,7 +3019,9 @@ impl Validator {
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
         let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
             self.ledger
-                .better_supported_rival(track_id, &candidate, sample_ts)
+                .better_supported_rival_where(track_id, &candidate, sample_ts, &[], |text| {
+                    !self.blocklist.contains(text)
+                })
         } else {
             None
         };
@@ -3164,11 +3174,12 @@ impl Validator {
         // copies: they are the damage the fusion already outvoted.
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&call));
         let rival = if !is_allowlisted && !scp_exempt {
-            self.ledger.better_supported_rival_except(
+            self.ledger.better_supported_rival_where(
                 track_id,
                 &call,
                 sample_ts,
                 &fused.disagreeing,
+                |text| !self.blocklist.contains(text),
             )
         } else {
             None
@@ -4402,6 +4413,288 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(second[0].reps, Some(2));
         assert_eq!(second[0].spot.as_ref(), Some(&spots[0]));
         assert!(v.take_decisions().is_empty(), "take drains the log");
+    }
+
+    #[test]
+    fn man531_scp_exemption_normal_and_refined_keeps_own_gate_and_blocklist() {
+        for refinement in [false, true] {
+            for (scp_member, blocked) in [(false, false), (true, false), (true, true)] {
+                let mut v = recording(CTY_FIXTURE);
+                v.scp = Some(Arc::new(scp::Set::parse(if scp_member {
+                    "K5AR"
+                } else {
+                    ""
+                })));
+                if blocked {
+                    v = v.with_blocklist(Blocklist::parse("K5AR"));
+                }
+                man531_seed_rival(&mut v, 1, "K5ARH", 4);
+                assert_eq!(v.ledger.support(1, "K5ARH", 100_000).reps, 4);
+                assert!(run(
+                    &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 300_000),
+                    &mut v
+                )
+                .is_empty());
+                let first = v.take_decisions();
+                if !blocked {
+                    assert!(decisions_for(&first, "K5AR")
+                        .iter()
+                        .any(|d| d.reason == Some(Reason::Repetition)));
+                }
+                let spots = if refinement {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5AX", "K"], 600_000),
+                        &mut v,
+                    );
+                    let (seq, span) = word_named(&v, 1, "K5AX");
+                    v.apply_refinement(1, seq, refined("K5AR", span, "engine:hsmm"), 700_000)
+                } else {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 600_000),
+                        &mut v,
+                    )
+                };
+                let log = v.take_decisions();
+                let d = decisions_for(&log, "K5AR").last().copied().unwrap();
+                if blocked {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Blocklist));
+                } else if scp_member {
+                    assert_eq!(spots.len(), 1, "{log:?}");
+                    assert_eq!(d.verdict, Verdict::Spotted);
+                    assert!(d.rival.is_none());
+                    assert_eq!(d.reps, Some(2));
+                } else {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Variant));
+                    assert_eq!(d.rival.as_ref().unwrap().call, "K5ARH");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn man531_scp_exemption_fused_keeps_blocklist_precedence() {
+        for (scp_member, blocked) in [(false, false), (true, false), (true, true)] {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            v.scp = Some(Arc::new(scp::Set::parse(if scp_member {
+                "W1AW"
+            } else {
+                ""
+            })));
+            if blocked {
+                v = v.with_blocklist(Blocklist::parse("W1AW"));
+            }
+            man531_seed_rival(&mut v, 1, "W1AX", 4);
+            assert_eq!(v.ledger.support(1, "W1AX", 100_000).reps, 4);
+            let spots = run(&complementary_copies(), &mut v);
+            let log = v.take_decisions();
+            let d = decisions_for(&log, "W1AW").last().copied().unwrap();
+            if blocked {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Blocklist));
+            } else if scp_member {
+                assert_eq!(spots.len(), 1, "{log:?}");
+                assert_eq!(d.confirmation, Some(Confirmation::Fused));
+                assert!(d.rival.is_none());
+                assert_eq!(d.reps, Some(2));
+            } else {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Variant));
+                assert_eq!(d.rival.as_ref().unwrap().call, "W1AX");
+            }
+        }
+    }
+
+    #[test]
+    fn man531_list_install_prunes_all_tracks_without_resurrection() {
+        for builder in [false, true] {
+            let mut v = recording(CTY_FIXTURE);
+            for track in [1, 2] {
+                man531_seed_rival(&mut v, track, "K5ARH", 3);
+            }
+            man531_seed_rival(&mut v, 1, "W1AW", 2);
+            let kept = v.ledger.support(1, "W1AW", 100_000);
+            let gate_before = v.gate.counted_total();
+            let counts_before = v.suppression_counts();
+            if builder {
+                v = v.with_blocklist(Blocklist::parse("K5ARH"));
+            } else {
+                v.replace_operator_lists(&[], Blocklist::parse("K5ARH"), NotchList::default());
+            }
+            for track in [1, 2] {
+                assert_eq!(v.ledger.support(track, "K5ARH", 100_000).reps, 0);
+            }
+            assert_eq!(v.ledger.support(1, "W1AW", 100_000), kept);
+            assert_eq!(v.gate.counted_total(), gate_before);
+            assert_eq!(v.suppression_counts(), counts_before);
+            assert!(v.tracks.contains_key(&1));
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 300_000),
+                &mut v,
+            );
+            let spots = run(
+                &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 600_000),
+                &mut v,
+            );
+            assert_eq!(spots.len(), 1);
+            assert_eq!(spots[0].callsign, "K5ARG");
+            assert!(v
+                .take_decisions()
+                .iter()
+                .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K5ARH")));
+            v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 0);
+            assert_eq!(v.ledger.support(1, "W1AW", v.now_ts), kept);
+            v = v.with_blocklist(Blocklist::default());
+            assert_eq!(v.ledger.support(1, "W1AW", v.now_ts), kept);
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], 900_000),
+                &mut v,
+            );
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 1);
+        }
+    }
+
+    #[test]
+    fn man531_blocked_variant_cannot_outvote_genuine_call() {
+        let mut v = recording(CTY_FIXTURE).with_blocklist(Blocklist::parse("k5arh\n"));
+        for i in 0..3 {
+            assert!(run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+                &mut v
+            )
+            .is_empty());
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 0);
+        }
+        man531_flush_context(&mut v, 900_000);
+        assert!(run(
+            &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 1_200_000),
+            &mut v
+        )
+        .is_empty());
+        let spots = run(
+            &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 1_500_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARG");
+        let log = v.take_decisions();
+        let genuine = decisions_for(&log, "K5ARG");
+        assert!(genuine.iter().any(|d| d.reason == Some(Reason::Repetition)));
+        assert!(genuine
+            .iter()
+            .any(|d| d.verdict == Verdict::Spotted && d.reps == Some(2) && d.required_reps == 2));
+        assert!(log
+            .iter()
+            .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K5ARH")));
+    }
+
+    fn man531_flush_context(v: &mut Validator, at: u64) {
+        let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+        let refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+        run(&transmission_events(1, &refs, at), v);
+    }
+
+    fn man531_seed_rival(v: &mut Validator, track: u32, call: &str, reps: u64) {
+        for i in 0..reps {
+            v.ledger.observe(track, call, i * 10, i * 10_000, 0.95);
+        }
+    }
+
+    #[test]
+    fn man531_refinement_into_blocked_text_removes_old_support() {
+        let mut v = recording(CTY_FIXTURE).with_blocklist(Blocklist::parse("K3ABD"));
+        man531_seed_rival(&mut v, 2, "W1AW", 1);
+        run(
+            &transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000),
+            &mut v,
+        );
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        assert_eq!(v.ledger.support(1, "K3ABC", v.now_ts).reps, 1);
+        assert!(v
+            .apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_100_000)
+            .is_empty());
+        assert_eq!(v.ledger.support(1, "K3ABC", v.now_ts).reps, 0);
+        assert_eq!(v.ledger.support(1, "K3ABD", v.now_ts).reps, 0);
+        assert_eq!(v.ledger.support(2, "W1AW", v.now_ts).reps, 1);
+        let log = v.take_decisions();
+        assert!(log
+            .iter()
+            .any(|d| d.call == "K3ABD" && d.reason == Some(Reason::Blocklist)));
+        assert!(log
+            .iter()
+            .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K3ABD")));
+        assert!(log
+            .iter()
+            .all(|d| d.spot.as_ref().is_none_or(|s| s.callsign != "K3ABD")));
+    }
+
+    #[test]
+    fn man531_stale_blocked_rival_is_filtered_in_ordinary_and_refined_paths() {
+        for refinement in [false, true] {
+            for blocked in [false, true] {
+                let mut v = recording(CTY_FIXTURE);
+                if blocked {
+                    v = v.with_blocklist(Blocklist::parse("K5ARH"));
+                }
+                man531_seed_rival(&mut v, 1, "K5ARH", 4);
+                run(
+                    &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 300_000),
+                    &mut v,
+                );
+                let spots = if refinement {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5ARX", "K"], 600_000),
+                        &mut v,
+                    );
+                    let (seq, span) = word_named(&v, 1, "K5ARX");
+                    v.apply_refinement(1, seq, refined("K5ARG", span, "engine:hsmm"), 700_000)
+                } else {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 600_000),
+                        &mut v,
+                    )
+                };
+                let log = v.take_decisions();
+                let d = decisions_for(&log, "K5ARG")
+                    .last()
+                    .copied()
+                    .expect("candidate decision");
+                if blocked {
+                    assert_eq!(spots.len(), 1, "{log:?}");
+                    assert_eq!(d.verdict, Verdict::Spotted);
+                    assert!(d.rival.is_none());
+                } else {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Variant));
+                    assert_eq!(d.rival.as_ref().unwrap().call, "K5ARH");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn man531_stale_blocked_rival_is_filtered_in_fusion() {
+        for blocked in [false, true] {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            if blocked {
+                v = v.with_blocklist(Blocklist::parse("W1AX"));
+            }
+            man531_seed_rival(&mut v, 1, "W1AX", 4);
+            let spots = run(&complementary_copies(), &mut v);
+            let log = v.take_decisions();
+            let d = decisions_for(&log, "W1AW").last().copied().unwrap();
+            if blocked {
+                assert_eq!(spots.len(), 1, "{log:?}");
+                assert_eq!(d.confirmation, Some(Confirmation::Fused));
+                assert!(d.rival.is_none());
+            } else {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Variant));
+                assert_eq!(d.rival.as_ref().unwrap().call, "W1AX");
+            }
+        }
     }
 
     #[test]
