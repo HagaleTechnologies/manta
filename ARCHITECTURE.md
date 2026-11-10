@@ -702,6 +702,15 @@ sample time. See
   restart. See [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)
   for retention and `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`
   for query semantics.
+  `set/dx/filter cq`, `band <list>` and `snr <n>` (combinable, e.g.
+  `set/dx/filter cq band 40m,20m snr 10`) set a per-connection filter that
+  governs the live stream, the shutdown drain and `sh/dx`, where it selects
+  before the count is applied. A new `set/dx/filter` replaces the previous
+  one; `set/dx/filter off` or a bare `set/dx/filter` clears every filter on
+  the connection, `unique` included. `snr` compares the 500 Hz whole-dB
+  figure the row prints, and a connection with `cq` set gets
+  `SETT: vlNormal CQ ...`. Other connections are unaffected. See
+  [MAN-546](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).

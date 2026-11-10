@@ -782,6 +782,10 @@ the live-state stream only if it sets `[server].live_port`.
   `sh/dx 30m`; `[server].history_minutes` sets retained history depth
   (default 30). A bare `sh/dx` shows the last 10. See
   [history limits](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md).
+  A client can ask for CQ spots only, a band list or a minimum SNR on its
+  own connection, for example `set/dx/filter cq band 40m,20m snr 10`; the
+  SNR is the figure the row shows. See
+  [MAN-546](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
 - **JSON Lines / WebSocket stream** (`:7301`) — one full-fidelity spot
   object per line; a raw TCP client and a WebSocket client share the
   port. This is the [cqdx](https://cqdx.app) ingest surface.

@@ -24,6 +24,12 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-546: a telnet client can send `set/dx/filter cq`, `band <list>` and
+  `snr <n>` (combinable) to receive only matching spots on its own
+  connection, live and from `sh/dx`; `set/dx/filter off` clears it, and
+  `SKIMMER/SETT` reports `CQ` for a connection with the CQ filter. The SNR
+  is the 500 Hz figure the row prints. See
+  [docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
 - MAN-533: `GET /status` carries a `sources` array, one row per input
   source with `healthy`, `losses_total`, `last_loss_reason`
   (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and

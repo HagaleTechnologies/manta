@@ -298,7 +298,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:98ad81e0b364655b1039dfd6a9d62e0aacd185dfa3f31ee83c1f8a800fa937be",
+      "hash": "sha256:fc8206b042c942e3fd01916c22b13ee5baa2b2cd912eea04b0325a726bec92b3",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -317,12 +317,13 @@
         "docs/RUNBOOKS/rbn-comparison.md",
         "docs/SPOT-SCHEMA.md",
         "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
-        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
+        "docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "799379d",
-      "verified_date": "2026-10-16",
+      "verified_commit": "acbc00f",
+      "verified_date": "2026-11-10",
       "visibility": "public"
     },
     {
