@@ -537,6 +537,15 @@ receiver is still a separate, manual check.
 
 ## What each artifact contains
 
+Every binary below is built with `[profile.release]` from the root
+`Cargo.toml` (MAN-528: fat LTO, one codegen unit, `panic = "unwind"`), since
+every route runs plain `cargo build --release` or `cross build --release`.
+A change to that profile is re-measured with
+`scripts/release-profile-ab.py` and checked with
+`gh workflow run release-publish.yml --repo HagaleTechnologies/manta --ref <branch> -f publish=false`
+before approval, so the Windows static-CRT, soapy and QEMU image builds run
+under it. See [the MAN-528 record](../DECISIONS/2026-11-10-man528-release-profile.md).
+
 - **Windows** (`manta-windows-x86_64.zip`): `manta.exe`, `README.md`,
   the two license files, and the unattended-service kit listed below. The
   binary links the MSVC C runtime **statically** (MAN-65 finding 2), so it
