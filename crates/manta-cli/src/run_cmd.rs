@@ -47,6 +47,7 @@ use crate::session_epoch::session_nonce_for_replay_path;
 use crate::shutdown_runtime_after_drain;
 use crate::signal_spot_server_shutdown;
 use crate::source_health_sink;
+use crate::source_loss_sink;
 use crate::source_spec::apply_raw_iq;
 use crate::source_spec::trusted_band_notice;
 use crate::source_spec::warn_if_audio_source_has_no_rf_reference;
@@ -854,6 +855,16 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                     replay_path.is_some(),
                 ),
             })?;
+            // MAN-541: the RBN skew reading attributes every graded spot
+            // to this one input and suggests a value for its entry.
+            server
+                .metrics
+                .set_rbn_skew_inputs(vec![manta_server::metrics::RbnSkewInput {
+                    name: source_name.to_string(),
+                    entry: loaded.inputs.first().and_then(|n| n.entry.clone()),
+                    applied_ppm: resolved.freq_correction_ppm,
+                    replaced_by_flag: resolved.replaced_file_source.is_some(),
+                }]);
             // MAN-45 (round-9 finding): the daemon's own copy of the
             // gauge `manta_engine::listen_with_observers` updates as
             // it runs (on the MAIN thread, outside this tokio
@@ -1023,7 +1034,11 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             stop.clone(),
             initial_healthy,
             on_health,
-        );
+        )
+        .with_loss_sink(source_loss_sink(
+            name,
+            spot_server.as_ref().map(|server| server.metrics.clone()),
+        ));
         input_health = wrapped.input_health();
         Box::new(wrapped)
     } else {

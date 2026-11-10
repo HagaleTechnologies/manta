@@ -179,19 +179,27 @@ impl Demod {
     }
 
     /// Feed one raw envelope sample at 375 Hz; returns any runs completed by
-    /// it. SPEC §3.
+    /// it. SPEC §3. Allocates when a run completes; the decoder uses
+    /// [`Demod::push_into`] instead.
     pub fn push(&mut self, a_raw: f32, sample_ts: u64) -> Vec<Run> {
+        let mut out = Vec::new();
+        self.push_into(a_raw, sample_ts, &mut out);
+        out
+    }
+
+    /// [`Demod::push`], appending the completed runs to `out` (never read or
+    /// cleared here) so a caller can reuse one buffer across hops (MAN-117).
+    pub fn push_into(&mut self, a_raw: f32, sample_ts: u64, out: &mut Vec<Run>) {
         self.raw_ring.push_back(a_raw);
         if self.raw_ring.len() > AREF_HOPS {
             self.raw_ring.pop_front();
         }
-        let mut out = Vec::new();
         // Borrow discipline: we can't reassign self.phase while `buf` is
         // borrowed from it, so the attempt path takes ownership of the phase.
         match &mut self.phase {
             Phase::Running => {
-                self.step(a_raw, sample_ts, &mut out);
-                return out;
+                self.step(a_raw, sample_ts, out);
+                return;
             }
             Phase::Init {
                 buf,
@@ -200,7 +208,7 @@ impl Demod {
                 buf.push((a_raw, sample_ts));
                 *hops_until_attempt -= 1;
                 if *hops_until_attempt > 0 {
-                    return out;
+                    return;
                 }
             }
         }
@@ -226,7 +234,7 @@ impl Demod {
             // decoded. Only the successful window replays (decision 10).
             let start = buf.len() - INIT_HOPS;
             for &(a, ts) in &buf[start..] {
-                self.step(a, ts, &mut out);
+                self.step(a, ts, out);
             }
             // self.phase is already Running.
         } else {
@@ -239,7 +247,6 @@ impl Demod {
                 hops_until_attempt: INIT_HOPS,
             };
         }
-        out
     }
 
     /// Takes the currently-`held` run (if any), merging in `open`'s

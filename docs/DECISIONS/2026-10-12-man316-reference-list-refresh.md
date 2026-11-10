@@ -1,5 +1,7 @@
 # MAN-316: scheduled refresh of cty.dat and MASTER.SCP
 
+> **Partly superseded by MAN-536** (2026-11-09-man536-https-list-downloads.md): downloads are HTTPS by default and `https://` URLs are accepted; plain HTTP remains only for an operator-chosen `http://` mirror. Follow-up 3 is done.
+
 manta builds `cty.dat` (country prefixes: a call whose prefix it lacks is
 not spotted) and `MASTER.SCP` (known calls: a listed call gains confidence)
 into the binary. MAN-79 let an operator replace either with a local file,
@@ -135,6 +137,8 @@ its SHA-256 for a repeatable replay.
   MASTER.SCP current".
 
 ## Threat note
+
+> **Partly superseded by MAN-536** (2026-11-09-man536-https-list-downloads.md): downloads are HTTPS by default and `https://` URLs are accepted; plain HTTP remains only for an operator-chosen `http://` mirror. Follow-up 3 is done.
 
 Downloads are plain HTTP. An on-path attacker can substitute a list that
 passes the acceptance checks. The impact is bounded to what the lists

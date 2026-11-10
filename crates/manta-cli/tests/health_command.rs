@@ -367,3 +367,16 @@ fn health_tracks_a_real_daemon() {
         stderr(&o)
     );
 }
+
+/// MAN-541: a held RBN skew warning is an extra line after the checks; the
+/// verdict stays `ok`, so `manta health` prints it and exits 0.
+#[test]
+fn health_prints_a_warn_line_and_exits_0() {
+    const BODY: &str = "ok\nsource kiwi: healthy\nlistener json: up\nlistener metrics: up\n\
+                        listener telnet: up\ndecode: ok\nWARN rbn skew 20m: +3.0 ppm for 35 min \
+                        (median +42 Hz, 40 spots; limit 2 ppm)\n";
+    let (addr, _) = fake_server(http_reply("200 OK", BODY), 1);
+    let o = health_at(addr);
+    assert_eq!(o.status.code(), Some(0), "stderr: {}", stderr(&o));
+    assert_eq!(stdout(&o), BODY);
+}

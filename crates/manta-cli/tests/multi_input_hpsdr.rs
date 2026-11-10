@@ -734,6 +734,10 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         &[("80m", false), ("40m", false)],
         Duration::from_secs(20),
     );
+    // MAN-533: until this point the independent radio sends only malformed
+    // datagrams, longer than the 30 s no-usable-samples window, so it may
+    // already have been reopened; count only reopens after it delivers.
+    let independent_generations = independent.generations().len();
     independent.mode.store(1, Ordering::Relaxed);
     wait_until_progress(
         Duration::from_secs(70),
@@ -810,7 +814,7 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         1,
         "capacity is only queried initially"
     );
-    assert_eq!(independent.generations().len(), 1);
+    assert_eq!(independent.generations().len(), independent_generations);
     assert!(daemon.errors.lock().unwrap().contains("input 40m: back"));
 }
 

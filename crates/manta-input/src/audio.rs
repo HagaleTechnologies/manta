@@ -22,7 +22,7 @@
 //! of file.
 
 use crate::devices::quoted_name;
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
+use crate::stall::{NoUsableSamples, StallEpisode, SOFT_STALL_AFTER};
 use crate::IqSource;
 use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
@@ -130,13 +130,16 @@ fn wrong_rate(label: &str, native: u32) -> anyhow::Error {
     )
 }
 
-/// A live device delivered nothing for `waited`.
+/// A live device delivered nothing for `waited`. Typed as
+/// [`NoUsableSamples`] (MAN-533 D4) so the reconnect layer reports it as
+/// `no usable samples`; the text is unchanged.
 fn no_samples(label: &str, waited: Duration) -> anyhow::Error {
-    anyhow!(
+    NoUsableSamples::new(format!(
         "audio input {label} delivered no samples in {} s at {TARGET_RATE_HZ} Hz -- {}",
         waited.as_secs_f64(),
         audio_input_hint()
-    )
+    ))
+    .into()
 }
 
 /// A capture device behind a non-blocking callback ring (coppa's
@@ -570,7 +573,10 @@ mod tests {
         assert_eq!(aiq.read(&mut buf).unwrap(), 256);
         assert_eq!(aiq.read(&mut buf).unwrap(), 0);
         assert!(aiq.take_stalled());
-        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        let err = aiq.read(&mut buf).unwrap_err();
+        // MAN-533 D4: the device-loss bound carries the shared type.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(err.contains("delivered no samples in 0.3 s"), "{err}");
     }
 
@@ -592,8 +598,12 @@ mod tests {
         let mut aiq = scripted(&[], stall);
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         let started = Instant::now();
-        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        let err = aiq.read(&mut buf).unwrap_err();
         let elapsed = started.elapsed();
+        // MAN-533 scenario 2 (audio): reads succeed with nothing, and the
+        // bound ends in the shared type the reconnect layer reopens on.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(
             err.contains("delivered no samples in 0.05 s at 48000 Hz"),
             "{err}"
