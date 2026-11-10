@@ -36,14 +36,9 @@
 
 use crate::audio_capture::{CaptureRing, CAPTURE_RING_FRAMES};
 use crate::devices::quoted_name;
-<<<<<<< HEAD
 use crate::overflow::OVERFLOW_WARN_INTERVAL;
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
-use crate::{InputHealthCounters, IqSource};
-=======
 use crate::stall::{NoUsableSamples, StallEpisode, SOFT_STALL_AFTER};
-use crate::IqSource;
->>>>>>> d0f42f14c270b7168d60521b4e2d04c6503cde81
+use crate::{InputHealthCounters, IqSource};
 use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
 use manta_dsp::hilbert::HilbertTransformer;

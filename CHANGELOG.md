@@ -499,7 +499,6 @@ the git history and `docs/DECISIONS/`.
 
 ### Fixed
 
-<<<<<<< HEAD
 - MAN-530: a live audio input whose decode thread falls behind no longer
   loses samples silently. Every frame the 8192-frame (~170 ms) capture ring
   rejects is counted in `manta_input_queue_dropped_samples_total`, and each
@@ -514,7 +513,6 @@ the git history and `docs/DECISIONS/`.
   segment, so audio is never spliced across it. coppa stays pinned at
   `f8a4d16d`. File input is unchanged. See
   docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md.
-=======
 - MAN-537: the published Docker image names its release commit. Its
   `manta --version`, the JSON stream's `decoderVersion` and `/metrics`
   `manta_build_info` used to read `unknown`, because the build context has
@@ -531,7 +529,6 @@ the git history and `docs/DECISIONS/`.
   `source <name> lost: ... no usable samples ...`, reconnects on the usual
   backoff, and `manta_source_health` drops to 0, so `MantaInputDown` fires.
   See [docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md](docs/DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md).
->>>>>>> d0f42f14c270b7168d60521b4e2d04c6503cde81
 - MAN-489: every live input (Kiwi, both HPSDR protocols, grouped HPSDR,
   audio, SoapySDR; ka9q already did) now reports a stopped stream through
   `take_stalled` within 4.5 s of its last sample (SoapySDR within 1 s),
