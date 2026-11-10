@@ -1937,8 +1937,9 @@ impl Metrics {
             .fetch_add(n, Ordering::Relaxed);
     }
 
-    /// A spot was suppressed by a client's own `set dx filter unique > n`
-    /// threshold, not by a broadcast-lag disconnect. ARCHITECTURE §8:
+    /// A spot was suppressed by a client's own filter -- its `set dx filter
+    /// unique > n` threshold or its `set dx filter cq`, `band` or `snr`
+    /// clause (MAN-546) -- not by a broadcast-lag disconnect. ARCHITECTURE §8:
     /// "every dropped/evicted/suppressed item is counted" -- deliberate
     /// per-client filtering is exactly the kind of drop that would
     /// otherwise be silent (a quiet feed and heavy filtering look

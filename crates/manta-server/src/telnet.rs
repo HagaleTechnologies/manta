@@ -10,6 +10,7 @@
 
 use crate::bounded_io::{read_line_bounded_telnet, read_line_bounded_telnet_with_timeout};
 use crate::bus::{BusSpot, SpotBus};
+use crate::client_filter::SpotFilter;
 use crate::command::{self, Command, HistorySelection, QueryMode, ShowDxQuery};
 use crate::iac::IacFilter;
 use crate::metrics::Metrics;
@@ -597,7 +598,7 @@ async fn handle_client(
         }
     }
 
-    let mut min_unique: Option<u32> = None;
+    let mut filters = ConnectionFilters::default();
     // Not cleared at the top of the loop, deliberately: `tokio::select!`
     // can cancel `read_line_bounded_telnet` mid-line (a spot arrived
     // first), and the bytes it already consumed from `reader` were
@@ -635,18 +636,10 @@ async fn handle_client(
             spot = rx.recv(), if !shutdown.has_changed().unwrap_or(true) => {
                 match spot {
                     Ok(bus_spot) => {
-                        // MAN-322 D5: another mode's spot is not this
-                        // listener's to serve. Skipped before the unique
-                        // filter and not counted as a suppression: no
-                        // filter of this client's withheld it.
-                        if bus_spot.spot.mode != mode {
+                        // MAN-322 D5 mode check, then this client's own
+                        // filters (MAN-546); see `admits_live`.
+                        if !filters.admits_live(&bus_spot, mode, &metrics) {
                             continue;
-                        }
-                        if let Some(min) = min_unique {
-                            if bus_spot.occurrence_count <= min {
-                                metrics.record_filter_suppressed(1);
-                                continue; // below threshold: filtered out
-                            }
                         }
                         if write_spot_line(&mut wr, &bus, &profile.call, &bus_spot.spot, line_format)
                             .await
@@ -796,7 +789,10 @@ async fn handle_client(
                         // first, entirely off-socket; only the selected
                         // entries reach the loop below. Entries the query
                         // didn't ask for are outside the result, not lost
-                        // spots, so nothing is counted for them.
+                        // spots, so nothing is counted for them. The
+                        // connection's cq/band/snr filter (MAN-546) joins
+                        // that selection, before count truncation, and
+                        // its non-matches are likewise uncounted.
                         //
                         // Apply the SAME `min_unique` predicate the live
                         // stream uses -- a spot suppressed live must stay
@@ -808,7 +804,8 @@ async fn handle_client(
                         // AFTER count selection, without backfilling, as
                         // before MAN-92.
                         let mut history =
-                            select_history_at(&bus, &query, unix_now_secs(), mode).into_iter();
+                            select_history_at(&bus, &query, unix_now_secs(), mode, &filters.spot)
+                                .into_iter();
                         loop {
                             // MAN-45 remediate (round-16 P1, finding 2):
                             // checked BEFORE pulling the next history
@@ -876,7 +873,7 @@ async fn handle_client(
                             let Some(bus_spot) = history.next() else {
                                 break;
                             };
-                            if let Some(min) = min_unique {
+                            if let Some(min) = filters.min_unique {
                                 if bus_spot.occurrence_count <= min {
                                     metrics.record_filter_suppressed(1);
                                     continue;
@@ -941,31 +938,22 @@ async fn handle_client(
                         }
                     }
                     Command::SetFilterUnique { min } => {
-                        min_unique = Some(min);
-                        if write_with_timeout(
-                            &mut wr,
-                            format!("Filter set: unique > {min}\r\n").as_bytes(),
-                        )
-                        .await
-                        .is_err()
-                        {
-                            // A bare `?` here (the prior behavior) left
-                            // whatever's queued on the live channel
-                            // abandoned uncounted -- the same accounting
-                            // gap every other write site in this file
-                            // already closed (round-15 review finding).
-                            // The failed write itself isn't a queued spot,
-                            // so only the retained live-channel backlog
-                            // counts here (no `1 +`).
-                            // MAN-59 review round 2: returns Ok(()), not
-                            // Err -- log it directly.
-                            if log_enabled {
-                                tracing::warn!("telnet: filter-ack write failed, disconnecting");
-                            }
-                            metrics.record_write_failed(crate::metrics::abandoned_spot_count(
-                                false,
-                                rx.len(),
-                            ));
+                        filters.min_unique = Some(min);
+                        if !write_filter_ack(&mut wr, &format!("unique > {min}"), &rx, &metrics, log_enabled).await {
+                            return Ok(());
+                        }
+                    }
+                    Command::SetSpotFilter(spot_filter) => {
+                        // MAN-546 D2: replaces the whole cq/band/snr
+                        // filter; `unique` is independent.
+                        filters.spot = spot_filter;
+                        if !write_filter_ack(&mut wr, &spot_filter.to_string(), &rx, &metrics, log_enabled).await {
+                            return Ok(());
+                        }
+                    }
+                    Command::ClearFilters => {
+                        filters = ConnectionFilters::default();
+                        if !write_filter_ack(&mut wr, "off", &rx, &metrics, log_enabled).await {
                             return Ok(());
                         }
                     }
@@ -974,12 +962,18 @@ async fn handle_client(
                         // no spots forwarded. Uses the same write-failure
                         // accounting every other write site in this loop
                         // uses.
-                        if write_with_timeout(
-                            &mut wr,
-                            format!("{}\r\n", profile.sett).as_bytes(),
-                        )
-                        .await
-                        .is_err()
+                        //
+                        // MAN-546 D8: the reply reports this connection's
+                        // own CQ filter. Every other field, and the reply
+                        // of a connection with no filter, is the station
+                        // profile's.
+                        let sett = crate::sett::SettSettings {
+                            cq_only: profile.sett.cq_only || filters.spot.cq_only,
+                            ..profile.sett.clone()
+                        };
+                        if write_with_timeout(&mut wr, format!("{sett}\r\n").as_bytes())
+                            .await
+                            .is_err()
                         {
                             if log_enabled {
                                 tracing::warn!("telnet: SETT reply write failed, disconnecting");
@@ -1070,16 +1064,12 @@ async fn handle_client(
                 loop {
                     match rx.try_recv() {
                         Ok(bus_spot) => {
-                            // MAN-322 D5: the drain serves this listener's
-                            // mode only, as the live arm does.
-                            if bus_spot.spot.mode != mode {
+                            // The drain serves this listener's mode and
+                            // this client's filters only, as the live arm
+                            // does (MAN-322 D5, MAN-546). A filtered spot
+                            // costs no budget.
+                            if !filters.admits_live(&bus_spot, mode, &metrics) {
                                 continue;
-                            }
-                            if let Some(min) = min_unique {
-                                if bus_spot.occurrence_count <= min {
-                                    metrics.record_filter_suppressed(1);
-                                    continue; // a filtered spot costs no budget
-                                }
                             }
                             // Checked BEFORE the write, not around it: this
                             // spot has already left `rx`, so a `timeout`
@@ -1159,6 +1149,7 @@ fn select_history_at(
     query: &ShowDxQuery,
     now_unix_secs: i64,
     listener_mode: SpotMode,
+    spot_filter: &SpotFilter,
 ) -> Vec<BusSpot> {
     // MAN-322 D5: a mode word intersects with the listener's own mode, so
     // naming the other mode selects nothing. It still never filters the
@@ -1170,29 +1161,94 @@ fn select_history_at(
     if query_mode.is_some_and(|m| m != listener_mode) {
         return Vec::new();
     }
-    let in_band = |entry: &BusSpot| {
+    // MAN-546 D6: the connection's cq/band/snr filter is one more
+    // selector, so `sh/dx N` means N matching rows. It takes no lock, so it
+    // is safe inside `select_recent`'s `keep`.
+    let wanted = |entry: &BusSpot| {
         entry.spot.mode == listener_mode
             && query
                 .band
                 .is_none_or(|band| crate::band::band_for_freq_hz(entry.spot.freq_hz) == band)
+            && spot_filter.passes(&entry.spot)
     };
     match query.selection {
-        HistorySelection::Count(n) => {
-            bus.select_recent(in_band, n.unwrap_or(DEFAULT_SHOW_DX_COUNT))
-        }
+        HistorySelection::Count(n) => bus.select_recent(wanted, n.unwrap_or(DEFAULT_SHOW_DX_COUNT)),
         // An explicit zero-minute window selects nothing, like `sh/dx 0`.
         HistorySelection::Window { secs: 0 } => Vec::new(),
         HistorySelection::Window { secs } => {
             let oldest = now_unix_secs.saturating_sub(secs).max(0);
             bus.select_recent(
                 |entry| {
-                    in_band(entry)
+                    wanted(entry)
                         && (oldest..=now_unix_secs).contains(&bus.unix_ts_for(entry.spot.sample_ts))
                 },
                 usize::MAX,
             )
         }
     }
+}
+
+/// One connection's persistent filters. A local of `handle_client`, so no
+/// other connection can see or change it (MAN-546 scenario 3).
+#[derive(Debug, Clone, Copy, Default)]
+struct ConnectionFilters {
+    /// `set dx filter cq`, `band <list>`, `snr <n>` (MAN-546).
+    spot: SpotFilter,
+    /// `set dx filter unique > n` (MAN-12).
+    min_unique: Option<u32>,
+}
+
+impl ConnectionFilters {
+    /// Whether the live arm or the shutdown drain writes `bus_spot`.
+    ///
+    /// MAN-322 D5: another mode's spot is not this listener's to serve. It
+    /// is skipped first and not counted as a suppression, because no filter
+    /// of this client's withheld it. Then this client's cq/band/snr filter
+    /// and its `unique` threshold: a spot either withholds counts once in
+    /// `manta_spots_suppressed_by_filter_total`, never twice.
+    fn admits_live(&self, bus_spot: &BusSpot, mode: SpotMode, metrics: &Metrics) -> bool {
+        if bus_spot.spot.mode != mode {
+            return false;
+        }
+        let withheld = !self.spot.passes(&bus_spot.spot)
+            || self
+                .min_unique
+                .is_some_and(|min| bus_spot.occurrence_count <= min);
+        if withheld {
+            metrics.record_filter_suppressed(1);
+        }
+        !withheld
+    }
+}
+
+/// Writes a `Filter set: <ack>` line. On failure, logs it and counts the
+/// live-channel backlog as abandoned, then returns `false`: the caller
+/// disconnects with `Ok(())`.
+///
+/// A bare `?` here (the prior behavior) left whatever's queued on the live
+/// channel abandoned uncounted -- the same accounting gap every other write
+/// site in this file already closed (round-15 review finding). The failed
+/// write itself isn't a queued spot, so only the retained live-channel
+/// backlog counts here (no `1 +`). MAN-59 review round 2: the caller
+/// returns Ok(()), not Err, so this logs directly.
+async fn write_filter_ack(
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    ack: &str,
+    rx: &broadcast::Receiver<BusSpot>,
+    metrics: &Metrics,
+    log_enabled: bool,
+) -> bool {
+    if write_with_timeout(wr, format!("Filter set: {ack}\r\n").as_bytes())
+        .await
+        .is_ok()
+    {
+        return true;
+    }
+    if log_enabled {
+        tracing::warn!("telnet: filter-ack write failed, disconnecting");
+    }
+    metrics.record_write_failed(crate::metrics::abandoned_spot_count(false, rx.len()));
+    false
 }
 
 fn unix_now_secs() -> i64 {
@@ -1262,6 +1318,8 @@ fn command_description(command: &Command) -> String {
             text
         }
         Command::SetFilterUnique { min } => format!("set dx filter unique > {min}"),
+        Command::SetSpotFilter(filter) => format!("set dx filter {filter}"),
+        Command::ClearFilters => "set dx filter off".into(),
         Command::Sett => "SKIMMER/SETT".into(),
         Command::Bye => "BYE".into(),
         Command::ShowVersion => "sh/version".into(),
@@ -1302,6 +1360,15 @@ mod tests {
                 Command::SetFilterUnique { min: 2 },
                 "set dx filter unique > 2",
             ),
+            (
+                Command::SetSpotFilter(SpotFilter {
+                    cq_only: true,
+                    bands: forty_twenty(),
+                    min_snr_db: Some(10),
+                }),
+                "set dx filter cq band 40m,20m snr 10",
+            ),
+            (Command::ClearFilters, "set dx filter off"),
             (Command::Sett, "SKIMMER/SETT"),
             (Command::Bye, "BYE"),
             (Command::ShowVersion, "sh/version"),
@@ -1363,10 +1430,195 @@ mod tests {
     const TWENTY: f64 = 14_027_100.0;
     const FORTY: f64 = 7_027_000.0;
 
+    fn band_set(names: &[&str]) -> crate::client_filter::BandSet {
+        let mut set = crate::client_filter::BandSet::default();
+        for name in names {
+            set.insert(
+                crate::band::allocations()
+                    .iter()
+                    .position(|(n, _, _)| n == name)
+                    .expect("allocation name"),
+            );
+        }
+        set
+    }
+
+    fn forty_twenty() -> crate::client_filter::BandSet {
+        band_set(&["40m", "20m"])
+    }
+
+    fn suppressed(metrics: &Metrics) -> u64 {
+        let text = metrics.render_prometheus_text();
+        text.lines()
+            .find_map(|line| line.strip_prefix("manta_spots_suppressed_by_filter_total "))
+            .expect("counter line")
+            .trim()
+            .parse()
+            .expect("counter value")
+    }
+
+    /// MAN-546 D7: one helper decides for the live arm and the drain. The
+    /// mode check is uncounted (MAN-322 D5); a spot this client's own
+    /// filters withhold counts exactly once, even when both would.
+    #[test]
+    fn connection_filters_admit_live_spots_and_count_each_rejection_once() {
+        let metrics = Metrics::new();
+        let filters = ConnectionFilters {
+            spot: SpotFilter {
+                cq_only: true,
+                ..SpotFilter::default()
+            },
+            min_unique: Some(1),
+        };
+        let bus_spot = |spot: Spot, occurrence_count| BusSpot {
+            spot,
+            occurrence_count,
+        };
+        let cq = heard("K1CQ", TWENTY, 0);
+        let de = Spot {
+            spot_type: SpotType::De,
+            ..heard("K1DE", TWENTY, 0)
+        };
+        let rtty = Spot {
+            mode: SpotMode::Rtty,
+            ..cq.clone()
+        };
+
+        assert!(!filters.admits_live(&bus_spot(rtty, 5), SpotMode::Cw, &metrics));
+        assert_eq!(suppressed(&metrics), 0, "another mode is not a suppression");
+
+        assert!(!filters.admits_live(&bus_spot(de.clone(), 5), SpotMode::Cw, &metrics));
+        assert_eq!(suppressed(&metrics), 1, "the spot filter withheld it");
+
+        assert!(!filters.admits_live(&bus_spot(cq.clone(), 1), SpotMode::Cw, &metrics));
+        assert_eq!(suppressed(&metrics), 2, "unique withheld it");
+
+        assert!(!filters.admits_live(&bus_spot(de, 1), SpotMode::Cw, &metrics));
+        assert_eq!(suppressed(&metrics), 3, "both withheld it: counted once");
+
+        assert!(filters.admits_live(&bus_spot(cq, 2), SpotMode::Cw, &metrics));
+        assert_eq!(suppressed(&metrics), 3, "a passing spot is not counted");
+    }
+
+    /// MAN-546 D6: the connection's filter selects before count
+    /// truncation, so `sh/dx 5` means five matching rows.
+    #[test]
+    fn the_spot_filter_selects_before_count_truncation() {
+        let bus = selector_bus();
+        for i in 0..5 {
+            bus.publish(heard(&format!("K{i}FT"), FORTY, i));
+        }
+        for i in 5..15 {
+            bus.publish(heard(&format!("K{i}TW"), TWENTY, i));
+        }
+        let forty = SpotFilter {
+            bands: band_set(&["40m"]),
+            ..SpotFilter::default()
+        };
+        let five = q(HistorySelection::Count(Some(5)), None, None);
+        assert_eq!(
+            calls(&select_history_at(&bus, &five, 0, SpotMode::Cw, &forty)),
+            ["K0FT", "K1FT", "K2FT", "K3FT", "K4FT"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &five,
+                0,
+                SpotMode::Cw,
+                &SpotFilter::default()
+            )),
+            ["K10TW", "K11TW", "K12TW", "K13TW", "K14TW"]
+        );
+    }
+
+    #[test]
+    fn a_persistent_band_and_a_query_band_intersect() {
+        let bus = selector_bus();
+        bus.publish(heard("K1FT", FORTY, 0));
+        bus.publish(heard("K1TW", TWENTY, 1));
+        let forty = SpotFilter {
+            bands: band_set(&["40m"]),
+            ..SpotFilter::default()
+        };
+        assert!(select_history_at(
+            &bus,
+            &q(HistorySelection::Count(None), Some("20m"), None),
+            0,
+            SpotMode::Cw,
+            &forty
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_spot_filter_applies_inside_a_minutes_window() {
+        let bus = selector_bus();
+        let de = |call: &str, secs| Spot {
+            spot_type: SpotType::De,
+            ..heard(call, TWENTY, secs)
+        };
+        bus.publish(heard("K1OLD", TWENTY, 0)); // CQ, outside the window
+        bus.publish(heard("K1EDG", TWENTY, 60)); // CQ, on the oldest bound
+        bus.publish(de("K1DEA", 70));
+        bus.publish(heard("K1MID", TWENTY, 90));
+        bus.publish(de("K1DEB", 100));
+        bus.publish(heard("K1NOW", TWENTY, 120)); // CQ, on the newest bound
+        bus.publish(heard("K1FUT", TWENTY, 121)); // CQ, in the future
+        let now = SELECTOR_EPOCH_SECS + 120;
+        let cq = SpotFilter {
+            cq_only: true,
+            ..SpotFilter::default()
+        };
+        let window = q(HistorySelection::Window { secs: 60 }, None, None);
+        assert_eq!(
+            calls(&select_history_at(&bus, &window, now, SpotMode::Cw, &cq)),
+            ["K1EDG", "K1MID", "K1NOW"]
+        );
+        assert_eq!(
+            calls(&select_history_at(
+                &bus,
+                &window,
+                now,
+                SpotMode::Cw,
+                &SpotFilter::default()
+            )),
+            ["K1EDG", "K1DEA", "K1MID", "K1DEB", "K1NOW"]
+        );
+    }
+
+    #[test]
+    fn the_spot_filter_does_not_widen_the_listener_mode() {
+        let bus = selector_bus();
+        for i in 0..3 {
+            bus.publish(heard(&format!("K{i}CW"), TWENTY, i));
+        }
+        for selection in [
+            HistorySelection::Count(None),
+            HistorySelection::Window { secs: i64::MAX },
+        ] {
+            assert!(select_history_at(
+                &bus,
+                &q(selection, None, None),
+                SELECTOR_EPOCH_SECS + 10,
+                SpotMode::Rtty,
+                &SpotFilter::default()
+            )
+            .is_empty());
+        }
+    }
+
     #[test]
     fn legacy_count_selection_returns_the_newest_entries_oldest_first() {
         let bus = selector_bus();
-        assert!(select_history_at(&bus, &ShowDxQuery::DEFAULT, 0, SpotMode::Cw).is_empty());
+        assert!(select_history_at(
+            &bus,
+            &ShowDxQuery::DEFAULT,
+            0,
+            SpotMode::Cw,
+            &SpotFilter::default()
+        )
+        .is_empty());
         for i in 0..15 {
             bus.publish(heard(&format!("K{i}AA"), TWENTY, i));
         }
@@ -1376,7 +1628,8 @@ mod tests {
                 &bus,
                 &ShowDxQuery::DEFAULT,
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             expected_default
         );
@@ -1385,7 +1638,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Count(Some(3)), None, None),
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K12AA", "K13AA", "K14AA"]
         );
@@ -1393,7 +1647,8 @@ mod tests {
             &bus,
             &q(HistorySelection::Count(Some(0)), None, None),
             0,
-            SpotMode::Cw
+            SpotMode::Cw,
+            &SpotFilter::default()
         )
         .is_empty());
         assert_eq!(
@@ -1401,7 +1656,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Count(Some(1000)), None, None),
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )
             .len(),
             15
@@ -1424,7 +1680,8 @@ mod tests {
                     &bus,
                     &q(selection, None, None),
                     SELECTOR_EPOCH_SECS + 600,
-                    SpotMode::Cw
+                    SpotMode::Cw,
+                    &SpotFilter::default()
                 )),
                 expected
             );
@@ -1434,7 +1691,8 @@ mod tests {
                 &bus,
                 &ShowDxQuery::DEFAULT,
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             expected[590..]
         );
@@ -1452,7 +1710,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Count(Some(usize::MAX)), None, None),
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             expected
         );
@@ -1480,7 +1739,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Count(Some(2)), Some("20m"), None),
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K2BBB", "K3CCC"]
         );
@@ -1493,7 +1753,8 @@ mod tests {
                     Some(QueryMode::Cw)
                 ),
                 0,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K1AAA", "K2BBB", "K3CCC"]
         );
@@ -1501,7 +1762,8 @@ mod tests {
             &bus,
             &q(HistorySelection::Count(None), Some("15m"), None),
             0,
-            SpotMode::Cw
+            SpotMode::Cw,
+            &SpotFilter::default()
         )
         .is_empty());
     }
@@ -1526,6 +1788,7 @@ mod tests {
                 &q(HistorySelection::Count(None), Some(name), None),
                 0,
                 SpotMode::Cw,
+                &SpotFilter::default(),
             ))
             .into_iter()
             .map(str::to_string)
@@ -1560,14 +1823,21 @@ mod tests {
         let now = SELECTOR_EPOCH_SECS + 1_000;
         let one_minute = q(HistorySelection::Window { secs: 60 }, None, None);
         assert_eq!(
-            calls(&select_history_at(&bus, &one_minute, now, SpotMode::Cw)),
+            calls(&select_history_at(
+                &bus,
+                &one_minute,
+                now,
+                SpotMode::Cw,
+                &SpotFilter::default()
+            )),
             ["K1NOW", "K1EDGE", "K1MID"]
         );
         assert!(select_history_at(
             &bus,
             &q(HistorySelection::Window { secs: 0 }, None, None),
             now,
-            SpotMode::Cw
+            SpotMode::Cw,
+            &SpotFilter::default()
         )
         .is_empty());
         assert_eq!(
@@ -1575,7 +1845,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Window { secs: i64::MAX }, None, None),
                 now,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K1NOW", "K1EDGE", "K1STALE", "K1MID"]
         );
@@ -1593,7 +1864,8 @@ mod tests {
                 &bus,
                 &q(HistorySelection::Window { secs: 600 }, None, None),
                 now,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )
             .len(),
             15
@@ -1613,7 +1885,8 @@ mod tests {
                 &bus,
                 &q(window, None, None),
                 now,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K2NEW", "W3NEW"]
         );
@@ -1622,7 +1895,8 @@ mod tests {
                 &bus,
                 &q(window, Some("20m"), Some(QueryMode::Cw)),
                 now,
-                SpotMode::Cw
+                SpotMode::Cw,
+                &SpotFilter::default()
             )),
             ["K2NEW"]
         );
@@ -1659,14 +1933,21 @@ mod tests {
                         &bus,
                         &q(selection, None, word),
                         now,
-                        listener
+                        listener,
+                        &SpotFilter::default()
                     )),
                     expected,
                     "{listener:?} listener, mode word {word:?}, {selection:?}"
                 );
             }
             for word in [None, Some(QueryMode::Cw)] {
-                let cw = select_history_at(&bus, &q(selection, None, word), now, SpotMode::Cw);
+                let cw = select_history_at(
+                    &bus,
+                    &q(selection, None, word),
+                    now,
+                    SpotMode::Cw,
+                    &SpotFilter::default(),
+                );
                 assert!(
                     cw.iter().all(|e| e.spot.mode == SpotMode::Cw),
                     "{selection:?}"
@@ -1675,7 +1956,13 @@ mod tests {
             }
         }
         // Ten CW rows by default, none of them displaced by the RTTY entry.
-        let cw_default = select_history_at(&bus, &ShowDxQuery::DEFAULT, now, SpotMode::Cw);
+        let cw_default = select_history_at(
+            &bus,
+            &ShowDxQuery::DEFAULT,
+            now,
+            SpotMode::Cw,
+            &SpotFilter::default(),
+        );
         let expected: Vec<String> = (2..12).map(|i| format!("K{i}CW")).collect();
         assert_eq!(calls(&cw_default), expected);
     }

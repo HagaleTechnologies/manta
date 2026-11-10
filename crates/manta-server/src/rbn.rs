@@ -141,6 +141,13 @@ const TYPE_START_OFFSET: usize = 16;
 /// column 71, the column MAN-88 exists to restore.
 const TIME_START_OFFSET: usize = 24;
 
+/// The whole-dB SNR a telnet or uplink row prints for a 2500 Hz-referenced
+/// `snr_db`: the 500 Hz figure, rounded. MAN-546's `set/dx/filter snr <n>`
+/// compares against this number, so a row reading `10 dB` passes `snr 10`.
+pub fn wire_snr_db(snr_db: f32) -> i32 {
+    (snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32
+}
+
 /// Renders one spot as a fixed-column AK1A `DX de` cluster line, e.g.
 /// `DX de W3XYZ-#:  14027.10  JA1ABC         CW    30 dB  28 WPM  CQ      0312Z`.
 ///
@@ -187,7 +194,7 @@ pub fn format_line(
             LineFormat::Rbn => spot.mode.label(),
             LineFormat::Skimmer => "",
         },
-        snr_db: (spot.snr_db + RBN_REF_BW_CORRECTION_DB).round() as i32,
+        snr_db: wire_snr_db(spot.snr_db),
         speed: match spot.mode {
             SpotMode::Cw => Some((spot.wpm.round() as i32, "WPM")),
             SpotMode::Rtty => spot.baud.map(|b| (b.round() as i32, "BPS")),
@@ -394,6 +401,18 @@ mod tests {
     /// Returns the 1-indexed column `needle` starts at.
     fn col_of(line: &str, needle: &str) -> usize {
         line.find(needle).expect("field missing from line") + 1
+    }
+
+    #[test]
+    fn wire_snr_db_is_the_figure_the_row_prints() {
+        // Measured at acbc00f: 2.5 dB (2500 Hz) prints `9 dB`, 2.9 prints `10 dB`.
+        for (snr_db, wire) in [(2.5, 9), (2.9, 10), (3.0, 10), (23.0, 30), (-20.0, -13)] {
+            assert_eq!(wire_snr_db(snr_db), wire, "{snr_db}");
+            let mut spot = capture_spot();
+            spot.snr_db = snr_db;
+            let row = format_line(&spot, "S53A", 0, LineFormat::Rbn);
+            assert!(row.contains(&format!(" {wire} dB")), "{row:?}");
+        }
     }
 
     #[test]
