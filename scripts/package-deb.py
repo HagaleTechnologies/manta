@@ -225,9 +225,6 @@ def build(args):
     debver = debian_version(args.version)
     if "/" in args.artifact or args.artifact in ("", ".", ".."):
         raise UsageError(f"--artifact {args.artifact!r} must be one path component")
-    dpkg_deb = shutil.which("dpkg-deb")
-    if not dpkg_deb:
-        raise InputError("package-deb: dpkg-deb not found; build Debian packages on Debian or Ubuntu")
     os.makedirs(args.out_dir, exist_ok=True)
     final = os.path.join(args.out_dir, f"{args.artifact}.deb")
     partial = os.path.join(args.out_dir, f".{args.artifact}.deb.partial")
@@ -235,6 +232,10 @@ def build(args):
         stage_dir = os.path.join(tmp, "manta")
         os.mkdir(stage_dir)
         stage(stage_dir, args, arch, debver)
+        # Inputs are checked before the tool, so a bad input is reported the same way on every OS.
+        dpkg_deb = shutil.which("dpkg-deb")
+        if not dpkg_deb:
+            raise InputError("package-deb: dpkg-deb not found; build Debian packages on Debian or Ubuntu")
         try:
             proc = subprocess.run(
                 [dpkg_deb, "--root-owner-group", "-Zxz", "--build", stage_dir, partial],
