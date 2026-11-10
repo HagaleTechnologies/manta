@@ -323,15 +323,10 @@ pub trait IqSource {
     /// discard whole packets on the wire (MAN-56). Returns `None` (the
     /// default) for sources with no such failure mode -- a file has no
     /// packets. KiwiSDR counts SND `seq` gaps and short frames (MAN-128);
-<<<<<<< HEAD
     /// ka9q-radio counts RTP sequence gaps and malformed datagrams (MAN-140);
-    /// SoapySDR counts driver overflow read errors (MAN-233); audio
-    /// currently counts nothing of the kind. A caller with
-=======
     /// SoapySDR counts driver overflow read errors (MAN-233); a live audio
     /// device counts frames its capture ring drops as queue-dropped samples
     /// and loss episodes as gaps (MAN-530). A caller with
->>>>>>> acbc00f0745e2b1146f7fecf1745abb9ac3eeb6b
     /// `Some(handle)` may keep polling it after the
     /// source itself has been moved into `manta_engine::listen`, which is
     /// the whole reason this is a shared handle rather than a `&self`

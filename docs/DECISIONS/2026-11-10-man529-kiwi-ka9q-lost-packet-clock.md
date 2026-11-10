@@ -82,9 +82,18 @@ and 4,097, exactly the 12,289 of one three-frame gap. When a loss is
 detected every output sample already produced is pre-loss, so the mark is
 never behind what has been delivered.
 
-**D6. Each tracker's existing window bounds one report.** Kiwi: 65,536
-frames (`MAX_PLAUSIBLE_SEQ_JUMP`), 46.6 min at 12 kHz. ka9q: the count comes
-from the RTP timestamp, `(ts - last_ts) - last_len` with wrapping arithmetic.
+**D6. Each tracker's existing window bounds one report.** Kiwi: a `seq`
+jump of at most 65,536 (`MAX_PLAUSIBLE_SEQ_JUMP`), so at most 65,535 lost
+frames, each sized as the last valid non-empty frame (else the arriving
+frame, as D4 says). That is 46.6 min for real 512-pair frames at 12 kHz.
+Frame size and rate come from the receiver: a frame may carry up to 16,379
+pairs (the 64 KiB `MAX_WS_FRAME_BYTES` cap) and the rate may be as low as
+1000 Hz. One report can therefore reach about 24.8 h with maximal frames at
+12 kHz, about 9.3 h with 512-pair frames at 1000 Hz, and about 12.4 days with
+maximal frames at 1000 Hz. The window bounds one report only: the tracker
+re-baselines after each gap, so every further jump adds its own. ka9q: the
+count comes from the RTP timestamp, `(ts - last_ts) - last_len` with wrapping
+arithmetic.
 RFC 3550 section 5.1 and RFC 3551 section 4.1 define the RTP clock as one tick
 per sampling instant, which for 2-channel IQ is one tick per complex sample.
 The count is used when it is at least one sample per lost packet and at most
@@ -116,10 +125,16 @@ within 4 samples.
 
 ## Accepted risks
 
-- A hostile or broken KiwiSDR can move the spot clock by up to 46.6 min with
-  one frame, where before it could not move it at all. MAN-275 already trusts
-  the IQ stream at face value, and the counters already accepted the same
-  window.
+- A hostile or broken KiwiSDR can move the spot clock with each `seq` jump,
+  where before it could not move it at all. With real 512-pair frames at
+  12 kHz one jump moves it at most 46.6 min. Lost frames are sized from the
+  last valid non-empty frame (else the arriving one), so a receiver that sends
+  maximal 64 KiB frames (16,379 pairs) can move it about 24.8 h per jump at
+  12 kHz. A low negotiated rate scales that up: at the 1000 Hz minimum, about
+  9.3 h with 512-pair frames and about 12.4 days with maximal ones. Successive
+  jumps add up with no total bound. MAN-275 already trusts the IQ stream at
+  face value, and the counters already accepted the same
+  `MAX_PLAUSIBLE_SEQ_JUMP` window.
 - A recording still does not carry a spliced loss. A replay of a recorded
   lossy KiwiSDR or ka9q-radio session splices short losses and stamps later
   spots early, as it already does for HPSDR protocol 2. A loss of 0.5 s or
