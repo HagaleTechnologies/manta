@@ -1557,7 +1557,7 @@ mod tests {
     /// MAN-529: streams SND frames `0..frames` at `rate`, omitting the `seq`
     /// values in `skip` (and sending `Malformed` in place of those in
     /// `malformed`), with a pulse in each frame of `pulses`. Reads until the
-    /// (shortened) soft stall's first `Ok(0)`, measuring the centroid
+    /// (shortened, 1.5 s) soft stall's first `Ok(0)`, measuring the centroid
     /// inside each `windows` entry (centre, half-width) of output indices.
     fn run_lossy_kiwi(
         rate: &'static str,
@@ -1568,7 +1568,10 @@ mod tests {
         windows: &[(u64, u64)],
     ) -> LossRun {
         let (mut src, tx, server) = scripted_kiwi_at(rate);
-        src.stall = StallEpisode::new(Duration::from_millis(400));
+        // Every frame is queued up front, so the first soft stall is the
+        // end of the stream. 1.5 s leaves room for a loaded CI scheduler
+        // (the hard bound is 10 s).
+        src.stall = StallEpisode::new(Duration::from_millis(1_500));
         for seq in 0..frames {
             if malformed.contains(&seq) {
                 tx.send(FakeOp::Malformed).unwrap();
