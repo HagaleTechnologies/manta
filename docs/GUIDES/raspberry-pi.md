@@ -108,6 +108,14 @@ For a USB SDR, also install `libsoapysdr-dev` and build with
 `cargo build --release -p manta-cli --features soapy`. Keep this source
 checkout for the config and service files used below.
 
+The release build optimises the whole program in its last step, which needs
+about 1.5 GB of free memory and takes several minutes on a Pi 4. On a board
+with 2 GB or less, install from the release archive above, or build with
+`CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 cargo build --release -p manta-cli`,
+which needs about 0.9 GB and makes a larger binary that decodes the same way
+(MAN-528; the measurements are in the source checkout's
+`docs/DECISIONS/2026-11-10-man528-release-profile.md`).
+
 ## 3. Configure your receiver
 
 ```sh

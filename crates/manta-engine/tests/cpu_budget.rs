@@ -310,3 +310,29 @@ fn cpu_budget_mac_under_half_core() {
         );
     }
 }
+
+/// MAN-528: writes this harness's scene (`cpu_budget_scene`) to
+/// `$MANTA_CPU_BUDGET_SCENE_DIR/cpu_budget.wav` plus its `cpu_budget.json`
+/// sidecar, so `scripts/release-profile-ab.py` can time the shipped
+/// `manta decode` binary (with its default config, not this file's
+/// `PipelineConfig`) on the MAN-49 scene. With the variable
+/// unset it writes nothing and passes, so the runbook's `-- --ignored` run
+/// of this file behaves as before.
+#[test]
+#[ignore]
+fn write_cpu_budget_scene() {
+    let Some(dir) = std::env::var_os("MANTA_CPU_BUDGET_SCENE_DIR") else {
+        println!("write_cpu_budget_scene: MANTA_CPU_BUDGET_SCENE_DIR is unset; nothing written");
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).expect("create scene dir");
+    let (iq, fs, center_freq_hz, _cfg) = cpu_budget_scene();
+    let wav = manta_testkit::wav::write_fixture(&dir, "cpu_budget", &iq, fs, center_freq_hz)
+        .expect("write scene");
+    println!(
+        "write_cpu_budget_scene: {} ({} samples at {fs} S/s)",
+        wav.display(),
+        iq.len()
+    );
+}

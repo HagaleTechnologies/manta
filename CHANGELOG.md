@@ -434,6 +434,14 @@ the git history and `docs/DECISIONS/`.
 
 ### Changed
 
+- MAN-528: release binaries are built with `lto = "fat"` and
+  `codegen-units = 1`, about 32% smaller (25,486,488 to 17,229,944 bytes on
+  x86_64 Linux), with byte-identical decode output and no measurable speed
+  change on x86_64. A Pi 4 has not been measured. `panic` stays `unwind`.
+  A clean release build uses about 23% more CPU and its final link needs
+  about 1.5 GB. See
+  [docs/DECISIONS/2026-11-10-man528-release-profile.md](docs/DECISIONS/2026-11-10-man528-release-profile.md).
+
 - MAN-536: `[spot].refresh_lists` downloads cty.dat and MASTER.SCP over
   HTTPS by default. `cty_url` and `scp_url` default to `https://` URLs,
   verified against the CA roots built into manta. `http://` stays accepted
