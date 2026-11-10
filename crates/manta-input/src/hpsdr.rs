@@ -394,9 +394,9 @@ impl GapDetector {
 /// Loss/reorder/malformed-packet counters for a device stream -- the
 /// HPSDR-facing snapshot of the shared `InputHealthCounters` handle
 /// (`GapDetector::counters`), which `manta-cli` polls into
-/// `manta_server::metrics::Metrics::set_input_health` (MAN-56). The
-/// *audio ring-overrun* deviation documented in `manta-engine::soak` is a
-/// different, still-open gap -- unrelated to these packet-level counters.
+/// `manta_server::metrics::Metrics::set_input_health` (MAN-56). Audio
+/// capture-ring overruns are counted separately, through the same shared
+/// handle's queue-dropped and gap counters (MAN-530).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GapStats {
     pub dropped_packets: u64,

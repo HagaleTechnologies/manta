@@ -252,6 +252,8 @@ the text report.
 | `distinctChars` | integer | never | Distinct decoded characters, prosigns left out. |
 | `spotsConfirmed` | integer | never | Validated spots. |
 | `badSamples` | integer | never | Input samples replaced with silence. Omitted when 0. |
+| `queueDroppedSamples` | integer | never | Samples this doctor run's input dropped from its capture queue, startup calibration included: for live audio, frames the capture ring rejected because reading fell behind (MAN-530). Measured over this invocation's own capture, never a running daemon's totals. The text report's `input:` line. Omitted when 0, and for a source with no health counters (a file). |
+| `inputGapsDetected` | integer | never | Input gaps this doctor run's source detected, startup calibration included: for live audio, contiguous runs of rejected frames; for other live sources, their own gap events (packet-sequence gaps, SoapySDR overflows). Measured over this invocation only. Omitted when 0, and for a source with no health counters. |
 | `inputConditioning` | object | never | What the input-conditioning chain observed (MAN-495): doctor runs every stage that is not `apply` as `observe`, so the object is always present when a receiver ran. The `impulse` and `dc` stage objects, `spans` and `spansDropped` are the decode `inputConditioning` shape; `dc.overChannelNoiseDb` is doctor-only (the offset's level over the median channel noise floor). Omitted in checks-only output, where no receiver ran. |
 | `verdict` | string | never | `NO_SIGNAL`, `NOT_CW`, `ACTIVITY_NO_SNR`, `NOISY_NO_DECODE`, `WEAK_NO_DECODE` or `DECODING`, as the text report's `verdict:` line. |
 | `checks` | array | never | One object per check line, in the text report's order. See [`checks` entries](#checks-entries). |

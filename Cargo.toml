@@ -46,6 +46,8 @@ coppa-channel = { git = "https://github.com/HagaleTechnologies/coppa.git", rev =
 pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "7f8078b19d759e24f50adb1efd0b3fd75371a39d" }
 
 cpal = "0.18"
+# MAN-530: manta-owned tagged capture ring (already locked through coppa-audio).
+rtrb = "0.3.5"
 ctrlc = "3"
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 libc = "0.2"

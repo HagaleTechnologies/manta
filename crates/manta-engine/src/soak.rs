@@ -2,17 +2,19 @@
 //! panic and bounded memory growth. ROADMAP M1 accept criterion; reused by
 //! M2/M3's longer soaks (design doc §7).
 //!
-//! Deviation from the design doc: input-*ring*-overrun tracking is NOT
-//! implemented. coppa-audio's CpalSource doesn't expose its internal
-//! ring's overflow_count() publicly, and file-replay sources (what this
-//! harness runs against in CI) have no ring and cannot overrun by
-//! construction. Live-hardware overrun observability needs a coppa-audio
-//! API addition -- a real upstream ask, not made unilaterally here. This
-//! is a different, still-open gap from MAN-56 (closed 2026-09-04), which
-//! wired HPSDR's wire-level UDP packet loss/malformed-datagram counters
-//! (`manta_input::InputHealthCounters`) into manta-server's Prometheus
-//! endpoint -- lost/rejected datagrams before demux, not ring
-//! backpressure after it.
+//! Input-*ring*-overrun tracking is not part of this harness. File-replay
+//! sources (what it runs against in CI) have no ring and cannot overrun
+//! by construction. Live audio's own capture ring is counted at the
+//! source since MAN-530: `AudioIqSource::from_device` exposes every frame
+//! its 8192-frame ring rejects, and each contiguous loss, through
+//! `IqSource::health_counters` (the `manta_input_*` series) and reports
+//! the hole to the engine at its exact sample
+//! (docs/DECISIONS/2026-11-09-man530-audio-ring-overrun-visibility.md).
+//! What stays unmeasurable is loss outside manta: a sound card or driver
+//! that drops samples before the capture callback sees them reports
+//! nothing manta can count. MAN-56 (closed 2026-09-04) is the separate
+//! wire-level layer: HPSDR's UDP packet loss/malformed-datagram counters,
+//! lost/rejected datagrams before demux, not ring backpressure after it.
 
 use crate::{listen_with_observers, ListenObservers, PipelineConfig};
 use anyhow::Result;
@@ -77,7 +79,7 @@ pub(crate) fn peak_rss_bytes() -> u64 {
 }
 
 /// Run `listen` against `src` for `duration`, tracking panics and peak-RSS
-/// growth. See module doc for the overrun-tracking deviation. Returns an
+/// growth. See module doc for where ring overruns are counted. Returns an
 /// error (not a panic report) if `listen()` itself returns `Err` -- e.g. no
 /// signal found during startup calibration.
 pub fn soak(

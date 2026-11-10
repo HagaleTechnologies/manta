@@ -1061,6 +1061,7 @@ dependencies = [
  "hound",
  "manta-dsp",
  "num-complex",
+ "rtrb",
  "rubato",
  "serde",
  "serde_json",
