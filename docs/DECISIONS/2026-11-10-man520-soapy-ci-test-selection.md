@@ -62,13 +62,15 @@ cargo test -p manta-cli --features soapy --locked --no-fail-fast --bin manta \
 - **No `timeout-minutes`.** A timeout turns a slow run red, and any red job
   in a tagged commit's push run blocks a release
   (`scripts/check-release-ci.py`). The 15-minute target is read from the
-  PR's own dispatched `ci-full` run and later push runs, not enforced.
+  merge-queue run and later push runs (see Consequences), not enforced.
 
 ### The guard
 
 `SoapyTestSelectionTests` in `scripts/tests/test_ci_gates.py` runs in the
-required `*-support` jobs. It requires the `manta-cli` command's `--test`
-set to equal the grep set plus `SOAPY_EXTRA_TESTS`, in both directions, and
+`ubuntu-support` job (the `test_ci_gates` step is Linux-only), so a failure
+turns the required `test (ubuntu-latest)` check red. It requires the
+`manta-cli` command's `--test` set to equal the grep set plus
+`SOAPY_EXTRA_TESTS`, in both directions, and
 reports missing and extra names separately. It also requires the
 `manta-input` command and the clippy line verbatim, allows only `-p`,
 `--features`, `--bin`, `--test`, `--locked` and `--no-fail-fast` in the
@@ -95,8 +97,16 @@ into a private prefix: the `manta-input` command took 85 s with a cold
 compile (13 passed), and the `manta-cli` command 233 s to build and 123 s
 to run (the `manta` binary 947 passed, `cli` 105, `docs_consistency` 117,
 `config_command` 77, the other eight roots 99). The hosted duration is not
-measured yet; the PR's `ci-full` run is the first reading, and the target
-is under 15 minutes on both legs.
+measured yet, and the target is under 15 minutes on both legs.
+
+This PR's own `ci-full` runs cannot measure it. Its author is trusted, so
+the native `pull_request` run skips `test-soapy`. `wait-for-codex.yml`
+dispatches the other run at the default branch, so that run executes
+`main`'s workflow, with the old whole-suite `test-soapy` line, against the
+PR head merged with `main` (MAN-243, MAN-340). Its `test-soapy` legs will
+take about 40 minutes, as before. The first hosted readings of the new
+selection are the `merge_group` run, which reads `ci-full.yml` from the
+queue commit, and the push run on `main` after merge.
 
 Mutations, each run against the selection and reverted:
 
