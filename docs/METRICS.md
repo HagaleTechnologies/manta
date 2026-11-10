@@ -106,7 +106,7 @@ missing series as "no loss" or "no traffic".
 | `manta_source_down_seconds_total` | counter | `source` | Seconds each input source spent in outages that have ended. An outage still in progress is added when it ends; until then it shows only as `manta_source_health` 0. | Same `source` set as `manta_source_health`; starts at 0. |
 | `manta_input_dropped_packets_total` | counter | `source` | Input packets estimated lost in transit before reaching the decoder. With several `[[input]]` entries, one series per entry's `name` (MAN-13). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only: from startup at 0, sampled every second, summed across reconnects. SoapySDR stays at 0 (a driver overflow carries no lost-sample estimate; see [MAN-233](DECISIONS/2026-10-15-man233-soapy-overflow-visibility.md)). Other sources (file, audio) show the `# TYPE` line but no samples: absent, not zero. |
 | `manta_input_gaps_detected_total` | counter | `source` | Distinct input-stream gap events detected. One gap may account for several dropped packets. | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR counts driver stream-overflow events, one per overflow the driver returns as a read error, each also warned rate-limited on the log; an overflow a driver flags only with `SOAPY_SDR_END_ABRUPT` on a successful read is not counted (MAN-233). Other sources: absent, not zero. |
-| `manta_input_malformed_packets_total` | counter | `source` | Input datagrams discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR stays at 0 (no malformed-packet concept; MAN-233). Other sources: absent, not zero. |
+| `manta_input_malformed_packets_total` | counter | `source` | Input datagrams or frames discarded as malformed: wrong length, or correct length but failed framing or sync validation (MAN-22). For KiwiSDR also every binary frame whose tag is not `SND` or `MSG`, and every WebSocket text frame, since a receiver never sends either on its sound channel ([MAN-533](DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md)). | HPSDR, KiwiSDR, ka9q-radio and SoapySDR sources only, as for `manta_input_dropped_packets_total`. SoapySDR stays at 0 (no malformed-packet concept; MAN-233). Other sources: absent, not zero. |
 | `manta_input_queue_dropped_samples_total` | counter | `source` | Complex IQ samples evicted from this input's bounded queue because its consumer fell behind, at the hardware rate before decimation. Exact sample count, not packets, network loss or outage duration. Cumulative across reconnects; resets on process restart. Reduce load or configured rate if it grows. | Inputs with `InputHealthCounters`; zero if no queue samples have been lost, including other packet sources. Sources without counters omit the series. |
 | `manta_input_bad_samples_total` | counter | `source` | Input samples replaced with silence (`0+0j`) because a component was NaN, infinite, or larger than 1e17 in magnitude, counted where they enter the channelizer. Decoding continues. A filter that runs before the channelizer can turn one bad source sample into several replaced ones: up to about 64 per halfband stage with `--capture-rate-hz`, or about 257 through a sound card's Hilbert filter (511 taps, 256 of them nonzero: that many outputs' imaginary parts, plus one delay-matched real part; MAN-273). See [SPEC §1.3](SPEC-decode-core.md#13-structure-and-per-hop-processing-wola-form) step 0 and [MAN-234](DECISIONS/2026-10-15-man234-bad-input-samples.md). | Every source; 0 from startup with a `[server]` table; summed across reconnects. |
 | `manta_input_conditioned_samples_total` | counter | `source`, `stage`, `mark` | Input samples an `[input]` conditioning stage changed, flagged or marked uncertain. Stages are `impulse` and `dc`; marks are `repaired`, `flagged`, `corrected`, `uncertain`. Counts come from the channelizer's exact log totals, summed across reconnects. | `run` with `[server]`; starts at 0 for marks a configured mode can produce: DC apply has `corrected`, impulse observe has `flagged`/`uncertain`, impulse apply also has `repaired`. Off stages and DC observe have no series. |
@@ -336,6 +336,7 @@ document.
 | `uplink.flapping_threshold` | Recent reconnect attempts that mark a target flapping, 3. |
 | `uplink.targets` | One object per `[[rbn_uplink]]` entry in config order, disabled entries included. |
 | `inputs` | One object per `[[input]]` entry in config order. Present only with two or more entries (MAN-14); a one-input document has no `inputs` key. |
+| `sources` | One object per source registered through the health sink (the `manta_source_health` label set), sorted by name. Absent until a source has reported health (MAN-533). |
 
 Each `uplink.targets` object has `target` (the same `host:port` label as
 the per-target metrics), `enabled`, `connected`, `sent`, `suppressed`,
@@ -355,18 +356,33 @@ a boolean) and `last_spot_age_seconds` (seconds since the input's last
 spot, `null` before its first). `manta status` prints them as an Inputs
 table: NAME, SPOTS, CALLS, XDUPES, LAST SPOT, SILENT.
 
+Each `sources` object ([MAN-533](DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md))
+has `name` (the same label as `manta_source_health{source}`), `healthy`
+(`manta_source_health` as a boolean), `losses_total` (connections the
+reconnecting source dropped: one per `source <name> lost:` log line, or for
+a grouped HPSDR input one per failed radio generation; a failed reopen
+attempt is not a loss), `last_loss_reason` and `last_loss_age_seconds`
+(whole seconds since the last loss). `last_loss_reason` is
+`no usable samples` when the source kept reading without a usable sample
+for its bound (30 s, or a source's own shorter bound), `read failed` for
+any other lost connection, and `null` before the first loss, as is the age.
+The reason is a string, so a newer daemon's label still parses in an older
+`manta status`. `manta status` prints the rows as a Sources table: NAME,
+STATE (`up` or `down`), LOST, LAST LOSS (`never`, or `3s ago, no usable
+samples`).
+
 Captured during the V1 replay (no `[[rbn_uplink]]` configured):
 
 ```text
 HTTP/1.1 200 OK
 Content-Type: application/json
-Content-Length: 433
+Content-Length: 604
 Connection: close
 
 {
   "schema_version": 1,
   "version": "0.1.0",
-  "uptime_seconds": 3,
+  "uptime_seconds": 26,
   "spots_total": 1,
   "telnet_clients": 0,
   "json_clients": 0,
@@ -382,7 +398,16 @@ Connection: close
     "reconnect_window_seconds": 300,
     "flapping_threshold": 3,
     "targets": []
-  }
+  },
+  "sources": [
+    {
+      "name": "file",
+      "healthy": true,
+      "losses_total": 0,
+      "last_loss_reason": null,
+      "last_loss_age_seconds": null
+    }
+  ]
 }
 ```
 
@@ -407,6 +432,24 @@ With two inputs, `live` and `deaf`, the document also carries `inputs`
       "cross_input_dupes_total": 0,
       "silent": true,
       "last_spot_age_seconds": null
+    }
+  ]
+}
+```
+
+A KiwiSDR that kept its connection open but sent no usable samples for
+30 s, then reconnected, carries this `sources` row (shown alone here; the
+other fields are as above):
+
+```json
+{
+  "sources": [
+    {
+      "name": "kiwi",
+      "healthy": false,
+      "losses_total": 1,
+      "last_loss_reason": "no usable samples",
+      "last_loss_age_seconds": 3.0
     }
   ]
 }
@@ -442,6 +485,8 @@ For what each uplink state means and what to do about it, see
   warning.
 - [MAN-318](DECISIONS/2026-10-27-man318-callsign-lookup.md): the callsign
   lookup families.
+- [MAN-533](DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md): the
+  `/status` `sources` rows and the widened KiwiSDR malformed counter.
 
 ### Delayed refinement
 

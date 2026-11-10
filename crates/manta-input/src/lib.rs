@@ -38,6 +38,7 @@ pub use recording::{
 mod overflow;
 
 mod stall;
+pub use stall::{is_no_usable_samples, NoUsableSamples, NO_USABLE_SAMPLES_AFTER};
 
 #[cfg(feature = "soapy")]
 pub mod soapy;

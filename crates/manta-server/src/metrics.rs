@@ -628,11 +628,56 @@ impl UplinkTarget {
 /// confirmed live) is start-up, not an outage. `down_seconds_total` only
 /// grows when an outage ENDS, so an outage still in progress shows only as
 /// `manta_source_health == 0`.
+///
+/// MAN-533 adds the lost-connection record `/status` reports: every lost
+/// connection the reconnecting source dropped, and the latest one's reason
+/// and time. Independent of the health edges: a never-productive source's
+/// repeated losses count while it stays unhealthy.
 #[derive(Debug, Default)]
 struct SourceOutages {
     outages_total: u64,
     down_seconds_total: f64,
     down_since: Option<Instant>,
+    losses_total: u64,
+    last_loss: Option<(SourceLossReason, Instant)>,
+}
+
+/// MAN-533: why a live source's connection was lost, as `/status` reports
+/// it. A closed, bounded vocabulary: the full cause stays in the log line,
+/// so no peer-supplied text reaches the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceLossReason {
+    /// The source kept reading without a usable sample for its bound
+    /// (`manta_input::NO_USABLE_SAMPLES_AFTER`, or a source's own shorter
+    /// no-sample bound).
+    NoUsableSamples,
+    /// Any other lost connection: a closed socket, a protocol error, a
+    /// device error.
+    ReadFailed,
+}
+
+impl SourceLossReason {
+    /// The `/status` `last_loss_reason` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoUsableSamples => "no usable samples",
+            Self::ReadFailed => "read failed",
+        }
+    }
+}
+
+/// MAN-533: one registered source's health and lost-connection record, as
+/// `/status` `sources[]` shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceSnapshot {
+    /// The `manta_source_health{source}` label.
+    pub name: String,
+    /// `manta_source_health` as a boolean.
+    pub healthy: bool,
+    /// Lost connections recorded with [`Metrics::record_source_loss`].
+    pub losses_total: u64,
+    /// The latest loss's reason and its age at the snapshot time.
+    pub last_loss: Option<(SourceLossReason, Duration)>,
 }
 
 /// MAN-64 round 7 (V-2): a source's health value, plus whether that value
@@ -2157,6 +2202,54 @@ impl Metrics {
             }
             _ => {}
         }
+    }
+
+    /// MAN-533: record one lost connection of `source` and its reason.
+    /// Changes neither the health gauge nor the outage counters: health
+    /// edges stay the health sink's job.
+    pub fn record_source_loss(&self, source: &str, reason: SourceLossReason) {
+        self.record_source_loss_at(source, reason, Instant::now());
+    }
+
+    /// MAN-533: `record_source_loss` with an explicit observation time, so
+    /// the record is testable without sleeping.
+    pub fn record_source_loss_at(&self, source: &str, reason: SourceLossReason, now: Instant) {
+        let mut outages = self
+            .source_outages
+            .lock()
+            .expect("source_outages lock poisoned");
+        let entry = outages.entry(source.to_string()).or_default();
+        entry.losses_total += 1;
+        entry.last_loss = Some((reason, now));
+    }
+
+    /// MAN-533: every source registered through the health sink, sorted by
+    /// name, with its lost-connection record as of `now`.
+    pub fn source_snapshot_at(&self, now: Instant) -> Vec<SourceSnapshot> {
+        // Lock order: `source_health` before `source_outages`, as the
+        // `/metrics` render takes them.
+        let health = self
+            .source_health
+            .read()
+            .expect("source_health lock poisoned");
+        let outages = self
+            .source_outages
+            .lock()
+            .expect("source_outages lock poisoned");
+        health
+            .iter()
+            .map(|(name, entry)| {
+                let record = outages.get(name);
+                SourceSnapshot {
+                    name: name.clone(),
+                    healthy: entry.healthy,
+                    losses_total: record.map_or(0, |r| r.losses_total),
+                    last_loss: record
+                        .and_then(|r| r.last_loss)
+                        .map(|(reason, at)| (reason, now.saturating_duration_since(at))),
+                }
+            })
+            .collect()
     }
 
     /// MAN-56: HPSDR's (and any future source's) packet loss/malformed
@@ -4170,6 +4263,68 @@ mod tests {
             text.contains(r#"manta_source_down_seconds_total{source="soapy"} 12.500"#),
             "{text}"
         );
+    }
+
+    // MAN-533: the lost-connection record behind `/status` `sources[]`.
+
+    #[test]
+    fn record_source_loss_counts_every_loss_and_keeps_the_latest_reason() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(5);
+        m.set_source_health_at("kiwi", true, t0);
+        m.record_source_loss_at("kiwi", SourceLossReason::ReadFailed, t0);
+        m.record_source_loss_at("kiwi", SourceLossReason::NoUsableSamples, t1);
+        let rows = m.source_snapshot_at(t1 + Duration::from_secs(3));
+        assert_eq!(
+            rows,
+            vec![SourceSnapshot {
+                name: "kiwi".to_string(),
+                healthy: true,
+                losses_total: 2,
+                last_loss: Some((SourceLossReason::NoUsableSamples, Duration::from_secs(3))),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_loss_changes_neither_health_nor_the_outage_counters() {
+        let m = Metrics::new();
+        let t0 = Instant::now();
+        m.set_source_health_at("kiwi", true, t0);
+        m.record_source_loss_at("kiwi", SourceLossReason::NoUsableSamples, t0);
+        m.record_source_loss_at("kiwi", SourceLossReason::ReadFailed, t0);
+        let text = m.render_prometheus_text();
+        assert!(
+            text.contains(r#"manta_source_health{source="kiwi"} 1"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_outages_total{source="kiwi"} 0"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"manta_source_down_seconds_total{source="kiwi"} 0.000"#),
+            "{text}"
+        );
+        // A source that has reported no health yet has no row: the health
+        // sink registers sources, the loss sink only annotates them.
+        m.record_source_loss_at("hpsdr", SourceLossReason::ReadFailed, t0);
+        let names: Vec<String> = m
+            .source_snapshot_at(t0)
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["kiwi".to_string()]);
+    }
+
+    #[test]
+    fn source_loss_reason_labels_are_the_documented_two() {
+        assert_eq!(
+            SourceLossReason::NoUsableSamples.label(),
+            "no usable samples"
+        );
+        assert_eq!(SourceLossReason::ReadFailed.label(), "read failed");
     }
 
     #[test]

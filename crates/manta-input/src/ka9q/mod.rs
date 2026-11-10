@@ -15,6 +15,7 @@
 
 pub mod wire;
 
+use crate::stall::NoUsableSamples;
 use crate::{InputHealthCounters, IqSource, MAX_IQ_WAV_RATE_HZ};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -921,13 +922,16 @@ impl IqSource for Ka9qIqSource {
                 return Ok(0);
             }
             if self.last_accepted.elapsed() >= self.stall_timeout {
-                bail!(
+                // MAN-533 D4: typed, so the reconnect layer reports it as
+                // `no usable samples`; the text is unchanged.
+                return Err(NoUsableSamples::new(format!(
                     "ka9q-radio stream stalled: no RTP data for ssrc {} on {}:{} for {} s",
                     self.ssrc,
                     self.group_label,
                     self.port,
                     secs(self.stall_timeout)
-                );
+                ))
+                .into());
             }
             match self.data.recv(&mut self.recv_buf) {
                 Ok(n) => self.accept_rtp(n),
@@ -2046,9 +2050,14 @@ mod tests {
             };
             let t = Instant::now();
             let mut buf = vec![Complex32::new(0.0, 0.0); 64];
-            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            let err = src.read(&mut buf).err().unwrap();
             stop.store(true, Ordering::Relaxed);
             flood.join().unwrap();
+            // MAN-533 scenario 2 (ka9q): foreign-SSRC traffic keeps the
+            // socket busy with no accepted packet; the stall carries the
+            // shared type the reconnect layer reopens on.
+            assert!(crate::is_no_usable_samples(&err), "{err:#}");
+            let e = format!("{err:#}");
             assert!(
                 e.contains("ka9q-radio stream stalled: no RTP data for ssrc 14000000"),
                 "{e}"

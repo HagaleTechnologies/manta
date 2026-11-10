@@ -47,6 +47,7 @@ use crate::session_epoch::session_nonce_for_replay_path;
 use crate::shutdown_runtime_after_drain;
 use crate::signal_spot_server_shutdown;
 use crate::source_health_sink;
+use crate::source_loss_sink;
 use crate::source_spec::apply_raw_iq;
 use crate::source_spec::trusted_band_notice;
 use crate::source_spec::warn_if_audio_source_has_no_rf_reference;
@@ -1033,7 +1034,11 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             stop.clone(),
             initial_healthy,
             on_health,
-        );
+        )
+        .with_loss_sink(source_loss_sink(
+            name,
+            spot_server.as_ref().map(|server| server.metrics.clone()),
+        ));
         input_health = wrapped.input_health();
         Box::new(wrapped)
     } else {

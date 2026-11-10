@@ -12,6 +12,8 @@
 //! `manta-server` as a library dependency), so there is no second,
 //! independently-drifting definition of the wire shape.
 
+#[cfg(test)]
+use crate::metrics::SourceLossReason;
 use crate::metrics::{
     overall_uplink_health_of, Metrics, OverallUplinkHealth, UplinkHealth, UplinkTargetSnapshot,
     FLAPPING_RECONNECTS, RECONNECT_WINDOW,
@@ -62,10 +64,51 @@ pub struct StatusDoc {
     /// stays 1 and a one-input document is unchanged).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inputs: Vec<InputHearingSnapshot>,
+    /// MAN-533: each live source's health and lost-connection record,
+    /// sorted by name (the `manta_source_health` label set). Additive, so
+    /// `schema_version` stays 1: an older CLI ignores it, and a document
+    /// from an older daemon parses with it empty. Omitted while no source
+    /// has reported health. `last_loss_reason` is a `String` on the wire,
+    /// not the closed `SourceLossReason`, so an older CLI still reads a
+    /// newer daemon's label instead of refusing the whole document.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<SourceStatus>,
     /// MAN-541: the RBN skew reading. Present only with `[rbn_compare]`
     /// enabled (additive, so `schema_version` stays 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rbn_compare: Option<RbnCompareStatus>,
+}
+
+/// MAN-533: one live source's row in `GET /status`'s `sources`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceStatus {
+    /// The same label as `manta_source_health{source}`.
+    pub name: String,
+    /// `manta_source_health` as a boolean.
+    pub healthy: bool,
+    /// Connections the reconnecting source dropped. A failed reopen
+    /// attempt is not a loss.
+    pub losses_total: u64,
+    /// `no usable samples` or `read failed`; `null` before the first loss.
+    pub last_loss_reason: Option<String>,
+    /// Whole seconds since the last loss; `null` before the first loss.
+    pub last_loss_age_seconds: Option<f64>,
+}
+
+impl SourceStatus {
+    fn rows(metrics: &Metrics, now: Instant) -> Vec<Self> {
+        metrics
+            .source_snapshot_at(now)
+            .into_iter()
+            .map(|s| SourceStatus {
+                name: s.name,
+                healthy: s.healthy,
+                losses_total: s.losses_total,
+                last_loss_reason: s.last_loss.map(|(reason, _)| reason.label().to_string()),
+                last_loss_age_seconds: s.last_loss.map(|(_, age)| age.as_secs_f64().round()),
+            })
+            .collect()
+    }
 }
 
 /// MAN-541: `GET /status`'s `rbn_compare` object.
@@ -227,6 +270,7 @@ impl StatusDoc {
                 targets,
             },
             inputs: InputHearingSnapshot::rows(metrics, now),
+            sources: SourceStatus::rows(metrics, now),
             rbn_compare: metrics.rbn_skew_snapshot_at(now),
         }
     }
@@ -334,6 +378,33 @@ pub fn render_human(doc: &StatusDoc) -> String {
             None => "n/a".to_string(),
         }
     ));
+
+    // MAN-533: each live source's state and its last lost connection, so a
+    // receiver that was dropped for sending nothing usable stands out.
+    if !doc.sources.is_empty() {
+        out.push_str(&format!(
+            "Sources:\n  {:<32} {:<5} {:>6}  {}\n",
+            "NAME", "STATE", "LOST", "LAST LOSS"
+        ));
+        for s in &doc.sources {
+            let last_loss = match (s.last_loss_age_seconds, &s.last_loss_reason) {
+                (Some(age), Some(reason)) => {
+                    format!("{age:.0}s ago, {}", escape_for_terminal(reason))
+                }
+                (Some(age), None) => format!("{age:.0}s ago"),
+                (None, Some(reason)) => escape_for_terminal(reason),
+                (None, None) => "never".to_string(),
+            };
+            out.push_str(&format!(
+                "  {:<32} {:<5} {:>6}  {}\n",
+                escape_for_terminal(&s.name),
+                if s.healthy { "up" } else { "down" },
+                s.losses_total,
+                last_loss
+            ));
+        }
+        out.push('\n');
+    }
 
     // MAN-14: each input's hearing, so a deaf receiver stands out.
     if !doc.inputs.is_empty() {
@@ -559,6 +630,127 @@ mod tests {
             .unwrap();
         assert!(deaf.contains("never") && deaf.ends_with("yes"), "{deaf}");
         assert!(human.lines().all(|l| l.chars().count() <= 80), "{human}");
+    }
+
+    /// MAN-533: a `kiwi` lost 3 s ago for sending nothing usable and a
+    /// healthy `file`, as `Metrics` holds them.
+    fn sources_fixture() -> Metrics {
+        let m = Metrics::new();
+        m.set_source_health("kiwi", true);
+        m.set_source_health("file", true);
+        let three_s_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .expect("the monotonic clock is past 3 s");
+        m.record_source_loss_at("kiwi", SourceLossReason::NoUsableSamples, three_s_ago);
+        m.set_source_health("kiwi", false);
+        m
+    }
+
+    #[test]
+    fn status_doc_carries_one_source_row_per_registered_source() {
+        let doc = StatusDoc::from_metrics(&sources_fixture());
+        let json = serde_json::to_string(&doc).unwrap();
+        assert!(
+            json.contains(
+                "\"sources\":[{\"name\":\"file\",\"healthy\":true,\"losses_total\":0,\
+                 \"last_loss_reason\":null,\"last_loss_age_seconds\":null},\
+                 {\"name\":\"kiwi\",\"healthy\":false,\"losses_total\":1,\
+                 \"last_loss_reason\":\"no usable samples\",\"last_loss_age_seconds\":3.0}]"
+            ),
+            "{json}"
+        );
+        assert!(json.starts_with("{\"schema_version\":1,"), "{json}");
+        let parsed: StatusDoc = serde_json::from_str(&doc.to_json()).unwrap();
+        assert_eq!(parsed, doc);
+    }
+
+    #[test]
+    fn status_doc_omits_sources_when_none_is_registered() {
+        let json = serde_json::to_string(&StatusDoc::from_metrics(&metrics_fixture())).unwrap();
+        assert!(!json.contains("\"sources\""), "{json}");
+    }
+
+    #[test]
+    fn a_document_without_sources_still_parses() {
+        // An older daemon sends no `sources` key at all.
+        let mut value = serde_json::to_value(StatusDoc::from_metrics(&sources_fixture())).unwrap();
+        assert!(value["sources"].is_array());
+        value.as_object_mut().unwrap().remove("sources");
+        let parsed: StatusDoc = serde_json::from_value(value).unwrap();
+        assert!(parsed.sources.is_empty());
+        assert!(!render_human(&parsed).contains("Sources:"));
+    }
+
+    #[test]
+    fn an_unknown_loss_reason_label_still_parses() {
+        // A newer daemon may add a reason this build does not know.
+        let json = serde_json::to_string(&StatusDoc::from_metrics(&sources_fixture()))
+            .unwrap()
+            .replace(
+                "\"last_loss_reason\":\"no usable samples\"",
+                "\"last_loss_reason\":\"something new\"",
+            );
+        let parsed: StatusDoc = serde_json::from_str(&json).unwrap();
+        let kiwi = parsed.sources.iter().find(|s| s.name == "kiwi").unwrap();
+        assert_eq!(kiwi.last_loss_reason.as_deref(), Some("something new"));
+    }
+
+    #[test]
+    fn human_render_shows_each_source_state_losses_and_last_loss() {
+        let doc = StatusDoc::from_metrics(&sources_fixture());
+        let human = render_human(&doc);
+        let lines: Vec<&str> = human.lines().collect();
+        let header = lines
+            .iter()
+            .position(|l| *l == "Sources:")
+            .unwrap_or_else(|| panic!("no Sources section: {human}"));
+        assert_eq!(
+            &lines[header..header + 4],
+            &[
+                "Sources:",
+                "  NAME                             STATE   LOST  LAST LOSS",
+                "  file                             up         0  never",
+                "  kiwi                             down       1  3s ago, no usable samples",
+            ],
+            "{human}"
+        );
+        // After the active-tracks block, before the uplink.
+        let tracks = lines
+            .iter()
+            .position(|l| l.starts_with("  active tracks"))
+            .unwrap();
+        let uplink = lines
+            .iter()
+            .position(|l| l.starts_with("RBN uplink"))
+            .unwrap();
+        assert!(tracks < header && header < uplink, "{human}");
+        assert!(human.lines().all(|l| l.chars().count() <= 80), "{human}");
+
+        // The longest realistic row is exactly 80 columns.
+        let mut wide = doc.clone();
+        wide.sources = vec![SourceStatus {
+            name: "a".repeat(32),
+            healthy: false,
+            losses_total: 999_999,
+            last_loss_reason: Some("no usable samples".to_string()),
+            last_loss_age_seconds: Some(1_000_000.0),
+        }];
+        let out = render_human(&wide);
+        let row = out
+            .lines()
+            .find(|l| l.contains("1000000s ago"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert_eq!(row.chars().count(), 80, "{row:?}");
+
+        // A daemon-supplied name or reason cannot reach the terminal raw.
+        let mut hostile = doc;
+        hostile.sources[0].name = "evil\u{1b}]0;pwned\u{7}\nforged".to_string();
+        hostile.sources[1].last_loss_reason = Some("x\u{1b}[2J".to_string());
+        let out = render_human(&hostile);
+        assert!(!out.chars().any(|c| c.is_control() && c != '\n'), "{out:?}");
+        assert!(out.contains(r"evil\u{1b}]0;pwned\u{7}\nforged"), "{out}");
+        assert!(out.contains(r"3s ago, x\u{1b}[2J"), "{out}");
+        assert_eq!(out.lines().count(), human.lines().count(), "{out:?}");
     }
 
     // ---- MAN-541: the RBN skew block ----

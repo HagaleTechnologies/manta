@@ -36,7 +36,9 @@
 //!   unless flags bit `0x80` is set (little-endian). Real captures were a
 //!   constant 2068 bytes (20-byte header + 512 complex pairs) every frame.
 
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
+use crate::stall::{
+    NoUsableSamples, StallEpisode, UsableSampleBudget, NO_USABLE_SAMPLES_AFTER, SOFT_STALL_AFTER,
+};
 use crate::{InputHealthCounters, IqSource};
 use anyhow::{anyhow, bail, Context, Result};
 use num_complex::Complex32;
@@ -310,11 +312,12 @@ pub struct KiwiIqSource {
     /// MAN-259: `connect`'s runtime up to the post-handshake `SET` loop
     /// that turns streaming on; surfaced by `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
-    /// MAN-489: time of the last *usable SND sample payload* -- a wall
-    /// clock ping/MSG/unknown frames cannot move, unlike the consecutive
-    /// timeout counter below, which any WebSocket frame resets. A peer
-    /// that keeps the transport alive while sending no IQ must still
-    /// report its stopped stream inside the 5 s bound.
+    /// MAN-489: time usable samples last reached the source's output --
+    /// resampler output reaching `pending` (MAN-533 D2), a wall clock
+    /// ping/MSG/unknown frames and a one-sample trickle cannot move, unlike
+    /// the consecutive timeout counter below, which any WebSocket frame
+    /// resets. A peer that keeps the transport alive while sending no IQ
+    /// must still report its stopped stream inside the 5 s bound.
     last_usable_iq: Instant,
     /// MAN-489: the one-shot soft-stall episode behind `take_stalled`.
     stall: StallEpisode,
@@ -327,6 +330,11 @@ pub struct KiwiIqSource {
     /// The consecutive-timeout bound: `MAX_CONSECUTIVE_TIMEOUTS` in
     /// production, a private knob so a test can shorten the hard budget.
     max_consecutive_timeouts: u32,
+    /// MAN-533: active read time with no resampler output, any frame
+    /// traffic included. Spent ends the connection with
+    /// [`NoUsableSamples`] so the reconnect layer reopens it.
+    /// `NO_USABLE_SAMPLES_AFTER` in production; a private test knob.
+    usable: UsableSampleBudget,
 }
 
 impl KiwiIqSource {
@@ -491,7 +499,70 @@ impl KiwiIqSource {
             stall: StallEpisode::new(SOFT_STALL_AFTER),
             consecutive_timeouts: 0,
             max_consecutive_timeouts: MAX_CONSECUTIVE_TIMEOUTS,
+            usable: UsableSampleBudget::new(NO_USABLE_SAMPLES_AFTER),
         })
+    }
+
+    /// MAN-533 D1/D2: account one receive iteration. `pending` is empty
+    /// when an iteration starts (the drain above returns first), so a
+    /// non-empty `pending` means this iteration's frame produced output:
+    /// that, and only that, is progress for the soft stall and the
+    /// usable-sample budget. Otherwise the iteration's active time is
+    /// spent, and a spent budget ends the connection.
+    fn note_iteration(&mut self, started: Instant) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.last_usable_iq = Instant::now();
+            self.stall.note_delivery();
+            self.usable.note_delivery();
+        } else if self.usable.spend(started.elapsed()) {
+            return Err(NoUsableSamples::new(format!(
+                "KiwiSDR delivered no usable samples for {} s",
+                self.usable.limit().as_secs()
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Dispatch one received WebSocket frame.
+    fn handle_frame(&mut self, msg: Message) -> Result<()> {
+        match msg {
+            Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"SND" => {
+                if let Some(samples) = account_snd_frame(&self.health, &mut self.seq, &b[3..]) {
+                    // MAN-533 D2: a parsed payload is not progress on
+                    // its own; `note_iteration` stamps it once the
+                    // resampler hands samples to `pending`.
+                    for s in samples {
+                        self.raw.push(s.re);
+                        self.raw.push(s.im);
+                    }
+                    self.drain_resampler()?;
+                }
+            }
+            Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"MSG" => {
+                let text = String::from_utf8_lossy(&b[3..]);
+                self.handle_msg(&text)?;
+            }
+            Message::Binary(_) => {
+                // MAN-533 D7: an unknown binary tag (or a frame too
+                // short to carry one) is discarded and counted. Not a
+                // SND frame, so the sequence tracker is untouched.
+                self.health.record_malformed();
+            }
+            Message::Text(_) => {
+                // MAN-533 D7: a receiver never sends text on its sound
+                // channel; discarded and counted.
+                self.health.record_malformed();
+            }
+            Message::Ping(_) | Message::Pong(_) => {
+                // tungstenite auto-replies to Ping internally; nothing to do.
+            }
+            Message::Close(_) => {
+                bail!("KiwiSDR closed the connection");
+            }
+            Message::Frame(_) => {}
+        }
+        Ok(())
     }
 
     fn send_keepalive_if_due(&mut self) -> Result<()> {
@@ -761,12 +832,15 @@ impl IqSource for KiwiIqSource {
                 return Ok(0);
             }
 
+            // MAN-533: this iteration's active read time, spent from the
+            // usable-sample budget unless it produced output.
+            let iteration = Instant::now();
             self.send_keepalive_if_due()?;
 
-            let msg = match self.socket.read() {
-                Ok(m) => {
+            match self.socket.read() {
+                Ok(msg) => {
                     self.consecutive_timeouts = 0;
-                    m
+                    self.handle_frame(msg)?;
                 }
                 Err(tungstenite::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::WouldBlock
@@ -774,51 +848,18 @@ impl IqSource for KiwiIqSource {
                 {
                     self.consecutive_timeouts += 1;
                     if self.consecutive_timeouts >= self.max_consecutive_timeouts {
-                        bail!(
+                        // MAN-533 D4: silence is "no usable samples" too,
+                        // with its text unchanged.
+                        return Err(NoUsableSamples::new(format!(
                             "KiwiSDR connection stalled: no data for {} consecutive read timeouts",
                             self.max_consecutive_timeouts
-                        );
+                        ))
+                        .into());
                     }
-                    continue;
                 }
                 Err(e) => return Err(e).context("KiwiSDR WebSocket read"),
-            };
-
-            match msg {
-                Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"SND" => {
-                    if let Some(samples) = account_snd_frame(&self.health, &mut self.seq, &b[3..]) {
-                        // MAN-489: only a usable sample payload is source
-                        // progress. A malformed frame counted above is not;
-                        // neither is an empty one.
-                        if !samples.is_empty() {
-                            self.last_usable_iq = Instant::now();
-                            self.stall.note_delivery();
-                        }
-                        for s in samples {
-                            self.raw.push(s.re);
-                            self.raw.push(s.im);
-                        }
-                        self.drain_resampler()?;
-                    }
-                }
-                Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"MSG" => {
-                    let text = String::from_utf8_lossy(&b[3..]);
-                    self.handle_msg(&text)?;
-                }
-                Message::Binary(_) => {
-                    // Unknown binary frame tag; ignore.
-                }
-                Message::Text(_) => {
-                    // The server never sends text frames in practice; ignore.
-                }
-                Message::Ping(_) | Message::Pong(_) => {
-                    // tungstenite auto-replies to Ping internally; nothing to do.
-                }
-                Message::Close(_) => {
-                    bail!("KiwiSDR closed the connection");
-                }
-                Message::Frame(_) => {}
             }
+            self.note_iteration(iteration)?;
         }
     }
 
@@ -1110,9 +1151,256 @@ mod tests {
     }
 
     /// What the fake receiver should put on the wire next.
+    #[derive(Clone, Copy)]
     enum FakeOp {
         Samples(u32),
         Ping,
+        /// MAN-533: a binary frame with an unknown tag.
+        Unknown,
+        /// MAN-533: a WebSocket text frame.
+        Text,
+        /// MAN-533: an `MSG` frame with a key manta ignores.
+        UnknownMsg,
+        /// MAN-533: an `SND` frame carrying a single I/Q pair.
+        Trickle(u32),
+    }
+
+    fn fake_frame(op: FakeOp) -> Message {
+        match op {
+            FakeOp::Samples(seq) => snd_frame(seq, 512),
+            FakeOp::Ping => Message::Ping(Vec::new().into()),
+            FakeOp::Unknown => Message::binary(b"XYZ\x00\x01\x02\x03".to_vec()),
+            FakeOp::Text => Message::Text("hello".to_string().into()),
+            FakeOp::UnknownMsg => Message::binary(b"MSG load_cfg=0".to_vec()),
+            FakeOp::Trickle(seq) => snd_frame(seq, 1),
+        }
+    }
+
+    /// MAN-533: a fake Kiwi that serves `FakeOp`s from a channel after the
+    /// handshake; a closed channel or a failed send ends the session.
+    fn scripted_kiwi() -> (
+        KiwiIqSource,
+        std::sync::mpsc::Sender<FakeOp>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<FakeOp>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read(); // SET auth
+            let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
+            for op in rx {
+                if ws.send(fake_frame(op)).is_err() {
+                    break;
+                }
+            }
+        });
+        let src = KiwiIqSource::connect("127.0.0.1", port, 14_025_000.0, "").unwrap();
+        (src, tx, server)
+    }
+
+    /// MAN-533: feed `op(i)` every `every` until the session ends or
+    /// `stop` is set.
+    fn feed(
+        tx: std::sync::mpsc::Sender<FakeOp>,
+        every: Duration,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        op: impl Fn(u32) -> FakeOp + Send + 'static,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut i = 0u32;
+            let mut next = Instant::now();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if tx.send(op(i)).is_err() {
+                    break;
+                }
+                i += 1;
+                // Keep the simulated sample rate independent of time spent
+                // sending and scheduler oversleep. A delayed wake catches up
+                // instead of adding its delay to every subsequent frame.
+                next += every;
+                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+        })
+    }
+
+    /// MAN-533 scenario 1 at unit level: a stream of `op` frames every
+    /// 200 ms, none of which yields a usable sample, ends `read` with
+    /// `NoUsableSamples` once the (shortened, 2 s) budget is spent.
+    fn assert_useless_stream_ends_in_no_usable_samples(
+        op: impl Fn(u32) -> FakeOp + Send + 'static,
+    ) {
+        let (mut src, tx, server) = scripted_kiwi();
+        src.usable = UsableSampleBudget::new(Duration::from_secs(2));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = feed(tx, Duration::from_millis(200), stop.clone(), op);
+        let mut buf = vec![Complex32::default(); 1024];
+        let started = Instant::now();
+        let err = src.read(&mut buf).unwrap_err();
+        let took = started.elapsed();
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        assert!(err.to_string().contains("no usable samples"), "{err:#}");
+        assert!(
+            took >= Duration::from_secs(2) && took < Duration::from_secs(3),
+            "took {took:?}"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(src);
+        feeder.join().unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unknown_tag_frames_end_in_no_usable_samples_within_the_window() {
+        assert_useless_stream_ends_in_no_usable_samples(|_| FakeOp::Unknown);
+    }
+
+    #[test]
+    fn unknown_msg_keys_end_in_no_usable_samples_within_the_window() {
+        assert_useless_stream_ends_in_no_usable_samples(|_| FakeOp::UnknownMsg);
+    }
+
+    #[test]
+    fn pings_alone_end_in_no_usable_samples_within_the_window() {
+        assert_useless_stream_ends_in_no_usable_samples(|_| FakeOp::Ping);
+    }
+
+    #[test]
+    fn a_one_sample_snd_trickle_ends_in_no_usable_samples_within_the_window() {
+        assert_useless_stream_ends_in_no_usable_samples(FakeOp::Trickle);
+    }
+
+    /// MAN-533 D2: a one-sample trickle after real delivery no longer
+    /// re-arms the soft stall forever: the outage reports once, then the
+    /// budget ends the connection.
+    #[test]
+    fn a_trickle_after_delivery_reports_the_soft_stall_then_fails() {
+        let (mut src, tx, server) = scripted_kiwi();
+        src.stall = StallEpisode::new(Duration::from_millis(250));
+        src.usable = UsableSampleBudget::new(Duration::from_secs(2));
+        for seq in 0..40 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = feed(tx, Duration::from_millis(200), stop.clone(), |i| {
+            FakeOp::Trickle(40 + i)
+        });
+        let mut buf = vec![Complex32::default(); 1024];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "the soft stall never reported");
+            if src.read(&mut buf).unwrap() == 0 {
+                break;
+            }
+        }
+        assert!(src.take_stalled());
+        let err = src.read(&mut buf).unwrap_err();
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(src);
+        feeder.join().unwrap();
+        server.join().unwrap();
+    }
+
+    /// MAN-533 scenario 3 / D7: each unknown-tag binary frame and each
+    /// text frame counts one malformed packet; unknown `MSG` keys and
+    /// pings do not, and none touches the SND sequence accounting.
+    #[test]
+    fn each_unknown_tag_and_text_frame_counts_one_malformed_packet() {
+        let (mut src, tx, server) = scripted_kiwi();
+        src.max_consecutive_timeouts = 8;
+        let script = [FakeOp::Unknown; 5]
+            .into_iter()
+            .chain([FakeOp::Text; 3])
+            .chain([FakeOp::UnknownMsg; 2])
+            .chain([FakeOp::Ping; 2]);
+        for op in script {
+            tx.send(op).unwrap();
+        }
+        let mut buf = vec![Complex32::default(); 1024];
+        let err = src.read(&mut buf).unwrap_err();
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let health = src.health_counters().unwrap();
+        assert_eq!(health.malformed_packets(), 8);
+        assert_eq!(health.gaps_detected(), 0);
+        assert_eq!(health.dropped_packets(), 0);
+        drop(tx);
+        drop(src);
+        server.join().unwrap();
+    }
+
+    /// MAN-533 D7: an unknown frame between two SND frames does not hide
+    /// a real sequence gap.
+    #[test]
+    fn an_unknown_tag_frame_does_not_hide_a_seq_gap() {
+        let (mut src, tx, server) = scripted_kiwi();
+        tx.send(FakeOp::Samples(0)).unwrap();
+        tx.send(FakeOp::Unknown).unwrap();
+        for seq in 2..42 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        let mut buf = vec![Complex32::default(); 1024];
+        assert!(src.read(&mut buf).unwrap() > 0);
+        let health = src.health_counters().unwrap();
+        assert_eq!(health.gaps_detected(), 1);
+        assert_eq!(health.dropped_packets(), 1);
+        assert_eq!(health.malformed_packets(), 1);
+        drop(tx);
+        drop(src);
+        server.join().unwrap();
+    }
+
+    /// MAN-533 D1: time a consumer spends away from `read` is not spent
+    /// from the budget.
+    #[test]
+    fn a_parked_consumer_does_not_spend_the_usable_sample_budget() {
+        let (mut src, tx, server) = scripted_kiwi();
+        src.usable = UsableSampleBudget::new(Duration::from_secs(1));
+        for seq in 0..40 {
+            tx.send(FakeOp::Samples(seq)).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let mut buf = vec![Complex32::default(); 1024];
+        assert!(src.read(&mut buf).unwrap() > 0);
+        drop(tx);
+        drop(src);
+        server.join().unwrap();
+    }
+
+    /// MAN-533: a real-time stream with interleaved chaff never spends the
+    /// budget, and every chaff frame is counted.
+    #[test]
+    fn valid_frames_with_interleaved_chaff_never_spend_the_budget() {
+        let (mut src, tx, server) = scripted_kiwi();
+        src.usable = UsableSampleBudget::new(Duration::from_secs(2));
+        // 512 samples at 12 kHz is ~43 ms; every 8th op of the first 96
+        // (4 s) is chaff, then plain SND frames until stopped.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let feeder = feed(tx, Duration::from_millis(43), stop.clone(), |i| {
+            if i < 96 && i % 8 == 7 {
+                FakeOp::Unknown
+            } else {
+                FakeOp::Samples(i)
+            }
+        });
+        let mut buf = vec![Complex32::default(); 1024];
+        let health = src.health_counters().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while health.malformed_packets() < 12 {
+            assert!(Instant::now() < deadline, "chaff not all read");
+            src.read(&mut buf)
+                .expect("a delivering stream must not fail");
+        }
+        assert_eq!(health.malformed_packets(), 12);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        drop(src);
+        feeder.join().unwrap();
+        server.join().unwrap();
     }
 
     /// MAN-489: a delivering Kiwi stream that stops sending IQ while the
@@ -1137,10 +1425,7 @@ mod tests {
             let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
             // Serve the script; a closed channel ends the session.
             for op in rx {
-                let frame = match op {
-                    FakeOp::Samples(seq) => snd_frame(seq, 512),
-                    FakeOp::Ping => Message::Ping(Vec::new().into()),
-                };
+                let frame = fake_frame(op);
                 if ws.send(frame).is_err() {
                     break;
                 }
@@ -1223,10 +1508,7 @@ mod tests {
             let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
             // Serve the script; a closed channel ends the session.
             for op in rx {
-                let frame = match op {
-                    FakeOp::Samples(seq) => snd_frame(seq, 512),
-                    FakeOp::Ping => Message::Ping(Vec::new().into()),
-                };
+                let frame = fake_frame(op);
                 if ws.send(frame).is_err() {
                     break;
                 }
@@ -1254,8 +1536,11 @@ mod tests {
         assert!(src.take_stalled());
         // The outage is permanent: the hard error must arrive within the
         // ORIGINAL budget, not soft + a restarted budget.
-        let err = src.read(&mut buf).unwrap_err().to_string();
+        let err = src.read(&mut buf).unwrap_err();
         let total = started.elapsed();
+        // MAN-533 D4: silence carries the shared type, text unchanged.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(
             err.contains("no data for 8 consecutive read timeouts"),
             "{err}"
@@ -1286,10 +1571,7 @@ mod tests {
             let _ = ws.read(); // SET auth
             let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
             for op in rx {
-                let frame = match op {
-                    FakeOp::Samples(seq) => snd_frame(seq, 512),
-                    FakeOp::Ping => Message::Ping(Vec::new().into()),
-                };
+                let frame = fake_frame(op);
                 if ws.send(frame).is_err() {
                     break;
                 }

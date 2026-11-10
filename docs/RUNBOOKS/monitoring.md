@@ -166,7 +166,9 @@ node. [node-health.md](node-health.md) explains each line.
 for 2 minutes. Severity `warning`.
 
 **Means** that input delivers no samples: its receiver is unreachable,
-unplugged or stopped, or (file replay) it reached its end. With several
+unplugged or stopped, or (file replay) it reached its end, or it keeps its
+connection open but sends nothing usable for 30 s (MAN-533: manta drops and
+reopens it; `manta status` shows `no usable samples`). With several
 `[[input]]` entries (MAN-13) the node stays healthy while at least one input
 decodes, so [MantaNodeUnhealthy](#mantanodeunhealthy) does not fire for one
 dead input; the other inputs keep spotting.
