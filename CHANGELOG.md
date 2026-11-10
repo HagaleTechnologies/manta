@@ -24,19 +24,16 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
-<<<<<<< HEAD
 - MAN-540: Debian packages for x86-64 and arm64 (`manta-linux-x86_64.deb`,
   `manta-linux-arm64.deb`). `sudo apt install ./<file>` installs
   `/usr/bin/manta`, the systemd service (enabled, not started) and
   `/etc/manta/manta.toml`, which upgrades never replace.
-=======
 - MAN-546: a telnet client can send `set/dx/filter cq`, `band <list>` and
   `snr <n>` (combinable) to receive only matching spots on its own
   connection, live and from `sh/dx`; `set/dx/filter off` clears it, and
   `SKIMMER/SETT` reports `CQ` for a connection with the CQ filter. The SNR
   is the 500 Hz figure the row prints. See
   [docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
->>>>>>> 785119b6d108493adaf3ab3bb4bfae8139f35f77
 - MAN-533: `GET /status` carries a `sources` array, one row per input
   source with `healthy`, `losses_total`, `last_loss_reason`
   (`no usable samples` or `read failed`) and `last_loss_age_seconds`, and
