@@ -54,10 +54,12 @@ them plainly; that crate is exempt from rustdoc's link and HTML lints.
 
 These mirror the core Rust checks in
 [CI](.github/workflows/ci-full.yml). CI also runs release, packaging and
-workflow checks and tests other platforms. Consult the workflow for those
-commands when changing the corresponding files. Keep Cargo.lock committed;
-do not drop `--locked` from verification to hide dependency drift. If you
-intentionally change dependencies, regenerate and review the lockfile.
+workflow checks and tests other platforms. `bash scripts/pre-push.sh` runs
+all of them in CI order on Linux and macOS and stops at the first failure;
+`--fast` runs fmt and clippy on the crates your branch changed. Keep
+Cargo.lock committed; do not drop `--locked` from verification to hide
+dependency drift. If you intentionally change dependencies, regenerate and
+review the lockfile.
 
 A change to `Cargo.lock`, any `Cargo.toml` or [deny.toml](deny.toml) is
 checked by the "Supply Chain" CI job with `cargo deny --locked check`

@@ -1268,5 +1268,121 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
 
 
+
+PRE_PUSH = os.path.join(ROOT, "scripts", "pre-push.sh")
+
+
+def ci_support_commands():
+    """(command, if) for each ubuntu-support `run:` step from the toolchain pin up to the evidence
+    step, written the way scripts/pre-push.sh runs it."""
+    out, started = [], False
+    for s in wf.steps(wf.job_block(wf.read("ci-full.yml"), "ubuntu-support")):
+        if wf.field(s, "name") == "Record support and doctest results":
+            break
+        body = (wf.run_body(s) or "").strip()
+        started = started or body == "scripts/check-rust-toolchain-pin.sh"
+        if not started or not body:
+            continue
+        suite = re.search(r"-m unittest (scripts\.tests\.test_\w+) -v", body)
+        if "\n" in body and suite:  # test_package_release's python/python3 switch
+            body = f"python3 -m unittest {suite.group(1)} -v"
+        env = wf.sub(s, "env")
+        if env:
+            body = f'RUSTDOCFLAGS="{wf.field(env, "RUSTDOCFLAGS")}" {body}'
+        out.append((body, wf.field(s, "if")))
+    return out
+
+
+def pre_push_list(path_prefix=None):
+    env = dict(os.environ)
+    if path_prefix:
+        env["PATH"] = path_prefix + os.pathsep + env["PATH"]
+    return subprocess.run(["bash", PRE_PUSH, "--list"], capture_output=True, text=True,
+                          check=True, env=env).stdout.splitlines()
+
+
+def claude_md_commands():
+    """CLAUDE.md's Build and test fence, one command per entry, the brace list expanded."""
+    with open(os.path.join(ROOT, "CLAUDE.md"), encoding="utf-8") as f:
+        build = f.read().split("\n## Build and test", 1)[1].split("\n## ", 1)[0]
+    tick3 = "`" * 3  # the fence marker, spelled out so this file has no literal fence
+    fence = build.split(tick3 + "sh\n", 1)[1].split(tick3, 1)[0].replace("\\\n", "")
+    cmds = []
+    for line in (l.strip() for l in fence.splitlines()):
+        if not line or line.startswith("#"):
+            continue
+        brace = re.fullmatch(r"python3 -m unittest -v scripts\.tests\.test_\{([^}]*)\}", line)
+        if brace:
+            cmds += [f"python3 -m unittest scripts.tests.test_{n.strip()} -v"
+                     for n in brace.group(1).split(",")]
+        else:
+            cmds += [c.strip() for c in line.split(" && ")]
+    return cmds
+
+
+def _stub(directory, name, body):
+    path = os.path.join(directory, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("#!/bin/sh\n" + body)
+    os.chmod(path, 0o755)
+
+
+class PrePushScriptTests(unittest.TestCase):
+    """MAN-522: scripts/pre-push.sh runs CLAUDE.md's pre-push list with one command, in the order
+    ci-full.yml's ubuntu-support job runs it, then `cargo test --workspace --locked` last, and
+    stops at the first failure with the failing command named. These tests fail when the script
+    drifts from the workflow or from CLAUDE.md; a PR that changes ubuntu-support's steps changes
+    the script in the same PR."""
+
+    def test_full_list_is_ci_support_order_then_workspace_tests(self):
+        expected = [cmd for cmd, _ in ci_support_commands()
+                    if cmd != "cargo test --workspace --doc --locked"]
+        expected.append("cargo test --workspace --locked")
+        self.assertEqual(pre_push_list(), expected)
+
+    def test_every_claude_md_command_is_a_step(self):
+        def unbash(cmd):
+            return cmd[len("bash "):] if cmd.startswith("bash ") else cmd
+
+        listed = [unbash(c) for c in pre_push_list()]
+        commands = claude_md_commands()
+        self.assertGreater(len(commands), 20)
+        for cmd in commands:
+            self.assertIn(unbash(cmd), listed, cmd)
+
+    def test_macos_skips_only_ci_linux_only_suites(self):
+        linux_only = {cmd for cmd, cond in ci_support_commands()
+                      if cond == "runner.os == 'Linux'" and "-m unittest" in cmd}
+        self.assertEqual(len(linux_only), 3, linux_only)
+        with tempfile.TemporaryDirectory() as d:
+            _stub(d, "uname", "echo Darwin\n")
+            darwin = pre_push_list(d)
+        linux = pre_push_list()
+        self.assertEqual(darwin, [c for c in linux if c not in linux_only])
+
+    def test_first_failure_stops_the_run_and_names_the_command(self):
+        with open(os.path.join(ROOT, "rust-toolchain.toml"), "rb") as f:
+            channel = tomllib.load(f)["toolchain"]["channel"]
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "cargo.log")
+            _stub(d, "cargo", f'echo "$*" >> "{log}"\n'
+                              'case "$1" in clippy) exit 7 ;; esac\nexit 0\n')
+            _stub(d, "rustc", f'echo "rustc {channel} (stub)"\n')
+            # A script that ran on past the failure would reach the python3 suites, and
+            # test_ci_gates would run this test again. The stub keeps that a failure, not a loop.
+            _stub(d, "python3", f'echo "python3 $*" >> "{log}"\n')
+            env = dict(os.environ)
+            env["PATH"] = d + os.pathsep + env["PATH"]
+            run = subprocess.run(["bash", PRE_PUSH], capture_output=True, text=True, env=env,
+                                 cwd=ROOT, timeout=300)
+            with open(log, encoding="utf-8") as f:
+                calls = f.read().splitlines()
+        self.assertEqual(run.returncode, 7, run.stdout + run.stderr)
+        self.assertIn("FAILED", run.stderr)
+        self.assertIn("cargo clippy --workspace --all-targets --locked -- -D warnings", run.stderr)
+        self.assertEqual(calls, ["fmt --all --check",
+                                 "clippy --workspace --all-targets --locked -- -D warnings"])
+
+
 if __name__ == '__main__':
     unittest.main()
