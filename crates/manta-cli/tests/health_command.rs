@@ -7,8 +7,13 @@
 mod common;
 use common::manta;
 
+// MAN-523: the claimed unit-test port band, for the one port a real daemon
+// must bind. Its UDP claim keeps cooperating test processes off the number.
+#[path = "../src/test_ports.rs"]
+mod test_ports;
+
 use common::{fake_server, http_reply};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
@@ -21,12 +26,44 @@ fn stderr(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// MAN-523: a loopback port that nothing can connect to, held until the
+/// caller drops the socket. Bound but never listening, without address
+/// reuse, so a competing bind fails while the guard lives. Binding
+/// `127.0.0.1:0` and dropping the listener let a sibling test's listener
+/// take the number before `manta health` dialled it. A connection must
+/// fail, either by refusal or when the finite connect deadline expires.
+fn unreachable_port() -> (socket2::Socket, u16) {
+    let socket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )
+    .unwrap();
+    let address = SocketAddr::from(([127, 0, 0, 1], 0));
+    socket.bind(&address.into()).unwrap();
+    let port = socket.local_addr().unwrap().as_socket().unwrap().port();
+    (socket, port)
+}
+
+#[test]
+fn an_unreachable_port_stays_reserved_and_unreachable_while_held() {
+    let (_guard, port) = unreachable_port();
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let error = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap_err();
+    // Windows can exhaust this deadline before its refusal is reported;
+    // macOS drops SYNs to a bound non-listening socket. Both are unreachable.
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "{address} must stay unreachable: {error}"
+    );
+    assert_eq!(
+        TcpListener::bind(address).unwrap_err().kind(),
+        std::io::ErrorKind::AddrInUse,
+        "{address} must stay reserved while the guard lives"
+    );
 }
 
 const HEALTHY_BODY: &str = "ok\nsource file: healthy\ndecode: ok\n";
@@ -134,13 +171,16 @@ fn health_against_a_silent_listener_times_out_with_exit_one() {
 
 #[test]
 fn health_against_a_closed_port_exits_one_not_two() {
-    let port = free_port();
+    // Held until `manta health` has exited, so no other listener can take it.
+    let (unreachable, port) = unreachable_port();
     let o = manta()
         .args(["health", "--addr", &format!("127.0.0.1:{port}")])
         .output()
         .unwrap();
+    drop(unreachable);
     assert_eq!(o.status.code(), Some(1), "stderr: {}", stderr(&o));
     assert!(stderr(&o).starts_with("manta health: "), "{}", stderr(&o));
+    assert_eq!(stdout(&o), "", "an unreachable peer prints no report");
 }
 
 /// MAN-282: `manta health` shares `query_daemon`'s deadline, so an
@@ -248,11 +288,13 @@ fn health_dials_the_metrics_address_the_config_names() {
         .unwrap();
     assert_eq!(o.status.code(), Some(0), "MANTA_CONFIG: {}", stderr(&o));
 
-    // The `MANTA_*` overlay `run` applies wins over the file here too.
+    // The `MANTA_*` overlay `run` applies wins over the file here too. The
+    // file's port is held unreachable, so dialling it would fail.
+    let (_wrong_guard, wrong_port) = unreachable_port();
     let wrong = write_config(
         dir.path(),
         "wrong.toml",
-        &format!("{server}metrics_port = {}\n", free_port()),
+        &format!("{server}metrics_port = {wrong_port}\n"),
     );
     let o = manta()
         .arg("health")
@@ -296,7 +338,7 @@ fn health_tracks_a_real_daemon() {
     use std::process::Stdio;
 
     let dir = tempfile::tempdir().unwrap();
-    let metrics_port = free_port();
+    let metrics_port = test_ports::free_port();
     let cfg = write_config(
         dir.path(),
         "manta.toml",
