@@ -600,6 +600,8 @@ pub struct Validator {
     /// `GATE_WINDOW_SECONDS` in samples, cached at construction -- the
     /// prune cutoff for `merged_into` below.
     gate_window_samples: u64,
+    /// Maximum candidate lag retained by dedupe (MAN-534).
+    dedupe_max_lag_samples: u64,
     /// `TURN_SILENCE_SECONDS` in samples, cached at construction (MAN-201).
     turn_silence_samples: u64,
     /// track_id -> (its current best-known root survivor, `now_ts` at the
@@ -722,6 +724,9 @@ fn evidence_links(counted: &[GateOccurrence]) -> Vec<EvidenceLink> {
 /// let it grow far past its steady-state size before the next sweep --
 /// a reasoned choice, not yet measured against real long-run data.
 const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
+
+/// MAN-534: an indefinitely open track may delay dedupe expiry by at most an hour.
+const DEDUPE_MAX_LAG_SECONDS: f64 = 3600.0;
 
 /// MAN-208: one externally computed refinement of a retained occurrence --
 /// the result of re-decoding that occurrence's preserved samples under an
@@ -855,6 +860,7 @@ impl Validator {
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
+            dedupe_max_lag_samples: (DEDUPE_MAX_LAG_SECONDS * fs) as u64,
             turn_silence_samples: (TURN_SILENCE_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
             decisions: None,
@@ -1694,8 +1700,30 @@ impl Validator {
         self.maybe_sweep();
     }
 
-    /// Sweeps the repetition gate if `sweep_interval_samples` has elapsed
-    /// since the last sweep -- throttled the same way regardless of
+    /// Oldest candidate timestamp retained for dedupe expiry (MAN-534).
+    ///
+    /// Refinements use gate occurrences, settled/fused candidates use open
+    /// tracks' word end times, and deferred beacons use their capture times.
+    /// A future word cannot precede its track's last sample timestamp.
+    /// Cap the lag so a permanently open track cannot pin memory forever.
+    /// Candidates more than an hour late, and new tracks on an input more
+    /// than the gate window behind now_ts, can see expired dedupe history.
+    fn dedupe_floor(&self) -> u64 {
+        let mut floor = self.now_ts.saturating_sub(self.gate_window_samples);
+        for track in self.tracks.values() {
+            floor = floor.min(track.last_sample_ts);
+            for word in &track.words {
+                floor = floor.min(word.end_ts);
+            }
+            if let Some(pb) = track.pending_beacons.first() {
+                floor = floor.min(pb.sample_ts);
+            }
+        }
+        floor.max(self.now_ts.saturating_sub(self.dedupe_max_lag_samples))
+    }
+
+    /// Sweeps the gate, dedupe and other time-bounded state if
+    /// `sweep_interval_samples` has elapsed since the last sweep -- throttled the same way regardless of
     /// caller, `TrackClosed` included: under real sustained track churn
     /// (tens of thousands of closes in a 15-minute recording, MAN-166) an
     /// *unthrottled* per-close sweep would mean an O(gate size) scan on
@@ -1708,6 +1736,7 @@ impl Validator {
                 lattice.sweep(self.now_ts);
             }
             self.observations.sweep(self.now_ts);
+            self.dedupe.sweep(self.dedupe_floor());
             // `merged_into` bounded the same way, on the same cadence, as
             // a memory-bound backstop for a root that lives past this
             // window without ever closing (its own `SignalEnded` retires
@@ -6633,6 +6662,136 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "gate must be swept periodically even with no TrackClosed at all, not just accumulate one entry per historical callsign (got {})",
             v.gate.len()
         );
+    }
+
+    #[test]
+    fn dedupe_sweeps_periodically_even_when_no_track_ever_closes() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let mut count = 0;
+        for i in 0..2000u64 {
+            let call = format!(
+                "K5{}{}{}",
+                (b'A' + (i / 676) as u8) as char,
+                (b'A' + ((i / 26) % 26) as u8) as char,
+                (b'A' + (i % 26) as u8) as char
+            );
+            let ts = i * (7 * 86400 * FS as u64) / 2000;
+            let words = ["DE", call.as_str(), "K"];
+            count += run(&transmission_events(1, &words, ts), &mut v).len();
+            count += run(&transmission_events(1, &words, ts + 100_000), &mut v).len();
+        }
+        assert_eq!(count, 2000);
+        assert!(v.dedupe.len() < 20, "entries: {}", v.dedupe.len());
+    }
+
+    #[test]
+    fn a_late_candidate_inside_the_window_is_still_withheld_after_a_sweep() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let first = run(&transmission_events(1, &words, 100_000), &mut v);
+        assert_eq!(first.len(), 1);
+        seed_meta(&mut v, 2);
+        run(
+            &transmission_events(2, &["DE", "W1AW", "K"], 605 * FS as u64),
+            &mut v,
+        );
+        seed_meta(&mut v, 3);
+        let mut late = run(&transmission_events(3, &words, 597 * FS as u64), &mut v);
+        late.extend(run(
+            &transmission_events(3, &words, 598 * FS as u64),
+            &mut v,
+        ));
+        assert!(late.is_empty(), "{late:?}");
+    }
+
+    #[test]
+    fn a_track_left_open_pins_dedupe_memory_for_at_most_the_lag_cap() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        assert!(run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 1000),
+            &mut v
+        )
+        .is_empty());
+        seed_meta(&mut v, 2);
+        let mut count = 0;
+        for i in 0..2000u64 {
+            let call = format!(
+                "K5{}{}{}",
+                (b'A' + (i / 676) as u8) as char,
+                (b'A' + ((i / 26) % 26) as u8) as char,
+                (b'A' + (i % 26) as u8) as char
+            );
+            let ts = 100_000 + i * (7 * 86400 * FS as u64) / 2000;
+            let words = ["DE", call.as_str(), "K"];
+            count += run(&transmission_events(2, &words, ts), &mut v).len();
+            count += run(&transmission_events(2, &words, ts + 100_000), &mut v).len();
+        }
+        assert_eq!(count, 2000);
+        assert!(v.dedupe.len() < 50, "entries: {}", v.dedupe.len());
+    }
+
+    #[test]
+    fn a_deferred_beacon_stays_stale_after_its_newer_spot_ages_past_the_window() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+
+        // Track 1 captures a Beacon candidate for K5ARH at an early
+        // timestamp, on 14_000_000.0 Hz (seed_meta's fixture value), but
+        // does not close yet.
+        seed_meta(&mut v, 1);
+        let words = ["V", "V", "V", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 1_000), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // A newer, ordinary (repetition-confirmed) spot for the SAME
+        // callsign/frequency arrives on a different track, well after.
+        seed_meta(&mut v, 2);
+        let words2 = ["DE", "K5ARH", "K"];
+        let mut spots2 = run(&transmission_events(2, &words2, 5_000_000), &mut v);
+        spots2.extend(run(&transmission_events(2, &words2, 5_100_000), &mut v));
+        assert_eq!(spots2.len(), 1, "the ordinary path must spot normally");
+        let newer_ts = spots2[0].sample_ts;
+
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
+            Some(newer_ts),
+            "dedupe must have recorded the newer, ordinary spot's timestamp"
+        );
+
+        seed_meta(&mut v, 3);
+        run(
+            &transmission_events(3, &["DE", "W1AW", "K"], 5_100_000 + 700 * FS as u64),
+            &mut v,
+        );
+
+        // Track 1 finally closes -- its captured (OLDER) Beacon candidate
+        // must not emit now, and must not roll dedupe's watermark back to
+        // its own stale timestamp. A plausible, confirmed final speed
+        // (MAN-174), so the candidate reaches the stale check rather than
+        // the round-10 unconfirmed-WPM refusal.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots3 = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(
+            spots3.is_empty(),
+            "an already-superseded deferred candidate must not emit, got {spots3:?}"
+        );
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
+            Some(newer_ts),
+            "resolving the stale deferred candidate must not roll the \
+             dedupe watermark backward"
+        );
+        // MAN-174 finding 6: the stale drop is counted.
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
     }
 
     // ---- MAN-208: bounded delayed refinement of ambiguous decodes ----
