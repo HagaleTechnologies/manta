@@ -78,17 +78,35 @@ class ShardTests(unittest.TestCase):
         self.assertEqual(s.parse_artifacts(json.dumps(artifact(kind='example')))[0]['kind'], 'example')
         self.assertEqual(s.parse_artifacts(json.dumps(artifact(executable=None))), [])
 
-    def test_complete_disjoint_stable_and_golden_isolated(self):
-        items = s.parse_artifacts('\n'.join(json.dumps(artifact(n)) for n in ['golden_v8_v8w', 'new', 'a', 'b']))
+    def test_complete_disjoint_stable_and_no_reserved_shard(self):
+        names = ['golden_v8', 'golden_v8w', 'golden_vc3', 'new', 'a', 'b', 'c', 'd']
+        items = s.parse_artifacts('\n'.join(json.dumps(artifact(n)) for n in names))
         shards = s.assign(items, {}, 8)
         self.assertEqual(shards, s.assign(list(reversed(items)), {}, 8))
-        self.assertEqual([x['name'] for x in shards[0]], ['golden_v8_v8w'])
+        # MAN-521: no shard is kept for one binary; equal weights fill every shard once.
+        self.assertEqual([len(group) for group in shards], [1] * 8)
         self.assertEqual(sorted(x['key'] for group in shards for x in group), sorted(x['key'] for x in items))
         for count in [0, 1]:
             with self.assertRaises(ValueError):
                 s.assign(items, {}, count)
         collision = s.parse_artifacts('\n'.join(json.dumps(artifact(package=p)) for p in ['p', 'q']))
         self.assertEqual(len(collision), 2)
+
+    def test_weights_file_puts_each_golden_scene_on_its_own_shard(self):
+        weights = json.loads((ROOT/'scripts/ci-test-weights.json').read_text())['weights']
+        self.assertNotIn('golden_v8_v8w', weights)
+        names = list(weights) + [f'small{i}' for i in range(20)]
+        items = s.parse_artifacts('\n'.join(json.dumps(artifact(n)) for n in names))
+        shard_of = {x['name']: i for i, group in enumerate(s.assign(items, weights, 8)) for x in group}
+        golden = [shard_of[n] for n in ('golden_v8', 'golden_v8w', 'golden_vc3')]
+        self.assertEqual(len(set(golden)), 3, shard_of)
+
+    def test_weight_keys_name_workspace_targets(self):
+        weights = json.loads((ROOT/'scripts/ci-test-weights.json').read_text())['weights']
+        meta = json.loads(subprocess.run(['cargo', 'metadata', '--no-deps', '--format-version', '1', '--offline'],
+                                         cwd=ROOT, check=True, capture_output=True, text=True).stdout)
+        targets = {t['name'] for p in meta['packages'] for t in p['targets'] if set(t['kind']) & {'lib', 'test'}}
+        self.assertEqual(sorted(set(weights) - targets), [])
 
     def test_evidence_fails_closed(self):
         inv = [dict(key='a', tests=['ok'], ignored=['ignored'])]

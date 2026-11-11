@@ -5,7 +5,9 @@
 //! MAN-252), and a fake metrics listener (`health_command.rs` and
 //! `status_command.rs`, MAN-285). The `manta()` launcher, its `MANTA_*`
 //! scrub and `free_ports()` live in the `std`-only leaf `launch.rs`
-//! (MAN-549), re-exported here.
+//! (MAN-549), re-exported here. The V8/V8w/VC3 pileup fixture and gates
+//! (`golden_v8.rs`, `golden_v8w.rs`, `golden_vc3.rs`, MAN-521) live in
+//! `pileup.rs`.
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
@@ -485,3 +487,7 @@ pub fn http_reply(status: &str, body: &str) -> Vec<u8> {
 }
 
 pub mod decode;
+
+/// MAN-521: the V8/V8w/VC3 pileup scenes, rendered once per binary, and the
+/// gates `golden_v8.rs`, `golden_v8w.rs` and `golden_vc3.rs` share.
+pub mod pileup;
