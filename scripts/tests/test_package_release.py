@@ -422,7 +422,8 @@ class WorkflowPackageStepTests(ArchiveAssertions):
                 self.assertLess(pkg[0], upload[0])
                 paths = wf.sub(wf.sub(build[upload[0]], "with"), "path")
                 self.assertEqual([p.strip() for p in paths[1:] if p.strip()],
-                                 ["${{ matrix.artifact }}.tar.gz", "${{ matrix.artifact }}.zip"])
+                                 ["${{ matrix.artifact }}.tar.gz", "${{ matrix.artifact }}.zip",
+                                  "${{ matrix.artifact }}.deb"])
 
     def test_soapy_package_step_precedes_its_upload(self):
         for name in RELEASE_WORKFLOWS:

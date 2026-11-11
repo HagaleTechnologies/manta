@@ -27,6 +27,10 @@ name = "fsk"
 harness = false
 
 [[bench]]
+name = "floor_gate"
+harness = false
+
+[[bench]]
 name = "comod"
 harness = false
 

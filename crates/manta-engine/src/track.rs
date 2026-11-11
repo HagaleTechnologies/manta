@@ -3253,11 +3253,12 @@ impl TrackManager {
         // on; each track's phase sum drops the lifted hops before it.
         let crash_onset = suppress && crash_hop.run_hops == 1;
         let hold = crash_hop.hold_decoder() && self.cfg.crash_filter == CrashFilter::Full;
-        self.floor.update_holding_reference(&power_db_vals, hold);
+        self.floor
+            .update_holding_reference(&power_db_vals, &hop.power, hold);
         let (rise, drop) = if suppress {
             self.gate.hold(&self.floor)
         } else {
-            self.gate.update(&power_db_vals, &self.floor)
+            self.gate.update(&power_db_vals, &hop.power, &self.floor)
         };
         // MAN-324: the live-state occupancy window; one `Option` check
         // when off.

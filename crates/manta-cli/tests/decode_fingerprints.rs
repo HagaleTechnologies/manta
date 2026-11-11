@@ -3,6 +3,8 @@
 //! V1-V10, V8w, V31, V34, V51 and VR1-VR8, for both engines. Run once on each
 //! build and diff, like `crates/manta-engine/tests/man398_grid.rs`:
 //! `cargo test --release -p manta-cli --test decode_fingerprints -- --ignored --nocapture | grep ^FINGERPRINT`
+//! (MAN-528: on a memory-limited host, prefix `MANTA_FINGERPRINT_JOBS=4` to
+//! render and decode four vectors at a time; unset, all run at once).
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -79,45 +81,56 @@ fn decode_fingerprints() {
         "vr1", "vr2", "vr3", "vr4", "vr5", "vr6a", "vr6b", "vr7", "vr8",
     ];
     let root = tempfile::tempdir().unwrap();
-    let lines: Vec<Vec<String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = names
-            .iter()
-            .map(|&name| {
-                let dir = root.path().join(name);
-                s.spawn(move || {
-                    std::fs::create_dir_all(&dir).unwrap();
-                    let (wav, extra) = render(name, &dir);
-                    ["legacy", "hsmm"]
-                        .iter()
-                        .map(|engine| {
-                            let out = Command::new(env!("CARGO_BIN_EXE_manta"))
-                                .args(["decode", "--json", "--engine", engine])
-                                .args(&extra)
-                                .arg(&wav)
-                                .output()
-                                .unwrap();
-                            let code = out.status.code().unwrap_or(-1);
-                            assert!(
-                                out.status.success() && !out.stdout.is_empty(),
-                                "{name} {engine}: exit {code}, {} stdout bytes, stderr: {}",
-                                out.stdout.len(),
-                                String::from_utf8_lossy(&out.stderr)
-                            );
-                            let sha: String = Sha256::digest(&out.stdout)
-                                .iter()
-                                .map(|b| format!("{b:02x}"))
-                                .collect();
-                            format!(
-                                "FINGERPRINT\t{name}\t{engine}\t{code}\t{}\t{sha}",
-                                out.stdout.len()
-                            )
-                        })
-                        .collect()
+    // MAN-528: MANTA_FINGERPRINT_JOBS=N renders and decodes N vectors at a
+    // time (unset: all at once, as before). N=4 fits a 5 GiB memory limit.
+    let jobs: usize = std::env::var("MANTA_FINGERPRINT_JOBS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(names.len());
+    let mut lines: Vec<Vec<String>> = Vec::new();
+    for batch in names.chunks(jobs) {
+        let part: Vec<Vec<String>> = std::thread::scope(|s| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|&name| {
+                    let dir = root.path().join(name);
+                    s.spawn(move || {
+                        std::fs::create_dir_all(&dir).unwrap();
+                        let (wav, extra) = render(name, &dir);
+                        ["legacy", "hsmm"]
+                            .iter()
+                            .map(|engine| {
+                                let out = Command::new(env!("CARGO_BIN_EXE_manta"))
+                                    .args(["decode", "--json", "--engine", engine])
+                                    .args(&extra)
+                                    .arg(&wav)
+                                    .output()
+                                    .unwrap();
+                                let code = out.status.code().unwrap_or(-1);
+                                assert!(
+                                    out.status.success() && !out.stdout.is_empty(),
+                                    "{name} {engine}: exit {code}, {} stdout bytes, stderr: {}",
+                                    out.stdout.len(),
+                                    String::from_utf8_lossy(&out.stderr)
+                                );
+                                let sha: String = Sha256::digest(&out.stdout)
+                                    .iter()
+                                    .map(|b| format!("{b:02x}"))
+                                    .collect();
+                                format!(
+                                    "FINGERPRINT\t{name}\t{engine}\t{code}\t{}\t{sha}",
+                                    out.stdout.len()
+                                )
+                            })
+                            .collect()
+                    })
                 })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        lines.extend(part);
+    }
     for line in lines.iter().flatten() {
         println!("{line}");
     }

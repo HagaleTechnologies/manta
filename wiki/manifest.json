@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-11-03T06:45:00Z",
-  "head_commit": "212fa51",
+  "head_commit": "acbc00f",
   "pages": [
     {
       "hash": "sha256:a77216f2c07a8f129b8b188dd6425862dd2838e26a245539efdbc07cf7b866fe",
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d47cbfbada9012ef5cef9ae283ec47ef70a0f65e51b48f2f6bd27cf4391d481b",
+      "hash": "sha256:53dae587af74c9bc2b757b03f8dd1c8fa8a437e11bf3e1098066c5df51d76697",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -298,7 +298,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:98ad81e0b364655b1039dfd6a9d62e0aacd185dfa3f31ee83c1f8a800fa937be",
+      "hash": "sha256:fc8206b042c942e3fd01916c22b13ee5baa2b2cd912eea04b0325a726bec92b3",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -317,12 +317,13 @@
         "docs/RUNBOOKS/rbn-comparison.md",
         "docs/SPOT-SCHEMA.md",
         "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
-        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md"
+        "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
+        "docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "799379d",
-      "verified_date": "2026-10-16",
+      "verified_commit": "acbc00f",
+      "verified_date": "2026-11-10",
       "visibility": "public"
     },
     {
@@ -398,7 +399,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:ea5bb625a75505fa8e108ffb3971e7965cc80a7e10256a3e7ee33fa169328973",
+      "hash": "sha256:f345de9c7831ff99be14b2fdc033b8732cef2e65ba68e2dc08e261da7d2a2e5d",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [

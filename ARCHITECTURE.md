@@ -185,9 +185,17 @@ trait IqSource: sample_rate(), center_freq_hz(), rf_passband_hz(), read(&mut [Co
   them. Pure std plus `socket2`, in every build. The wire facts are pinned
   against ka9q-radio's documentation and headers, not yet a live radiod
   ([docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md](docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md)).
+  Its RTP packets are numbered, so a short loss is counted from the RTP
+  timestamp and reported through `IqSource::take_missing_samples()`, and a
+  loss of 0.5 s or more goes through `take_discontinuity()`; a read ends at
+  the loss
+  ([docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md](docs/DECISIONS/2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md)).
 - **KiwiSDR client**: the kiwisdr websocket IQ protocol (12 kHz IQ per channel) —
   narrow, but gives instant worldwide receiver access for development and lets
-  low-budget nodes contribute spots.
+  low-budget nodes contribute spots. Its SND frames are numbered, so a short
+  loss is converted to output samples at the negotiated rate and reported
+  through `IqSource::take_missing_samples()`, and a loss of 0.5 s or more goes
+  through `take_discontinuity()` (MAN-529).
 - **File playback**: WAV (via `hound`, matching coppa): Float32 or
   16/24/32-bit integer PCM, streamed from disk, so memory does not grow with
   the recording
@@ -694,6 +702,15 @@ sample time. See
   restart. See [MAN-93](docs/DECISIONS/2026-10-11-man93-sh-dx-history-window.md)
   for retention and `docs/DECISIONS/2026-10-10-man92-telnet-commands.md`
   for query semantics.
+  `set/dx/filter cq`, `band <list>` and `snr <n>` (combinable, e.g.
+  `set/dx/filter cq band 40m,20m snr 10`) set a per-connection filter that
+  governs the live stream, the shutdown drain and `sh/dx`, where it selects
+  before the count is applied. A new `set/dx/filter` replaces the previous
+  one; `set/dx/filter off` or a bare `set/dx/filter` clears every filter on
+  the connection, `unique` included. `snr` compares the 500 Hz whole-dB
+  figure the row prints, and a connection with `cq` set gets
+  `SETT: vlNormal CQ ...`. Other connections are unaffected. See
+  [MAN-546](docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md).
   `SKIMMER/SETT` replies with validation level and the live decodable
   passband (`SETT: vlNormal 14000.0-14070.0`); Aggregator will not forward
   spots from a source that never answers it (Aggregator manual v6.0 §9.2).

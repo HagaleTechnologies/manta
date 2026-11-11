@@ -1,14 +1,16 @@
 {
-  "source": "MAN-498 supplied Ubuntu baseline run 41726268369; estimates for placement, default 30 seconds for every new target",
+  "source": "MAN-498 supplied Ubuntu baseline run 41726268369; MAN-521's golden_v8w, golden_vc3 and golden_v8 are estimates (local times scaled by golden_v8_v8w's Ubuntu/local ratio 650/785.6); default 30 seconds for every new target",
   "weights": {
-    "golden_v8_v8w": 626,
     "manta_engine": 425,
     "determinism_hsmm": 239,
+    "golden_v8w": 190,
     "multi_input_hpsdr": 180,
+    "golden_vc3": 173,
     "listen_inputs": 122,
     "rtty": 120,
     "soak_ci": 120,
     "multi_input": 118,
+    "golden_v8": 114,
     "rtty_detector": 102
   }
 }

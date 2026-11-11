@@ -272,6 +272,36 @@ fn readme_installation_offers_every_release_archive() {
     }
 }
 
+/// MAN-540: Installation offers the Debian package of every Linux matrix
+/// archive, and says how to install it with apt and where the config lands.
+#[test]
+fn readme_installation_offers_every_debian_package() {
+    let install = squash_whitespace(section(&doc("README.md"), "Installation"));
+    let workflow = doc(".github/workflows/release-publish.yml");
+    let linux: Vec<&str> = workflow
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("artifact: "))
+        .filter(|artifact| artifact.starts_with("manta-linux-"))
+        .collect();
+    assert!(
+        !linux.is_empty(),
+        "no `manta-linux-*` `artifact:` entries in the release build matrix"
+    );
+    for artifact in linux {
+        let package = format!("{artifact}.deb");
+        assert!(
+            install.contains(&package),
+            "README Installation never names Debian package `{package}`"
+        );
+    }
+    for needle in ["sudo apt install ./", "/etc/manta/manta.toml"] {
+        assert!(
+            install.contains(needle),
+            "README Installation's Debian package route never says `{needle}`"
+        );
+    }
+}
+
 /// Every command in the Quickstart must run on a build the reader was told
 /// to make. `--soapy-driver` needs `--features soapy`, which is in neither
 /// the default build nor any default release binary.
