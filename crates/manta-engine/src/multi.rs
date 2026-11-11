@@ -119,6 +119,8 @@ impl TrackIdSpace {
 /// What one input's front end publishes from its own thread.
 #[derive(Clone, Default)]
 pub struct InputObservers {
+    /// Close counts and spawns only; other lifecycle fields stay zero on input fronts.
+    pub track_lifecycle: Option<Arc<crate::TrackLifecycleObserver>>,
     /// Tracks holding a decoder on this input (the caller sums inputs).
     pub active_tracks: Option<Arc<AtomicU64>>,
     /// Static crashes on this input so far (the caller sums inputs).
@@ -516,6 +518,7 @@ pub fn listen_inputs(
             ids: TrackIdSpace::for_input(index, n),
             factor: factors[index],
             observers: FrontObservers {
+                track_lifecycle: opened.observers[index].track_lifecycle.clone(),
                 active_tracks: opened.observers[index].active_tracks.clone(),
                 static_crashes: opened.observers[index].static_crashes.clone(),
                 bad_samples: opened.observers[index].bad_samples.clone(),

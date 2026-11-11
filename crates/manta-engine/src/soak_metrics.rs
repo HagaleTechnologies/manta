@@ -40,6 +40,7 @@ pub struct SoakMetricsReport {
     pub rss_growth_bytes: u64,
     pub panicked: bool,
     pub peak_active_tracks: usize,
+    /// Includes tracks closed at source end and outage teardown.
     pub final_close_counts: CloseCounts,
     /// Count of `DecoderEvent::TrackClosed` actually emitted -- distinct
     /// from `final_close_counts`'s total (which counts every close,
@@ -260,7 +261,7 @@ mod tests {
         manta_testkit::vectors::render(&spec).unwrap().samples
     }
 
-    fn close_fields(c: CloseCounts) -> [u64; 8] {
+    fn close_fields(c: CloseCounts) -> [u64; 10] {
         [
             c.unconfirmed,
             c.hang_expired,
@@ -270,6 +271,8 @@ mod tests {
             c.rtty,
             c.not_cw,
             c.unkeyed,
+            c.source_end,
+            c.reconnect,
         ]
     }
 

@@ -1351,3 +1351,36 @@ fn a_held_call_spots_on_the_stall_before_resume_multi_input() {
     assert!(seen.contains(&"K1AW".to_string()), "{seen:?}");
     assert_eq!(seen.iter().filter(|c| *c == "W1AW").count(), 1, "{seen:?}");
 }
+
+#[test]
+fn each_inputs_close_counts_reach_its_lifecycle_observer() {
+    let a = Arc::new(manta_engine::TrackLifecycleObserver::default());
+    let b = Arc::new(manta_engine::TrackLifecycleObserver::default());
+    let mut inputs = vec![
+        plain("a", short_scene()),
+        spec("b", short_scene(), 0.0, 96_000 * 15, Fault::Error),
+    ];
+    inputs[0].observers.track_lifecycle = Some(a.clone());
+    inputs[1].observers.track_lifecycle = Some(b.clone());
+    run(inputs);
+    assert!(a.snapshot().close_counts.source_end >= 1);
+    assert!(b.snapshot().close_counts.reconnect >= 1);
+    for obs in [a, b] {
+        let snap = obs.snapshot();
+        let c = snap.close_counts;
+        assert_eq!(
+            c.restricted
+                + c.unconfirmed
+                + c.hang_expired
+                + c.silent
+                + c.merged
+                + c.evicted
+                + c.rtty
+                + c.not_cw
+                + c.unkeyed
+                + c.source_end
+                + c.reconnect,
+            snap.spawns
+        );
+    }
+}

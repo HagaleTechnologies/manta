@@ -1,7 +1,7 @@
 //! Track and gate counters from the streaming loop (MAN-236).
 //!
-//! Includes every track-map entry, even unconfirmed candidates. Relaxed
-//! atomics keep the decode loop independent of readers; nothing here feeds
+//! Includes every track-map entry, even unconfirmed candidates, and closes
+//! at source end or during outages. Relaxed atomics keep the decode loop independent of readers; nothing here feeds
 //! back into decoding. Fields are individually current, with no cross-field
 //! snapshot guarantee for readers on another thread. Use one fresh observer
 //! per run, with the streaming loop as its only writer.
@@ -45,6 +45,8 @@ pub struct TrackLifecycleObserver {
     not_cw: AtomicU64,
     unkeyed: AtomicU64,
     false_lease_hops: AtomicU64,
+    source_end: AtomicU64,
+    reconnect: AtomicU64,
     gate_records_total: AtomicU64,
 }
 
@@ -67,12 +69,16 @@ impl TrackLifecycleObserver {
                 not_cw: self.not_cw.load(Ordering::Relaxed),
                 unkeyed: self.unkeyed.load(Ordering::Relaxed),
                 false_lease_hops: self.false_lease_hops.load(Ordering::Relaxed),
+                source_end: self.source_end.load(Ordering::Relaxed),
+                reconnect: self.reconnect.load(Ordering::Relaxed),
             },
             gate_records_total: self.gate_records_total.load(Ordering::Relaxed),
         }
     }
 
     pub(crate) fn publish_counts(&self, closes: CloseCounts, gate_records_total: u64, spawns: u64) {
+        self.source_end.store(closes.source_end, Ordering::Relaxed);
+        self.reconnect.store(closes.reconnect, Ordering::Relaxed);
         self.restricted.store(closes.restricted, Ordering::Relaxed);
         self.spawns.store(spawns, Ordering::Relaxed);
         self.unconfirmed
@@ -128,6 +134,8 @@ mod tests {
             not_cw: 7,
             unkeyed: 8,
             false_lease_hops: 750,
+            source_end: 9,
+            reconnect: 10,
         };
         obs.publish_counts(closes, 19, 27);
         assert_eq!(

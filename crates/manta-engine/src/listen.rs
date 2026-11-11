@@ -1185,6 +1185,13 @@ pub fn listen_with_observers(
                     &mut on_event,
                     &mut on_spot,
                 );
+                if let Some(obs) = &observers.track_lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        validator.gate_records_total(),
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                }
                 stalled = true;
                 continue;
             }
@@ -1607,6 +1614,7 @@ impl<'a> Back<'a> {
 
 /// MAN-13: what one input's front end publishes on its own thread.
 pub(crate) struct FrontObservers {
+    pub(crate) track_lifecycle: Option<Arc<crate::TrackLifecycleObserver>>,
     pub(crate) active_tracks: Option<Arc<AtomicU64>>,
     pub(crate) static_crashes: Option<Arc<AtomicU64>>,
     pub(crate) bad_samples: Option<Arc<AtomicU64>>,
@@ -1724,6 +1732,8 @@ pub(crate) fn run_input_front(
     let analytic = src.analytic_guard_hz() > 0.0;
     let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
+    let mut close_base = crate::track::CloseCounts::default();
+    let mut spawn_base = 0;
     // MAN-141: this input's spectrum tap, with its own calibration.
     let spectrum = observers.spectrum.clone().map(|sink| SpectrumFeed {
         sink,
@@ -1832,6 +1842,13 @@ pub(crate) fn run_input_front(
     let b = batch(events, fill_end, &mut seg.tm);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1845,6 +1862,13 @@ pub(crate) fn run_input_front(
     tick(&mut b, &mut seg.tm, fill_end);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1873,6 +1897,13 @@ pub(crate) fn run_input_front(
             // MAN-201, as `listen_with_observers`.
             if src.take_stalled() {
                 let finish_events = seg.tm.finish_for_discontinuity();
+                if let Some(obs) = &observers.track_lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        0,
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                }
                 if !send(batch(finish_events, seg_base + seg_consumed, &mut seg.tm)) {
                     return Ok(());
                 }
@@ -1901,6 +1932,8 @@ pub(crate) fn run_input_front(
             let finish_events = seg.tm.finish_for_discontinuity();
             pending.push(batch(finish_events, seg_base + seg_consumed, &mut seg.tm));
             let next_id = seg.tm.next_track_id();
+            close_base = close_base + seg.tm.close_counts();
+            spawn_base += seg.tm.total_spawns();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
             conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
@@ -1940,6 +1973,13 @@ pub(crate) fn run_input_front(
         pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        if let Some(obs) = &observers.track_lifecycle {
+            obs.publish_counts(
+                close_base + seg.tm.close_counts(),
+                0,
+                spawn_base + seg.tm.total_spawns(),
+            );
+        }
         report_bad_samples(bad_base + seg.ch.bad_samples());
         if let Some(observer) = &observers.conditioned {
             observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1970,6 +2010,13 @@ pub(crate) fn run_input_front(
     let mut last = batch(events, seg_base + seg_consumed, &mut seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -2336,7 +2383,7 @@ mod tests {
         }
     }
 
-    fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 8] {
+    fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 10] {
         [
             c.unconfirmed,
             c.hang_expired,
@@ -2346,6 +2393,8 @@ mod tests {
             c.rtty,
             c.not_cw,
             c.unkeyed,
+            c.source_end,
+            c.reconnect,
         ]
     }
 
