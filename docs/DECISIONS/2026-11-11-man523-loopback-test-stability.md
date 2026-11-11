@@ -65,9 +65,11 @@ assertions unchanged and stay open until the observation in D5.
 
 ### D3. Changed socket tests run ten more times before merge
 
-`scripts/ci-shards.py --repeat-base SHA` (Unix shards, `--from-bundle` only)
-loads `scripts/socket-test-repeat.py` after the ordinary whole-executable
-run. It diffs SHA to HEAD and selects, per executable in the shard's slice:
+`scripts/ci-shards.py --repeat-base SHA` loads `scripts/socket-test-repeat.py`
+after the ordinary tests. Unix shards use `--from-bundle`; Windows uses
+`--inventory-only` after `cargo test --workspace --locked`, capturing the
+executables with `--no-run --message-format=json`. It diffs SHA to HEAD and
+selects per executable in the shard's slice, or the full Windows inventory:
 
 - candidates: an integration target whose sources (the root file and every
   file it includes by `mod` or `#[path]`) contain `TcpListener::bind` or
@@ -144,13 +146,11 @@ pending".
   including a real Cargo bundle where the edited test runs ten more times,
   its siblings once, and a failure on iteration seven fails the shard.
 
-No macOS or Windows run happened here. Windows keeps its ordinary
-`cargo test --workspace` with no repetition (D6).
+No macOS or Windows run happened here. Windows repetition is wired into
+the workflow, but has not been verified on Windows in this session.
 
 ### D6. Not built in this change
 
-- Windows repetition: the plan's `--no-run` executable capture for the
-  Windows job is not built. Windows is not a required check.
 - Function-level selection uses a line scanner, not a Rust parser: macro-
   generated test names and aliased socket types (`use ... as`) are not
   followed. Helper and target-level fallbacks cover most of that.
