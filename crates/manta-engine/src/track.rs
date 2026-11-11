@@ -299,9 +299,7 @@ impl CloseReason {
 
 /// Per-`CloseReason` close counters (issue #26: SPEC §2.5 / ARCHITECTURE §4,
 /// §8 both describe merges and evictions as "counted" -- this is that count.
-/// Exposed via `TrackManager::close_counts` for the future M3 metrics
-/// endpoint to read; nothing wires it externally yet, since the Prometheus
-/// text endpoint itself is explicit M3 scope (ROADMAP.md).
+/// Per-reason close counts, published through the lifecycle observer and /metrics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CloseCounts {
     pub restricted: u64,
@@ -318,6 +316,10 @@ pub struct CloseCounts {
     pub unkeyed: u64,
     /// Hops spent holding leases by tracks closed NotCw or Unkeyed.
     pub false_lease_hops: u64,
+    /// Tracks still open at plain source end or stop.
+    pub source_end: u64,
+    /// Tracks closed by outage teardown, including reconnect, stall and read error.
+    pub reconnect: u64,
 }
 
 impl std::ops::Add for CloseCounts {
@@ -335,6 +337,8 @@ impl std::ops::Add for CloseCounts {
             not_cw: self.not_cw + rhs.not_cw,
             unkeyed: self.unkeyed + rhs.unkeyed,
             false_lease_hops: self.false_lease_hops + rhs.false_lease_hops,
+            source_end: self.source_end + rhs.source_end,
+            reconnect: self.reconnect + rhs.reconnect,
         }
     }
 }
@@ -3134,7 +3138,7 @@ impl TrackManager {
     /// machine, `Merged`/`Evicted` from `merge_converged`/`evict_over_cap`).
     /// SPEC §2.5 and ARCHITECTURE §4/§8 both describe these closes as
     /// "counted" -- this is the count. Published by `TrackLifecycleObserver`
-    /// for `soak_metrics::soak_with_metrics` (MAN-236).
+    /// for soak metrics and /metrics, including source-end and outage closes.
     pub fn close_counts(&self) -> CloseCounts {
         self.close_counts
     }
@@ -4972,6 +4976,12 @@ impl TrackManager {
                 }),
         );
         events.sort_by_key(|e| (event_sample_ts(e), event_track_id(e)));
+        let n_closed = self.tracks.len() as u64;
+        if discontinuity {
+            self.close_counts.reconnect += n_closed;
+        } else {
+            self.close_counts.source_end += n_closed;
+        }
         self.tracks.clear();
         events
     }
@@ -5454,6 +5464,8 @@ mod tests {
             not_cw: 7,
             unkeyed: 8,
             false_lease_hops: 9,
+            source_end: 10,
+            reconnect: 11,
         };
         let b = CloseCounts {
             restricted: 0,
@@ -5466,6 +5478,8 @@ mod tests {
             not_cw: 70,
             unkeyed: 80,
             false_lease_hops: 90,
+            source_end: 100,
+            reconnect: 110,
         };
         assert_eq!(
             a + b,
@@ -5480,6 +5494,8 @@ mod tests {
                 not_cw: 77,
                 unkeyed: 88,
                 false_lease_hops: 99,
+                source_end: 110,
+                reconnect: 121,
             }
         );
     }
@@ -10617,6 +10633,60 @@ mod tests {
                 at_4096, at_2048,
                 "{name}: TrackMeta.freq_hz must not depend on the caller's process_hops chunk size"
             );
+        }
+    }
+
+    #[test]
+    fn finish_and_finish_for_discontinuity_count_every_open_track() {
+        use manta_dsp::channelizer::Channelizer;
+        let spec = manta_testkit::vectors::v1();
+        let rendered = manta_testkit::vectors::render(&spec).unwrap();
+        for discontinuity in [false, true] {
+            let mut ch = Channelizer::new(spec.fs, spec.center_freq_hz).unwrap();
+            let hop = ch.hop() as u64;
+            let mut tm = TrackManager::new(
+                ch.n_channels(),
+                spec.fs,
+                spec.center_freq_hz,
+                DetectorConfig::default(),
+                DecodeConfig::default(),
+            );
+            for chunk in rendered.samples.chunks(4096) {
+                tm.process_hops(&ch.process(chunk), |m| m * hop);
+            }
+            let n = tm.active_track_count() as u64;
+            assert!(n >= 1);
+            let before = tm.close_counts();
+            for _ in 0..2 {
+                if discontinuity {
+                    tm.finish_for_discontinuity();
+                } else {
+                    tm.finish();
+                }
+                let c = tm.close_counts();
+                assert_eq!(
+                    c.source_end - before.source_end,
+                    if discontinuity { 0 } else { n }
+                );
+                assert_eq!(
+                    c.reconnect - before.reconnect,
+                    if discontinuity { n } else { 0 }
+                );
+                assert_eq!(
+                    c.restricted
+                        + c.unconfirmed
+                        + c.hang_expired
+                        + c.silent
+                        + c.merged
+                        + c.evicted
+                        + c.rtty
+                        + c.not_cw
+                        + c.unkeyed
+                        + c.source_end
+                        + c.reconnect,
+                    tm.total_spawns()
+                );
+            }
         }
     }
 

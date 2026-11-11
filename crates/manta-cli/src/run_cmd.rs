@@ -779,6 +779,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
         decode_latency,
         mut decode_latency_poller,
         decode_quality,
+        lifecycle,
     ) = match loaded.server.clone() {
         Some(server_cfg) => {
             // `epoch` feeds SpotBus's wall-clock conversion (every
@@ -911,15 +912,20 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             server
                 .metrics
                 .set_decode_quality(decode_quality_of(&decode_quality.snapshot()));
+            let lifecycle = std::sync::Arc::new(manta_engine::TrackLifecycleObserver::default());
             let decode_latency_poller = {
                 let obs = decode_latency.clone();
                 let quality = decode_quality.clone();
+                let lifecycle = lifecycle.clone();
                 let latency_metrics = server.metrics.clone();
                 rt.spawn(async move {
                     loop {
                         tokio::time::sleep(DECODE_LATENCY_POLL_INTERVAL).await;
                         latency_metrics.set_decode_latency(latency_histogram_of(&obs.snapshot()));
                         latency_metrics.set_decode_quality(decode_quality_of(&quality.snapshot()));
+                        latency_metrics.set_track_closes_total(crate::track_closes_of(
+                            &lifecycle.snapshot().close_counts,
+                        ));
                     }
                 })
             };
@@ -952,9 +958,10 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                 Some(decode_latency),
                 Some(decode_latency_poller),
                 Some(decode_quality),
+                Some(lifecycle),
             )
         }
-        None => (None, None, None, None, None, None, None),
+        None => (None, None, None, None, None, None, None, None),
     };
     // MAN-316: after the `listening:` banner, before `manta:
     // listening;`: the `lists:` lines, `manta_list_info`, and the
@@ -1283,7 +1290,7 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
                     )) as std::sync::Arc<dyn manta_engine::LiveStateSink>
                 }),
             detector_confirmations: None,
-            track_lifecycle: None,
+            track_lifecycle: lifecycle.clone(),
             spectrum: spectrum_sink,
             funnel_trace: None,
         },
@@ -1486,6 +1493,11 @@ pub(crate) fn run(args: RunArgs) -> Result<std::process::ExitCode> {
             server
                 .metrics
                 .set_decode_quality(decode_quality_of(&obs.snapshot()));
+        }
+        if let Some(obs) = &lifecycle {
+            server
+                .metrics
+                .set_track_closes_total(crate::track_closes_of(&obs.snapshot().close_counts));
         }
         server.metrics.mark_decode_stopped();
         if let Some(poller) = decode_latency_poller.take() {

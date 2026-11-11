@@ -2322,6 +2322,36 @@ fn create_observation_file(path: &Path) -> Result<std::fs::File> {
     }
 }
 
+fn track_closes_of(c: &manta_engine::CloseCounts) -> [u64; 11] {
+    let manta_engine::CloseCounts {
+        restricted,
+        unconfirmed,
+        hang_expired,
+        silent,
+        merged,
+        evicted,
+        rtty,
+        not_cw,
+        unkeyed,
+        source_end,
+        reconnect,
+        false_lease_hops: _,
+    } = *c;
+    [
+        restricted,
+        unconfirmed,
+        hang_expired,
+        silent,
+        merged,
+        evicted,
+        rtty,
+        not_cw,
+        unkeyed,
+        source_end,
+        reconnect,
+    ]
+}
+
 /// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
 /// bounds and the repetition gate's bucket bounds to their snapshots.
 fn decode_quality_of(

@@ -9,6 +9,21 @@
 //! outage counters (`manta_source_outages_total`,
 //! `manta_source_down_seconds_total`; MAN-96).
 
+/// Stable label order for detector track closes.
+pub const TRACK_CLOSE_REASONS: [&str; 11] = [
+    "restricted",
+    "unconfirmed",
+    "hang_expired",
+    "silent",
+    "merged",
+    "evicted",
+    "rtty",
+    "not_cw",
+    "unkeyed",
+    "source_end",
+    "reconnect",
+];
+
 use crate::health::{DecodeWatch, HealthCheck, HealthReport};
 use crate::pskreporter::PskDrop;
 use crate::spectrum::{SpectrumDrop, SpectrumStats};
@@ -1105,6 +1120,7 @@ pub struct Metrics {
     /// MAN-312: static crashes the engine has detected, injected by the
     /// daemon wiring layer like `active_tracks`.
     static_crashes_total: AtomicU64,
+    track_closes_total: [AtomicU64; 11],
     /// MAN-314: `manta_rtty_signals{band}` -- RTTY signals the engine's
     /// detector currently marks, by amateur band. A band's series appears
     /// at its first mark and stays (at 0) after its signals clear; bounded
@@ -2076,6 +2092,13 @@ impl Metrics {
         self.active_tracks.store(count, Ordering::Relaxed);
     }
 
+    /// Publish cumulative closes by TRACK_CLOSE_REASONS, without decreasing a series.
+    pub fn set_track_closes_total(&self, by_reason: [u64; 11]) {
+        for (slot, value) in self.track_closes_total.iter().zip(by_reason) {
+            slot.fetch_max(value, Ordering::Relaxed);
+        }
+    }
+
     /// MAN-312: the engine's running static-crash count. `fetch_max`, so a
     /// stale or out-of-order injection can never make the counter go
     /// backwards.
@@ -2997,6 +3020,15 @@ impl Metrics {
             "manta_static_crashes_total {}\n",
             self.static_crashes_total.load(Ordering::Relaxed)
         ));
+
+        out.push_str("# HELP manta_track_closes_total Tracks the detector closed since start, by reason, unconfirmed candidates included. Every track opened is closed exactly once, so once the source has ended the series sum to the tracks opened. source_end and reconnect count the tracks still open when the source ended or reconnected.\n");
+        out.push_str("# TYPE manta_track_closes_total counter\n");
+        for (reason, count) in TRACK_CLOSE_REASONS.iter().zip(&self.track_closes_total) {
+            out.push_str(&format!(
+                "manta_track_closes_total{{reason=\"{reason}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
 
         out.push_str(
             "# HELP manta_rtty_signals RTTY (two-tone FSK) signals currently marked by the detector, by amateur band; no CW tracks start on them.\n",
@@ -4053,6 +4085,29 @@ mod tests {
         m.set_active_tracks(12);
         let text = m.render_prometheus_text();
         assert!(text.contains("manta_active_tracks 12"));
+    }
+
+    #[test]
+    fn track_closes_total_renders_every_reason_and_never_goes_backwards() {
+        let m = Metrics::new();
+        let text = m.render_prometheus_text();
+        assert!(text.contains("# TYPE manta_track_closes_total counter\n"));
+        let mut last = 0;
+        for reason in TRACK_CLOSE_REASONS {
+            let line = format!("manta_track_closes_total{{reason=\"{reason}\"}} 0\n");
+            let pos = text.find(&line).unwrap();
+            assert!(pos > last);
+            last = pos;
+        }
+        let counts = std::array::from_fn(|i| i as u64 + 1);
+        m.set_track_closes_total(counts);
+        m.set_track_closes_total([0; 11]);
+        let text = m.render_prometheus_text();
+        for (reason, value) in TRACK_CLOSE_REASONS.iter().zip(counts) {
+            assert!(text.contains(&format!(
+                "manta_track_closes_total{{reason=\"{reason}\"}} {value}\n"
+            )));
+        }
     }
 
     #[test]

@@ -1006,10 +1006,10 @@ sample time. See
   `metrics`)" phrasing in older revisions of this doc was stale, no Cargo
   `metrics` feature has ever existed; the endpoint is served whenever
   the resolved config has a `[server]` table — `--server-config` is
-  MAN-77's deprecated alias of `--config`): input overruns, active tracks, evictions, decode rate,
+  MAN-77's deprecated alias of `--config`): input overruns, active tracks, decode rate,
   spots/min, per-stage queue depths, spot confidence histogram — still
   aspirational for several of these fields; the currently-implemented
-  subset is `manta_spots_total`, `manta_spots_dropped_lagged_total`,
+  subset is `manta_track_closes_total` (including evictions and merges), `manta_spots_total`, `manta_spots_dropped_lagged_total`,
   `manta_spots_suppressed_by_filter_total`,
   `manta_spots_dropped_write_failed_total`,
   `manta_spots_dropped_shutdown_total` (backlog abandoned because the
