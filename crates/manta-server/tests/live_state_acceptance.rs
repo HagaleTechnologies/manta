@@ -362,24 +362,98 @@ async fn a_live_client_that_reads_slowly_stays_connected_while_a_stalled_one_is_
     only_the_stalled_live_client_is_dropped(Some(SLOW_READER_LINES_PER_SEC)).await;
 }
 
+/// MAN-523: polls until the bus has `n` live receivers and the gauge reads
+/// `n`, or fails after ten seconds naming both. Fixed sleeps lost the race
+/// when the runner paused the process across them: frozen past the 500 ms
+/// protocol peek, the test read `left: 0, right: 32`.
+async fn wait_for_live_clients(node: &Node, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let receivers = node.bus.live_receiver_count();
+        let gauge = node.metrics.live_clients();
+        if receivers == n && gauge == n as i64 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "live clients never reached {n}: {receivers} receivers, gauge {gauge}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_live_listener_admits_at_most_32_clients() {
     // A per-IP quota above the total cap, so only the cap binds.
     let node = spawn_node(1_000).await;
-    let mut clients = Vec::new();
-    for _ in 0..MAX_LIVE_STREAM_CONNECTIONS + 3 {
-        clients.push(TcpStream::connect(node.live).await.unwrap());
+    let total = MAX_LIVE_STREAM_CONNECTIONS + 3;
+    // Every client reads on its own task and reports (client, line), so a
+    // queued client's pending read never blocks the others.
+    let (lines_tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<(usize, String)>();
+    let mut readers = Vec::new();
+    for i in 0..total {
+        let stream = TcpStream::connect(node.live).await.unwrap();
+        let tx = lines_tx.clone();
+        readers.push(tokio::spawn(async move {
+            let mut reader = BufReader::new(stream);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        if tx.send((i, line)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }));
     }
-    tokio::time::sleep(Duration::from_millis(1_500)).await;
-    assert_eq!(node.bus.live_receiver_count(), MAX_LIVE_STREAM_CONNECTIONS);
-    assert_eq!(
-        node.metrics.live_clients(),
-        MAX_LIVE_STREAM_CONNECTIONS as i64
-    );
-    // Freeing one slot admits a waiting client.
-    drop(clients.remove(0));
-    tokio::time::sleep(Duration::from_millis(1_000)).await;
-    assert_eq!(node.bus.live_receiver_count(), MAX_LIVE_STREAM_CONNECTIONS);
+    drop(lines_tx);
+    wait_for_live_clients(&node, MAX_LIVE_STREAM_CONNECTIONS).await;
+
+    // The admitted clients are the ones a published record reaches.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    node.bus.publish_live(Arc::from("probe"));
+    let mut admitted = std::collections::BTreeSet::new();
+    while admitted.len() < MAX_LIVE_STREAM_CONNECTIONS {
+        let (i, line) = tokio::time::timeout_at(deadline, lines.recv())
+            .await
+            .unwrap_or_else(|_| panic!("only {admitted:?} received the probe"))
+            .expect("every reader task ended");
+        assert_eq!(line, "probe\n", "client {i}");
+        admitted.insert(i);
+    }
+
+    // Freeing one slot admits a waiting client: it receives a record
+    // published after the slot was freed. Publish distinct markers until
+    // one reaches a formerly queued client, so a marker published before
+    // its subscription cannot decide the outcome.
+    let freed = *admitted.iter().next().unwrap();
+    readers[freed].abort();
+    let _ = (&mut readers[freed]).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut marker = 0u32;
+    'admitted: loop {
+        node.bus.publish_live(Arc::from(format!("admit {marker}")));
+        marker += 1;
+        let tick = tokio::time::Instant::now() + Duration::from_millis(100);
+        while let Ok(received) = tokio::time::timeout_at(tick.min(deadline), lines.recv()).await {
+            let (i, line) = received.expect("every reader task ended");
+            if !admitted.contains(&i) {
+                assert!(line.starts_with("admit "), "client {i} read {line:?}");
+                break 'admitted;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no queued client was admitted after one slot was freed"
+        );
+    }
+    wait_for_live_clients(&node, MAX_LIVE_STREAM_CONNECTIONS).await;
+    for reader in readers {
+        reader.abort();
+    }
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 MAN-240: the Dependabot diff verifier's tests in the required `test` job.
 MAN-245: the Codex gate's verdict (a complete thread read, a check-run title naming what produced
 it) and the record of which source may report each required check.
+MAN-520: test-soapy runs only the tests the soapy feature can change.
 
 stdlib unittest only -- workflows are read as text with test_ci_trust_boundary.py's helpers.
 Run: python3 -m unittest scripts.tests.test_ci_gates -v
@@ -13,6 +14,7 @@ import io
 import json
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import tomllib
@@ -92,6 +94,189 @@ class FieldNodeTestsGateTests(unittest.TestCase):
         self.assertTrue(pins, "expected the verifier's setup-python pin")
         for pin in pins:
             self.assertLess(here, all_steps.index(pin))
+
+
+# MAN-520: test roots that observe the soapy build without naming it.
+SOAPY_EXTRA_TESTS = {
+    "completions_and_man_pages": "reads every long flag from --help, so it checks the --soapy-* flags",
+}
+SOAPY_INPUT_TESTS = "cargo test -p manta-input --features soapy --locked --lib soapy"
+SOAPY_CLI_TESTS_PREFIX = "cargo test -p manta-cli --features soapy"
+SOAPY_CLIPPY = "cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings"
+# Options of the manta-cli command that take a value, and the bare flags it may carry.
+SOAPY_CLI_VALUED = {"-p", "--features", "--bin", "--test"}
+SOAPY_CLI_BARE = {"--locked", "--no-fail-fast"}
+
+
+def _mentions_soapy(paths):
+    for path in paths:
+        with open(path, encoding="utf-8") as f:
+            if "soapy" in f.read().lower():
+                return True
+    return False
+
+
+def soapy_test_stems(crate):
+    """Names of crates/<crate>'s integration-test targets as Cargo discovers them (tests/<name>.rs,
+    and tests/<name>/main.rs with the rest of that directory) whose text contains 'soapy',
+    case-insensitively."""
+    tests = os.path.join(ROOT, "crates", crate, "tests")
+    stems = {os.path.splitext(os.path.basename(path))[0]
+             for path in glob.glob(os.path.join(tests, "*.rs")) if _mentions_soapy([path])}
+    for main in glob.glob(os.path.join(tests, "*", "main.rs")):
+        target = os.path.dirname(main)
+        if _mentions_soapy(glob.glob(os.path.join(target, "**", "*.rs"), recursive=True)):
+            stems.add(os.path.basename(target))
+    return stems
+
+
+def soapy_test_helpers(crate):
+    """Shared test code (.rs under a crates/<crate>/tests/ directory that is not a target of its
+    own) whose text contains 'soapy': the roots that use it are not visible to a text grep."""
+    tests = os.path.join(ROOT, "crates", crate, "tests")
+    found = []
+    for target in sorted(glob.glob(os.path.join(tests, "*", ""))):
+        if os.path.isfile(os.path.join(target, "main.rs")):
+            continue
+        for path in sorted(glob.glob(os.path.join(target, "**", "*.rs"), recursive=True)):
+            if _mentions_soapy([path]):
+                found.append(os.path.relpath(path, ROOT))
+    return found
+
+
+# An item (fn or mod) and the attribute lines directly above it.
+ATTRIBUTED_ITEM = re.compile(r"((?:^[ \t]*#\[[^\n]*\][ \t]*\n)+)[ \t]*(?:pub(?:\([^)]*\))? )?(fn|mod)\s+(\w+)",
+                             re.MULTILINE)
+
+
+def soapy_gated_tests_outside_the_filter(crate):
+    """'<file>: <item>' for each unit test or module in crates/<crate>/src that only a soapy build
+    compiles (a #[cfg(...)] naming feature = "soapy", not negated) but whose test path would not
+    contain 'soapy', so `--lib soapy` would skip it. Items in soapy.rs or under soapy/ match by
+    their module path."""
+    src = os.path.join(ROOT, "crates", crate, "src")
+    found = []
+    for path in sorted(glob.glob(os.path.join(src, "**", "*.rs"), recursive=True)):
+        rel = os.path.relpath(path, src)
+        if "soapy" in rel.lower():
+            continue
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        for m in ATTRIBUTED_ITEM.finditer(text):
+            attrs, kind, name = m.group(1), m.group(2), m.group(3)
+            gated = any(line.strip().startswith("#[cfg(") and 'feature = "soapy"' in line
+                        and 'not(feature = "soapy")' not in line for line in attrs.splitlines())
+            is_test = kind == "mod" or any(line.strip() == "#[test]" for line in attrs.splitlines())
+            if gated and is_test and "soapy" not in name.lower():
+                found.append(f"{os.path.relpath(path, ROOT)}: {kind} {name}")
+    return found
+
+
+def cargo_test_args(tokens):
+    """(option/value pairs, bare flags, unexpected tokens) of the tokens after `cargo test`. A
+    valued option with no value, or a value that starts with '-', is reported as unexpected."""
+    pairs, bare, unexpected, i = [], [], [], 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in SOAPY_CLI_VALUED and i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            pairs.append((tok, tokens[i + 1]))
+            i += 2
+        elif tok in SOAPY_CLI_BARE:
+            bare.append(tok)
+            i += 1
+        else:
+            unexpected.append(tok)
+            i += 1
+    return pairs, bare, unexpected
+
+
+class SoapyTestSelectionTests(unittest.TestCase):
+    """MAN-520: the non-required test-soapy leg runs manta-input's soapy unit tests and the
+    manta-cli test roots the feature can change, not the whole feature-on suite, and the list of
+    roots stays equal to the manta-cli test files that mention soapy."""
+
+    def setUp(self):
+        self.job = wf.job_block(wf.read("ci-full.yml"), "test-soapy")
+        self.assertTrue(self.job, "ci-full.yml: no test-soapy job")
+        self.job_steps = wf.steps(self.job)
+
+    def bodies(self):
+        return [(wf.run_body(s) or "").strip() for s in self.job_steps]
+
+    def cli_step(self):
+        found = [s for s in self.job_steps
+                 if (wf.run_body(s) or "").strip().startswith(SOAPY_CLI_TESTS_PREFIX + " ")]
+        self.assertEqual(len(found), 1,
+                         f"test-soapy: expected one step starting {SOAPY_CLI_TESTS_PREFIX!r}, found {len(found)}")
+        return found[0]
+
+    def cli_tokens(self):
+        tokens = shlex.split(wf.run_body(self.cli_step()).replace("\\\n", " "))
+        self.assertEqual(tokens[:2], ["cargo", "test"])
+        return tokens[2:]
+
+    def test_manta_input_runs_only_its_soapy_tests(self):
+        found = steps_running(self.job, SOAPY_INPUT_TESTS)
+        self.assertEqual(len(found), 1, f"test-soapy: expected one step running {SOAPY_INPUT_TESTS!r}")
+        self.assertIsNone(wf.field(found[0], "continue-on-error"),
+                          "test-soapy: the manta-input soapy tests must be able to fail the leg")
+        skipped = soapy_gated_tests_outside_the_filter("manta-input")
+        self.assertFalse(skipped, "these items only build with the soapy feature, but `--lib soapy` skips "
+                                  f"them because their test path lacks 'soapy': {skipped}. Put soapy in "
+                                  "the test's name or module.")
+
+    def test_manta_cli_runs_every_test_file_that_mentions_soapy(self):
+        pairs, _, _ = cargo_test_args(self.cli_tokens())
+        listed = [value for opt, value in pairs if opt == "--test"]
+        duplicated = sorted({name for name in listed if listed.count(name) > 1})
+        self.assertFalse(duplicated, f"test-soapy: --test listed more than once: {duplicated}")
+        for name, why in SOAPY_EXTRA_TESTS.items():
+            path = os.path.join(ROOT, "crates", "manta-cli", "tests", name + ".rs")
+            self.assertTrue(os.path.isfile(path),
+                            f"SOAPY_EXTRA_TESTS names {name} ({why}), but {path} does not exist")
+        expected = soapy_test_stems("manta-cli") | set(SOAPY_EXTRA_TESTS)
+        missing = sorted(expected - set(listed))
+        extra = sorted(set(listed) - expected)
+        self.assertFalse(missing, "test-soapy: these crates/manta-cli/tests/*.rs mention soapy but the "
+                                  f"manta-cli cargo test step has no --test for them: {missing}")
+        self.assertFalse(extra, "test-soapy: the manta-cli cargo test step runs test roots that neither "
+                                f"mention soapy nor appear in SOAPY_EXTRA_TESTS: {extra}")
+        helpers = soapy_test_helpers("manta-cli")
+        self.assertFalse(helpers, "shared manta-cli test code mentions soapy, so the roots that use it "
+                                  f"cannot be found by text: {helpers}. List those roots in test-soapy and "
+                                  "SOAPY_EXTRA_TESTS, then extend this guard.")
+
+    def test_manta_cli_runs_whole_targets_and_the_binary(self):
+        pairs, bare, unexpected = cargo_test_args(self.cli_tokens())
+        self.assertFalse(unexpected, "test-soapy: the manta-cli cargo test step may carry only -p, --features, "
+                                     "--bin and --test with a value, --locked and --no-fail-fast; a name "
+                                     "filter or `--` would drop tests that are not named for soapy. "
+                                     f"Unexpected: {unexpected}")
+        self.assertIn(("--bin", "manta"), pairs,
+                      "test-soapy: --bin manta must stay (only its unit tests catch a SoapyOpts::from_file break)")
+        self.assertIn("--no-fail-fast", bare,
+                      "test-soapy: --no-fail-fast keeps one red test root from hiding another")
+        self.assertIn("--locked", bare, "test-soapy: the manta-cli cargo test step must keep --locked (MAN-219)")
+        self.assertIsNone(wf.field(self.cli_step(), "continue-on-error"),
+                          "test-soapy: the manta-cli soapy tests must be able to fail the leg")
+
+    def test_no_manta_input_integration_test_mentions_soapy(self):
+        found = sorted(soapy_test_stems("manta-input")) + soapy_test_helpers("manta-input")
+        self.assertFalse(found, "these crates/manta-input/tests/*.rs mention soapy, but test-soapy's "
+                                f"manta-input command runs only --lib soapy: {found}. Add them to that "
+                                "command and to SoapyTestSelectionTests.")
+
+    def test_clippy_still_builds_every_target_with_the_feature(self):
+        found = steps_running(self.job, SOAPY_CLIPPY)
+        self.assertEqual(len(found), 1, f"test-soapy: expected one step running {SOAPY_CLIPPY!r}")
+
+    def test_no_step_runs_the_whole_feature_on_suite(self):
+        for body in self.bodies():
+            for whole in ("cargo test -p manta-input -p manta-cli", "cargo test -p manta-cli -p manta-input"):
+                self.assertNotIn(whole, body, "test-soapy: a step runs the whole feature-on suite again")
+            if "cargo test" in body:
+                self.assertTrue(body == SOAPY_INPUT_TESTS or body.startswith(SOAPY_CLI_TESTS_PREFIX + " "),
+                                f"test-soapy: a cargo test step outside the MAN-520 selection: {body!r}")
 
 
 class VerifierTestsGateTests(unittest.TestCase):
@@ -1058,7 +1243,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertIn('shard: [0, 1, 2, 3, 4, 5, 6, 7]', '\n'.join(shards))
             self.assertIn('fail-fast: false', '\n'.join(shards))
             self.assertNotIn('max-parallel', '\n'.join(shards))
-            self.assertEqual(wf.field(shards, 'timeout-minutes'), '35')
+            self.assertEqual(wf.field(shards, 'timeout-minutes'), '50')  # MAN-523: room for ten repeats
             self.assertEqual(wf.field(shards, 'needs'), f'{platform}-build')
             self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')
                                 and '--from-bundle' in (wf.run_body(s) or '') for s in wf.steps(shards)))
@@ -1263,11 +1448,14 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 command = (wf.run_body(step) or '').strip()
                 if not command or command == 'cargo test --workspace --locked':
                     continue
+                if '--repeat-base' in command:
+                    continue  # MAN-523: the Unix home of Windows's repeat is each shard's own repeat
                 matches = steps_running(support, command)
                 self.assertEqual(len(matches), 1, command)
                 self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
 
 
+<<<<<<< HEAD
 
 PRE_PUSH = os.path.join(ROOT, "scripts", "pre-push.sh")
 
@@ -1382,6 +1570,55 @@ class PrePushScriptTests(unittest.TestCase):
         self.assertIn("cargo clippy --workspace --all-targets --locked -- -D warnings", run.stderr)
         self.assertEqual(calls, ["fmt --all --check",
                                  "clippy --workspace --all-targets --locked -- -D warnings"])
+=======
+class SocketTestRepeatTests(unittest.TestCase):
+    """MAN-523: every OS repeats the socket tests a change adds or edits, from the event's base."""
+
+    BASE = ("${{ github.event_name == 'workflow_dispatch' && github.sha || "
+            "github.event_name == 'pull_request' && 'HEAD^1' || "
+            "github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}")
+
+    def repeat_steps(self, block):
+        return [s for s in wf.steps(block) if '--repeat-base "$REPEAT_BASE"' in (wf.run_body(s) or '')]
+
+    def test_unix_shards_repeat_from_their_bundle_with_the_event_base(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            steps = self.repeat_steps(wf.job_block(text, f'{platform}-shards'))
+            self.assertEqual(len(steps), 1, platform)
+            body = wf.run_body(steps[0])
+            self.assertIn('scripts/ci-shards.py', body)
+            self.assertIn('--from-bundle', body)
+            self.assertNotIn('--repeat-count', body)  # fixed at ten in the script
+            self.assertEqual(wf.field(wf.sub(steps[0], 'env'), 'REPEAT_BASE'), self.BASE)
+            self.assertIsNone(wf.field(steps[0], 'continue-on-error'))
+            uploads = [s for s in wf.steps(wf.job_block(text, f'{platform}-shards'))
+                       if (wf.field(s, 'uses') or '').startswith('actions/upload-artifact@')]
+            self.assertEqual([wf.field(s, 'if') for s in uploads], ['always()'], platform)
+
+    def test_windows_repeats_after_its_ordinary_suite(self):
+        block = wf.job_block(wf.read('ci-full.yml'), 'test')
+        steps = wf.steps(block)
+        repeats = self.repeat_steps(block)
+        self.assertEqual(len(repeats), 1)
+        body = wf.run_body(repeats[0])
+        self.assertIn('scripts/ci-shards.py', body)
+        self.assertIn('--inventory-only', body)
+        self.assertEqual(wf.field(wf.sub(repeats[0], 'env'), 'REPEAT_BASE'), self.BASE)
+        self.assertIsNone(wf.field(repeats[0], 'continue-on-error'))
+        ordinary = [i for i, s in enumerate(steps) if (wf.run_body(s) or '').strip() == 'cargo test --workspace --locked']
+        self.assertEqual(len(ordinary), 1)
+        self.assertLess(ordinary[0], steps.index(repeats[0]))
+        uploads = [s for s in steps if any('repeat-evidence' in line for line in s)]
+        self.assertEqual(len(uploads), 2)  # written by the repeat, uploaded even on failure
+        self.assertTrue(wf.field(uploads[1], 'if').startswith('always()'))
+
+    def test_the_selector_suite_runs_on_both_unix_supports(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            support = wf.job_block(text, f'{platform}-support')
+            self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_socket_test_repeat -v')), 1)
+>>>>>>> 46096dcf62cd05b17309e9e4a8f58275392d53c1
 
 
 if __name__ == '__main__':

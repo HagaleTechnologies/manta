@@ -11,10 +11,18 @@ Three modes (MAN-518):
 - `--from-bundle FILE`: check the slice's plan against this checkout, extract it, re-list
   and run its group. This mode never invokes `cargo`, `rustc` or `rustup`; children see
   tripwire shims for all three.
+
+`--repeat-base SHA` (MAN-523) then runs each socket test the diff from SHA to HEAD adds or
+edits ten more times (scripts/socket-test-repeat.py). With `--from-bundle` it repeats the
+slice's tests after their ordinary run; with `--inventory-only` (the Windows job, after its
+ordinary `cargo test --workspace`) it repeats them across the whole inventory, reusing the
+built executables. The evidence keeps those runs in `repeatResults`, apart from the ordinary
+`results`; any failed run fails the command.
 """
 import argparse
 import collections
 import concurrent.futures
+import importlib.util
 import io
 import json
 import os
@@ -68,7 +76,7 @@ def assign(items, weights, count):
     shards, loads = [[] for _ in range(count)], [0] * count
     for item in sorted(items, key=lambda x: (-weights.get(x['name'], 30), x['key'])):
         weight = weights.get(item['name'], 30)
-        index = 0 if item['name'] == 'golden_v8_v8w' else min(range(1, count), key=lambda i: (loads[i], i))
+        index = min(range(count), key=lambda i: (loads[i], i))
         shards[index].append(item)
         loads[index] += weight
     assert collections.Counter(x['key'] for group in shards for x in group) == collections.Counter(x['key'] for x in items)
@@ -306,6 +314,35 @@ def build_bundles(args, record):
     return 0
 
 
+def load_repeater():
+    """scripts/socket-test-repeat.py, loaded only when a shard is asked to repeat."""
+    spec = importlib.util.spec_from_file_location('socket_test_repeat', Path(__file__).with_name('socket-test-repeat.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_repeats(args, record, root, runs):
+    """MAN-523: after the ordinary run, repeat the changed socket tests of this slice."""
+    repeater = load_repeater()
+    repeat_plan = repeater.plan(root, [item for item, _, _ in runs], args.repeat_base)
+    record['repeatPlan'] = repeat_plan
+    record['repeatResults'] = []
+    if repeat_plan['noop']:
+        print(f"Socket-test repeat: {repeat_plan['noop']} since {args.repeat_base}", flush=True)
+        return 0
+    if any(x['exitCode'] for x in record['results']):
+        record['repeatSkipped'] = 'an ordinary run failed'
+        return 1
+    by_key = {item['key']: (item, cwd, env) for item, cwd, env in runs}
+    for entry in repeat_plan['selected']:
+        item, cwd, env = by_key[entry['key']]
+        print(f"Repeating {entry['test']} ({entry['reason']})", flush=True)
+        record['repeatResults'].append(repeater.repeat(item, entry['test'], cwd, env))
+    repeater.audit_repeats(repeat_plan, record['repeatResults'])
+    return 0
+
+
 def run_bundle(args, record):
     root = Path.cwd().resolve()
     with tarfile.open(args.from_bundle, 'r:gz') as tar:
@@ -334,12 +371,19 @@ def run_bundle(args, record):
             list_item(item, cwd, env, expected=item)
         for item, cwd, env in runs:
             record['results'].append(run_item(item, cwd, env))
-    return int(any(x['exitCode'] for x in record['results']))
+        repeated = run_repeats(args, record, root, runs) if args.repeat_base is not None else 0
+    return int(any(x['exitCode'] for x in record['results']) or repeated)
 
 
 def run_legacy(args, record):
     meta = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--locked', '--format-version=1']))
     record['gitHead'], record['gitTree'] = git_identity(meta['workspace_root'], required=False)
+    if args.repeat_base is not None and not load_repeater().rust_changed(meta['workspace_root'], args.repeat_base):
+        # MAN-523: nothing to repeat, so skip listing every executable.
+        record['repeatPlan'] = dict(base=args.repeat_base, removed=[], selected=[], noop='no Rust change')
+        record['repeatResults'] = []
+        print(f'Socket-test repeat: no Rust change since {args.repeat_base}', flush=True)
+        return 0
     items = parse_artifacts(cargo_build(record))
     if not items:
         raise ValueError('empty workspace inventory')
@@ -354,6 +398,15 @@ def run_legacy(args, record):
     # All groups are computed on each host; assert complete/disjoint placement before running.
     record['inventory'] = items
     record['selected'] = groups[args.shard]
+    if args.repeat_base is not None:
+        root = Path(meta['workspace_root']).resolve()
+        runs = []
+        for item in items:
+            package = packages[item['package']]
+            cwd = Path(package['manifest_path']).parent.resolve()
+            env = child_env(package, Path(meta['target_directory']), sysroot)
+            runs.append((dict(item, cwd=cwd.relative_to(root).as_posix()), cwd, env))
+        return run_repeats(args, record, root, runs)
     for item in ([] if args.inventory_only else record['selected']):
         package = packages[item['package']]
         cwd = Path(package['manifest_path']).parent
@@ -371,7 +424,12 @@ def main():
     mode.add_argument('--inventory-only', action='store_true')
     mode.add_argument('--build-bundles', type=Path, metavar='DIR', help='build once and write one slice per shard into DIR')
     mode.add_argument('--from-bundle', type=Path, metavar='FILE', help="run this shard's slice without a compiler")
+    parser.add_argument('--repeat-base', metavar='SHA',
+                        help='with --from-bundle or --inventory-only: repeat the socket tests changed since SHA '
+                             'ten times (MAN-523)')
     args = parser.parse_args()
+    if args.repeat_base is not None and not (args.from_bundle or args.inventory_only):
+        parser.error('--repeat-base needs --from-bundle or --inventory-only')
     if args.audit:
         bundle = json.loads(args.audit.read_text())
         elapsed = audit_evidence(bundle['shards'], bundle['support'], bundle['workflowStarted'], bundle['completed'],

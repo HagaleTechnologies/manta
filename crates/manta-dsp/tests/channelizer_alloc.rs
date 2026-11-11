@@ -1,5 +1,7 @@
 //! MAN-117: a steady-state `Channelizer::process` call allocates only its
-//! outputs (each hop's `x` and `power`, and the returned `Vec`).
+//! outputs (each hop's `x` and `power`, and the returned `Vec`). MAN-527: a
+//! steady-state `Channelizer::process_into` call with one `out` kept across
+//! calls allocates nothing at all.
 
 use manta_dsp::channelizer::Channelizer;
 use num_complex::Complex32;
@@ -93,5 +95,37 @@ fn a_steady_state_process_call_allocates_only_its_outputs() {
             2 * hops + 2
         );
         drop(out);
+    }
+}
+
+#[test]
+fn process_into_allocates_nothing_after_warm_up() {
+    for fs in [192_000.0, 96_000.0] {
+        for chunk in [4096usize, 2048, 1000] {
+            let mut ch = Channelizer::new(fs, 14e6).unwrap();
+            let hop = ch.hop();
+            let mut out = Vec::new();
+            // Whole chunks only, as the test above explains.
+            let warm = (2.0 * fs) as usize / chunk * chunk;
+            let iq = pseudo_noise(warm + 1_000 * hop + chunk);
+            for piece in iq[..warm].chunks(chunk) {
+                ch.process_into(piece, &mut out);
+            }
+            let mut hops = 0usize;
+            let mut total = 0u64;
+            for piece in iq[warm..].chunks_exact(chunk) {
+                let ((), events) = counting::events_during(|| ch.process_into(piece, &mut out));
+                total += events;
+                hops += out.len();
+                if hops >= 1_000 {
+                    break;
+                }
+            }
+            assert!(hops >= 1_000, "fs {fs} chunk {chunk}: only {hops} hops");
+            assert_eq!(
+                total, 0,
+                "fs {fs} chunk {chunk}: {total} allocation events over {hops} hops"
+            );
+        }
     }
 }

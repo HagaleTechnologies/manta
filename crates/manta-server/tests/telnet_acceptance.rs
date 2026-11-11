@@ -1208,6 +1208,46 @@ async fn a_command_terminated_with_cr_nul_from_an_interactive_client_is_recogniz
     assert_eq!(line.trim_end(), expected);
 }
 
+/// MAN-538: a valid multi-byte character whose bytes arrive in two TCP
+/// writes is read as one line (here an unknown command), not rejected as
+/// invalid UTF-8 with the connection dropped.
+#[tokio::test]
+async fn a_command_with_a_character_split_across_tcp_writes_is_read_whole() {
+    let (addr, _bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    read_lines_until(&mut reader, "the callsign prompt", |line| {
+        line.to_lowercase().contains("enter your callsign")
+    })
+    .await;
+
+    wr.write_all(b"W5AU\r\n").await.unwrap();
+    let mut got: Vec<u8> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&got).contains(STATION_CALL) {
+        let mut chunk = [0u8; 256];
+        let n = tokio::time::timeout_at(deadline, reader.read(&mut chunk))
+            .await
+            .expect("login must complete")
+            .unwrap();
+        assert!(n > 0, "connection closed before login completed: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+
+    // `€` is E2 82 AC: the first two bytes in one segment, the last in the
+    // next.
+    wr.write_all(b"caf\xE2\x82").await.unwrap();
+    wr.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    wr.write_all(b"\xAC\r\n").await.unwrap();
+
+    let lines = read_lines_until(&mut reader, "the unknown-command reply", |line| {
+        line.contains("Unknown command")
+    })
+    .await;
+    assert!(!lines.is_empty());
+}
+
 #[tokio::test]
 async fn a_connecting_client_gets_the_cw_skimmer_shaped_banner_and_callsign_prompt() {
     // MAN-86 scenario 2. Byte-level, because the exact wording is the
@@ -2238,4 +2278,316 @@ async fn the_unique_filter_counts_each_mode_separately() {
         metric(&metrics, "manta_spots_suppressed_by_filter_total"),
         1
     );
+}
+
+// ---------------------------------------------------------------------------
+// MAN-546: per-connection `set/dx/filter cq`, `band <list>` and `snr <n>`.
+// Withheld spots are published BEFORE a delivered one, so a leaked spot
+// would arrive first; no silence timeouts.
+// ---------------------------------------------------------------------------
+
+const SUPPRESSED: &str = "manta_spots_suppressed_by_filter_total";
+const SETT_NO_CQ: &str = "SETT: vlNormal 14000.0-14088.0";
+const SETT_CQ: &str = "SETT: vlNormal CQ 14000.0-14088.0";
+
+/// A spot of `spot_type` at `snr_db` (2500 Hz reference; the row shows the
+/// 500 Hz figure, rounded: 2.5 reads `9 dB`, 2.9 reads `10 dB`).
+fn typed_spot(callsign: &str, freq_hz: f64, spot_type: SpotType, snr_db: f32) -> Spot {
+    let mut spot = spot_on(callsign, freq_hz);
+    spot.spot_type = spot_type;
+    spot.snr_db = snr_db;
+    spot
+}
+
+/// Sends one command line and returns the next line the server writes.
+async fn send_and_read(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    wr: &mut tokio::net::tcp::OwnedWriteHalf,
+    command: &str,
+) -> String {
+    wr.write_all(format!("{command}\r\n").as_bytes())
+        .await
+        .unwrap();
+    next_line(reader, &format!("the reply to {command:?}")).await
+}
+
+/// Ticket scenario 1: a CQ-only client receives only CQ spots, and its
+/// SETT reply carries the `CQ` token.
+#[tokio::test]
+async fn set_dx_filter_cq_withholds_non_cq_spots_and_sett_reports_cq() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+
+    let de = typed_spot("K2DEE", 7_027_000.0, SpotType::De, 5.0);
+    let cq = typed_spot("K1CQQ", 14_027_100.0, SpotType::Cq, 5.0);
+    bus.publish(de);
+    bus.publish(cq.clone());
+    assert_eq!(
+        next_line(&mut reader, "the CQ spot").await,
+        rbn_row(&bus, &cq)
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "SKIMMER/SETT").await,
+        SETT_CQ
+    );
+    assert_eq!(metric(&metrics, SUPPRESSED), 1);
+}
+
+/// Ticket scenario 3: one client's filter does not reach another client.
+#[tokio::test]
+async fn filters_are_per_connection() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut a_reader, mut a_wr) = connect_and_login(addr).await;
+    let (mut b_reader, mut b_wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut a_reader, &mut a_wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+
+    let de = typed_spot("K2DEE", 7_027_000.0, SpotType::De, 5.0);
+    let cq = typed_spot("K1CQQ", 14_027_100.0, SpotType::Cq, 5.0);
+    bus.publish(de.clone());
+    bus.publish(cq.clone());
+
+    assert_eq!(
+        next_line(&mut b_reader, "B's DE row").await,
+        rbn_row(&bus, &de)
+    );
+    assert_eq!(
+        next_line(&mut b_reader, "B's CQ row").await,
+        rbn_row(&bus, &cq)
+    );
+    assert_eq!(
+        next_line(&mut a_reader, "A's CQ row").await,
+        rbn_row(&bus, &cq)
+    );
+    assert_eq!(
+        send_and_read(&mut b_reader, &mut b_wr, "SKIMMER/SETT").await,
+        SETT_NO_CQ
+    );
+    assert_eq!(
+        send_and_read(&mut a_reader, &mut a_wr, "SKIMMER/SETT").await,
+        SETT_CQ
+    );
+}
+
+/// Ticket scenario 2, live half: only 40 m and 20 m spots whose row reads
+/// 10 dB or more arrive. A second `set/dx/filter` replaces the first.
+#[tokio::test]
+async fn band_and_snr_filter_passes_only_matching_live_spots() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter band 40m,20m snr 10").await,
+        "Filter set: band 40m,20m snr 10"
+    );
+
+    let wrong_band = typed_spot("K5HIG", 21_027_000.0, SpotType::Cq, 23.0);
+    let too_weak = typed_spot("K3LOW", 7_027_000.0, SpotType::Cq, 2.5);
+    let on_the_edge = typed_spot("K4EDG", 7_031_000.0, SpotType::Cq, 2.9);
+    let twenty_de = typed_spot("K6DEE", 14_027_100.0, SpotType::De, 5.0);
+    assert!(rbn_row(&bus, &too_weak).contains("  9 dB"));
+    assert!(rbn_row(&bus, &on_the_edge).contains(" 10 dB"));
+    bus.publish(wrong_band);
+    bus.publish(too_weak);
+    bus.publish(on_the_edge.clone());
+    bus.publish(twenty_de.clone());
+    assert_eq!(
+        next_line(&mut reader, "the 10 dB 40 m row").await,
+        rbn_row(&bus, &on_the_edge)
+    );
+    assert_eq!(
+        next_line(&mut reader, "the 20 m DE row").await,
+        rbn_row(&bus, &twenty_de)
+    );
+    assert_eq!(metric(&metrics, SUPPRESSED), 2);
+
+    // Replace, not merge: the band clause is gone after `cq` alone.
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+    let fifteen = typed_spot("K7HIG", 21_027_000.0, SpotType::Cq, 23.0);
+    bus.publish(fifteen.clone());
+    assert_eq!(
+        next_line(&mut reader, "the 15 m CQ row").await,
+        rbn_row(&bus, &fifteen)
+    );
+}
+
+#[tokio::test]
+async fn set_dx_filter_off_and_the_bare_form_clear_every_filter_including_unique() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set dx filter unique > 1").await,
+        "Filter set: unique > 1"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter off").await,
+        "Filter set: off"
+    );
+
+    // A first-occurrence DE spot: both `unique > 1` and `cq` would have
+    // withheld it.
+    let de = typed_spot("K8DEE", 7_027_000.0, SpotType::De, 5.0);
+    bus.publish(de.clone());
+    assert_eq!(
+        next_line(&mut reader, "the DE row").await,
+        rbn_row(&bus, &de)
+    );
+
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter").await,
+        "Filter set: off"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "SKIMMER/SETT").await,
+        SETT_NO_CQ
+    );
+    let de_again = typed_spot("K9DEE", 7_027_000.0, SpotType::De, 5.0);
+    bus.publish(de_again.clone());
+    assert_eq!(
+        next_line(&mut reader, "the second DE row").await,
+        rbn_row(&bus, &de_again)
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_filter_command_leaves_the_current_filter_in_place() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter band 40m, 20m").await,
+        "Unknown command"
+    );
+
+    let de = typed_spot("K2DEE", 7_027_000.0, SpotType::De, 5.0);
+    let cq = typed_spot("K1CQQ", 14_027_100.0, SpotType::Cq, 5.0);
+    bus.publish(de);
+    bus.publish(cq.clone());
+    assert_eq!(
+        next_line(&mut reader, "the CQ row").await,
+        rbn_row(&bus, &cq)
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "SKIMMER/SETT").await,
+        SETT_CQ
+    );
+}
+
+#[tokio::test]
+async fn the_shutdown_drain_applies_the_client_filter() {
+    let (addr, bus, _metrics, shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+
+    let cq = typed_spot("K1CQQ", 14_027_100.0, SpotType::Cq, 5.0);
+    bus.publish(typed_spot("K2DEE", 7_027_000.0, SpotType::De, 5.0));
+    bus.publish(cq.clone());
+    bus.publish(typed_spot("K3DEE", 7_028_000.0, SpotType::De, 5.0));
+    let _ = shutdown_tx.send(true);
+
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        let n = tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("connection never closed after the shutdown drain")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    assert_eq!(lines, [rbn_row(&bus, &cq)], "got {lines:?}");
+}
+
+#[tokio::test]
+async fn unique_and_the_spot_filter_compose_and_each_withheld_spot_counts_once() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set dx filter unique > 1").await,
+        "Filter set: unique > 1"
+    );
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter cq").await,
+        "Filter set: cq"
+    );
+
+    // Both filters withhold this one (DE, first occurrence): counted once.
+    bus.publish(typed_spot("K9DEE", 7_027_000.0, SpotType::De, 5.0));
+    // `cq` passes it, `unique > 1` withholds its first occurrence.
+    let k5arh = typed_spot("K5ARH", 14_027_100.0, SpotType::Cq, 5.0);
+    bus.publish(k5arh.clone());
+    bus.publish(k5arh.clone());
+    assert_eq!(
+        next_line(&mut reader, "the second K5ARH row").await,
+        rbn_row(&bus, &k5arh)
+    );
+    assert_eq!(metric(&metrics, SUPPRESSED), 2);
+}
+
+/// Ticket scenario 2, `sh/dx` half: replay honours the connection's
+/// filter, selected before count truncation, and rows it keeps out of a
+/// replay are not counted as suppressions.
+#[tokio::test]
+async fn sh_dx_honours_the_connection_filter() {
+    let (addr, bus, metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let forty_de = typed_spot("K2DEE", 7_027_000.0, SpotType::De, 5.0);
+    let twenty_cq = typed_spot("K1CQQ", 14_027_100.0, SpotType::Cq, 5.0);
+    let too_weak = typed_spot("K3LOW", 7_029_000.0, SpotType::Cq, 2.5);
+    let on_the_edge = typed_spot("K4EDG", 7_031_000.0, SpotType::Cq, 2.9);
+    let fifteen = typed_spot("K5HIG", 21_027_000.0, SpotType::Cq, 23.0);
+    let all = [&forty_de, &twenty_cq, &too_weak, &on_the_edge, &fifteen];
+    let rows: Vec<String> = all.iter().map(|s| rbn_row(&bus, s)).collect();
+    for spot in all {
+        bus.publish(spot.clone());
+    }
+
+    let (mut reader, mut wr) = connect_and_login(addr).await;
+    assert_eq!(
+        send_and_read(&mut reader, &mut wr, "set/dx/filter band 40m,20m snr 10").await,
+        "Filter set: band 40m,20m snr 10"
+    );
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx").await,
+        [rows[0].clone(), rows[1].clone(), rows[3].clone()]
+    );
+    // The 15 m entry is newer: a filter applied after truncation would
+    // leave nothing here.
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "sh/dx 1").await,
+        [rows[3].clone()]
+    );
+    assert!(rows_for(&mut reader, &mut wr, "sh/dx BAND 15m")
+        .await
+        .is_empty());
+    assert_eq!(metric(&metrics, SUPPRESSED), 0);
+
+    assert_eq!(
+        rows_for(&mut reader, &mut wr, "set/dx/filter off").await,
+        ["Filter set: off"]
+    );
+    assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx").await, rows);
 }

@@ -81,8 +81,17 @@ Then run:
 
 ```sh
 cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
-cargo test -p manta-input -p manta-cli --features soapy --locked
+cargo test -p manta-input --features soapy --locked --lib soapy
+cargo test -p manta-cli --features soapy --locked --no-fail-fast --bin manta \
+  --test build_identity --test cli --test completions_and_man_pages \
+  --test config_command --test docker_image --test docs_consistency \
+  --test field_node_runbook --test operator_guides --test output_style_guard \
+  --test packaging_examples --test source_check
 ```
+
+This is what CI's `test-soapy` leg runs.
+`cargo test -p manta-input -p manta-cli --features soapy --locked` also
+works, but it takes about 40 minutes and repeats the default suite.
 
 Hardware-free tests do not establish real receiver compatibility. Say which
 device, driver and operating system you actually tested in a hardware report.

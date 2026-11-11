@@ -460,17 +460,24 @@ struct Segment {
     /// MAN-141: `Some` only when a spectrum sink is set and the source has
     /// an RF centre; new per segment, so a frame never spans a discontinuity.
     spectrum: Option<SpectrumAccumulator>,
+    /// MAN-527: hop buffers `track` hands to `process_into`, recycled every
+    /// call.
+    hops: Vec<manta_dsp::channelizer::HopOutput>,
 }
 
 impl Segment {
-    /// MAN-141: every channelizer call goes through here, so the spectrum tap
-    /// sees every hop the track manager sees.
-    fn channelize(&mut self, iq: &[Complex32]) -> Vec<manta_dsp::channelizer::HopOutput> {
-        let hops = self.ch.process(iq);
+    /// MAN-141 and MAN-527: every channelizer call goes through here. It
+    /// channelizes `iq` into the segment's recycled hop buffers, feeds the
+    /// spectrum tap the same hops the track manager sees, and runs the track
+    /// manager on them with `held`'s hop timestamps.
+    fn track(&mut self, iq: &[Complex32], seg_base: u64) -> Vec<DecoderEvent> {
+        self.ch.process_into(iq, &mut self.hops);
         if let Some(acc) = self.spectrum.as_mut() {
-            acc.fold(&hops, self.pad_hops);
+            acc.fold(&self.hops, self.pad_hops);
         }
-        hops
+        let (held, pad_hops, hop) = (&self.held, self.pad_hops, self.hop);
+        self.tm
+            .process_hops(&self.hops, |m| held.hop_ts(seg_base, pad_hops, hop, m))
     }
 
     /// The startup calibration fill, through `process_hops` one
@@ -481,10 +488,7 @@ impl Segment {
     fn process_fill(&mut self, fill: &[Complex32], seg_base: u64) -> Vec<DecoderEvent> {
         let mut events = Vec::new();
         for piece in fill.chunks(CHUNK_SAMPLES) {
-            let hops = self.channelize(piece);
-            events.extend(self.tm.process_hops(&hops, |m| {
-                self.held.hop_ts(seg_base, self.pad_hops, self.hop, m)
-            }));
+            events.extend(self.track(piece, seg_base));
         }
         events
     }
@@ -622,6 +626,7 @@ fn new_segment(
         pad_hops,
         held: HeldLosses::default(),
         spectrum,
+        hops: Vec::new(),
     })
 }
 
@@ -1046,10 +1051,7 @@ pub fn listen_with_observers(
     // fill has returned, not before it: its `on_tracks` call is the first
     // per-batch callback, and the daemon reads that first call as "the
     // calibration read has returned" (MAN-122's `ready: decoding` event).
-    let hops = seg.channelize(&padding);
-    let events = seg.tm.process_hops(&hops, |m| {
-        seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-    });
+    let events = seg.track(&padding, seg_base);
     emit(
         events,
         &mut validator,
@@ -1183,6 +1185,13 @@ pub fn listen_with_observers(
                     &mut on_event,
                     &mut on_spot,
                 );
+                if let Some(obs) = &observers.track_lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        validator.gate_records_total(),
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                }
                 stalled = true;
                 continue;
             }
@@ -1262,10 +1271,7 @@ pub fn listen_with_observers(
                 }
             };
             seg.tm.set_funnel_trace(observers.funnel_trace.clone());
-            let hops = seg.channelize(&padding);
-            let events = seg.tm.process_hops(&hops, |m| {
-                seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-            });
+            let events = seg.track(&padding, seg_base);
             emit(
                 events,
                 &mut validator,
@@ -1290,10 +1296,7 @@ pub fn listen_with_observers(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-        let hops = seg.channelize(&chunk[..n]);
-        let events = seg.tm.process_hops(&hops, |m| {
-            seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-        });
+        let events = seg.track(&chunk[..n], seg_base);
         emit(
             events,
             &mut validator,
@@ -1611,6 +1614,7 @@ impl<'a> Back<'a> {
 
 /// MAN-13: what one input's front end publishes on its own thread.
 pub(crate) struct FrontObservers {
+    pub(crate) track_lifecycle: Option<Arc<crate::TrackLifecycleObserver>>,
     pub(crate) active_tracks: Option<Arc<AtomicU64>>,
     pub(crate) static_crashes: Option<Arc<AtomicU64>>,
     pub(crate) bad_samples: Option<Arc<AtomicU64>>,
@@ -1728,6 +1732,8 @@ pub(crate) fn run_input_front(
     let analytic = src.analytic_guard_hz() > 0.0;
     let guard_hz = effective_guard_hz(cfg.detector.guard_hz, src.analytic_guard_hz());
     let mut crash_base: u64 = 0;
+    let mut close_base = crate::track::CloseCounts::default();
+    let mut spawn_base = 0;
     // MAN-141: this input's spectrum tap, with its own calibration.
     let spectrum = observers.spectrum.clone().map(|sink| SpectrumFeed {
         sink,
@@ -1832,13 +1838,17 @@ pub(crate) fn run_input_front(
     // batches as before, and `tick` still fires on the batch that closes
     // the fill.
     let fill_end = seg_base + filled as u64;
-    let hops = seg.channelize(&padding[..]);
-    let events = seg.tm.process_hops(&hops, |m| {
-        seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-    });
+    let events = seg.track(&padding[..], seg_base);
     let b = batch(events, fill_end, &mut seg.tm);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1852,6 +1862,13 @@ pub(crate) fn run_input_front(
     tick(&mut b, &mut seg.tm, fill_end);
     report_active_tracks(b.n_tracks);
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1880,6 +1897,13 @@ pub(crate) fn run_input_front(
             // MAN-201, as `listen_with_observers`.
             if src.take_stalled() {
                 let finish_events = seg.tm.finish_for_discontinuity();
+                if let Some(obs) = &observers.track_lifecycle {
+                    obs.publish_counts(
+                        close_base + seg.tm.close_counts(),
+                        0,
+                        spawn_base + seg.tm.total_spawns(),
+                    );
+                }
                 if !send(batch(finish_events, seg_base + seg_consumed, &mut seg.tm)) {
                     return Ok(());
                 }
@@ -1908,6 +1932,8 @@ pub(crate) fn run_input_front(
             let finish_events = seg.tm.finish_for_discontinuity();
             pending.push(batch(finish_events, seg_base + seg_consumed, &mut seg.tm));
             let next_id = seg.tm.next_track_id();
+            close_base = close_base + seg.tm.close_counts();
+            spawn_base += seg.tm.total_spawns();
             crash_base += seg.tm.static_crash_count();
             bad_base += seg.ch.bad_samples();
             conditioned_base = conditioning_counts(&seg.ch, conditioned_base);
@@ -1929,10 +1955,7 @@ pub(crate) fn run_input_front(
                 spectrum.as_ref(),
             )?;
             seg.tm.export_refine_feed();
-            let hops = seg.channelize(&padding);
-            let events = seg.tm.process_hops(&hops, |m| {
-                seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-            });
+            let events = seg.track(&padding, seg_base);
             pending.push(batch(events, seg_base, &mut seg.tm));
         } else if cont.unknown_gap {
             // MAN-202, as `listen_with_observers`.
@@ -1943,16 +1966,20 @@ pub(crate) fn run_input_front(
             .decode_latency
             .as_ref()
             .map(|_| std::time::Instant::now());
-        let hops = seg.channelize(&chunk[..n]);
-        let events = seg.tm.process_hops(&hops, |m| {
-            seg.held.hop_ts(seg_base, seg.pad_hops, seg.hop, m)
-        });
+        let events = seg.track(&chunk[..n], seg_base);
         seg_consumed += n as u64;
         let mut b = batch(events, seg_base + seg_consumed, &mut seg.tm);
         tick(&mut b, &mut seg.tm, seg_base + seg_consumed);
         pending.push(b);
         report_active_tracks(seg.tm.decoding_track_count());
         report_static_crashes(crash_base + seg.tm.static_crash_count());
+        if let Some(obs) = &observers.track_lifecycle {
+            obs.publish_counts(
+                close_base + seg.tm.close_counts(),
+                0,
+                spawn_base + seg.tm.total_spawns(),
+            );
+        }
         report_bad_samples(bad_base + seg.ch.bad_samples());
         if let Some(observer) = &observers.conditioned {
             observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -1983,6 +2010,13 @@ pub(crate) fn run_input_front(
     let mut last = batch(events, seg_base + seg_consumed, &mut seg.tm);
     last.n_tracks = 0;
     report_static_crashes(crash_base + seg.tm.static_crash_count());
+    if let Some(obs) = &observers.track_lifecycle {
+        obs.publish_counts(
+            close_base + seg.tm.close_counts(),
+            0,
+            spawn_base + seg.tm.total_spawns(),
+        );
+    }
     report_bad_samples(bad_base + seg.ch.bad_samples());
     if let Some(observer) = &observers.conditioned {
         observer.report(conditioning_counts(&seg.ch, conditioned_base));
@@ -2349,7 +2383,7 @@ mod tests {
         }
     }
 
-    fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 8] {
+    fn lifecycle_close_fields(c: crate::track::CloseCounts) -> [u64; 10] {
         [
             c.unconfirmed,
             c.hang_expired,
@@ -2359,6 +2393,8 @@ mod tests {
             c.rtty,
             c.not_cw,
             c.unkeyed,
+            c.source_end,
+            c.reconnect,
         ]
     }
 

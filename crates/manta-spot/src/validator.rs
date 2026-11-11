@@ -600,6 +600,8 @@ pub struct Validator {
     /// `GATE_WINDOW_SECONDS` in samples, cached at construction -- the
     /// prune cutoff for `merged_into` below.
     gate_window_samples: u64,
+    /// Maximum candidate lag retained by dedupe (MAN-534).
+    dedupe_max_lag_samples: u64,
     /// `TURN_SILENCE_SECONDS` in samples, cached at construction (MAN-201).
     turn_silence_samples: u64,
     /// track_id -> (its current best-known root survivor, `now_ts` at the
@@ -722,6 +724,9 @@ fn evidence_links(counted: &[GateOccurrence]) -> Vec<EvidenceLink> {
 /// let it grow far past its steady-state size before the next sweep --
 /// a reasoned choice, not yet measured against real long-run data.
 const SWEEP_INTERVAL_SECONDS: f64 = 10.0;
+
+/// MAN-534: an indefinitely open track may delay dedupe expiry by at most an hour.
+const DEDUPE_MAX_LAG_SECONDS: f64 = 3600.0;
 
 /// MAN-208: one externally computed refinement of a retained occurrence --
 /// the result of re-decoding that occurrence's preserved samples under an
@@ -855,6 +860,7 @@ impl Validator {
             last_swept_ts: 0,
             sweep_interval_samples: (SWEEP_INTERVAL_SECONDS * fs) as u64,
             gate_window_samples: (GATE_WINDOW_SECONDS * fs) as u64,
+            dedupe_max_lag_samples: (DEDUPE_MAX_LAG_SECONDS * fs) as u64,
             turn_silence_samples: (TURN_SILENCE_SECONDS * fs) as u64,
             merged_into: BTreeMap::new(),
             decisions: None,
@@ -1366,8 +1372,9 @@ impl Validator {
             // revise it there too, or the rival check below compares the
             // refined call against the reading it just superseded
             // (validate round 2, PR #520). Moved, never added.
-            let plausible =
-                grammar::is_plausible(&refined.call) && self.cty.is_allocated(&refined.call);
+            let plausible = grammar::is_plausible(&refined.call)
+                && self.cty.is_allocated(&refined.call)
+                && !self.blocklist.contains(&refined.call);
             self.ledger.revise_occurrence(
                 track_id,
                 word_seq,
@@ -1516,7 +1523,9 @@ impl Validator {
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
         let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
             self.ledger
-                .better_supported_rival(track_id, &candidate, sample_ts)
+                .better_supported_rival_where(track_id, &candidate, sample_ts, &[], |text| {
+                    !self.blocklist.contains(text)
+                })
         } else {
             None
         };
@@ -1691,8 +1700,30 @@ impl Validator {
         self.maybe_sweep();
     }
 
-    /// Sweeps the repetition gate if `sweep_interval_samples` has elapsed
-    /// since the last sweep -- throttled the same way regardless of
+    /// Oldest candidate timestamp retained for dedupe expiry (MAN-534).
+    ///
+    /// Refinements use gate occurrences, settled/fused candidates use open
+    /// tracks' word end times, and deferred beacons use their capture times.
+    /// A future word cannot precede its track's last sample timestamp.
+    /// Cap the lag so a permanently open track cannot pin memory forever.
+    /// Candidates more than an hour late, and new tracks on an input more
+    /// than the gate window behind now_ts, can see expired dedupe history.
+    fn dedupe_floor(&self) -> u64 {
+        let mut floor = self.now_ts.saturating_sub(self.gate_window_samples);
+        for track in self.tracks.values() {
+            floor = floor.min(track.last_sample_ts);
+            for word in &track.words {
+                floor = floor.min(word.end_ts);
+            }
+            if let Some(pb) = track.pending_beacons.first() {
+                floor = floor.min(pb.sample_ts);
+            }
+        }
+        floor.max(self.now_ts.saturating_sub(self.dedupe_max_lag_samples))
+    }
+
+    /// Sweeps the gate, dedupe and other time-bounded state if
+    /// `sweep_interval_samples` has elapsed since the last sweep -- throttled the same way regardless of
     /// caller, `TrackClosed` included: under real sustained track churn
     /// (tens of thousands of closes in a 15-minute recording, MAN-166) an
     /// *unthrottled* per-close sweep would mean an O(gate size) scan on
@@ -1705,6 +1736,7 @@ impl Validator {
                 lattice.sweep(self.now_ts);
             }
             self.observations.sweep(self.now_ts);
+            self.dedupe.sweep(self.dedupe_floor());
             // `merged_into` bounded the same way, on the same cadence, as
             // a memory-bound backstop for a root that lives past this
             // window without ever closing (its own `SignalEnded` retires
@@ -1772,8 +1804,13 @@ impl Validator {
     /// Sets the operator's bad-callsign blocklist (MAN-31). Empty by
     /// default -- no suppression until the operator supplies one.
     pub fn with_blocklist(mut self, blocklist: Blocklist) -> Self {
-        self.blocklist = blocklist;
+        self.install_blocklist(blocklist);
         self
+    }
+
+    fn install_blocklist(&mut self, blocklist: Blocklist) {
+        self.ledger.retain_texts(|text| !blocklist.contains(text));
+        self.blocklist = blocklist;
     }
 
     /// Sets the operator's notched-frequency list (MAN-31). Empty by
@@ -1784,8 +1821,9 @@ impl Validator {
     }
 
     /// MAN-78: replaces the operator's three lists as one unit, for a live
-    /// config reload. Tracks, dedupe, the repetition gate, the ledger and
-    /// `suppression_counts` are untouched; a word already attempted under the
+    /// config reload. Blocked ledger entries are pruned. Tracks, dedupe,
+    /// the repetition gate and `suppression_counts` are untouched; a word
+    /// already attempted under the
     /// old lists is not re-evaluated, so the new lists apply from the next
     /// decoder event.
     pub fn replace_operator_lists(
@@ -1795,12 +1833,12 @@ impl Validator {
         notch: NotchList,
     ) {
         self.allowlist = allowlist.iter().map(|c| c.to_ascii_uppercase()).collect();
-        self.blocklist = blocklist;
+        self.install_blocklist(blocklist);
         self.notch = notch;
     }
 
     /// MAN-316: replaces the country table and known-call set, for a
-    /// scheduled list refresh. Like `replace_operator_lists`, tracks, dedupe,
+    /// scheduled list refresh. Tracks, dedupe,
     /// the repetition gate, the ledger and `suppression_counts` are
     /// untouched; the new tables apply from the next decoder event.
     pub fn replace_reference_tables(&mut self, cty: Arc<cty::Table>, scp: Option<Arc<scp::Set>>) {
@@ -1934,15 +1972,14 @@ impl Validator {
                     }
                 }
                 track.last_sample_ts = *sample_ts;
-                // MAN-100 Scenario 1: the ledger records every observed
-                // word that is ITSELF spottable-shaped (grammar + cty) --
-                // a form that could never be spotted must not be able to
-                // veto one that could. Gated on the same two checks
-                // `evaluate_candidate` runs for a non-allowlisted
-                // candidate below, so the ledger's population is never
-                // wider than what could plausibly spot.
+                // MAN-100/MAN-531: only grammar/cty-plausible, unblocked
+                // words may supply variant support. A blocked reading
+                // must not veto an eligible call.
                 if let Some((text, seq, start_ts, geo)) = newly_completed {
-                    if grammar::is_plausible(&text) && self.cty.is_allocated(&text) {
+                    if grammar::is_plausible(&text)
+                        && self.cty.is_allocated(&text)
+                        && !self.blocklist.contains(&text)
+                    {
                         self.ledger.observe_span(
                             *track_id,
                             &text,
@@ -3011,7 +3048,9 @@ impl Validator {
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&candidate));
         let rival = if !is_allowlisted && !scp_exempt && spot_type != SpotType::Beacon {
             self.ledger
-                .better_supported_rival(track_id, &candidate, sample_ts)
+                .better_supported_rival_where(track_id, &candidate, sample_ts, &[], |text| {
+                    !self.blocklist.contains(text)
+                })
         } else {
             None
         };
@@ -3164,11 +3203,12 @@ impl Validator {
         // copies: they are the damage the fusion already outvoted.
         let scp_exempt = self.scp.as_ref().is_some_and(|s| s.contains(&call));
         let rival = if !is_allowlisted && !scp_exempt {
-            self.ledger.better_supported_rival_except(
+            self.ledger.better_supported_rival_where(
                 track_id,
                 &call,
                 sample_ts,
                 &fused.disagreeing,
+                |text| !self.blocklist.contains(text),
             )
         } else {
             None
@@ -4402,6 +4442,288 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
         assert_eq!(second[0].reps, Some(2));
         assert_eq!(second[0].spot.as_ref(), Some(&spots[0]));
         assert!(v.take_decisions().is_empty(), "take drains the log");
+    }
+
+    #[test]
+    fn man531_scp_exemption_normal_and_refined_keeps_own_gate_and_blocklist() {
+        for refinement in [false, true] {
+            for (scp_member, blocked) in [(false, false), (true, false), (true, true)] {
+                let mut v = recording(CTY_FIXTURE);
+                v.scp = Some(Arc::new(scp::Set::parse(if scp_member {
+                    "K5AR"
+                } else {
+                    ""
+                })));
+                if blocked {
+                    v = v.with_blocklist(Blocklist::parse("K5AR"));
+                }
+                man531_seed_rival(&mut v, 1, "K5ARH", 4);
+                assert_eq!(v.ledger.support(1, "K5ARH", 100_000).reps, 4);
+                assert!(run(
+                    &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 300_000),
+                    &mut v
+                )
+                .is_empty());
+                let first = v.take_decisions();
+                if !blocked {
+                    assert!(decisions_for(&first, "K5AR")
+                        .iter()
+                        .any(|d| d.reason == Some(Reason::Repetition)));
+                }
+                let spots = if refinement {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5AX", "K"], 600_000),
+                        &mut v,
+                    );
+                    let (seq, span) = word_named(&v, 1, "K5AX");
+                    v.apply_refinement(1, seq, refined("K5AR", span, "engine:hsmm"), 700_000)
+                } else {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5AR", "K"], 600_000),
+                        &mut v,
+                    )
+                };
+                let log = v.take_decisions();
+                let d = decisions_for(&log, "K5AR").last().copied().unwrap();
+                if blocked {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Blocklist));
+                } else if scp_member {
+                    assert_eq!(spots.len(), 1, "{log:?}");
+                    assert_eq!(d.verdict, Verdict::Spotted);
+                    assert!(d.rival.is_none());
+                    assert_eq!(d.reps, Some(2));
+                } else {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Variant));
+                    assert_eq!(d.rival.as_ref().unwrap().call, "K5ARH");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn man531_scp_exemption_fused_keeps_blocklist_precedence() {
+        for (scp_member, blocked) in [(false, false), (true, false), (true, true)] {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            v.scp = Some(Arc::new(scp::Set::parse(if scp_member {
+                "W1AW"
+            } else {
+                ""
+            })));
+            if blocked {
+                v = v.with_blocklist(Blocklist::parse("W1AW"));
+            }
+            man531_seed_rival(&mut v, 1, "W1AX", 4);
+            assert_eq!(v.ledger.support(1, "W1AX", 100_000).reps, 4);
+            let spots = run(&complementary_copies(), &mut v);
+            let log = v.take_decisions();
+            let d = decisions_for(&log, "W1AW").last().copied().unwrap();
+            if blocked {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Blocklist));
+            } else if scp_member {
+                assert_eq!(spots.len(), 1, "{log:?}");
+                assert_eq!(d.confirmation, Some(Confirmation::Fused));
+                assert!(d.rival.is_none());
+                assert_eq!(d.reps, Some(2));
+            } else {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Variant));
+                assert_eq!(d.rival.as_ref().unwrap().call, "W1AX");
+            }
+        }
+    }
+
+    #[test]
+    fn man531_list_install_prunes_all_tracks_without_resurrection() {
+        for builder in [false, true] {
+            let mut v = recording(CTY_FIXTURE);
+            for track in [1, 2] {
+                man531_seed_rival(&mut v, track, "K5ARH", 3);
+            }
+            man531_seed_rival(&mut v, 1, "W1AW", 2);
+            let kept = v.ledger.support(1, "W1AW", 100_000);
+            let gate_before = v.gate.counted_total();
+            let counts_before = v.suppression_counts();
+            if builder {
+                v = v.with_blocklist(Blocklist::parse("K5ARH"));
+            } else {
+                v.replace_operator_lists(&[], Blocklist::parse("K5ARH"), NotchList::default());
+            }
+            for track in [1, 2] {
+                assert_eq!(v.ledger.support(track, "K5ARH", 100_000).reps, 0);
+            }
+            assert_eq!(v.ledger.support(1, "W1AW", 100_000), kept);
+            assert_eq!(v.gate.counted_total(), gate_before);
+            assert_eq!(v.suppression_counts(), counts_before);
+            assert!(v.tracks.contains_key(&1));
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 300_000),
+                &mut v,
+            );
+            let spots = run(
+                &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 600_000),
+                &mut v,
+            );
+            assert_eq!(spots.len(), 1);
+            assert_eq!(spots[0].callsign, "K5ARG");
+            assert!(v
+                .take_decisions()
+                .iter()
+                .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K5ARH")));
+            v.replace_operator_lists(&[], Blocklist::default(), NotchList::default());
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 0);
+            assert_eq!(v.ledger.support(1, "W1AW", v.now_ts), kept);
+            v = v.with_blocklist(Blocklist::default());
+            assert_eq!(v.ledger.support(1, "W1AW", v.now_ts), kept);
+            run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], 900_000),
+                &mut v,
+            );
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 1);
+        }
+    }
+
+    #[test]
+    fn man531_blocked_variant_cannot_outvote_genuine_call() {
+        let mut v = recording(CTY_FIXTURE).with_blocklist(Blocklist::parse("k5arh\n"));
+        for i in 0..3 {
+            assert!(run(
+                &transmission_events(1, &["CQ", "DE", "K5ARH", "K"], i * 300_000),
+                &mut v
+            )
+            .is_empty());
+            assert_eq!(v.ledger.support(1, "K5ARH", v.now_ts).reps, 0);
+        }
+        man531_flush_context(&mut v, 900_000);
+        assert!(run(
+            &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 1_200_000),
+            &mut v
+        )
+        .is_empty());
+        let spots = run(
+            &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 1_500_000),
+            &mut v,
+        );
+        assert_eq!(spots.len(), 1, "{spots:?}");
+        assert_eq!(spots[0].callsign, "K5ARG");
+        let log = v.take_decisions();
+        let genuine = decisions_for(&log, "K5ARG");
+        assert!(genuine.iter().any(|d| d.reason == Some(Reason::Repetition)));
+        assert!(genuine
+            .iter()
+            .any(|d| d.verdict == Verdict::Spotted && d.reps == Some(2) && d.required_reps == 2));
+        assert!(log
+            .iter()
+            .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K5ARH")));
+    }
+
+    fn man531_flush_context(v: &mut Validator, at: u64) {
+        let filler: Vec<String> = (1..=16).map(|i| format!("QQQ{i}")).collect();
+        let refs: Vec<&str> = filler.iter().map(String::as_str).collect();
+        run(&transmission_events(1, &refs, at), v);
+    }
+
+    fn man531_seed_rival(v: &mut Validator, track: u32, call: &str, reps: u64) {
+        for i in 0..reps {
+            v.ledger.observe(track, call, i * 10, i * 10_000, 0.95);
+        }
+    }
+
+    #[test]
+    fn man531_refinement_into_blocked_text_removes_old_support() {
+        let mut v = recording(CTY_FIXTURE).with_blocklist(Blocklist::parse("K3ABD"));
+        man531_seed_rival(&mut v, 2, "W1AW", 1);
+        run(
+            &transmission_events(1, &["DE", "K3ABC", "K"], 1_000_000),
+            &mut v,
+        );
+        let (seq, span) = word_named(&v, 1, "K3ABC");
+        assert_eq!(v.ledger.support(1, "K3ABC", v.now_ts).reps, 1);
+        assert!(v
+            .apply_refinement(1, seq, refined("K3ABD", span, "engine:hsmm"), 1_100_000)
+            .is_empty());
+        assert_eq!(v.ledger.support(1, "K3ABC", v.now_ts).reps, 0);
+        assert_eq!(v.ledger.support(1, "K3ABD", v.now_ts).reps, 0);
+        assert_eq!(v.ledger.support(2, "W1AW", v.now_ts).reps, 1);
+        let log = v.take_decisions();
+        assert!(log
+            .iter()
+            .any(|d| d.call == "K3ABD" && d.reason == Some(Reason::Blocklist)));
+        assert!(log
+            .iter()
+            .all(|d| d.rival.as_ref().is_none_or(|r| r.call != "K3ABD")));
+        assert!(log
+            .iter()
+            .all(|d| d.spot.as_ref().is_none_or(|s| s.callsign != "K3ABD")));
+    }
+
+    #[test]
+    fn man531_stale_blocked_rival_is_filtered_in_ordinary_and_refined_paths() {
+        for refinement in [false, true] {
+            for blocked in [false, true] {
+                let mut v = recording(CTY_FIXTURE);
+                if blocked {
+                    v = v.with_blocklist(Blocklist::parse("K5ARH"));
+                }
+                man531_seed_rival(&mut v, 1, "K5ARH", 4);
+                run(
+                    &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 300_000),
+                    &mut v,
+                );
+                let spots = if refinement {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5ARX", "K"], 600_000),
+                        &mut v,
+                    );
+                    let (seq, span) = word_named(&v, 1, "K5ARX");
+                    v.apply_refinement(1, seq, refined("K5ARG", span, "engine:hsmm"), 700_000)
+                } else {
+                    run(
+                        &transmission_events(1, &["CQ", "DE", "K5ARG", "K"], 600_000),
+                        &mut v,
+                    )
+                };
+                let log = v.take_decisions();
+                let d = decisions_for(&log, "K5ARG")
+                    .last()
+                    .copied()
+                    .expect("candidate decision");
+                if blocked {
+                    assert_eq!(spots.len(), 1, "{log:?}");
+                    assert_eq!(d.verdict, Verdict::Spotted);
+                    assert!(d.rival.is_none());
+                } else {
+                    assert!(spots.is_empty());
+                    assert_eq!(d.reason, Some(Reason::Variant));
+                    assert_eq!(d.rival.as_ref().unwrap().call, "K5ARH");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn man531_stale_blocked_rival_is_filtered_in_fusion() {
+        for blocked in [false, true] {
+            let mut v = recording(CTY_FIXTURE).with_repetition_fusion(true);
+            if blocked {
+                v = v.with_blocklist(Blocklist::parse("W1AX"));
+            }
+            man531_seed_rival(&mut v, 1, "W1AX", 4);
+            let spots = run(&complementary_copies(), &mut v);
+            let log = v.take_decisions();
+            let d = decisions_for(&log, "W1AW").last().copied().unwrap();
+            if blocked {
+                assert_eq!(spots.len(), 1, "{log:?}");
+                assert_eq!(d.confirmation, Some(Confirmation::Fused));
+                assert!(d.rival.is_none());
+            } else {
+                assert!(spots.is_empty());
+                assert_eq!(d.reason, Some(Reason::Variant));
+                assert_eq!(d.rival.as_ref().unwrap().call, "W1AX");
+            }
+        }
     }
 
     #[test]
@@ -6340,6 +6662,136 @@ United States:    5:  8: NA:  40.0:  75.0:  5.0:  K:
             "gate must be swept periodically even with no TrackClosed at all, not just accumulate one entry per historical callsign (got {})",
             v.gate.len()
         );
+    }
+
+    #[test]
+    fn dedupe_sweeps_periodically_even_when_no_track_ever_closes() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let mut count = 0;
+        for i in 0..2000u64 {
+            let call = format!(
+                "K5{}{}{}",
+                (b'A' + (i / 676) as u8) as char,
+                (b'A' + ((i / 26) % 26) as u8) as char,
+                (b'A' + (i % 26) as u8) as char
+            );
+            let ts = i * (7 * 86400 * FS as u64) / 2000;
+            let words = ["DE", call.as_str(), "K"];
+            count += run(&transmission_events(1, &words, ts), &mut v).len();
+            count += run(&transmission_events(1, &words, ts + 100_000), &mut v).len();
+        }
+        assert_eq!(count, 2000);
+        assert!(v.dedupe.len() < 20, "entries: {}", v.dedupe.len());
+    }
+
+    #[test]
+    fn a_late_candidate_inside_the_window_is_still_withheld_after_a_sweep() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        let words = ["DE", "K5ARH", "K"];
+        run(&transmission_events(1, &words, 0), &mut v);
+        let first = run(&transmission_events(1, &words, 100_000), &mut v);
+        assert_eq!(first.len(), 1);
+        seed_meta(&mut v, 2);
+        run(
+            &transmission_events(2, &["DE", "W1AW", "K"], 605 * FS as u64),
+            &mut v,
+        );
+        seed_meta(&mut v, 3);
+        let mut late = run(&transmission_events(3, &words, 597 * FS as u64), &mut v);
+        late.extend(run(
+            &transmission_events(3, &words, 598 * FS as u64),
+            &mut v,
+        ));
+        assert!(late.is_empty(), "{late:?}");
+    }
+
+    #[test]
+    fn a_track_left_open_pins_dedupe_memory_for_at_most_the_lag_cap() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        seed_meta(&mut v, 1);
+        assert!(run(
+            &transmission_events(1, &["V", "V", "V", "K5ARH"], 1000),
+            &mut v
+        )
+        .is_empty());
+        seed_meta(&mut v, 2);
+        let mut count = 0;
+        for i in 0..2000u64 {
+            let call = format!(
+                "K5{}{}{}",
+                (b'A' + (i / 676) as u8) as char,
+                (b'A' + ((i / 26) % 26) as u8) as char,
+                (b'A' + (i % 26) as u8) as char
+            );
+            let ts = 100_000 + i * (7 * 86400 * FS as u64) / 2000;
+            let words = ["DE", call.as_str(), "K"];
+            count += run(&transmission_events(2, &words, ts), &mut v).len();
+            count += run(&transmission_events(2, &words, ts + 100_000), &mut v).len();
+        }
+        assert_eq!(count, 2000);
+        assert!(v.dedupe.len() < 50, "entries: {}", v.dedupe.len());
+    }
+
+    #[test]
+    fn a_deferred_beacon_stays_stale_after_its_newer_spot_ages_past_the_window() {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+
+        // Track 1 captures a Beacon candidate for K5ARH at an early
+        // timestamp, on 14_000_000.0 Hz (seed_meta's fixture value), but
+        // does not close yet.
+        seed_meta(&mut v, 1);
+        let words = ["V", "V", "V", "K5ARH"];
+        let spots = run(&transmission_events(1, &words, 1_000), &mut v);
+        assert!(spots.is_empty(), "should be captured, not yet resolved");
+
+        // A newer, ordinary (repetition-confirmed) spot for the SAME
+        // callsign/frequency arrives on a different track, well after.
+        seed_meta(&mut v, 2);
+        let words2 = ["DE", "K5ARH", "K"];
+        let mut spots2 = run(&transmission_events(2, &words2, 5_000_000), &mut v);
+        spots2.extend(run(&transmission_events(2, &words2, 5_100_000), &mut v));
+        assert_eq!(spots2.len(), 1, "the ordinary path must spot normally");
+        let newer_ts = spots2[0].sample_ts;
+
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
+            Some(newer_ts),
+            "dedupe must have recorded the newer, ordinary spot's timestamp"
+        );
+
+        seed_meta(&mut v, 3);
+        run(
+            &transmission_events(3, &["DE", "W1AW", "K"], 5_100_000 + 700 * FS as u64),
+            &mut v,
+        );
+
+        // Track 1 finally closes -- its captured (OLDER) Beacon candidate
+        // must not emit now, and must not roll dedupe's watermark back to
+        // its own stale timestamp. A plausible, confirmed final speed
+        // (MAN-174), so the candidate reaches the stale check rather than
+        // the round-10 unconfirmed-WPM refusal.
+        v.ingest(&DecoderEvent::SpeedUpdate {
+            track_id: 1,
+            wpm: 22.0,
+        });
+        let spots3 = v.ingest(&DecoderEvent::TrackClosed {
+            track_id: 1,
+            closure: ClosureKind::SignalEnded,
+        });
+        assert!(
+            spots3.is_empty(),
+            "an already-superseded deferred candidate must not emit, got {spots3:?}"
+        );
+        assert_eq!(
+            v.dedupe.last_sample_ts("K5ARH", 14_000_000.0, 0),
+            Some(newer_ts),
+            "resolving the stale deferred candidate must not roll the \
+             dedupe watermark backward"
+        );
+        // MAN-174 finding 6: the stale drop is counted.
+        assert_eq!(v.suppression_counts().pending_beacon_stale, 1);
     }
 
     // ---- MAN-208: bounded delayed refinement of ambiguous decodes ----

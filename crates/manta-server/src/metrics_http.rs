@@ -4,7 +4,7 @@
 //! Hand-rolled rather than pulling in a full HTTP framework -- two static
 //! text responses to two paths is the entire surface.
 
-use crate::bounded_io::read_line_bounded;
+use crate::bounded_io::{read_line_bounded, Utf8Tail};
 use crate::metrics::Metrics;
 use crate::rate_limit::IpRateLimiter;
 use crate::status_doc::StatusDoc;
@@ -211,12 +211,13 @@ async fn read_headers<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     request_line: &mut String,
 ) -> std::io::Result<bool> {
-    if read_line_bounded(reader, request_line).await? == 0 {
+    let mut tail = Utf8Tail::default();
+    if read_line_bounded(reader, request_line, &mut tail).await? == 0 {
         return Ok(true);
     }
     for _ in 0..MAX_HEADER_LINES {
         let mut line = String::new();
-        let n = read_line_bounded(reader, &mut line).await?;
+        let n = read_line_bounded(reader, &mut line, &mut tail).await?;
         if n == 0 || line == "\r\n" {
             break;
         }

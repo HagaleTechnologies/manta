@@ -36,6 +36,7 @@
 //!   unless flags bit `0x80` is set (little-endian). Real captures were a
 //!   constant 2068 bytes (20-byte header + 512 complex pairs) every frame.
 
+use crate::loss_marks::LossMarks;
 use crate::stall::{
     NoUsableSamples, StallEpisode, UsableSampleBudget, NO_USABLE_SAMPLES_AFTER, SOFT_STALL_AFTER,
 };
@@ -306,9 +307,23 @@ pub struct KiwiIqSource {
     last_keepalive: Instant,
     /// MAN-128: shared packet-loss/malformed counters, fed from each SND
     /// frame's `seq` field by `account_snd_frame`. Surfaced via
-    /// `health_counters()`, same as HPSDR's `GapDetector` handle.
+    /// `health_counters()`, same as HPSDR's `GapDetector` handle. MAN-529:
+    /// a `seq` gap also reaches the sample clock, through `losses`.
     health: Arc<InputHealthCounters>,
     seq: SndSeqTracker,
+    /// MAN-529: the negotiated input rate, as rounded for the resampler.
+    rate_in_hz: u64,
+    /// MAN-529: `resampler.output_delay()`, in output samples.
+    output_delay: u64,
+    /// MAN-529: raw pairs pushed into the resampler since connect.
+    raw_pairs: u64,
+    /// MAN-529: the last valid non-empty SND frame's pair count.
+    last_frame_pairs: u64,
+    /// MAN-529: remainder of the lost-span rate conversion, carried so a
+    /// run of small gaps at a fractional ratio sums exactly.
+    lost_carry: u64,
+    /// MAN-529: lost SND frames, marked at their resampled output position.
+    losses: LossMarks,
     /// MAN-259: `connect`'s runtime up to the post-handshake `SET` loop
     /// that turns streaming on; surfaced by `acquisition_start_offset()`.
     acquisition_start_offset: Duration,
@@ -484,6 +499,7 @@ impl KiwiIqSource {
             anyhow!("construct KiwiSDR resampler ({rate_in_hz} -> {TARGET_RATE_HZ} Hz): {e}")
         })?;
 
+        let output_delay = resampler.output_delay() as u64;
         Ok(KiwiIqSource {
             socket,
             fs: OUTPUT_RATE_HZ,
@@ -494,6 +510,12 @@ impl KiwiIqSource {
             last_keepalive: Instant::now(),
             health: Arc::new(InputHealthCounters::new()),
             seq: SndSeqTracker::default(),
+            rate_in_hz: rate_in_hz as u64,
+            output_delay,
+            raw_pairs: 0,
+            last_frame_pairs: 0,
+            lost_carry: 0,
+            losses: LossMarks::new(OUTPUT_RATE_HZ),
             acquisition_start_offset,
             last_usable_iq: Instant::now(),
             stall: StallEpisode::new(SOFT_STALL_AFTER),
@@ -528,13 +550,25 @@ impl KiwiIqSource {
     fn handle_frame(&mut self, msg: Message) -> Result<()> {
         match msg {
             Message::Binary(b) if b.len() >= 3 && &b[0..3] == b"SND" => {
-                if let Some(samples) = account_snd_frame(&self.health, &mut self.seq, &b[3..]) {
+                if let Some((samples, skipped)) =
+                    account_snd_frame(&self.health, &mut self.seq, &b[3..])
+                {
+                    let pairs = samples.len() as u64;
+                    // MAN-529: mark the lost frames at the output position
+                    // of this frame's first pair, before it is pushed.
+                    if skipped > 0 {
+                        self.mark_lost_frames(skipped, pairs);
+                    }
                     // MAN-533 D2: a parsed payload is not progress on
                     // its own; `note_iteration` stamps it once the
                     // resampler hands samples to `pending`.
                     for s in samples {
                         self.raw.push(s.re);
                         self.raw.push(s.im);
+                    }
+                    self.raw_pairs = self.raw_pairs.saturating_add(pairs);
+                    if pairs > 0 {
+                        self.last_frame_pairs = pairs;
                     }
                     self.drain_resampler()?;
                 }
@@ -563,6 +597,33 @@ impl KiwiIqSource {
             Message::Frame(_) => {}
         }
         Ok(())
+    }
+
+    /// MAN-529: mark `skipped` lost SND frames before the raw pair
+    /// `raw_pairs`. A lost frame is assumed to hold the last valid non-empty
+    /// frame's pair count, else the arriving frame's (`arriving_pairs`);
+    /// with neither, no mark. Raw coordinates convert to output ones with
+    /// `floor(raw x 96000 / rate_in) + output_delay` (measured exact at
+    /// 12000 Hz, within 5 samples at 11999 Hz); the lost span carries its
+    /// remainder so small gaps sum exactly.
+    fn mark_lost_frames(&mut self, skipped: u32, arriving_pairs: u64) {
+        let pairs = if self.last_frame_pairs > 0 {
+            self.last_frame_pairs
+        } else {
+            arriving_pairs
+        };
+        if pairs == 0 || self.rate_in_hz == 0 {
+            return;
+        }
+        let (at, lost, carry) = lost_frame_mark(
+            self.raw_pairs,
+            u64::from(skipped).saturating_mul(pairs),
+            self.rate_in_hz,
+            self.output_delay,
+            self.lost_carry,
+        );
+        self.lost_carry = carry;
+        self.losses.mark(at, lost);
     }
 
     fn send_keepalive_if_due(&mut self) -> Result<()> {
@@ -608,6 +669,24 @@ impl KiwiIqSource {
             }
         }
     }
+}
+
+/// MAN-529: converts a Kiwi loss in raw (input-rate) pairs to output
+/// coordinates: returns (output position of raw pair `raw_pos`, output
+/// samples for `lost_raw` lost raw pairs, the new carried remainder).
+fn lost_frame_mark(
+    raw_pos: u64,
+    lost_raw: u64,
+    rate_in_hz: u64,
+    output_delay: u64,
+    carry: u64,
+) -> (u64, u64, u64) {
+    let out = TARGET_RATE_HZ as u128;
+    let rate = u128::from(rate_in_hz.max(1));
+    let at = u128::from(raw_pos) * out / rate + u128::from(output_delay);
+    let t = u128::from(lost_raw) * out + u128::from(carry);
+    let sat = |v: u128| u64::try_from(v).unwrap_or(u64::MAX);
+    (sat(at), sat(t / rate), sat(t % rate))
 }
 
 /// Shared by `connect()`'s handshake loop (before a `KiwiIqSource` exists)
@@ -689,7 +768,8 @@ fn parse_snd_frame(body: &[u8]) -> Option<SndFrame> {
 
 /// Tracks the `seq` field across consecutive `SND` frames (MAN-128,
 /// generalizing MAN-56's HPSDR gap-stat wiring to KiwiSDR) to detect lost
-/// frames. KiwiSDR's SND `seq` advances by exactly 1 per frame in normal
+/// frames. MAN-529: a gap reaches the sample clock too, counted from
+/// `skipped` (malformed frames included, as they carry no samples). KiwiSDR's SND `seq` advances by exactly 1 per frame in normal
 /// operation (confirmed against kiwirecorder.py's own `Block: %08x` log,
 /// `jks-prv/kiwiclient`).
 #[derive(Default)]
@@ -707,8 +787,11 @@ enum SeqObservation {
     /// `seq` advanced by exactly 1: no loss.
     InOrder,
     /// `seq` advanced by more than 1 (bounded by `MAX_PLAUSIBLE_SEQ_JUMP`):
-    /// `missing` frames were dropped in transit.
-    Gap { missing: u32 },
+    /// `skipped` frames are absent from the stream, of which `missing` were
+    /// dropped in transit (the rest arrived malformed, so they count as
+    /// received but carry no samples). MAN-529: counters use `missing`, the
+    /// sample clock uses `skipped`.
+    Gap { missing: u32, skipped: u32 },
     /// A duplicate, backward, or implausibly large jump: most likely a
     /// server-side counter reset, not a real loss event. Re-baselines
     /// silently rather than reporting a nonsensical gap.
@@ -723,9 +806,10 @@ impl SndSeqTracker {
                 0 => SeqObservation::Resync,
                 1 => SeqObservation::InOrder,
                 delta if delta <= MAX_PLAUSIBLE_SEQ_JUMP => {
-                    match (delta - 1).saturating_sub(self.malformed_since_last) {
-                        0 => SeqObservation::InOrder,
-                        missing => SeqObservation::Gap { missing },
+                    let skipped = delta - 1;
+                    SeqObservation::Gap {
+                        missing: skipped.saturating_sub(self.malformed_since_last),
+                        skipped,
                     }
                 }
                 _ => SeqObservation::Resync,
@@ -747,12 +831,14 @@ impl SndSeqTracker {
 /// a malformed (too-short) frame counts as one malformed packet, and a
 /// forward `seq` jump counts as one gap event plus its missing-frame count,
 /// net of malformed frames received since the previous valid one.
-/// Returns the frame's samples, or `None` if the frame was malformed.
+/// Returns the frame's samples and the frames skipped before it (MAN-529:
+/// for the sample clock, malformed ones included), or `None` if the frame
+/// was malformed.
 fn account_snd_frame(
     counters: &InputHealthCounters,
     tracker: &mut SndSeqTracker,
     body: &[u8],
-) -> Option<Vec<Complex32>> {
+) -> Option<(Vec<Complex32>, u32)> {
     let frame = match parse_snd_frame(body) {
         Some(frame) => frame,
         None => {
@@ -761,11 +847,15 @@ fn account_snd_frame(
             return None;
         }
     };
-    if let SeqObservation::Gap { missing } = tracker.observe(frame.seq) {
-        counters.record_gap();
-        counters.record_dropped(missing as u64);
+    let mut skipped_frames = 0;
+    if let SeqObservation::Gap { missing, skipped } = tracker.observe(frame.seq) {
+        if missing > 0 {
+            counters.record_gap();
+            counters.record_dropped(missing as u64);
+        }
+        skipped_frames = skipped;
     }
-    Some(frame.samples)
+    Some((frame.samples, skipped_frames))
 }
 
 impl IqSource for KiwiIqSource {
@@ -809,6 +899,9 @@ impl IqSource for KiwiIqSource {
         loop {
             let n = self.pending.len().min(buf.len());
             if n > 0 {
+                // MAN-529: a read ends at the next lost frame, so a loss
+                // report always describes the first sample of its read.
+                let n = self.losses.begin_read(n);
                 // Safe: `n` is bounded above by `self.pending.len()`, so
                 // every one of these `n` pops has an element to take.
                 for slot in buf.iter_mut().take(n) {
@@ -816,6 +909,7 @@ impl IqSource for KiwiIqSource {
                         *slot = s;
                     }
                 }
+                self.losses.delivered(n);
                 return Ok(n);
             }
 
@@ -867,6 +961,18 @@ impl IqSource for KiwiIqSource {
     /// `StallEpisode` episode state.
     fn take_stalled(&mut self) -> bool {
         self.stall.take()
+    }
+
+    /// MAN-529: lost SND frames under 0.5 s of output, after the read that
+    /// follows them.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.losses.take_missing()
+    }
+
+    /// MAN-529: lost SND frames of 0.5 s or more of output, after the read
+    /// that follows them.
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.losses.take_discontinuity()
     }
 }
 
@@ -1163,6 +1269,14 @@ mod tests {
         UnknownMsg,
         /// MAN-533: an `SND` frame carrying a single I/Q pair.
         Trickle(u32),
+        /// MAN-529: a 512-pair `SND` frame, zero but for an optional unit
+        /// pulse at pair 256.
+        Frame {
+            seq: u32,
+            pulse: bool,
+        },
+        /// MAN-529: a malformed (shorter than its header) `SND` frame.
+        Malformed,
     }
 
     fn fake_frame(op: FakeOp) -> Message {
@@ -1173,12 +1287,41 @@ mod tests {
             FakeOp::Text => Message::Text("hello".to_string().into()),
             FakeOp::UnknownMsg => Message::binary(b"MSG load_cfg=0".to_vec()),
             FakeOp::Trickle(seq) => snd_frame(seq, 1),
+            FakeOp::Frame { seq, pulse } => pulse_frame(seq, pulse),
+            FakeOp::Malformed => Message::binary(b"SND\x08\x00\x00\x00".to_vec()),
         }
+    }
+
+    /// MAN-529: a 512-pair SND frame, zero but for an optional pulse of
+    /// amplitude 0.5 at pair 256 (I only).
+    fn pulse_frame(seq: u32, pulse: bool) -> Message {
+        let mut body = vec![0u8; 17];
+        body[0] = 0x08; // stereo, big-endian
+        body[1..5].copy_from_slice(&seq.to_le_bytes());
+        for i in 0..512 {
+            let re: i16 = if pulse && i == 256 { 16_384 } else { 0 };
+            body.extend_from_slice(&re.to_be_bytes());
+            body.extend_from_slice(&0i16.to_be_bytes());
+        }
+        let mut frame = b"SND".to_vec();
+        frame.extend_from_slice(&body);
+        Message::binary(frame)
     }
 
     /// MAN-533: a fake Kiwi that serves `FakeOp`s from a channel after the
     /// handshake; a closed channel or a failed send ends the session.
     fn scripted_kiwi() -> (
+        KiwiIqSource,
+        std::sync::mpsc::Sender<FakeOp>,
+        std::thread::JoinHandle<()>,
+    ) {
+        scripted_kiwi_at("12000")
+    }
+
+    /// `scripted_kiwi` with the receiver reporting `sample_rate=<rate>`.
+    fn scripted_kiwi_at(
+        rate: &'static str,
+    ) -> (
         KiwiIqSource,
         std::sync::mpsc::Sender<FakeOp>,
         std::thread::JoinHandle<()>,
@@ -1193,7 +1336,9 @@ mod tests {
                 .unwrap();
             let mut ws = tungstenite::accept(stream).unwrap();
             let _ = ws.read(); // SET auth
-            let _ = ws.send(Message::binary("MSG sample_rate=12000".as_bytes().to_vec()));
+            let _ = ws.send(Message::binary(
+                format!("MSG sample_rate={rate}").into_bytes(),
+            ));
             for op in rx {
                 if ws.send(fake_frame(op)).is_err() {
                     break;
@@ -1350,9 +1495,253 @@ mod tests {
         assert_eq!(health.gaps_detected(), 1);
         assert_eq!(health.dropped_packets(), 1);
         assert_eq!(health.malformed_packets(), 1);
+        // MAN-529: the lost frame (512 pairs at 12000 Hz) also reaches the
+        // sample clock, once, after the read that starts past it.
+        let mut reports = Vec::new();
+        let mut delivered = 0usize;
+        while delivered < 20_000 {
+            let n = src.read(&mut buf).unwrap();
+            if let Some(k) = src.take_missing_samples() {
+                reports.push(k);
+            }
+            assert_eq!(src.take_discontinuity(), None);
+            delivered += n;
+        }
+        assert_eq!(reports, vec![4_096]);
         drop(tx);
         drop(src);
         server.join().unwrap();
+    }
+
+    /// MAN-529: what one scripted gapped stream delivered.
+    struct LossRun {
+        /// Every read: (index of its first output sample, length).
+        reads: Vec<(u64, usize)>,
+        /// Every loss report: (first index of the read that carried it,
+        /// `take_missing_samples`, `take_discontinuity`).
+        reports: Vec<(u64, Option<u64>, Option<u64>)>,
+        /// Power-weighted centroid of the output inside each requested
+        /// window, in this stream's output coordinates.
+        centroids: Vec<f64>,
+        output_delay: u64,
+    }
+
+    impl LossRun {
+        /// The output position `p` has on the gap-free clock: `p` plus
+        /// every loss reported at or before it.
+        fn clock(&self, p: f64) -> f64 {
+            let lost: u64 = self
+                .reports
+                .iter()
+                .filter(|(at, _, _)| (*at as f64) <= p)
+                .map(|(_, m, d)| m.unwrap_or(0) + d.unwrap_or(0))
+                .sum();
+            p + lost as f64
+        }
+
+        fn assert_no_read_straddles(&self, at: u64) {
+            for &(start, len) in &self.reads {
+                assert!(
+                    !(start < at && start + len as u64 > at),
+                    "read [{start}, {}) straddles the loss at {at}",
+                    start + len as u64
+                );
+            }
+        }
+
+        fn report_values(&self) -> Vec<(Option<u64>, Option<u64>)> {
+            self.reports.iter().map(|r| (r.1, r.2)).collect()
+        }
+    }
+
+    /// MAN-529: streams SND frames `0..frames` at `rate`, omitting the `seq`
+    /// values in `skip` (and sending `Malformed` in place of those in
+    /// `malformed`), with a pulse in each frame of `pulses`. Reads until the
+    /// (shortened, 1.5 s) soft stall's first `Ok(0)`, measuring the centroid
+    /// inside each `windows` entry (centre, half-width) of output indices.
+    fn run_lossy_kiwi(
+        rate: &'static str,
+        frames: u32,
+        skip: &[u32],
+        malformed: &[u32],
+        pulses: &[u32],
+        windows: &[(u64, u64)],
+    ) -> LossRun {
+        let (mut src, tx, server) = scripted_kiwi_at(rate);
+        // Every frame is queued up front, so the first soft stall is the
+        // end of the stream. 1.5 s leaves room for a loaded CI scheduler
+        // (the hard bound is 10 s).
+        src.stall = StallEpisode::new(Duration::from_millis(1_500));
+        for seq in 0..frames {
+            if malformed.contains(&seq) {
+                tx.send(FakeOp::Malformed).unwrap();
+            } else if !skip.contains(&seq) {
+                let pulse = pulses.contains(&seq);
+                tx.send(FakeOp::Frame { seq, pulse }).unwrap();
+            }
+        }
+        let mut run = LossRun {
+            reads: Vec::new(),
+            reports: Vec::new(),
+            centroids: Vec::new(),
+            output_delay: src.output_delay,
+        };
+        let mut sums = vec![(0f64, 0f64); windows.len()];
+        let mut buf = vec![Complex32::default(); 4096];
+        let mut delivered = 0u64;
+        loop {
+            let n = src.read(&mut buf).expect("read");
+            if n == 0 {
+                break;
+            }
+            let (m, d) = (src.take_missing_samples(), src.take_discontinuity());
+            if m.is_some() || d.is_some() {
+                run.reports.push((delivered, m, d));
+            }
+            run.reads.push((delivered, n));
+            for (w, &(centre, half)) in windows.iter().enumerate() {
+                let (lo, hi) = (centre.saturating_sub(half), centre + half);
+                if delivered + n as u64 <= lo || delivered > hi {
+                    continue;
+                }
+                for (i, x) in buf[..n].iter().enumerate() {
+                    let pos = delivered + i as u64;
+                    if (lo..=hi).contains(&pos) {
+                        let p = f64::from(x.norm_sqr());
+                        sums[w].0 += pos as f64 * p;
+                        sums[w].1 += p;
+                    }
+                }
+            }
+            delivered += n as u64;
+        }
+        run.centroids = sums
+            .iter()
+            .map(|&(m, p)| if p > 0.0 { m / p } else { f64::NAN })
+            .collect();
+        drop(tx);
+        drop(src);
+        server.join().unwrap();
+        run
+    }
+
+    /// Output index of raw pair `g` at `rate` Hz with `delay`, per D5.
+    fn out_pos(g: u64, rate: u64, delay: u64) -> f64 {
+        (g * 96_000 / rate + delay) as f64
+    }
+
+    /// The raw index of frame `f`'s pulse after `lost` frames before it.
+    fn pulse_raw(f: u64, lost: u64) -> u64 {
+        (f - lost) * 512 + 256
+    }
+
+    /// MAN-529 scenario 1 at driver level, at 12000 Hz (ratio exactly 8).
+    #[test]
+    fn three_lost_frames_at_12000_hz_report_12288_samples_at_the_gap() {
+        let delay = 1_024;
+        let gapped = out_pos(pulse_raw(60, 3), 12_000, delay) as u64;
+        let run = run_lossy_kiwi(
+            "12000",
+            130,
+            &[40, 41, 42],
+            &[],
+            &[20, 60],
+            &[(gapped, 2_048)],
+        );
+        assert_eq!(run.output_delay, delay);
+        assert_eq!(run.reports.len(), 1, "{:?}", run.reports);
+        let (at, m, d) = run.reports[0];
+        assert_eq!((m, d), (Some(12_288), None));
+        assert!(at.abs_diff(40 * 512 * 8 + 1_024) <= 8, "carried at {at}");
+        run.assert_no_read_straddles(at);
+        let clean = out_pos(pulse_raw(60, 0), 12_000, delay);
+        assert_eq!(clean, 248_832.0);
+        let clocked = run.clock(run.centroids[0]);
+        assert!((clocked - clean).abs() <= 4.0, "{clocked} vs {clean}");
+    }
+
+    /// The same at a fractional ratio (11999 Hz): 1,536 raw pairs are
+    /// 12,289.02 output samples.
+    #[test]
+    fn three_lost_frames_at_11999_hz_report_12289_samples() {
+        let delay = 48_000;
+        let gapped = out_pos(pulse_raw(60, 3), 11_999, delay) as u64;
+        let run = run_lossy_kiwi(
+            "11999",
+            130,
+            &[40, 41, 42],
+            &[],
+            &[20, 60],
+            &[(gapped, 2_048)],
+        );
+        assert_eq!(run.output_delay, delay);
+        assert_eq!(run.reports.len(), 1, "{:?}", run.reports);
+        let (at, m, d) = run.reports[0];
+        assert_eq!((m, d), (Some(12_289), None));
+        assert!(at.abs_diff(211_849) <= 9, "carried at {at}");
+        run.assert_no_read_straddles(at);
+        let clean = out_pos(pulse_raw(60, 0), 11_999, delay);
+        let clocked = run.clock(run.centroids[0]);
+        assert!((clocked - clean).abs() <= 9.0, "{clocked} vs {clean}");
+    }
+
+    /// Ticket scenario 1 at sample level: a pulse 60 s after a three-frame
+    /// gap sits on the gap-free clock.
+    #[test]
+    fn a_spot_60_s_after_a_gap_keeps_the_gap_free_clock() {
+        let delay = 1_024;
+        // Frame 1450's pulse is 722,176 raw pairs (60.2 s) after the gap.
+        let gapped = out_pos(pulse_raw(1_450, 3), 12_000, delay) as u64;
+        let run = run_lossy_kiwi(
+            "12000",
+            1_490,
+            &[40, 41, 42],
+            &[],
+            &[1_450],
+            &[(gapped, 2_048)],
+        );
+        assert_eq!(run.report_values(), vec![(Some(12_288), None)]);
+        let clean = out_pos(pulse_raw(1_450, 0), 12_000, delay);
+        assert!(clean - (40.0 * 512.0 * 8.0 + 1_024.0) >= 60.0 * 96_000.0);
+        let clocked = run.clock(run.centroids[0]);
+        assert!((clocked - clean).abs() <= 4.0, "{clocked} vs {clean}");
+    }
+
+    /// MAN-305 D10's split at 0.5 s (48,000 output samples): 11 frames
+    /// (45,056) splice, 12 (49,152) start a new segment.
+    #[test]
+    fn eleven_lost_frames_splice_and_twelve_start_a_new_segment() {
+        let eleven: Vec<u32> = (40..51).collect();
+        let run = run_lossy_kiwi("12000", 90, &eleven, &[], &[], &[]);
+        assert_eq!(run.report_values(), vec![(Some(45_056), None)]);
+
+        let twelve: Vec<u32> = (40..52).collect();
+        let run = run_lossy_kiwi("12000", 90, &twelve, &[], &[], &[]);
+        assert_eq!(run.report_values(), vec![(None, Some(49_152))]);
+    }
+
+    /// At 11999 Hz one frame is 4,096.34 output samples: the carried
+    /// remainder makes three one-frame gaps sum to the three-frame span.
+    #[test]
+    fn small_gaps_sum_to_one_large_gap_at_a_fractional_rate() {
+        let run = run_lossy_kiwi("11999", 110, &[30, 50, 70], &[], &[], &[]);
+        assert_eq!(
+            run.report_values(),
+            vec![
+                (Some(4_096), None),
+                (Some(4_096), None),
+                (Some(4_097), None)
+            ]
+        );
+        assert_eq!(3 * 512 * 96_000 / 11_999, 12_289);
+    }
+
+    /// D4 through the driver: a malformed frame in the gap carries no
+    /// samples, so it moves the clock like a lost one.
+    #[test]
+    fn a_malformed_frame_in_a_gap_moves_the_clock_by_its_frame() {
+        let run = run_lossy_kiwi("12000", 80, &[41, 42], &[40], &[], &[]);
+        assert_eq!(run.report_values(), vec![(Some(12_288), None)]);
     }
 
     /// MAN-533 D1: time a consumer spends away from `read` is not spent
@@ -1622,7 +2011,13 @@ mod tests {
     fn seq_tracker_forward_jump_reports_one_gap_and_missing_frames() {
         let mut t = SndSeqTracker::default();
         t.observe(7);
-        assert_eq!(t.observe(11), SeqObservation::Gap { missing: 3 });
+        assert_eq!(
+            t.observe(11),
+            SeqObservation::Gap {
+                missing: 3,
+                skipped: 3
+            }
+        );
     }
 
     #[test]
@@ -1633,7 +2028,13 @@ mod tests {
 
         let mut t2 = SndSeqTracker::default();
         t2.observe(u32::MAX);
-        assert_eq!(t2.observe(2), SeqObservation::Gap { missing: 2 });
+        assert_eq!(
+            t2.observe(2),
+            SeqObservation::Gap {
+                missing: 2,
+                skipped: 2
+            }
+        );
     }
 
     #[test]
@@ -1708,6 +2109,49 @@ mod tests {
         assert_eq!(counters.malformed_packets(), 2);
         assert_eq!(counters.gaps_detected(), 1);
         assert_eq!(counters.dropped_packets(), 2);
+    }
+
+    /// MAN-529 D4: a malformed frame inside a gap arrived (counters) but
+    /// carries no samples (clock).
+    #[test]
+    fn a_malformed_frame_inside_a_gap_counts_for_the_clock_but_not_the_counters() {
+        let counters = InputHealthCounters::new();
+        let mut tracker = SndSeqTracker::default();
+        let frame_with_seq = |seq: u32| {
+            let mut body = vec![0u8; 17];
+            body[1..5].copy_from_slice(&seq.to_le_bytes());
+            body
+        };
+        assert_eq!(
+            account_snd_frame(&counters, &mut tracker, &frame_with_seq(39)).map(|(_, k)| k),
+            Some(0)
+        );
+        assert!(account_snd_frame(&counters, &mut tracker, &[0u8; 5]).is_none());
+        let (_, skipped) =
+            account_snd_frame(&counters, &mut tracker, &frame_with_seq(42)).expect("valid");
+        assert_eq!(skipped, 2);
+        assert_eq!(counters.dropped_packets(), 1);
+        assert_eq!(counters.malformed_packets(), 1);
+        assert_eq!(counters.gaps_detected(), 1);
+    }
+
+    /// MAN-529 D5: the lost span carries its remainder across gaps.
+    #[test]
+    fn lost_frame_mark_converts_raw_to_output_coordinates() {
+        assert_eq!(
+            lost_frame_mark(20_480, 1_536, 12_000, 1_024, 0),
+            (164_864, 12_288, 0)
+        );
+        let (at, lost, _) = lost_frame_mark(20_480, 1_536, 11_999, 48_000, 0);
+        assert_eq!((at, lost), (211_853, 12_289));
+        let mut carry = 0;
+        let mut total = 0;
+        for _ in 0..3 {
+            let (_, lost, c) = lost_frame_mark(0, 512, 11_999, 0, carry);
+            carry = c;
+            total += lost;
+        }
+        assert_eq!(total, 12_289);
     }
 
     /// Resampling math alone, no network: construct the same `rubato::Fft`

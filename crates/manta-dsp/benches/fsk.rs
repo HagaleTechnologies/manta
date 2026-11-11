@@ -39,8 +39,8 @@ fn block() -> Vec<(HopOutput, Vec<f64>)> {
 fn bench_fsk(c: &mut Criterion) {
     let hops = block();
     let mut floor = FloorBank::new(N);
-    for (_, db) in hops.iter().cycle().take(BLOCK_HOPS * 20) {
-        floor.update(db);
+    for (h, db) in hops.iter().cycle().take(BLOCK_HOPS * 20) {
+        floor.update(db, &h.power);
     }
     let mut group = c.benchmark_group("fsk");
     group.sample_size(10);

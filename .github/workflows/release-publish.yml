@@ -304,12 +304,68 @@ jobs:
             --man-dir man-pages \
             --out-dir .
 
+      # MAN-540: the Debian package of the binary the archive above ships, for Debian 12+,
+      # Ubuntu 24.04 and 64-bit Raspberry Pi OS. dpkg-deb comes with the runner; the helper
+      # writes <artifact>.deb or fails, because the upload below ignores missing files.
+      # scripts/tests/test_package_deb.py runs this step's body.
+      - name: Package (.deb)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package-deb.py \
+            --binary "target/${{ matrix.target }}/release/${BIN_NAME}" \
+            --target "${{ matrix.target }}" \
+            --version "$VERSION" \
+            --artifact "${{ matrix.artifact }}" \
+            --man-dir man-pages \
+            --out-dir .
+
+      # The arm64 package's check below runs an arm64 container on this x86_64 runner.
+      - name: Set up QEMU for the arm64 package check
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      # The operator's machine: a fresh Debian bookworm (the base of 64-bit Raspberry Pi OS
+      # bookworm) with nothing from this runner but the package and the checker, both read-only.
+      # Installs, reinstalls over an edited config and purges (scripts/check-deb.py).
+      - name: Verify the .deb in a clean Debian bookworm
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          platform=linux/amd64
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then platform=linux/arm64; fi
+          docker run --rm --platform "$platform" \
+            -v "$PWD/${{ matrix.artifact }}.deb:/release/${{ matrix.artifact }}.deb:ro" \
+            -v "$PWD/scripts/check-deb.py:/release/check-deb.py:ro" \
+            debian:bookworm bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends python3
+              python3 /release/check-deb.py /release/${{ matrix.artifact }}.deb
+            '
+
+      # This runner's PID 1 is systemd: install the package, start the service on a looping
+      # recording, read back the DynamicUser sandbox packaging/README.md documents, reinstall
+      # (a running service restarts, the config stays) and purge.
+      - name: Verify the .deb under systemd on this runner
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo python3 scripts/check-deb.py --systemd "${{ matrix.artifact }}.deb"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
           path: |
             ${{ matrix.artifact }}.tar.gz
             ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.deb
           if-no-files-found: ignore
           retention-days: 14
 
@@ -509,6 +565,8 @@ jobs:
       # an image in which nothing starts, and one without the modules opens no USB receiver. Build
       # linux/arm64 alone, load it and check it before anything is pushed. The multi-platform build
       # below reuses this build's arm64 layers from the same builder.
+      # MAN-537: both builds pass the same MANTA_GIT_SHA build-arg, so the image names the release
+      # commit and the push still reuses those layers; the check fails an image that does not.
       - name: Build the arm64 image to check
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -516,14 +574,16 @@ jobs:
           platforms: linux/arm64
           load: true
           tags: manta-soapy-check:local
+          build-args: MANTA_GIT_SHA=${{ github.sha }}
 
       - name: Check the image's SoapySDR input
-        run: python3 scripts/check-soapy-release.py --docker-image manta-soapy-check:local --platform linux/arm64
+        run: python3 scripts/check-soapy-release.py --docker-image manta-soapy-check:local --platform linux/arm64 --expect-git-sha "$GITHUB_SHA"
 
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: MANTA_GIT_SHA=${{ github.sha }}
           push: true
           # The version tag only. `:latest` is no longer written HERE at all
           # (MAN-65 finding 3) -- see `publish-latest` below. Version and image
@@ -616,6 +676,8 @@ jobs:
       # an image in which nothing starts, and one without the modules opens no USB receiver. Build
       # linux/arm64 alone, load it and check it before anything is pushed. The multi-platform build
       # below reuses this build's arm64 layers from the same builder.
+      # MAN-537: both builds pass the same MANTA_GIT_SHA build-arg, so the image names the release
+      # commit and the push still reuses those layers; the check fails an image that does not.
       - name: Build the arm64 image to check
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -623,14 +685,16 @@ jobs:
           platforms: linux/arm64
           load: true
           tags: manta-soapy-check:local
+          build-args: MANTA_GIT_SHA=${{ github.sha }}
 
       - name: Check the image's SoapySDR input
-        run: python3 scripts/check-soapy-release.py --docker-image manta-soapy-check:local --platform linux/arm64
+        run: python3 scripts/check-soapy-release.py --docker-image manta-soapy-check:local --platform linux/arm64 --expect-git-sha "$GITHUB_SHA"
 
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+          build-args: MANTA_GIT_SHA=${{ github.sha }}
           push: ${{ inputs.publish == true }}
           # `:latest` is reserved for real tag pushes only (`publish-latest`) --
           # a workflow_dispatch run with publish=true can target any branch, not
@@ -790,7 +854,9 @@ jobs:
 
   # MAN-80: every Release carries a SHA256SUMS asset and a SLSA build-provenance
   # attestation over the same seven archives (build's five, MAN-82's build-soapy one and
-  # MAN-539's build-soapy-arm64 one, so it needs all three producers), so an operator can
+  # MAN-539's build-soapy-arm64 one, so it needs all three producers) and two Debian packages
+  # (MAN-540: build's Linux legs upload <artifact>.deb in the same artifact, so this job needs
+  # no new producer), so an operator can
   # check a download with `sha256sum -c` and `gh attestation verify` (docs/RUNBOOKS/release.md,
   # "Verifying a downloaded release"). Signing happens HERE, not in `build`: the
   # build legs run dependency build scripts and `cross` containers, and keeping
@@ -891,6 +957,8 @@ jobs:
             before running anything:
             [Verifying a downloaded release](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/RUNBOOKS/release.md#verifying-a-downloaded-release).
             Linux binaries need the ALSA runtime library (`libasound2`).
+            Debian 12 (bookworm) or later, Ubuntu 24.04 and 64-bit Raspberry Pi OS: `sudo apt install ./manta-linux-arm64.deb` (or `./manta-linux-x86_64.deb`) installs manta and its systemd service, enabled but not started.
+            Edit `/etc/manta/manta.toml`, then `sudo systemctl start manta`.
 
             SoapySDR users on Ubuntu 24.04 x86_64: choose `manta-linux-x86_64-soapy.tar.gz`.
             SoapySDR users on 64-bit Raspberry Pi OS (bookworm or later): choose `manta-linux-arm64-soapy.tar.gz`.

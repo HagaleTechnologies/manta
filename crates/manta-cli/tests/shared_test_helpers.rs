@@ -156,3 +156,111 @@ fn pending_launcher_copies_are_still_copies() {
          `fn manta`: {stale:?}"
     );
 }
+
+/// MAN-523 (after MAN-410 and MAN-508): the shapes that bind an ephemeral
+/// port, release it and hand its number on for later use. A sibling test
+/// can bind the freed number first. Compared with all whitespace removed.
+const RELEASED_EPHEMERAL_PORT: [&str; 4] = [
+    // The listener is a temporary, dropped at the end of the statement.
+    "TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr()",
+    "UdpSocket::bind(\"127.0.0.1:0\").unwrap().local_addr()",
+    // A block that binds and yields only the port.
+    "letlistener=TcpListener::bind(\"127.0.0.1:0\").unwrap();listener.local_addr().unwrap().port()}",
+    // The address is kept and the listener dropped.
+    "letaddr=listener.local_addr().unwrap();drop(listener);",
+];
+
+/// Sources that still release an ephemeral port: test-only UDP and TCP
+/// ports whose collision MAN-523 has not seen. Never add to it; a file
+/// that stops matching must leave it.
+const PENDING_RELEASED_PORTS: [&str; 5] = [
+    "cli.rs",
+    "common/ka9q.rs",
+    "docker_image.rs",
+    "multi_input_ka9q.rs",
+    "n1mm_spectrum.rs",
+];
+
+/// Inline unit-test modules under `src/` that MAN-523 moved to the claimed
+/// band in `src/test_ports.rs`, scanned with the integration tests.
+const UNIT_SOURCES: [&str; 2] = ["list_http.rs", "list_refresh.rs"];
+
+fn releases_an_ephemeral_port(text: &str) -> bool {
+    let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    RELEASED_EPHEMERAL_PORT
+        .iter()
+        .any(|shape| squeezed.contains(shape))
+}
+
+/// Integration-test sources, then the named unit-test sources as `src/…`.
+fn port_sources() -> Vec<(String, String)> {
+    let mut out = sources();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    for name in UNIT_SOURCES {
+        let text = std::fs::read_to_string(src.join(name)).unwrap();
+        out.push((format!("src/{name}"), text));
+    }
+    out
+}
+
+#[test]
+fn the_released_port_shapes_match_the_copies_man523_removed() {
+    let removed = [
+        // health_command.rs's `free_port()`.
+        "fn free_port() -> u16 {\n    TcpListener::bind(\"127.0.0.1:0\")\n        .unwrap()\n        \
+         .local_addr()\n        .unwrap()\n        .port()\n}\n",
+        // list_http.rs's `a_closed_port_is_connection_refused`.
+        "let port = {\n    let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    \
+         listener.local_addr().unwrap().port()\n};\n",
+        // list_refresh.rs's `closed_url`.
+        "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n\
+         let addr = listener.local_addr().unwrap();\ndrop(listener);\n",
+    ];
+    for copy in removed {
+        assert!(releases_an_ephemeral_port(copy), "missed:\n{copy}");
+    }
+    let held = [
+        // A listener kept alive by the caller.
+        "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n\
+         let port = listener.local_addr().unwrap().port();\n",
+        // The claimed band.
+        "let port = crate::test_ports::free_port();\n",
+    ];
+    for shape in held {
+        assert!(!releases_an_ephemeral_port(shape), "flagged:\n{shape}");
+    }
+}
+
+#[test]
+fn no_test_releases_an_ephemeral_port_for_reuse() {
+    let found: Vec<String> = port_sources()
+        .into_iter()
+        .filter(|(rel, text)| {
+            !PENDING_RELEASED_PORTS.contains(&rel.as_str()) && releases_an_ephemeral_port(text)
+        })
+        .map(|(rel, _)| rel)
+        .collect();
+    assert!(
+        found.is_empty(),
+        "hold the socket until the probe ends, or take a port from the claimed band \
+         (src/test_ports.rs): {found:?}"
+    );
+}
+
+#[test]
+fn pending_released_ports_still_release_one() {
+    let sources = port_sources();
+    let stale: Vec<&str> = PENDING_RELEASED_PORTS
+        .iter()
+        .copied()
+        .filter(|name| {
+            !sources
+                .iter()
+                .any(|(rel, text)| rel == name && releases_an_ephemeral_port(text))
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "remove from PENDING_RELEASED_PORTS, they no longer release a port: {stale:?}"
+    );
+}

@@ -670,3 +670,17 @@ fn ka9q_agc_warning_is_design_section_3s_text() {
              signal in the passband"
     );
 }
+
+#[test]
+fn audio_overrun_warning_is_the_exact_operator_text() {
+    assert_eq!(
+        audio_overrun_warning("\"USB Audio\""),
+        "warning: audio input \"USB Audio\" capture ring overran because the decode thread \
+         fell behind; lost samples are counted in manta_input_queue_dropped_samples_total \
+         and gaps in manta_input_gaps_detected_total for this input (warning limited to \
+         once per 60 s)"
+    );
+    // The label arrives already escaped; nothing raw is interpolated.
+    let w = audio_overrun_warning(&manta_input::devices::quoted_name("Mic\u{1b}[2J\"x\""));
+    assert!(!w.contains('\u{1b}'), "{w}");
+}

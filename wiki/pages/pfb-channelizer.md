@@ -19,7 +19,7 @@ The channelizer is a 4×-oversampled polyphase filterbank (PFB) that splits the 
 
 ## How it works
 
-- Polyphase FIR commutator + one N-point FFT per hop, with the forward plan `coppa-dsp::fft::FftProcessor` builds, run in place with the channelizer's own scratch (MAN-117; see [[coppa-reuse]]).
+- Polyphase FIR commutator + one N-point FFT per hop, with the forward plan `coppa-dsp::fft::FftProcessor` builds, run in place with the channelizer's own scratch (MAN-117; see [[coppa-reuse]]). The fold runs slab by slab (taps reversed, channels inner, rotation as the write index), and `process_into` recycles hop buffers so the decode path allocates nothing per hop (MAN-527).
 - N scales with input rate to hold channel spacing near 100 Hz; the exact N table and hop are in SPEC §1.1.
 - Prototype lowpass is a Kaiser-designed FIR — **new code** in `manta-dsp::proto`, not from coppa (SPEC §1.2, §10.1).
 - Fine frequency estimate (for ±10 Hz spot accuracy, SPEC §1.4): two estimators. The dB quadratic in `manta-dsp::channelizer::interpolate_offset` feeds the ownership centroid (`Track::update_centroid`) and the drift fitter. The spot frequency (`Track::freq_hz`) comes from a power-weighted EMA of lag-1 phase products (`phase_lag_product`/`phase_position`), because AWGN on the quadratic's weak neighbour bin biased it by up to 38 Hz off channel centre on every table (`docs/DECISIONS/2026-10-17-man114-phase-difference-spot-frequency.md`). Both are live EMAs, deliberately not §1.4's old lifetime mean (`docs/DECISIONS/2026-07-19-m2-detector-track-pool-pins.md` item 5).

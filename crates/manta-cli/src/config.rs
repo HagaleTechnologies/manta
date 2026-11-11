@@ -160,7 +160,7 @@ pub(crate) enum Env<'a> {
 }
 
 /// Every table of the resolved file + environment, typed and validated.
-#[derive(Debug)]
+/// `Debug` is by hand (MAN-538): `raw` holds every secret in the file.
 pub(crate) struct Loaded {
     /// `path.display()` for messages, or "environment" when no file was given.
     pub origin: String,
@@ -205,6 +205,54 @@ pub(crate) struct Loaded {
     /// Stderr notes about the file itself (an inert table), printed by the
     /// caller with `resolve`'s merge notes.
     pub notes: Vec<String>,
+}
+
+/// MAN-538: every field except `raw`, which would print `input.password`
+/// and `qrz_password` past their own redaction. Destructured without `..`,
+/// so a new field fails to compile until it is listed here.
+impl std::fmt::Debug for Loaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Loaded {
+            origin,
+            server,
+            rbn_uplink,
+            rbn_compare,
+            skimmer_relay,
+            wsjtx_relay,
+            pskreporter,
+            wsjtx_output,
+            callsign_lookup,
+            decode,
+            detector,
+            spot,
+            input,
+            inputs,
+            present,
+            raw: _,
+            env_vars,
+            notes,
+        } = self;
+        f.debug_struct("Loaded")
+            .field("origin", origin)
+            .field("server", server)
+            .field("rbn_uplink", rbn_uplink)
+            .field("rbn_compare", rbn_compare)
+            .field("skimmer_relay", skimmer_relay)
+            .field("wsjtx_relay", wsjtx_relay)
+            .field("pskreporter", pskreporter)
+            .field("wsjtx_output", wsjtx_output)
+            .field("callsign_lookup", callsign_lookup)
+            .field("decode", decode)
+            .field("detector", detector)
+            .field("spot", spot)
+            .field("input", input)
+            .field("inputs", inputs)
+            .field("present", present)
+            .field("raw", &format_args!("<redacted>"))
+            .field("env_vars", env_vars)
+            .field("notes", notes)
+            .finish()
+    }
 }
 
 /// MAN-318: `[callsign_lookup]`: withhold a spot whose callsign QRZ.com does
@@ -493,7 +541,8 @@ impl InputKind {
     }
 }
 
-#[derive(Debug, Default, Clone, serde::Deserialize)]
+// No `Debug` (MAN-538): it holds the Kiwi `password`.
+#[derive(Default, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputToml {
     cw_segments_hz: Option<Vec<Vec<f64>>>,
@@ -865,7 +914,8 @@ fn spectrum_out(t: &InputToml) -> std::result::Result<Option<SpectrumOut>, Strin
     }))
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Debug` is by hand (MAN-538): it never prints the Kiwi password.
+#[derive(Clone, PartialEq)]
 pub(crate) enum SourceFromFile {
     Audio {
         device: Option<String>,
@@ -915,6 +965,89 @@ pub(crate) enum SourceFromFile {
         ssrc: Option<u32>,
         interface: Option<Ipv4Addr>,
     },
+}
+
+/// MAN-538: the derived output, except the Kiwi `password` reads
+/// `<redacted>`. Destructured without `..`, so a new field fails to compile
+/// until it is listed here.
+impl std::fmt::Debug for SourceFromFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SourceFromFile::Audio { device } => {
+                f.debug_struct("Audio").field("device", device).finish()
+            }
+            SourceFromFile::File {
+                path,
+                iq,
+                realtime,
+                looped,
+                raw,
+            } => f
+                .debug_struct("File")
+                .field("path", path)
+                .field("iq", iq)
+                .field("realtime", realtime)
+                .field("looped", looped)
+                .field("raw", raw)
+                .finish(),
+            SourceFromFile::Kiwi {
+                host,
+                port,
+                freq_hz,
+                password: _,
+            } => f
+                .debug_struct("Kiwi")
+                .field("host", host)
+                .field("port", port)
+                .field("freq_hz", freq_hz)
+                .field("password", &format_args!("<redacted>"))
+                .finish(),
+            SourceFromFile::Soapy {
+                driver,
+                freq_hz,
+                rate_hz,
+                gain_db,
+            } => f
+                .debug_struct("Soapy")
+                .field("driver", driver)
+                .field("freq_hz", freq_hz)
+                .field("rate_hz", rate_hz)
+                .field("gain_db", gain_db)
+                .finish(),
+            SourceFromFile::Hpsdr {
+                receivers,
+                host,
+                mac,
+                port,
+                protocol,
+                freq_hz,
+                rate_hz,
+                auto_attenuation,
+            } => f
+                .debug_struct("Hpsdr")
+                .field("receivers", receivers)
+                .field("host", host)
+                .field("mac", mac)
+                .field("port", port)
+                .field("protocol", protocol)
+                .field("freq_hz", freq_hz)
+                .field("rate_hz", rate_hz)
+                .field("auto_attenuation", auto_attenuation)
+                .finish(),
+            SourceFromFile::Ka9q {
+                group,
+                port,
+                ssrc,
+                interface,
+            } => f
+                .debug_struct("Ka9q")
+                .field("group", group)
+                .field("port", port)
+                .field("ssrc", ssrc)
+                .field("interface", interface)
+                .finish(),
+        }
+    }
 }
 
 impl SourceFromFile {
@@ -6018,6 +6151,110 @@ mod tests {
         assert!(
             !format!("{on:?}").contains("p&ss"),
             "Debug hides the password"
+        );
+    }
+
+    /// MAN-538: no `{:?}`/`{:#?}` of a parsed Kiwi source, or of anything
+    /// that holds one, carries the password.
+    #[test]
+    fn debug_of_a_kiwi_source_redacts_the_password() {
+        const SECRET: &str = "hunter2-secret";
+        let single = load_file(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000\n\
+             password = \"hunter2-secret\"\n",
+        )
+        .unwrap();
+        let multi = load_file(
+            "[[input]]\nname = \"a\"\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000\n\
+             password = \"hunter2-secret\"\n\n\
+             [[input]]\nname = \"b\"\ntype = \"kiwi\"\nhost = \"k\"\nfreq_hz = 14030000\n",
+        )
+        .unwrap();
+        let from_env = load_env(
+            Some("[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000\n"),
+            &[("MANTA_INPUT_PASSWORD", SECRET)],
+        )
+        .unwrap();
+        for (label, loaded) in [("single", &single), ("multi", &multi), ("env", &from_env)] {
+            let mut renderings = vec![
+                format!("{:?}", loaded.input.source),
+                format!("{:#?}", loaded.input.source),
+                format!("{:?}", loaded.input),
+                format!("{:#?}", loaded.input),
+                format!("{loaded:?}"),
+                format!("{loaded:#?}"),
+            ];
+            for named in &loaded.inputs {
+                renderings.push(format!("{named:?}"));
+                renderings.push(format!("{named:#?}"));
+            }
+            for r in &renderings {
+                assert!(!r.contains(SECRET), "{label}: {r}");
+            }
+            for r in [
+                format!("{:?}", loaded.input.source),
+                format!("{:?}", loaded.input),
+                format!("{:?}", loaded.inputs[0]),
+                format!("{loaded:?}"),
+            ] {
+                assert!(r.contains("password: <redacted>"), "{label}: {r}");
+            }
+        }
+        // The parsed value itself is untouched.
+        let Some(SourceFromFile::Kiwi { password, .. }) = &single.input.source else {
+            panic!("expected a kiwi source");
+        };
+        assert_eq!(password, SECRET);
+        assert_eq!(
+            format!("{:?}", single.input.source),
+            r#"Some(Kiwi { host: "h", port: 8073, freq_hz: 7030000.0, password: <redacted> })"#
+        );
+    }
+
+    /// MAN-538: `Loaded.raw` would print every secret in the file, the QRZ
+    /// password `CallsignLookupConfig` already redacts included.
+    #[test]
+    fn debug_of_loaded_hides_every_secret_in_raw() {
+        let loaded = load_file(&format!(
+            "[input]\ntype = \"kiwi\"\nhost = \"h\"\nfreq_hz = 7030000\n\
+             password = \"hunter2-secret\"\n\n{LOOKUP_ON}"
+        ))
+        .unwrap();
+        assert_eq!(
+            loaded.raw["callsign_lookup"]["qrz_password"].as_str(),
+            Some("p&ss;w=rd")
+        );
+        for debug in [format!("{loaded:?}"), format!("{loaded:#?}")] {
+            assert!(!debug.contains("hunter2-secret"), "{debug}");
+            assert!(!debug.contains("p&ss"), "{debug}");
+        }
+        assert!(format!("{loaded:?}").contains("raw: <redacted>"));
+    }
+
+    /// MAN-538: the hand-written `Debug` prints every other source exactly
+    /// as `#[derive(Debug)]` did (strings recorded from the derive).
+    #[test]
+    fn debug_of_other_sources_matches_the_derive() {
+        let soapy = SourceFromFile::Soapy {
+            driver: "rtlsdr".into(),
+            freq_hz: 7_030_000.0,
+            rate_hz: 192_000.0,
+            gain_db: Some(30.5),
+        };
+        assert_eq!(
+            format!("{soapy:?}"),
+            r#"Soapy { driver: "rtlsdr", freq_hz: 7030000.0, rate_hz: 192000.0, gain_db: Some(30.5) }"#
+        );
+        let ka9q = SourceFromFile::Ka9q {
+            group: "239.101.6.1".into(),
+            port: 5010,
+            ssrc: Some(14_100_000),
+            interface: Some(Ipv4Addr::new(192, 168, 1, 20)),
+        };
+        assert_eq!(
+            format!("{ka9q:?}"),
+            "Ka9q { group: \"239.101.6.1\", port: 5010, ssrc: Some(14100000), \
+             interface: Some(192.168.1.20) }"
         );
     }
 

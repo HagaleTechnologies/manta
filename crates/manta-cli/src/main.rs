@@ -2322,6 +2322,36 @@ fn create_observation_file(path: &Path) -> Result<std::fs::File> {
     }
 }
 
+fn track_closes_of(c: &manta_engine::CloseCounts) -> [u64; 11] {
+    let manta_engine::CloseCounts {
+        restricted,
+        unconfirmed,
+        hang_expired,
+        silent,
+        merged,
+        evicted,
+        rtty,
+        not_cw,
+        unkeyed,
+        source_end,
+        reconnect,
+        false_lease_hops: _,
+    } = *c;
+    [
+        restricted,
+        unconfirmed,
+        hang_expired,
+        silent,
+        merged,
+        evicted,
+        rtty,
+        not_cw,
+        unkeyed,
+        source_end,
+        reconnect,
+    ]
+}
+
 /// MAN-118: as `latency_histogram_of`, attaching the engine's rail-ratio
 /// bounds and the repetition gate's bucket bounds to their snapshots.
 fn decode_quality_of(
@@ -2431,8 +2461,9 @@ fn spawn_attenuation_poller(
 }
 
 /// MAN-128: feeds `manta_build_info`. `git_sha` comes from `build.rs`
-/// (`MANTA_GIT_SHA`, "unknown" with no `.git` -- e.g. a Docker build
-/// context, which `.dockerignore` excludes it from). MAN-83: the values are
+/// (`MANTA_GIT_SHA`, "unknown" with neither it nor `.git` -- e.g. a local
+/// Docker build without the build-arg, as `.dockerignore` excludes `.git`;
+/// the release image passes it, MAN-537). MAN-83: the values are
 /// `build_info`'s constants, the same ones `--version` and the JSON
 /// stream's `decoderVersion` read, so the gauge, the version line and the
 /// spots always name the same build.

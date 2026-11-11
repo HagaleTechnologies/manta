@@ -36,7 +36,7 @@ use super::ak1a::{self, LineKind};
 use super::grade::RbnReport;
 use super::Clock;
 use crate::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
-use crate::bounded_io::{read_line_bounded, MAX_LINE_BYTES};
+use crate::bounded_io::{read_line_bounded, Utf8Tail, MAX_LINE_BYTES};
 use crate::metrics::Metrics;
 use crate::uplink::{connect_first_reachable_bounded, CONNECT_TIMEOUT, OVERALL_CONNECT_TIMEOUT};
 
@@ -273,13 +273,14 @@ async fn session(
 
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
+    let mut tail = Utf8Tail::default();
     let mut non_cw: u64 = 0;
     let mut deadline = Instant::now() + FEED_IDLE_TIMEOUT;
     loop {
         // `read_line_bounded` is resumable: `line` is not cleared until a
         // whole line is in, so losing a race never drops consumed bytes.
         let read = tokio::select! {
-            r = read_line_bounded(&mut reader, &mut line) => r,
+            r = read_line_bounded(&mut reader, &mut line, &mut tail) => r,
             _ = tokio::time::sleep_until(deadline) => return SessionEnd::Lost(Lost::Idle),
             _ = shutdown_signalled(shutdown) => return SessionEnd::Shutdown,
         };

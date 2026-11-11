@@ -283,6 +283,20 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
       - run: cargo test --workspace --locked
+      # MAN-523: then repeat each socket test this change adds or edits ten more times, from the
+      # executables the step above built (the Unix shards do the same from their bundles). The
+      # base is the event's own; an unavailable base fails the step rather than passing.
+      - if: runner.os == 'Windows'
+        shell: bash
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && 'HEAD^1' || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+        run: python scripts/ci-shards.py --count 2 --shard 0 --inventory-only --repeat-base "$REPEAT_BASE" --output repeat-evidence/windows.json
+      - if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: socket-test-repeats-${{ matrix.os }}
+          path: repeat-evidence/*.json
+          if-no-files-found: ignore
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
       - if: runner.os != 'Windows'
@@ -323,6 +337,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -519,6 +537,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -544,6 +566,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
@@ -554,6 +579,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
+      # MAN-523: the changed-socket-test selector and its ten-repeat runner.
+      - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
         if: always()
         env:
@@ -757,7 +784,10 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
-    timeout-minutes: 35
+    # MAN-523: 50, not 35, so ten more runs of a changed heavy socket target fit (multi_input_hpsdr
+    # is about 190 s a run). A shard with nothing to repeat finishes as before; the merge queue's
+    # 60-minute check timeout still bounds the run.
+    timeout-minutes: 50
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -834,7 +864,13 @@ jobs:
         with:
           name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
           path: test-bundle
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+      # MAN-523: then repeat each socket test this change adds or edits ten more times. The base
+      # is the event's own: the main commit a dispatch merged in, the first parent of a PR's merge
+      # commit, the merge-group base, or the commit a push replaced. scripts/socket-test-repeat.py fetches it into this shallow
+      # checkout; an unavailable base fails the shard rather than passing an empty diff.
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --repeat-base "$REPEAT_BASE" --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && 'HEAD^1' || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -1019,6 +1055,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -1044,6 +1084,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
@@ -1054,6 +1097,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
+      # MAN-523: the changed-socket-test selector and its ten-repeat runner.
+      - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
         if: always()
         env:
@@ -1257,7 +1302,10 @@ jobs:
       matrix:
         os: [macos-latest]
         shard: [0, 1, 2, 3, 4, 5, 6, 7]
-    timeout-minutes: 35
+    # MAN-523: 50, not 35, so ten more runs of a changed heavy socket target fit (multi_input_hpsdr
+    # is about 190 s a run). A shard with nothing to repeat finishes as before; the merge queue's
+    # 60-minute check timeout still bounds the run.
+    timeout-minutes: 50
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1334,7 +1382,13 @@ jobs:
         with:
           name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
           path: test-bundle
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+      # MAN-523: then repeat each socket test this change adds or edits ten more times. The base
+      # is the event's own: the main commit a dispatch merged in, the first parent of a PR's merge
+      # commit, the merge-group base, or the commit a push replaced. scripts/socket-test-repeat.py fetches it into this shallow
+      # checkout; an unavailable base fails the shard rather than passing an empty diff.
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --repeat-base "$REPEAT_BASE" --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && 'HEAD^1' || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -1441,7 +1495,16 @@ jobs:
           env-vars: SOAPYSDR_BREW_VERSION
       # --locked: see the MAN-219 note in the test job above.
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
-      - run: cargo test -p manta-input -p manta-cli --features soapy --locked
+      # MAN-520: only the tests the soapy feature can change; clippy above still compiles every
+      # target with it. scripts/tests/test_ci_gates.py (SoapyTestSelectionTests) keeps this list
+      # equal to the manta-cli tests/*.rs files that mention soapy, plus completions_and_man_pages.
+      - run: cargo test -p manta-input --features soapy --locked --lib soapy
+      - run: |
+          cargo test -p manta-cli --features soapy --locked --no-fail-fast --bin manta \
+            --test build_identity --test cli --test completions_and_man_pages \
+            --test config_command --test docker_image --test docs_consistency \
+            --test field_node_runbook --test operator_guides --test output_style_guard \
+            --test packaging_examples --test source_check
 
   # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
   # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of

@@ -185,7 +185,8 @@ fn temp_path(dir: &Path, name: &OsStr, suffix: u64) -> PathBuf {
 
 /// A random temp-name suffix, from std's randomly keyed SipHash: a run that
 /// gets an earlier run's PID (PID 1 in a container) still picks new names.
-fn random_suffix() -> u64 {
+/// `list_cache::write_atomic` uses it too (MAN-538).
+pub(crate) fn random_suffix() -> u64 {
     RandomState::new().build_hasher().finish()
 }
 

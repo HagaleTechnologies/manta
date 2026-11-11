@@ -58,6 +58,11 @@ MAN-30's fate.
    (~1.45x slower per this workspace's `opt-level = 1` first-party dev
    profile — see `docs/DECISIONS/2026-07-24-m2-pileup-cpu-budget-pins.md`
    item 5) and will produce a misleadingly pessimistic number.
+   Since MAN-528, `cargo test --release` builds the pinned
+   `[profile.release]` (fat LTO, one codegen unit), which takes longer and
+   peaks at about 1.5 GB in its final link. On a 1 or 2 GB board, use
+   "Cross-compiling" below or the override in
+   [the MAN-528 record](../DECISIONS/2026-11-10-man528-release-profile.md).
 4. Read the printed output:
    ```
    cpu_budget: 300 tracks sustained across most of the run (scene has 300 signals)
@@ -586,6 +591,38 @@ Nothing in `manta-engine`'s own `Cargo.toml` pulls in SoapySDR or another
 native SDR library beyond `manta-input`'s ALSA dependency above (checked
 2026-09-02) — this bench only needs `manta-testkit`'s synthetic scene
 generator, no additional hardware-specific features to disable.
+
+## Release-profile A/B (MAN-528)
+
+`[profile.release]` in the root `Cargo.toml` was chosen by
+`scripts/release-profile-ab.py` on x86_64 only
+([the MAN-528 record](../DECISIONS/2026-11-10-man528-release-profile.md)). The same script
+re-measures it here. It renders this harness's own scene through the
+`write_cpu_budget_scene` test, builds each of the eight variants (`base`,
+`thin`, `fat`, `cu1`, `thin_cu1`, `fat_cu1`, `abort`, `fat_cu1_abort`) from
+clean into `--out`, times `manta decode <scene> --json` single-threaded
+(and multi-threaded with `all`), and prints the tables and the `ineligible:`
+and `verdict:` lines. Eight clean release builds take hours on a Pi 4, and
+the fat-LTO links need about 1.5 GB, so use a 4 GB or larger board.
+
+On the Pi 4, record throttling and clock state before and after, as step 2
+does (the script also records `vcgencmd` when it is on `PATH`):
+
+```
+vcgencmd get_throttled; vcgencmd measure_clock arm
+python3 scripts/release-profile-ab.py --out ~/ab --threads 1,all --cpu 3 --reps 7
+vcgencmd get_throttled; vcgencmd measure_clock arm
+```
+
+On an M-series Mac, drop `--cpu` (macOS has no `taskset`):
+
+```
+python3 scripts/release-profile-ab.py --out /tmp/ab --threads 1,all --reps 7
+```
+
+Append the run below either way. If the verdict differs from the pinned
+profile, write a new decision record that supersedes the MAN-528 record and
+re-pin `Cargo.toml` in the same PR.
 
 ## Runs
 

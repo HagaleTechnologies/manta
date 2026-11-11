@@ -1,0 +1,59 @@
+#!/bin/sh
+# manta's postinst (MAN-540, docs/DECISIONS/2026-11-09-man540-debian-package.md).
+# The two systemd blocks make debhelper 13.14's autoscripts postinst-systemd-enable
+# and postinst-systemd-restartnostart (RESTART_ACTION=try-restart) calls for
+# manta.service, under the same conditions. Where debhelper ignores a call's
+# exit status, this script prints what failed and carries on, so a failed
+# systemd call does not fail `dpkg --configure`. Paths sit under
+# ${DPKG_ROOT:-} so a scratch-root install (scripts/tests/test_package_deb.py)
+# touches only that root.
+set -e
+
+conf="${DPKG_ROOT:-}/etc/manta/manta.toml"
+migrate="https://github.com/HagaleTechnologies/manta/blob/main/packaging/README.md#moving-from-an-archive-install-to-the-package"
+
+if [ "$1" = "configure" ]; then
+	# Created once from the scaffold `manta config init` writes. Not a conffile:
+	# dpkg never replaces it or prompts about it, so edits survive every upgrade.
+	if [ ! -e "$conf" ] && [ ! -L "$conf" ]; then
+		(umask 077 && cp "${DPKG_ROOT:-}/usr/share/manta/manta.toml" "$conf.dpkg-tmp")
+		mv "$conf.dpkg-tmp" "$conf"
+		echo "manta: wrote /etc/manta/manta.toml. manta.service is enabled but not started."
+		echo "manta: set [server] station_callsign and an [input] receiver in it, then run"
+		echo "manta:   sudo manta config check --config /etc/manta/manta.toml"
+		echo "manta:   sudo systemctl start manta"
+	fi
+	if [ -f "${DPKG_ROOT:-}/etc/systemd/system/manta.service" ] &&
+		grep -q '^ExecStart=/usr/local/bin/manta' "${DPKG_ROOT:-}/etc/systemd/system/manta.service"; then
+		echo "manta: /etc/systemd/system/manta.service overrides the packaged unit and runs /usr/local/bin/manta." >&2
+		echo "manta: remove it to run this package's binary: $migrate" >&2
+	fi
+	if [ -e "${DPKG_ROOT:-}/usr/local/bin/manta" ]; then
+		echo "manta: /usr/local/bin/manta comes before /usr/bin/manta on PATH; remove it: $migrate" >&2
+	fi
+fi
+
+# debhelper 13.14 postinst-systemd-enable
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	deb-systemd-helper unmask 'manta.service' >/dev/null ||
+		echo "manta: unmasking manta.service failed (exit $?); continuing." >&2
+	if deb-systemd-helper --quiet was-enabled 'manta.service'; then
+		deb-systemd-helper enable 'manta.service' >/dev/null ||
+			echo "manta: enabling manta.service failed (exit $?); continuing." >&2
+	else
+		deb-systemd-helper update-state 'manta.service' >/dev/null ||
+			echo "manta: recording manta.service's enable state failed (exit $?); continuing." >&2
+	fi
+fi
+
+# debhelper 13.14 postinst-systemd-restartnostart, RESTART_ACTION=try-restart
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ] ; then
+	if [ -z "${DPKG_ROOT:-}" ] && [ -d /run/systemd/system ]; then
+		systemctl --system daemon-reload >/dev/null ||
+			echo "manta: systemctl daemon-reload failed (exit $?); continuing." >&2
+		if [ -n "$2" ]; then
+			deb-systemd-invoke try-restart 'manta.service' >/dev/null ||
+				echo "manta: restarting manta.service failed (exit $?); continuing." >&2
+		fi
+	fi
+fi
