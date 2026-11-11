@@ -77,8 +77,11 @@ run. It diffs SHA to HEAD and selects, per executable in the shard's slice:
 - any other changed line in a candidate integration target, or in a helper
   it includes, selects every test of the target;
 - in `src/`, a changed line in `#[cfg(test)]` code outside a test function
-  selects every test of that file's module; production code selects
-  nothing; blank and `//` lines select nothing.
+  selects every test of that file's module; a changed whole-file test module
+  (`#[cfg(test)] mod test_ports;`) selects its own tests and those of every
+  module that names it; production code selects nothing;
+- added blank and `//` lines select nothing; a deletion always counts;
+- `#[ignore]` tests are never selected.
 
 Each selected test runs ten times as `<executable> --exact <name>`, in the
 shard's working directory and environment, with the compiler tripwires
@@ -89,15 +92,20 @@ fails the shard, and so `test (ubuntu-latest)` or `test (macos-latest)`.
 No change relevant to a shard prints and records an explicit no-op.
 
 The base is the event's own: `github.sha` for a dispatch (the main commit
-its merge step merges in), the PR base, the merge-group base, or a push's
-`before`. The shard fetches it into its shallow checkout. A missing,
+its merge step merges in), the first parent of a pull request's merge commit
+(`HEAD^1`, read from the commit object, since the PR's recorded base may be
+older), the merge-group base, or a push's `before`. The shard fetches it into its shallow checkout. A missing,
 all-zero or unfetchable base fails the shard as unverified; it never passes
 as an empty diff. A PR's dispatched run uses main's workflow, so the merge
 group is the first run of a new workflow's arguments.
 
 Cost: repeats add execution time only, no compile. A helper change repeats
-whole targets; `multi_input_hpsdr` runs about 180 s, so ten more runs of it
-are about 30 minutes in its shard. No test is exempt for cost.
+whole targets; one `--exact` pass over `multi_input_hpsdr` takes about
+190 s, so ten more are about 32 minutes in its shard. The Unix shards'
+`timeout-minutes` goes from 35 to 50 so that fits; a shard with nothing to
+repeat finishes as before, and the merge queue's 60-minute check timeout
+still bounds the run. A change whose repeats do not fit fails as unverified.
+No test is exempt for cost.
 
 ### D4. No retry to green, no quarantine, no nextest
 

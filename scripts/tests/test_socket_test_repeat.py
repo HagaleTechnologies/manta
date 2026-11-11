@@ -3,7 +3,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -206,6 +205,48 @@ class Selection(unittest.TestCase):
         git(self.repo.root, 'commit', '-qm', 'docs')
         self.assertEqual(self.repo.plan()['noop'], 'no Rust change')
 
+    def test_an_ignored_test_is_never_selected(self):
+        self.repo.edit('crates/p/tests/sock.rs', 'assert_eq!(1, 1);', 'assert_eq!(2, 2);')
+        items = self.repo.items()
+        items[0]['ignored'] = ['second']
+        self.assertEqual(r.plan(self.repo.root, items, self.repo.base)['selected'], [])
+
+    def test_a_deletion_under_a_blank_line_still_selects_its_test(self):
+        self.repo.edit('crates/p/tests/sock.rs', '    // a } in a comment\n    assert_eq!(1, 1);\n',
+                       '    // a } in a comment\n\n    assert_eq!(1, 1);\n')
+        self.repo.base = git(self.repo.root, 'rev-parse', 'HEAD')
+        self.repo.edit('crates/p/tests/sock.rs', '\n\n    assert_eq!(1, 1);\n', '\n\n')
+        self.assertEqual(self.repo.selected(), [('p::test::sock', 'second')])
+
+    def test_a_comment_only_helper_edit_selects_nothing(self):
+        self.repo.edit('crates/p/tests/common/mod.rs', 'pub fn shared', '// a note\npub fn shared')
+        self.assertEqual(self.repo.selected(), [])
+
+    def test_hunk_lines_that_look_like_file_headers_do_not_reset_the_file(self):
+        self.repo.edit('crates/p/tests/sock.rs', 'let text = "a { brace } in a string";',
+                       'let text = "a { brace } in a string\n++ b/elsewhere.rs\n";')
+        self.assertEqual(self.repo.selected(), [('p::test::sock', 'first')])
+
+    def test_a_whole_file_test_module_selects_the_modules_that_name_it(self):
+        src = self.repo.root/'crates/p/src'
+        (src/'lib.rs').write_text('pub mod net;\npub mod other;\n#[cfg(test)]\nmod ports;\n')
+        (src/'ports.rs').write_text('pub(crate) fn port() -> u16 { 1 }\n')
+        (src/'other.rs').write_text('#[cfg(test)]\nmod tests {\n    #[test]\n    fn other_one() {}\n}\n')
+        git(self.repo.root, 'add', '-A')
+        self.repo.edit('crates/p/src/net.rs', 'fn unit_two() {}', 'fn unit_two() { crate::ports::port(); }')
+        self.repo.base = git(self.repo.root, 'rev-parse', 'HEAD')
+        self.repo.edit('crates/p/src/ports.rs', '{ 1 }', '{ 2 }')
+        items = self.repo.items()
+        items[2]['tests'].append('other::tests::other_one')
+        picked = sorted(x['test'] for x in r.plan(self.repo.root, items, self.repo.base)['selected'])
+        self.assertEqual(picked, ['net::tests::unit_one', 'net::tests::unit_two'])
+
+    def test_head_first_parent_is_a_valid_base(self):
+        self.repo.edit('crates/p/tests/sock.rs', 'assert_eq!(1, 1);', 'assert_eq!(2, 2);')
+        plan = r.plan(self.repo.root, self.repo.items(), 'HEAD^1')
+        self.assertEqual(plan['base'], self.repo.base)
+        self.assertEqual([x['test'] for x in plan['selected']], ['second'])
+
     def test_a_missing_or_zero_base_is_an_error_not_an_empty_diff(self):
         for base in ('', '0' * 40, 'not-a-sha'):
             with self.assertRaises(ValueError):
@@ -312,7 +353,6 @@ fn flaky() {
 '''
 
 
-@unittest.skipUnless(shutil.which('cargo') and shutil.which('git'), 'needs cargo and git')
 class RealCargo(unittest.TestCase):
     """A real bundle: the ordinary run once, then ten fresh `--exact` runs of the edited test."""
 

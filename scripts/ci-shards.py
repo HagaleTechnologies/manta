@@ -378,6 +378,12 @@ def run_bundle(args, record):
 def run_legacy(args, record):
     meta = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--locked', '--format-version=1']))
     record['gitHead'], record['gitTree'] = git_identity(meta['workspace_root'], required=False)
+    if args.repeat_base is not None and not load_repeater().rust_changed(meta['workspace_root'], args.repeat_base):
+        # MAN-523: nothing to repeat, so skip listing every executable.
+        record['repeatPlan'] = dict(base=args.repeat_base, removed=[], selected=[], noop='no Rust change')
+        record['repeatResults'] = []
+        print(f'Socket-test repeat: no Rust change since {args.repeat_base}', flush=True)
+        return 0
     items = parse_artifacts(cargo_build(record))
     if not items:
         raise ValueError('empty workspace inventory')

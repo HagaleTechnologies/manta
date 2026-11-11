@@ -16,6 +16,7 @@ Selection, per test executable in the shard's inventory:
   every test of that target, or for `src/`, every test of the changed file's module;
 - production code outside `#[cfg(test)]` code selects nothing.
 """
+import functools
 import json
 import re
 import subprocess
@@ -43,7 +44,14 @@ def git(cwd, *args):
 
 
 def ensure_base(root, base):
-    """Make `base` available for a tree diff; a shallow CI checkout lacks it."""
+    """Make `base` available for a tree diff; a shallow CI checkout lacks it. `HEAD^1` names the
+    tested merge commit's first parent (a pull_request run's refs/pull/N/merge), which the
+    commit object records even when the checkout is shallow. Returns the SHA."""
+    if base == 'HEAD^1':
+        parents = re.findall(r'^parent ([0-9a-f]{40})$', git(root, 'cat-file', '-p', 'HEAD'), re.M)
+        if not parents:
+            raise ValueError('HEAD has no parent: socket-test repetition is unverified')
+        base = parents[0]
     if not base or base == ZERO_SHA or not re.fullmatch(r'[0-9a-f]{40}', base):
         raise ValueError(f'repeat base {base!r} is not a commit SHA: socket-test repetition is unverified')
     probe = subprocess.run(['git', 'cat-file', '-e', f'{base}^{{commit}}'], cwd=root,
@@ -52,28 +60,32 @@ def ensure_base(root, base):
         fetched = subprocess.run(['git', 'fetch', '--no-tags', '--depth=1', 'origin', base], cwd=root)
         if fetched.returncode:
             raise ValueError(f'repeat base {base} is unavailable: socket-test repetition is unverified')
+    return base
 
 
 def changed_lines(root, base, head='HEAD'):
-    """{new path: set of changed new-side lines (or {0} for a pure deletion point)} plus removed paths."""
+    """({new path: changed new-side lines}, removed paths). A pure deletion is recorded as the
+    negated number of the line it follows, so a blank line above it cannot hide it."""
     raw = git(root, 'diff', '--no-color', '--find-renames', '--unified=0', base, head, '--', '*.rs')
-    changed, removed, path = {}, [], None
-    old = None
+    changed, removed, path, old, header = {}, [], None, None, False
     for line in raw.splitlines():
-        if line.startswith('--- '):
+        if line.startswith('diff --git '):
+            header, path, old = True, None, None
+        elif header and line.startswith('--- '):
             old = None if line == '--- /dev/null' else line[6:]
-        elif line.startswith('+++ '):
+        elif header and line.startswith('+++ '):
             path = None if line == '+++ /dev/null' else line[6:]
             if path is None and old is not None:
                 removed.append(old)
             elif path is not None:
                 changed.setdefault(path, set())
-        elif path is not None:
+        elif line.startswith('@@'):
+            # Hunk bodies follow; a body line may itself start with `--- ` or `+++ `.
+            header = False
             hunk = _HUNK.match(line)
-            if hunk:
+            if hunk and path is not None:
                 start, count = int(hunk.group(1)), int(hunk.group(2) or 1)
-                # A pure deletion (count 0) changes the line it follows.
-                changed[path].update(range(start, start + count) if count else {max(start, 1)})
+                changed[path].update(range(start, start + count) if count else {-max(start, 1)})
     return changed, removed
 
 
@@ -192,20 +204,47 @@ def module_prefix(src_dir, path):
 
 
 def _meaningful(text, lines):
-    """Changed lines other than blank and `//` comment lines, which change no test."""
+    """Changed lines other than added blank and `//` comment lines, which change no test.
+    Deletion points (negated) always count."""
     source = text.splitlines()
-    return {n for n in lines if n > len(source) or not (source[n - 1].strip() == '' or source[n - 1].lstrip().startswith('//'))}
+    out = set()
+    for n in lines:
+        if n < 0:
+            out.add(-n)
+        elif n > len(source) or not (source[n - 1].strip() == '' or source[n - 1].lstrip().startswith('//')):
+            out.add(n)
+    return out
+
+
+def _file_binds(path):
+    """Whether the file's code, not its strings or comments, binds a socket."""
+    return any(b in _code(path) for b in SOCKET_BINDS)
 
 
 def _binds(paths):
-    return any(any(b in p.read_text(errors='replace') for b in SOCKET_BINDS) for p in paths if p.exists())
+    return any(_file_binds(p) for p in paths if p.exists())
+
+
+def _test_only_file(src_dir, path):
+    """Whether a `src/` file is a whole module declared `#[cfg(test)] mod <stem>;` (test_ports.rs)."""
+    stem = path.parent.name if path.name == 'mod.rs' else path.stem
+    pattern = re.compile(r'#\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+'
+                         + re.escape(stem) + r'\s*;')
+    return any(pattern.search(_code(p)) for p in src_dir.rglob('*.rs') if p != path)
+
+
+@functools.lru_cache(maxsize=None)
+def _code(path):
+    return _blank_strings_and_comments(path.read_text(errors='replace'))
 
 
 def select(root, item, changed):
-    """[(test name, reason)] for one inventory item; `changed` is {repo-relative path: lines}."""
+    """[(test name, reason)] for one inventory item; `changed` is {repo-relative path: lines}.
+    Ignored tests are never selected: `--exact` without `--include-ignored` would run none."""
     root = Path(root).resolve()
     package_dir = (root / item['cwd']).resolve()
-    tests = item.get('tests', [])
+    ignored = set(item.get('ignored', []))
+    tests = [t for t in item.get('tests', []) if t not in ignored]
     package_name = Path(item['cwd']).name
     picked = {}
     if item['kind'] == 'test':
@@ -218,10 +257,12 @@ def select(root, item, changed):
             path = (root / rel).resolve()
             if path not in closure:
                 continue
-            if path != own:
-                return [(t, f'helper {rel} changed') for t in tests]
             text = path.read_text(errors='replace')
             lines = _meaningful(text, lines)
+            if not lines:
+                continue
+            if path != own:
+                return [(t, f'helper {rel} changed') for t in tests]
             spans = test_functions(text)
             covered = set()
             for name, first, last in spans:
@@ -253,8 +294,18 @@ def select(root, item, changed):
                     for t in tests:
                         if t.startswith(prefix) and (t == name or t.endswith(f'::{name}')):
                             picked[t] = f'{rel}: {name} changed'
-            test_mod = _cfg_test_lines(text)
-            if (lines - covered) & test_mod:
+            rest = lines - covered
+            if not rest:
+                continue
+            if _test_only_file(src_dir, path):
+                # A shared test helper module: its own tests and those of every module naming it.
+                stem = path.parent.name if path.name == 'mod.rs' else path.stem
+                prefixes = {prefix} | {module_prefix(src_dir, p) for p in src_dir.rglob('*.rs')
+                                       if p != path and f'{stem}::' in _code(p)}
+                for t in tests:
+                    if any(t.startswith(x) for x in prefixes):
+                        picked.setdefault(t, f'{rel}: test helper module changed')
+            elif rest & _cfg_test_lines(text):
                 for t in tests:
                     if t.startswith(prefix):
                         picked.setdefault(t, f'{rel}: test-only code outside a test function changed')
@@ -284,9 +335,15 @@ def _cfg_test_lines(text):
     return lines
 
 
+def rust_changed(root, base, head='HEAD'):
+    """Whether the diff touches any Rust file: the cheap check before building an inventory."""
+    changed, removed = changed_lines(root, ensure_base(root, base), head)
+    return bool(changed or removed)
+
+
 def plan(root, items, base, head='HEAD'):
     """{'base', 'removed', 'selected': [{key, test, reason}], 'noop': reason or None}."""
-    ensure_base(root, base)
+    base = ensure_base(root, base)
     changed, removed = changed_lines(root, base, head)
     selected = []
     for item in items:

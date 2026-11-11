@@ -1243,7 +1243,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertIn('shard: [0, 1, 2, 3, 4, 5, 6, 7]', '\n'.join(shards))
             self.assertIn('fail-fast: false', '\n'.join(shards))
             self.assertNotIn('max-parallel', '\n'.join(shards))
-            self.assertEqual(wf.field(shards, 'timeout-minutes'), '35')
+            self.assertEqual(wf.field(shards, 'timeout-minutes'), '50')  # MAN-523: room for ten repeats
             self.assertEqual(wf.field(shards, 'needs'), f'{platform}-build')
             self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')
                                 and '--from-bundle' in (wf.run_body(s) or '') for s in wf.steps(shards)))
@@ -1459,7 +1459,7 @@ class SocketTestRepeatTests(unittest.TestCase):
     """MAN-523: every OS repeats the socket tests a change adds or edits, from the event's base."""
 
     BASE = ("${{ github.event_name == 'workflow_dispatch' && github.sha || "
-            "github.event_name == 'pull_request' && github.event.pull_request.base.sha || "
+            "github.event_name == 'pull_request' && 'HEAD^1' || "
             "github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}")
 
     def repeat_steps(self, block):
