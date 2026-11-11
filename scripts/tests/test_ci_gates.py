@@ -1455,7 +1455,6 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
 
 
-<<<<<<< HEAD
 
 PRE_PUSH = os.path.join(ROOT, "scripts", "pre-push.sh")
 
@@ -1570,7 +1569,8 @@ class PrePushScriptTests(unittest.TestCase):
         self.assertIn("cargo clippy --workspace --all-targets --locked -- -D warnings", run.stderr)
         self.assertEqual(calls, ["fmt --all --check",
                                  "clippy --workspace --all-targets --locked -- -D warnings"])
-=======
+
+
 class SocketTestRepeatTests(unittest.TestCase):
     """MAN-523: every OS repeats the socket tests a change adds or edits, from the event's base."""
 
@@ -1618,7 +1618,6 @@ class SocketTestRepeatTests(unittest.TestCase):
         for platform in ('ubuntu', 'macos'):
             support = wf.job_block(text, f'{platform}-support')
             self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_socket_test_repeat -v')), 1)
->>>>>>> 46096dcf62cd05b17309e9e4a8f58275392d53c1
 
 
 if __name__ == '__main__':

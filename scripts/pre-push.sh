@@ -93,6 +93,7 @@ else
   suite soapy_release
   suite packaging
   suite package_release
+  suite package_deb
   suite score_against_rbn_replay
   suite corpus
   suite score_transcript
@@ -100,8 +101,10 @@ else
   linux_suite ci_gates
   linux_suite decisions_index
   suite field_node
+  suite release_profile_ab
   linux_suite verify_dependabot_diff_safe
   suite ci_shards
+  suite socket_test_repeat
   step "cargo test --workspace --locked"
 fi
 
