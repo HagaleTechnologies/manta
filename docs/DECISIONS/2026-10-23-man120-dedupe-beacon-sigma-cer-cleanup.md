@@ -109,6 +109,12 @@ fading eventually emits a garbled-ID `Beacon` spot at any SNR — the
 exact un-gated risk the ticket named, now demonstrated. The heuristic
 itself (MAN-48's guard) is untouched.
 
+**2026-11-09 update:** MAN-201 D8 subsequently restricted trailing-`T`
+Beacon candidates to the decoded allowlisted call. MAN-532 closes this
+historical claim for the deterministic 120-second scenes at +6/+10 dB.
+See [the regression record](2026-11-09-man532-beacon-fading-regression.md)
+for results and the separate, unmeasured framed-beacon risk.
+
 Coordination: MAN-94 (RBN `NCDXF B` label/roster, in flight) changes
 labelling/identity; this test pins classification stability under
 fading. Files overlap only in `validator.rs`'s beacon paths.

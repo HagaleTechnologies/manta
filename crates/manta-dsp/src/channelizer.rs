@@ -4,8 +4,8 @@
 use crate::condition::{ConditioningConfig, ConditioningLog, InputConditioner};
 use crate::proto::{design_prototype, TAPS_PER_BRANCH};
 use crate::sample_guard;
-use coppa_dsp::fft::FftProcessor;
 use num_complex::{Complex32, Complex64};
+use std::sync::Arc;
 
 pub const CHANNEL_SPACING_HZ: f64 = 93.75; // SPEC §1.1
 /// SPEC §1.3/§1.4 power-to-dB epsilon.
@@ -124,8 +124,22 @@ pub fn phase_position(z: Complex64, near: f64) -> Option<f64> {
 pub struct Channelizer {
     n: usize,
     hop: usize,
-    taps: Vec<f32>, // length L*N, L = TAPS_PER_BRANCH
-    fft: FftProcessor,
+    /// SPEC §1.2's prototype reversed, `taps_rev[i] = h[LN-1-i]`, so slab p
+    /// of the window meets `taps_rev[p*N..(p+1)*N]` in order (MAN-527).
+    /// Length L*N, L = TAPS_PER_BRANCH.
+    taps_rev: Vec<f32>,
+    /// MAN-117: the forward plan `coppa_dsp::fft::FftProcessor::new(n)`
+    /// builds (`FftPlanner::new().plan_fft_forward(n)`), run in place with
+    /// `fft_scratch` so a hop allocates only its own `x` and `power`.
+    fwd: Arc<dyn rustfft::Fft<f32>>,
+    /// MAN-117: `fwd.get_inplace_scratch_len()` elements, reused every hop.
+    fft_scratch: Vec<Complex32>,
+    /// MAN-117: SPEC §1.3 step 1's N-point f64 fold, reused every hop.
+    fold: Vec<Complex64>,
+    /// MAN-527: hops `process_into` recycled from the caller's previous
+    /// `out`, reused before anything is allocated; at most
+    /// `SPARE_RETAIN_HOPS` kept after a call.
+    spare: Vec<HopOutput>,
     /// Sliding input window; `read` indexes the next window start. Samples
     /// before `read` are dead and get compacted away (same pattern as
     /// `single.rs::SingleChannelExtractor`).
@@ -173,11 +187,20 @@ impl Channelizer {
                 "unsupported sample rate {fs}: fs/93.75 must be a power of two"
             ));
         }
+        let fwd = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
+        let fft_scratch = vec![Complex32::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
         Ok(Channelizer {
             n,
             hop: n / 4,
-            taps: design_prototype(n, TAPS_PER_BRANCH),
-            fft: FftProcessor::new(n),
+            taps_rev: {
+                let mut taps = design_prototype(n, TAPS_PER_BRANCH);
+                taps.reverse();
+                taps
+            },
+            fwd,
+            fft_scratch,
+            fold: vec![Complex64::new(0.0, 0.0); n],
+            spare: Vec::new(),
             buf: Vec::new(),
             read: 0,
             m: 0,
@@ -209,7 +232,7 @@ impl Channelizer {
     /// property as `single.rs`'s extractor -- see the M0 lead-in-padding
     /// fix in `manta-engine`, which Task 6/7 apply here too.
     pub fn filter_len(&self) -> usize {
-        self.taps.len()
+        self.taps_rev.len()
     }
 
     /// Channel `k`'s RF center frequency. SPEC §1.1:
@@ -239,6 +262,19 @@ impl Channelizer {
     /// are never formed (one hop at every rate from 12 kS/s up, where
     /// `hop >= 32`).
     pub fn process(&mut self, iq: &[Complex32]) -> Vec<HopOutput> {
+        let mut out = Vec::new();
+        self.process_into(iq, &mut out);
+        out
+    }
+
+    /// [`Channelizer::process`], writing the hops into `out` instead of a
+    /// new `Vec`. `out`'s previous contents are recycled, not kept: on
+    /// return it holds exactly the hops this call produced. Any
+    /// `HopOutput` may be passed in; its buffers are reused when their
+    /// capacity is enough. With one `out` kept across calls, a steady-state
+    /// call allocates nothing (MAN-527).
+    pub fn process_into(&mut self, iq: &[Complex32], out: &mut Vec<HopOutput>) {
+        self.spare.append(out);
         let start = self.buf.len();
         self.buf.extend_from_slice(iq);
         self.bad_samples += sample_guard::replace_unusable(&mut self.buf[start..]);
@@ -247,18 +283,141 @@ impl Channelizer {
             Some(c) => ready + c.condition(&mut self.buf[ready..]),
             None => self.buf.len(),
         };
-        let ln = self.taps.len();
-        let mut outputs = Vec::new();
+        let n = self.n;
+        let ln = self.taps_rev.len();
         while self.read + ln <= self.ready {
             let window = &self.buf[self.read..self.read + ln];
 
-            // Step 1: window & fold. u[n] = x[n]*h[LN-1-n]; v[j] = sum_p
-            // u[j + p*N]. Sequential f64 accumulation (SPEC §6.4 convention,
-            // matching single.rs's direct-FIR sum).
-            let mut v = vec![Complex64::new(0.0, 0.0); self.n];
+            // Steps 1-2: window, fold and rotate left by r = (m*hop) mod N.
+            // u[n] = x[n]*h[LN-1-n]; v[j] = sum_p u[j + p*N], summed slab by
+            // slab (p ascending, channels inner, contiguous slices) in f64
+            // from +0.0 into the reused `fold` buffer (SPEC §6.4, MAN-117),
+            // with the rotation applied as the write index (MAN-527).
+            let r = ((self.m.wrapping_mul(self.hop as u64)) % n as u64) as usize;
+            fold_rotated(&mut self.fold, window, &self.taps_rev, r);
+
+            // The hop's buffers come from the spare pool when it has one
+            // (MAN-527); a fresh hop allocates exactly its `x` and `power`.
+            let mut hop = self.spare.pop().unwrap_or_else(|| HopOutput {
+                m: 0,
+                x: Vec::with_capacity(n),
+                power: Vec::with_capacity(n),
+            });
+            hop.m = self.m;
+            // Narrow to f32: the same values as rotating the f32 copy.
+            hop.x.clear();
+            hop.x.extend(
+                self.fold
+                    .iter()
+                    .map(|c| Complex32::new(c.re as f32, c.im as f32)),
+            );
+
+            // Step 3: FFT, in place on the hop's own output buffer with the
+            // channelizer's scratch; bit-identical to `FftProcessor::forward`
+            // (MAN-117). Step 4: power.
+            self.fwd
+                .process_with_scratch(&mut hop.x, &mut self.fft_scratch);
+            hop.power.clear();
+            hop.power.extend(hop.x.iter().map(|c| c.norm_sqr()));
+            if let Some(c) = self.conditioner.as_mut() {
+                c.observe_hop(&hop.x, self.m * self.hop as u64);
+            }
+            out.push(hop);
+
+            self.m += 1;
+            self.read += self.hop;
+        }
+        self.spare.truncate(SPARE_RETAIN_HOPS);
+        if self.read >= ln {
+            self.buf.drain(..self.read);
+            self.ready -= self.read;
+            self.read = 0;
+        }
+    }
+}
+
+/// MAN-527: recycled hops `process_into` keeps beyond what a call used. 32
+/// covers the lead-in padding call (`filter_len / hop` = 32 hops) and four
+/// offline 8-hop batches; a larger one-off read's surplus is released. At
+/// N = 2048 a hop's buffers are 24 KB, so the pool holds at most 768 KB.
+const SPARE_RETAIN_HOPS: usize = 32;
+
+/// SPEC §1.3 steps 1-2 for one hop, into `fold` (length N): window and fold,
+/// then rotate left by `r`, with the rotation applied as the write index.
+/// Slab p of `window` (samples p*N..(p+1)*N) meets `taps_rev[p*N..(p+1)*N]`;
+/// slab position j lands at `fold[(j + N - r) mod N]`, so positions r..N fill
+/// `fold[..N-r]` and positions 0..r fill `fold[N-r..]`. Every `fold[j]`
+/// starts at +0.0 and adds its products in ascending p, as separate f64
+/// multiplies and adds (SPEC §6 rule 4), so the values are bit-identical to
+/// the per-sample loop this replaces (MAN-527).
+fn fold_rotated(fold: &mut [Complex64], window: &[Complex32], taps_rev: &[f32], r: usize) {
+    let n = fold.len();
+    fold.fill(Complex64::new(0.0, 0.0));
+    for (w, h) in window.chunks_exact(n).zip(taps_rev.chunks_exact(n)) {
+        let (w_lo, w_hi) = w.split_at(r);
+        let (h_lo, h_hi) = h.split_at(r);
+        let (f_lo, f_hi) = fold.split_at_mut(n - r);
+        accumulate(f_lo, w_hi, h_hi);
+        accumulate(f_hi, w_lo, h_lo);
+    }
+}
+
+/// `acc[j] += h[j] * w[j]` in f64 over three equal-length slices. A separate
+/// multiply and add, never `mul_add`: an FMA would change the bits (MAN-527).
+fn accumulate(acc: &mut [Complex64], w: &[Complex32], h: &[f32]) {
+    for ((a, x), &h) in acc.iter_mut().zip(w).zip(h) {
+        let h = h as f64;
+        a.re += h * x.re as f64;
+        a.im += h * x.im as f64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coppa_dsp::fft::FftProcessor;
+
+    /// Deterministic LCG pseudo-noise plus two tones (MAN-117 fixtures).
+    fn noise_and_tones(fs: f64, n: usize) -> Vec<Complex32> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+        };
+        (0..n)
+            .map(|i| {
+                let t = i as f64 / fs;
+                let a = 2.0 * std::f64::consts::PI * 1_234.5 * t;
+                let b = 2.0 * std::f64::consts::PI * -20_007.0 * t;
+                let tones = Complex32::new(
+                    (0.3 * a.cos() + 0.05 * b.cos()) as f32,
+                    (0.3 * a.sin() + 0.05 * b.sin()) as f32,
+                );
+                tones + Complex32::new(0.1 * next(), 0.1 * next())
+            })
+            .collect()
+    }
+
+    /// MAN-117: the pre-MAN-117 per-hop path, verbatim: fold into a fresh
+    /// `Vec<Complex64>`, convert to f32, rotate into a fresh `Vec`, coppa
+    /// `FftProcessor::forward`, power.
+    fn reference_hops(fs: f64, iq: &[Complex32]) -> Vec<(Vec<Complex32>, Vec<f32>)> {
+        let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+        let hop = n / 4;
+        let taps = design_prototype(n, TAPS_PER_BRANCH);
+        let ln = taps.len();
+        let fft = FftProcessor::new(n);
+        let mut out = Vec::new();
+        let mut read = 0usize;
+        let mut m = 0u64;
+        while read + ln <= iq.len() {
+            let window = &iq[read..read + ln];
+            let mut v = vec![Complex64::new(0.0, 0.0); n];
             for (n_idx, &x) in window.iter().enumerate() {
-                let h = self.taps[ln - 1 - n_idx] as f64;
-                let j = n_idx % self.n;
+                let h = taps[ln - 1 - n_idx] as f64;
+                let j = n_idx % n;
                 v[j].re += h * x.re as f64;
                 v[j].im += h * x.im as f64;
             }
@@ -266,41 +425,221 @@ impl Channelizer {
                 .iter()
                 .map(|c| Complex32::new(c.re as f32, c.im as f32))
                 .collect();
-
-            // Step 2: circular rotation left by r = (m*hop) mod N.
-            let r = ((self.m.wrapping_mul(self.hop as u64)) % self.n as u64) as usize;
-            let mut v_rot = vec![Complex32::new(0.0, 0.0); self.n];
-            for j in 0..self.n {
-                v_rot[j] = v[(j + r) % self.n];
+            let r = ((m.wrapping_mul(hop as u64)) % n as u64) as usize;
+            let mut v_rot = vec![Complex32::new(0.0, 0.0); n];
+            for j in 0..n {
+                v_rot[j] = v[(j + r) % n];
             }
-
-            // Step 3: FFT. Step 4: power.
-            let x = self.fft.forward(&v_rot);
+            let x = fft.forward(&v_rot);
             let power: Vec<f32> = x.iter().map(|c| c.norm_sqr()).collect();
-            if let Some(c) = self.conditioner.as_mut() {
-                c.observe_hop(&x, self.m * self.hop as u64);
-            }
-            outputs.push(HopOutput {
-                m: self.m,
-                x,
-                power,
-            });
-
-            self.m += 1;
-            self.read += self.hop;
+            out.push((x, power));
+            m += 1;
+            read += hop;
         }
-        if self.read >= ln {
-            self.buf.drain(..self.read);
-            self.ready -= self.read;
-            self.read = 0;
-        }
-        outputs
+        out
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[test]
+    fn process_is_bit_identical_to_the_fft_processor_path() {
+        for fs in [96_000.0, 192_000.0] {
+            let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+            let hops = 400usize;
+            let len = TAPS_PER_BRANCH * n + (hops - 1) * (n / 4);
+            let iq = noise_and_tones(fs, len);
+            let reference = reference_hops(fs, &iq);
+            assert_eq!(reference.len(), hops);
+            for chunk in [4096usize, 1000] {
+                let mut ch = Channelizer::new(fs, 14e6).unwrap();
+                let got: Vec<HopOutput> = iq.chunks(chunk).flat_map(|c| ch.process(c)).collect();
+                assert_eq!(got.len(), reference.len(), "fs {fs} chunk {chunk}");
+                for (i, (h, (x, power))) in got.iter().zip(&reference).enumerate() {
+                    assert_eq!(h.m, i as u64);
+                    let bits = |v: &[Complex32]| -> Vec<(u32, u32)> {
+                        v.iter().map(|c| (c.re.to_bits(), c.im.to_bits())).collect()
+                    };
+                    assert_eq!(bits(&h.x), bits(x), "x, fs {fs} chunk {chunk} hop {i}");
+                    let pbits = |v: &[f32]| -> Vec<u32> { v.iter().map(|p| p.to_bits()).collect() };
+                    assert_eq!(
+                        pbits(&h.power),
+                        pbits(power),
+                        "power, fs {fs} chunk {chunk} hop {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_forward_matches_fft_processor_forward() {
+        for n in [64usize, 1024, 2048] {
+            let input = noise_and_tones(96_000.0, n);
+            let fwd = rustfft::FftPlanner::<f32>::new().plan_fft_forward(n);
+            let mut scratch = vec![Complex32::new(0.0, 0.0); fwd.get_inplace_scratch_len()];
+            let mut buf = input.clone();
+            fwd.process_with_scratch(&mut buf, &mut scratch);
+            let expected = FftProcessor::new(n).forward(&input);
+            for (k, (a, b)) in buf.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    (a.re.to_bits(), a.im.to_bits()),
+                    (b.re.to_bits(), b.im.to_bits()),
+                    "n {n} bin {k}"
+                );
+            }
+        }
+    }
+
+    /// MAN-527: the old fold and rotation, verbatim, in f64: u[n] = x[n] *
+    /// h[LN-1-n] accumulated into v[n % N] in ascending n (so ascending p per
+    /// j) from +0.0, then v'[j] = v[(j + r) % N].
+    fn reference_fold(window: &[Complex32], taps: &[f32], n: usize, r: usize) -> Vec<Complex64> {
+        let ln = taps.len();
+        let mut v = vec![Complex64::new(0.0, 0.0); n];
+        for (n_idx, &x) in window.iter().enumerate() {
+            let h = taps[ln - 1 - n_idx] as f64;
+            let j = n_idx % n;
+            v[j].re += h * x.re as f64;
+            v[j].im += h * x.im as f64;
+        }
+        (0..n).map(|j| v[(j + r) % n]).collect()
+    }
+
+    /// MAN-527: `fold_rotated` gives the old per-sample fold's f64 values bit
+    /// for bit, so it sums each channel in the same order (p ascending).
+    /// Output-level identity cannot show this: reversing the slab order still
+    /// passed `process_is_bit_identical_to_the_fft_processor_path`, because
+    /// narrowing to f32 absorbed the difference, while this test failed with
+    /// 10,207 of 16,384 f64 values different at 96 kS/s.
+    #[test]
+    fn fold_rotated_matches_the_spec_sum_bit_for_bit_in_f64() {
+        for fs in [96_000.0, 192_000.0] {
+            let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+            let hop = n / 4;
+            let taps = design_prototype(n, TAPS_PER_BRANCH);
+            let mut taps_rev = taps.clone();
+            taps_rev.reverse();
+            let ln = taps.len();
+            let mut fold = vec![Complex64::new(0.0, 0.0); n];
+            let mut check = |label: &str, window: &[Complex32], r: usize| {
+                fold_rotated(&mut fold, window, &taps_rev, r);
+                let expected = reference_fold(window, &taps, n, r);
+                let differing = fold
+                    .iter()
+                    .zip(&expected)
+                    .filter(|(a, b)| {
+                        (a.re.to_bits(), a.im.to_bits()) != (b.re.to_bits(), b.im.to_bits())
+                    })
+                    .count();
+                assert_eq!(differing, 0, "fs {fs} window {label} r {r}");
+            };
+            // 16 consecutive hops, so each r in {0, N/4, N/2, 3N/4} appears 4 times.
+            let iq = noise_and_tones(fs, ln + 15 * hop);
+            for m in 0..16usize {
+                let r = (m * hop) % n;
+                check(&format!("hop {m}"), &iq[m * hop..m * hop + ln], r);
+            }
+            let silent = vec![Complex32::new(-0.0, -0.0); ln];
+            let mut half = noise_and_tones(fs, ln);
+            for c in &mut half[ln / 2..] {
+                *c = Complex32::new(0.0, -0.0);
+            }
+            for r in [0, hop, 2 * hop, 3 * hop] {
+                check("all -0.0", &silent, r);
+                check("noise then signed zeros", &half, r);
+            }
+        }
+    }
+
+    #[test]
+    fn process_into_with_recycled_buffers_matches_process() {
+        let check =
+            |label: &str, make: &dyn Fn() -> Channelizer, iq: &[Complex32], chunk: usize| {
+                let reference = make().process(iq);
+                let mut ch = make();
+                let n = ch.n_channels();
+                let mut out = Vec::new();
+                let mut collected = Vec::new();
+                for piece in iq.chunks(chunk) {
+                    ch.process_into(piece, &mut out);
+                    collected.extend(out.iter().cloned());
+                }
+                assert!(!reference.is_empty(), "{label} chunk {chunk}");
+                assert_hops_bitwise_equal(&reference, &collected);
+                for h in &collected {
+                    assert_eq!(h.x.len(), n, "{label} chunk {chunk} hop {}", h.m);
+                    assert_eq!(h.power.len(), n, "{label} chunk {chunk} hop {}", h.m);
+                }
+            };
+        for fs in [96_000.0, 192_000.0] {
+            let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+            let iq = noise_and_tones(fs, TAPS_PER_BRANCH * n + 199 * (n / 4));
+            for chunk in [1usize, 7, 1000, 4096] {
+                if chunk == 1 && fs != 96_000.0 {
+                    continue;
+                }
+                check(
+                    &format!("fs {fs}"),
+                    &|| Channelizer::new(fs, 14e6).unwrap(),
+                    &iq,
+                    chunk,
+                );
+            }
+        }
+        use crate::condition::StageMode;
+        let cfg = ConditioningConfig {
+            dc: StageMode::Apply,
+            impulse: StageMode::Apply,
+            ..Default::default()
+        };
+        let iq = tone_with_impulses(30_000);
+        for chunk in [7usize, 1000, 4096] {
+            check(
+                "conditioned",
+                &|| Channelizer::with_conditioning(FS, 0.0, &cfg).unwrap(),
+                &iq,
+                chunk,
+            );
+        }
+    }
+
+    #[test]
+    fn process_into_overwrites_whatever_out_held() {
+        let fs = 96_000.0;
+        let n = (fs / CHANNEL_SPACING_HZ).round() as usize;
+        let iq = noise_and_tones(fs, TAPS_PER_BRANCH * n + 7 * (n / 4));
+        let junk = |x_len: usize| HopOutput {
+            m: 99,
+            x: vec![Complex32::new(3.0, -3.0); x_len],
+            power: vec![1.0; 3],
+        };
+        let mut out = vec![junk(0), junk(0), junk(5)];
+        let mut ch = Channelizer::new(fs, 14e6).unwrap();
+        ch.process_into(&iq, &mut out);
+        let expected = Channelizer::new(fs, 14e6).unwrap().process(&iq);
+        assert_eq!(expected.len(), 8);
+        assert_eq!(out.len(), expected.len());
+        assert_hops_bitwise_equal(&expected, &out);
+        for h in &out {
+            assert_eq!((h.x.len(), h.power.len()), (n, n));
+        }
+    }
+
+    #[test]
+    fn process_into_keeps_at_most_spare_retain_hops_surplus() {
+        let fs = 192_000.0;
+        let mut ch = Channelizer::new(fs, 14e6).unwrap();
+        let (ln, hop) = (ch.filter_len(), ch.hop());
+        let iq = noise_and_tones(fs, ln + 99 * hop + 4096);
+        let mut out = Vec::new();
+        ch.process_into(&iq[..ln + 99 * hop], &mut out);
+        assert_eq!(out.len(), 100);
+        ch.process_into(&iq[ln + 99 * hop..], &mut out);
+        assert_eq!(out.len(), 8);
+        assert!(
+            ch.spare.len() <= SPARE_RETAIN_HOPS,
+            "{} spare hops kept",
+            ch.spare.len()
+        );
+    }
 
     /// MAN-526: `power_linear` is the value the old `10^(power_db/10)`
     /// round trip approximated, to a few f64 ulp, digital silence included.

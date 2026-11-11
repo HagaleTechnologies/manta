@@ -323,6 +323,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -519,6 +523,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -544,6 +552,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
@@ -1019,6 +1030,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -1044,6 +1059,9 @@ jobs:
       # MAN-445: run the field-node script tests in the required Unix test checks.
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_field_node -v
+      # MAN-528: the release-profile A/B script's decision rule and helpers. Pure Python.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_release_profile_ab -v
       # MAN-240: the Dependabot diff verifier's own tests, under the Python dependabot-auto-merge.yml
       # runs the verifier with (same setup-python pin). Last in the job so the pin does not change
       # the python3 the steps above use.
@@ -1441,7 +1459,16 @@ jobs:
           env-vars: SOAPYSDR_BREW_VERSION
       # --locked: see the MAN-219 note in the test job above.
       - run: cargo clippy -p manta-input -p manta-cli --all-targets --features soapy --locked -- -D warnings
-      - run: cargo test -p manta-input -p manta-cli --features soapy --locked
+      # MAN-520: only the tests the soapy feature can change; clippy above still compiles every
+      # target with it. scripts/tests/test_ci_gates.py (SoapyTestSelectionTests) keeps this list
+      # equal to the manta-cli tests/*.rs files that mention soapy, plus completions_and_man_pages.
+      - run: cargo test -p manta-input --features soapy --locked --lib soapy
+      - run: |
+          cargo test -p manta-cli --features soapy --locked --no-fail-fast --bin manta \
+            --test build_identity --test cli --test completions_and_man_pages \
+            --test config_command --test docker_image --test docs_consistency \
+            --test field_node_runbook --test operator_guides --test output_style_guard \
+            --test packaging_examples --test source_check
 
   # MAN-516: the relay is two jobs, so a Unix result reaches the PR when the Unix aggregates
   # finish instead of when the Windows leg does (53-92 min). Each relays the real conclusion of

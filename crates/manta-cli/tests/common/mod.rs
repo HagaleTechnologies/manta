@@ -352,6 +352,51 @@ pub fn send_snd_frames(ws: &mut tungstenite::WebSocket<TcpStream>, stop: impl Fn
     }
 }
 
+/// MAN-529: streams `samples` (12 kHz IQ) as 512-pair `SND` frames at
+/// `speed` times real time, numbering frames by index. A frame whose `seq`
+/// is in `skip` is not sent but keeps its time slot, as a frame the server
+/// lost would. Returns at the end of `samples`, or early on `stop()` or a
+/// hung-up client. Layout as `send_snd_frames`.
+pub fn stream_snd_samples(
+    ws: &mut tungstenite::WebSocket<TcpStream>,
+    samples: &[num_complex::Complex32],
+    speed: f64,
+    skip: &[u32],
+    stop: impl Fn() -> bool,
+) {
+    use tungstenite::Message;
+
+    const PAIRS: usize = 512;
+    let frame_period = Duration::from_secs_f64(PAIRS as f64 / 12_000.0 / speed);
+    let start = Instant::now();
+    for (index, block) in samples.chunks(PAIRS).enumerate() {
+        if stop() {
+            return;
+        }
+        let seq = index as u32;
+        if !skip.contains(&seq) {
+            let mut frame = Vec::with_capacity(3 + 17 + PAIRS * 4);
+            frame.extend_from_slice(b"SND");
+            frame.push(0x08);
+            frame.extend_from_slice(&seq.to_le_bytes());
+            frame.extend_from_slice(&[0u8; 2 + 10]);
+            for sample in block {
+                for value in [sample.re, sample.im] {
+                    let v = (value * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    frame.extend_from_slice(&v.to_be_bytes());
+                }
+            }
+            if ws.send(Message::binary(frame)).is_err() {
+                return;
+            }
+        }
+        let due = start + frame_period * (seq + 1);
+        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
 /// MAN-310: plays `n` KiwiSDR sessions on one listener, one per stream of a
 /// band plan. Sends each session's `SET mod=iq ... freq=...` tune line on
 /// `tunes`, then streams SND noise until `done`.

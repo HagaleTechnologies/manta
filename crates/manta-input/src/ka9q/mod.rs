@@ -15,6 +15,8 @@
 
 pub mod wire;
 
+use crate::loss_marks::LossMarks;
+use crate::stall::NoUsableSamples;
 use crate::{InputHealthCounters, IqSource, MAX_IQ_WAV_RATE_HZ};
 use anyhow::{bail, Context, Result};
 use num_complex::Complex32;
@@ -372,6 +374,12 @@ fn usable_edges(s: &ChannelStatus) -> Option<(f64, f64)> {
 }
 
 /// One radiod IQ channel as an [`IqSource`].
+///
+/// MAN-529: a skipped RTP sequence number is counted in the health counters
+/// and also reported to the sample clock, through
+/// [`IqSource::take_missing_samples`] (under 0.5 s) or
+/// [`IqSource::take_discontinuity`] (0.5 s or more), after the `read()` whose
+/// first sample is the first one after the loss.
 pub struct Ka9qIqSource {
     data: UdpSocket,
     status_sock: UdpSocket,
@@ -384,6 +392,13 @@ pub struct Ka9qIqSource {
     center_hz: f64,
     queue: VecDeque<Complex32>,
     seq: Option<SeqTracker>,
+    /// MAN-529: lost packets, marked at their position in the queued stream.
+    losses: LossMarks,
+    /// MAN-529: samples ever pushed into `queue` (after a `Stale` packet's
+    /// truncation), the coordinate `losses` marks are in.
+    queued_total: u64,
+    /// MAN-529: the last accepted packet's RTP timestamp and sample count.
+    last_rtp: Option<(u32, u32)>,
     recv_buf: Vec<u8>,
     last_accepted: Instant,
     stall_timeout: Duration,
@@ -453,18 +468,22 @@ impl Ka9qIqSource {
         status_sock
             .set_nonblocking(true)
             .context("ka9q-radio: set status socket non-blocking")?;
+        let fs = status.sample_rate_hz.unwrap_or(0) as f64;
         let mut src = Self {
             data,
             status_sock,
             group_label: cfg.group.clone(),
             port: cfg.port,
             ssrc,
-            fs: status.sample_rate_hz.unwrap_or(0) as f64,
+            fs,
             center_hz: status.radio_frequency_hz.unwrap_or(0.0),
             status,
             enc,
             queue: VecDeque::new(),
             seq: None,
+            losses: LossMarks::new(fs),
+            queued_total: 0,
+            last_rtp: None,
             recv_buf: vec![0u8; RECV_BUF_LEN],
             last_accepted: Instant::now(),
             stall_timeout: cfg.stall_timeout,
@@ -477,7 +496,8 @@ impl Ka9qIqSource {
         };
         // Replay what the wait stashed, exactly as if it arrived now, so
         // the stream starts at its first retained packet with no startup
-        // gap.
+        // gap. MAN-529: a sequence gap inside the replay is marked at its
+        // queue position like any other.
         for (_, pkt) in &stash {
             src.recv_buf[..pkt.len()].copy_from_slice(pkt);
             src.accept_rtp(pkt.len());
@@ -609,6 +629,10 @@ impl Ka9qIqSource {
         res
     }
 
+    /// Accepts one RTP datagram from `recv_buf`. MAN-529: a sequence gap is
+    /// counted and also marked at its position in the queued stream, so the
+    /// lost samples (from the RTP timestamp, [`lost_samples`]) reach the
+    /// sample clock after the read that starts right after them.
     fn accept_rtp(&mut self, n: usize) {
         let Ok((h, payload)) = wire::parse_rtp(&self.recv_buf[..n]) else {
             self.counters.record_malformed();
@@ -641,11 +665,38 @@ impl Ka9qIqSource {
             SeqObservation::Gap { missing } => {
                 self.counters.record_gap();
                 self.counters.record_dropped(u64::from(missing));
+                if let Some((last_ts, last_len)) = self.last_rtp {
+                    let lost = lost_samples(h.timestamp, last_ts, last_len, missing, fs);
+                    self.losses.mark(self.queued_total, lost);
+                }
             }
             SeqObservation::Baseline | SeqObservation::InOrder | SeqObservation::Resync => {}
         }
+        self.queued_total = self.queued_total.saturating_add(got as u64);
+        self.last_rtp = Some((h.timestamp, u32::try_from(got).unwrap_or(u32::MAX)));
         self.last_accepted = Instant::now();
         self.confirmed_live.store(true, Ordering::Relaxed);
+    }
+}
+
+/// MAN-529: samples lost in a sequence gap, from the RTP timestamp. RFC 3550
+/// section 5.1 and RFC 3551 section 4.1 define the RTP clock as one tick per
+/// sampling instant, which for 2-channel IQ is one tick per complex sample,
+/// so the lost span is `(ts - last_ts) - last_len` (wrapping). D6 of the
+/// MAN-529 decision record bounds it: the count is used when it is at least
+/// one sample per lost packet and at most `SEQ_WINDOW_S` seconds of samples;
+/// otherwise it falls back to `missing_packets x last_len`.
+fn lost_samples(ts: u32, last_ts: u32, last_len: u32, missing_packets: u16, fs: f64) -> u64 {
+    let fallback = u64::from(missing_packets) * u64::from(last_len);
+    let Some(lost) = ts.wrapping_sub(last_ts).checked_sub(last_len) else {
+        return fallback;
+    };
+    let lost = u64::from(lost);
+    let most = (fs * SEQ_WINDOW_S).max(0.0) as u64;
+    if lost >= u64::from(missing_packets) && lost <= most {
+        lost
+    } else {
+        fallback
     }
 }
 
@@ -902,10 +953,13 @@ impl IqSource for Ka9qIqSource {
                 // startup stash replay) are returned, so the kernel's
                 // grant does not overflow before the queue empties.
                 self.drain_ready_rtp()?;
-                let n = buf.len().min(self.queue.len());
+                // MAN-529: a read ends at the next lost packet, so a loss
+                // report always describes the first sample of its read.
+                let n = self.losses.begin_read(buf.len().min(self.queue.len()));
                 for (dst, src) in buf.iter_mut().zip(self.queue.drain(..n)) {
                     *dst = src;
                 }
+                self.losses.delivered(n);
                 self.delivering = true;
                 return Ok(n);
             }
@@ -921,13 +975,16 @@ impl IqSource for Ka9qIqSource {
                 return Ok(0);
             }
             if self.last_accepted.elapsed() >= self.stall_timeout {
-                bail!(
+                // MAN-533 D4: typed, so the reconnect layer reports it as
+                // `no usable samples`; the text is unchanged.
+                return Err(NoUsableSamples::new(format!(
                     "ka9q-radio stream stalled: no RTP data for ssrc {} on {}:{} for {} s",
                     self.ssrc,
                     self.group_label,
                     self.port,
                     secs(self.stall_timeout)
-                );
+                ))
+                .into());
             }
             match self.data.recv(&mut self.recv_buf) {
                 Ok(n) => self.accept_rtp(n),
@@ -939,6 +996,16 @@ impl IqSource for Ka9qIqSource {
 
     fn take_stalled(&mut self) -> bool {
         std::mem::take(&mut self.stalled)
+    }
+
+    /// MAN-529: a lost span under 0.5 s, after the read that follows it.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.losses.take_missing()
+    }
+
+    /// MAN-529: a lost span of 0.5 s or more, after the read that follows it.
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.losses.take_discontinuity()
     }
 
     fn confirmed_live_handle(&self) -> Option<Arc<AtomicBool>> {
@@ -1302,6 +1369,29 @@ mod tests {
 
     // ---- Socket tests against a fake radiod on loopback multicast (D19).
 
+    #[test]
+    fn lost_samples_come_from_the_rtp_timestamp() {
+        // last accepted: seq 2 at ts 360, 180 samples; next: seq 5 at ts 900.
+        // seq 3 and 4 (360 samples) were lost.
+        assert_eq!(lost_samples(900, 360, 180, 2, 96_000.0), 360);
+        // last: seq 1 at ts 180, 180 samples; the one lost packet held 100
+        // samples, so the packet count (180) would be wrong.
+        assert_eq!(lost_samples(460, 180, 180, 1, 96_000.0), 100);
+    }
+
+    #[test]
+    fn lost_samples_survive_a_timestamp_wrap() {
+        // (u32::MAX - 179) + 540 wraps to 360.
+        assert_eq!(lost_samples(360, u32::MAX - 179, 180, 2, 96_000.0), 360);
+    }
+
+    #[test]
+    fn an_implausible_timestamp_falls_back_to_the_packet_count() {
+        assert_eq!(lost_samples(360, 360, 180, 2, 96_000.0), 360); // no advance
+        assert_eq!(lost_samples(2_000_000, 0, 180, 2, 96_000.0), 360); // more than 10 s
+        assert_eq!(lost_samples(541, 360, 180, 2, 96_000.0), 360); // under 1 per packet
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod sockets {
         use super::*;
@@ -1421,6 +1511,25 @@ mod tests {
                 };
                 self.send(&wire::encode_rtp(&h, &wire::encode_iq(enc, samples)));
             }
+
+            /// `send_rtp` with an explicit RTP timestamp (MAN-529).
+            fn send_rtp_at(
+                &self,
+                ssrc: u32,
+                seq: u16,
+                ts: u32,
+                enc: Encoding,
+                samples: &[Complex32],
+            ) {
+                let h = RtpHeader {
+                    payload_type: 111,
+                    seq,
+                    timestamp: ts,
+                    ssrc,
+                    marker: false,
+                };
+                self.send(&wire::encode_rtp(&h, &wire::encode_iq(enc, samples)));
+            }
         }
 
         impl Drop for FakeRadiod {
@@ -1468,6 +1577,44 @@ mod tests {
                 out.extend_from_slice(&buf[..k]);
             }
             out
+        }
+
+        /// A loss report taken after one read: (index of the read's first
+        /// sample, `take_missing_samples`, `take_discontinuity`).
+        type Report = (usize, Option<u64>, Option<u64>);
+
+        /// MAN-529: reads `n` samples with a `chunk`-sample buffer, recording
+        /// each read as (first index, length) and each loss report after it.
+        fn read_reports(
+            src: &mut Ka9qIqSource,
+            n: usize,
+            chunk: usize,
+        ) -> (Vec<Complex32>, Vec<(usize, usize)>, Vec<Report>) {
+            let mut out = Vec::new();
+            let mut reads = Vec::new();
+            let mut reports = Vec::new();
+            let mut buf = vec![Complex32::new(0.0, 0.0); chunk];
+            while out.len() < n {
+                let k = src.read(&mut buf).expect("read");
+                let (m, d) = (src.take_missing_samples(), src.take_discontinuity());
+                if m.is_some() || d.is_some() {
+                    reports.push((out.len(), m, d));
+                }
+                reads.push((out.len(), k));
+                out.extend_from_slice(&buf[..k]);
+            }
+            (out, reads, reports)
+        }
+
+        /// No read returns samples from both sides of output index `at`.
+        fn no_read_straddles(reads: &[(usize, usize)], at: usize) {
+            for &(start, len) in reads {
+                assert!(
+                    !(start < at && start + len > at),
+                    "read [{start}, {}) straddles the loss at {at}",
+                    start + len
+                );
+            }
         }
 
         fn open_err(s: ChannelStatus) -> String {
@@ -1969,6 +2116,116 @@ mod tests {
         }
 
         #[test]
+        fn a_lost_packet_is_reported_after_the_read_that_starts_past_it() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            for seq in [1u16, 2, 5, 6] {
+                f.send_rtp(SSRC, seq, Encoding::F32Le, &ramp(180, seq as usize));
+            }
+            let (out, reads, reports) = read_reports(&mut src, 720, 100);
+            assert_eq!(out.len(), 720);
+            assert_eq!(reports, vec![(360, Some(360), None)]);
+            no_read_straddles(&reads, 360);
+            let want: Vec<Complex32> = [1usize, 2, 5, 6]
+                .iter()
+                .flat_map(|&k| ramp(180, k))
+                .collect();
+            assert_eq!(out, want);
+            let c = src.health_counters().unwrap();
+            assert_eq!((c.gaps_detected(), c.dropped_packets()), (1, 2));
+        }
+
+        /// The startup stash replay goes through `accept_rtp`, so a gap
+        /// inside it is marked at its position like a live one.
+        #[test]
+        fn a_gap_inside_the_startup_stash_replay_is_reported_at_its_position() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut cfg = f.config(None);
+            cfg.settle = Duration::from_millis(700);
+            cfg.open_timeout = Duration::from_millis(1500);
+            let sender = {
+                let (group, port) = (f.group, f.data_port);
+                std::thread::spawn(move || {
+                    let tx = sender();
+                    // After open() joins, inside the settle window.
+                    std::thread::sleep(Duration::from_millis(200));
+                    for seq in [1u16, 2, 5] {
+                        let h = RtpHeader {
+                            payload_type: 111,
+                            seq,
+                            timestamp: u32::from(seq) * 180,
+                            ssrc: SSRC,
+                            marker: false,
+                        };
+                        let payload = wire::encode_iq(Encoding::F32Le, &ramp(180, seq as usize));
+                        let _ = tx.send_to(
+                            &wire::encode_rtp(&h, &payload),
+                            SocketAddrV4::new(group, port),
+                        );
+                    }
+                })
+            };
+            let mut src = Ka9qIqSource::open(cfg).unwrap();
+            sender.join().unwrap();
+            let (out, reads, reports) = read_reports(&mut src, 540, 4096);
+            assert_eq!(out.len(), 540);
+            assert_eq!(reports, vec![(360, Some(360), None)]);
+            no_read_straddles(&reads, 360);
+        }
+
+        #[test]
+        fn the_lost_count_follows_the_timestamp_not_the_packet_size() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            // seq 3 (100 samples at ts 540) is lost.
+            f.send_rtp_at(SSRC, 1, 180, Encoding::F32Le, &ramp(180, 1));
+            f.send_rtp_at(SSRC, 2, 360, Encoding::F32Le, &ramp(180, 2));
+            f.send_rtp_at(SSRC, 4, 640, Encoding::F32Le, &ramp(180, 4));
+            let (out, reads, reports) = read_reports(&mut src, 540, 4096);
+            assert_eq!(out.len(), 540);
+            assert_eq!(reports, vec![(360, Some(100), None)]);
+            no_read_straddles(&reads, 360);
+        }
+
+        #[test]
+        fn stale_packets_add_no_report_and_no_samples() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            // seq 3 arrives late, after seq 5: stale, discarded. seq 6
+            // follows so the read loop has a known end.
+            for seq in [1u16, 2, 5, 3, 6] {
+                f.send_rtp(SSRC, seq, Encoding::F32Le, &ramp(180, seq as usize));
+            }
+            let (out, _, reports) = read_reports(&mut src, 720, 4096);
+            assert_eq!(reports, vec![(360, Some(360), None)]);
+            let want: Vec<Complex32> = [1usize, 2, 5, 6]
+                .iter()
+                .flat_map(|&k| ramp(180, k))
+                .collect();
+            assert_eq!(out, want, "540 samples before seq 6; seq 3 added none");
+        }
+
+        /// MAN-305 D10's split at 0.5 s (48,000 samples at 96 kHz): 266
+        /// lost packets of 180 splice, 267 start a new segment.
+        #[test]
+        fn a_half_second_loss_is_a_discontinuity() {
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(180, 1));
+            f.send_rtp(SSRC, 268, Encoding::F32Le, &ramp(180, 2));
+            let (_, _, reports) = read_reports(&mut src, 360, 4096);
+            assert_eq!(reports, vec![(180, Some(47_880), None)]);
+            drop(src);
+
+            let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
+            let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
+            f.send_rtp(SSRC, 1, Encoding::F32Le, &ramp(180, 1));
+            f.send_rtp(SSRC, 269, Encoding::F32Le, &ramp(180, 2));
+            let (_, _, reports) = read_reports(&mut src, 360, 4096);
+            assert_eq!(reports, vec![(180, None, Some(48_060))]);
+        }
+
+        #[test]
         fn malformed_datagrams_are_counted_and_reading_continues() {
             let f = FakeRadiod::start(vec![channel(SSRC, 14e6)]);
             let mut src = Ka9qIqSource::open(f.config(Some(SSRC))).unwrap();
@@ -2046,9 +2303,14 @@ mod tests {
             };
             let t = Instant::now();
             let mut buf = vec![Complex32::new(0.0, 0.0); 64];
-            let e = format!("{:#}", src.read(&mut buf).err().unwrap());
+            let err = src.read(&mut buf).err().unwrap();
             stop.store(true, Ordering::Relaxed);
             flood.join().unwrap();
+            // MAN-533 scenario 2 (ka9q): foreign-SSRC traffic keeps the
+            // socket busy with no accepted packet; the stall carries the
+            // shared type the reconnect layer reopens on.
+            assert!(crate::is_no_usable_samples(&err), "{err:#}");
+            let e = format!("{err:#}");
             assert!(
                 e.contains("ka9q-radio stream stalled: no RTP data for ssrc 14000000"),
                 "{e}"

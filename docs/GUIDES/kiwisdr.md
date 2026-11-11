@@ -17,6 +17,14 @@ The Kiwi's native IQ stream is about 12 kHz. manta resamples it to 96 kS/s for
 its channelizer; that does not widen the 10 kHz of RF it requested. See the
 [KiwiSDR input notes](../DECISIONS/2026-07-25-m2-kiwisdr-input-pins.md).
 
+Lost SND frames show on manta's metrics endpoint as
+`manta_input_dropped_packets_total{source="kiwi"}` and
+`manta_input_gaps_detected_total{source="kiwi"}`. manta also moves its spot
+clock on by each lost frame's samples, counted from the frame sequence numbers
+and the receiver's sample rate, so spots after the loss keep their true time.
+A loss of 0.5 s or more also closes the tracks in progress, and decoding
+starts again after it (MAN-529).
+
 ## Several CW segments from one Kiwi: `bands`
 
 `bands` plans one Kiwi channel per slice of a band's CW segment, instead of
@@ -62,7 +70,9 @@ a publicly listed receiver does not imply permission for a permanent service.
    for connection by non-Kiwi apps"), is not yours to use.
 4. Respect time limits. manta can't present a time-limit exemption password and
    doesn't recognise being refused or kicked. It reconnects after 1 s, backing off
-   to 60 s, forever, and the systemd service restarts it too. Never install the
+   to 60 s, forever, and the systemd service restarts it too. A receiver that keeps
+   the connection open without sending usable samples is reconnected after 30 s, on
+   the same backoff. Never install the
    service against a public receiver without the owner's agreement, and stop
    manta if the owner asks.
 

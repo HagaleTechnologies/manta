@@ -18,12 +18,13 @@ const ALERTS: &str = "manta-alerts.yml";
 const ALERT_TESTS: &str = "manta-alerts.test.yml";
 const PROMETHEUS: &str = "prometheus.yml";
 const DASHBOARD: &str = "manta-dashboard.json";
-const ALERT_NAMES: [&str; 5] = [
+const ALERT_NAMES: [&str; 6] = [
     "MantaNodeDown",
     "MantaNodeUnhealthy",
     "MantaInputDown",
     "MantaNoSpots",
     "MantaUplinkDisconnected",
+    "MantaRbnSkew",
 ];
 /// The four panels the ticket names.
 const TICKET_PANELS: [&str; 4] = [
@@ -176,7 +177,7 @@ fn rule_for(rule: &serde_yaml_ng::Value) -> Option<&str> {
 }
 
 #[test]
-fn alert_rules_define_the_five_alerts() {
+fn alert_rules_define_the_six_alerts() {
     let doc = yaml(ALERTS);
     let groups = doc["groups"].as_sequence().expect("groups list");
     assert_eq!(groups.len(), 1, "{ALERTS} must have exactly one group");
@@ -205,6 +206,40 @@ fn alert_rules_define_the_five_alerts() {
             "{name}'s runbook_url must land on its section of {RUNBOOK}"
         );
     }
+}
+
+/// MAN-541: the skew alert fires on the daemon's own warning gauge, so
+/// "the same condition" as `/healthz`'s WARN line holds by construction,
+/// and a node's `skew_warn_ppm` is never copied into the static rule.
+#[test]
+fn rbn_skew_alert_fires_on_the_daemons_warning_gauge() {
+    let rules = alert_rules();
+    let r = rule(&rules, "MantaRbnSkew");
+    let e = expr(r);
+    assert_eq!(
+        selected_metrics(&e),
+        BTreeSet::from([
+            "manta_rbn_compare_freq_offset_median_ppm".to_string(),
+            "manta_rbn_compare_skew_warning".to_string(),
+        ]),
+        "{e}"
+    );
+    assert!(e.contains("manta_rbn_compare_skew_warning == 1"), "{e}");
+    let numbers: Vec<&str> = e
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        .collect();
+    assert_eq!(numbers, vec!["1"], "no threshold but the gauge's 1: {e}");
+    assert_eq!(rule_for(r), None, "the daemon already holds 30 minutes");
+    let on = e
+        .split("on(")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or("");
+    assert!(
+        on.split(',').any(|l| l.trim() == "band"),
+        "the match must keep the band: {e}"
+    );
 }
 
 /// MAN-13: with several inputs the node stays healthy while one decodes,

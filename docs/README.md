@@ -14,7 +14,8 @@ Then:
 - [METRICS.md](METRICS.md): every `/metrics` family, plus `/healthz` and
   `/status`.
 - [packaging/README.md](../packaging/README.md): running unattended under
-  systemd, launchd or Docker Compose.
+  systemd, launchd or Docker Compose, from a release archive or from the
+  Debian package.
 - [Keeping cty.dat and MASTER.SCP current](../packaging/README.md#keeping-ctydat-and-masterscp-current):
   downloading newer country-prefix and known-call lists without a release
   (MAN-316).

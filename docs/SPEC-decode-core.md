@@ -45,8 +45,8 @@ rates by construction; nothing below depends on `fs`.
 **[DEVIATION]** `coppa-dsp::filter` provides only `RrcFilter` (root-raised
 cosine); there is no general Kaiser/windowed-sinc designer to reuse. The
 prototype designer is therefore new code in `manta-dsp::proto` (~40 lines:
-Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused as
-specified.
+Kaiser window + windowed sinc). `coppa-dsp::fft::FftProcessor` is reused for
+the plan; the channelizer runs that plan in place (MAN-117).
 
 Prototype lowpass, length `L·N` with **L = 8 taps per branch**:
 
@@ -121,16 +121,23 @@ Maintain a sliding input window `x[0..LN)` (newest sample at the end). Every
    `process` calls. `check` runs
    no conditioning: it reports the raw receiver.
 1. **Window & fold:** `u[n] = x[n] · h[LN−1−n]` for `n = 0..LN`, then fold to
-   `N` points: `v[j] = Σ_{p=0..L-1} u[j + pN]`, `j = 0..N`.
+   `N` points: `v[j] = Σ_{p=0..L-1} u[j + pN]`, `j = 0..N`. Implemented slab
+   by slab (MAN-527): for each `p` ascending, every `j` adds `u[j + pN]` to its
+   own `f64` accumulator, which starts at +0.0, so each `v[j]` sums in
+   ascending `p`.
 2. **Phase correction for hop < N:** circularly rotate `v` left by
    `r = (m · hop) mod N` samples: `v'[j] = v[(j + r) mod N]`. (Equivalent to
    multiplying bin `k` by `e^{+j2πk·m·hop/N}`; the rotation keeps every
    channel's passband centered at DC in its own output stream so the envelope
-   is phase-continuous across hops.)
-3. **FFT:** `X[k, m] = FFT_N(v')[k]` via `FftProcessor::new(N)` (one instance,
-   created once; `forward()` allocates — acceptable at 375 calls/s, but the
-   engine may pre-allocate via `try_forward` into a scratch buffer if profiling
-   demands; not required for M0/M1).
+   is phase-continuous across hops.) The channelizer applies it as the fold's
+   write index, with no separate copy (MAN-527).
+3. **FFT:** `X[k, m] = FFT_N(v')[k]` via the forward plan `FftProcessor::new(N)`
+   builds (`rustfft` `FftPlanner::new().plan_fft_forward(N)`), planned once and
+   run in place with a scratch buffer the channelizer owns, so a hop allocates
+   only its output (MAN-117), and `process_into` recycles the previous call's
+   output buffers, so a steady-state call allocates nothing (MAN-527);
+   bit-identical to `FftProcessor::forward()`, which
+   allocates its output and rustfft's scratch per call.
 4. **Power:** `P[k, m] = |X[k, m]|²`. Report in dB: `PdB = 10·log10(P + ε)`,
    `ε = 1e-20`.
 
@@ -1950,7 +1957,8 @@ rules:
    sorted `Vec`, never a `HashMap` iterated.
 4. **Float discipline:** all per-sample state is `f32` with a fixed operation
    order (no fast-math, no FMA-dependent reductions: the fold in §1.3 and the
-   centroid in §1.4 accumulate in `f64` sequentially). `rustfft` is
+   centroid in §1.4 accumulate in `f64` sequentially (the fold: each output
+   index in ascending `p` from +0.0, as separate multiplies and adds)). `rustfft` is
    deterministic per-platform for power-of-two sizes; cross-platform FFT
    bit-equality is NOT assumed — the byte-identical requirement applies to
    like-for-like builds, and cross-platform equality is asserted at the
@@ -2405,9 +2413,9 @@ allowlist = []
 # scp/<sha256>.scp, patterns/<sha256>.lst, state.json). Same path rule.
 # Unset: memory only.
 # list_cache_dir = "/var/cache/manta"
-# http:// only (no TLS); https:// is refused at load.
-# cty_url = "http://www.country-files.com/cty/cty.dat"
-# scp_url = "http://www.supercheckpartial.com/MASTER.SCP"
+# https:// (checked against built-in CA roots) or http:// for a local mirror.
+# cty_url = "https://www.country-files.com/cty/cty.dat"
+# scp_url = "https://www.supercheckpartial.com/MASTER.SCP"
 # Pin a list by the SHA-256 of its bytes (64 hex digits), for every
 # validating command: a set cty_path/scp_path must match it; otherwise it
 # is looked up in the bundled copy, then list_cache_dir. No match stops

@@ -5,6 +5,7 @@
 //!   Scenario: A week-old cty.dat is refreshed without a restart
 //!   Scenario: An unreachable SCP server keeps the last good copy
 //!   Scenario: A fresh install without network runs on the bundled lists
+//!   Scenario: An https list URL is fetched with certificate checks (MAN-536)
 //!   MAN-542 Scenario: The pattern list refreshes with the others
 //!   MAN-542 Scenario: No URL means no download
 //!
@@ -335,6 +336,73 @@ fn serve_one(mut stream: TcpStream, served: &Served) -> std::io::Result<()> {
         )?,
     }
     stream.flush()
+}
+
+/// MAN-536: a TLS server on an ephemeral port presenting the `list_tls`
+/// test certificate, which no root built into manta trusts. Counts the
+/// connections (handshake attempts) and the HTTP requests read over TLS.
+struct TlsListServer {
+    port: u16,
+    connections: Arc<AtomicUsize>,
+    requests: Arc<AtomicUsize>,
+}
+
+impl TlsListServer {
+    fn start() -> TlsListServer {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/list_tls");
+        let cert = std::fs::read(fixtures.join("localhost.der")).unwrap();
+        let key = std::fs::read(fixtures.join("localhost.key.der")).unwrap();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(cert)],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
+            )
+            .unwrap(),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server = TlsListServer {
+            port: listener.local_addr().unwrap().port(),
+            connections: Arc::default(),
+            requests: Arc::default(),
+        };
+        let (connections, requests) = (server.connections.clone(), server.requests.clone());
+        // Never joined: it blocks in `accept` until the test binary exits.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                connections.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let Ok(conn) = rustls::ServerConnection::new(config.clone()) else {
+                    continue;
+                };
+                let mut tls = rustls::StreamOwned::new(conn, stream);
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 16 * 1024 {
+                    match tls.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                if head.ends_with(b"\r\n\r\n") {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    let _ = tls.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+                }
+            }
+        });
+        server
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("https://127.0.0.1:{}{path}", self.port)
+    }
 }
 
 /// A child's stderr lines, ANSI-stripped, plus every line seen so far, so
@@ -817,6 +885,43 @@ fn scenario_3a_a_fresh_install_without_network_runs_on_the_bundled_lists() {
         "{body}"
     );
     daemon.assert_still_running("without a network");
+}
+
+#[test]
+fn scenario_4_an_https_list_url_is_fetched_with_certificate_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    let scp_sha = sha256_hex(bundled_scp());
+    let server = ListServer::start(bundled_cty().to_vec(), bundled_scp().to_vec());
+    let cty_url = server.url("/cty.dat");
+    let tls = TlsListServer::start();
+    let scp_url = tls.url("/MASTER.SCP");
+
+    // Given an https scp_url, `run` accepts it ...
+    let mut daemon = Live::start(dir.path(), &refresh_spot_toml(&cache, &cty_url, &scp_url));
+    daemon
+        .log
+        .wait_for(&[&format!("scp every day from {scp_url}")], WAIT);
+    // ... connects over TLS, and refuses a certificate no built-in root
+    // vouches for, before sending any request.
+    daemon.log.wait_for(
+        &[
+            &format!(
+                "warning: list refresh: scp failed: connecting to 127.0.0.1:{}: invalid peer \
+                 certificate: UnknownIssuer",
+                tls.port
+            ),
+            &format!("; still using sha256 {scp_sha} (built in); next try in 1 hour"),
+        ],
+        WAIT,
+    );
+    daemon.wait_for_metrics("one scp failure", |b| {
+        metric_value(b, &refresh_total("scp", "failed")) == Some(1.0)
+    });
+    assert!(tls.connections.load(Ordering::SeqCst) >= 1);
+    assert_eq!(tls.requests.load(Ordering::SeqCst), 0);
+    daemon.assert_still_running("after the certificate failure");
 }
 
 #[test]

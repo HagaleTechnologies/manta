@@ -100,3 +100,6 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 # as YAML rather than matching text fragments. Test-only; pinned here, not
 # in [workspace.dependencies], because no other crate reads YAML.
 serde_yaml_ng = "0.10"
+# MAN-536: the hermetic TLS list server in list_http's tests and
+# tests/list_refresh.rs. Same rustls ureq already locks; no new package.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

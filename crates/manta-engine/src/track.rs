@@ -808,6 +808,9 @@ pub(crate) struct Track {
     /// `freq_hz` is the track's centroid at the hop the entry describes,
     /// set on the decoder before that entry's `push_hop` so `TrackMeta`
     /// pairs it with the same hop's `sample_ts` (MAN-211).
+    /// MAN-117: `drain_pool` drains it in place and keeps its capacity up
+    /// to `PENDING_RETAIN_ENTRIES`, so `queue_input` does not regrow it
+    /// from zero every batch.
     pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
     /// MAN-202: unknown-length input gaps this track has yet to apply, as
     /// the `sample_ts` of the first post-gap hop (`TrackManager::note_input_gap`).
@@ -985,6 +988,12 @@ pub const ISO_MIN_FRACTION: f64 = 0.5;
 /// oldest entries are then dropped, and a track that qualifies that late
 /// is decoded from at most 20 s back.
 pub const MAX_UNQUALIFIED_BACKLOG: usize = 7500;
+
+/// MAN-117: `pending` capacity a decoding track keeps across batches, so
+/// `queue_input` does not regrow it every batch. 64 entries cover every
+/// batch up to 64 hops (`decode_samples` batches 8); a larger one-off
+/// backlog (a MAN-313 qualification wait, a large live read) is released.
+const PENDING_RETAIN_ENTRIES: usize = 64;
 /// MAN-271 (SPEC §2.8 D′): the few debounced key-down runs ("keyed
 /// marks") a short transmission must show inside its queued input to
 /// qualify through rule D′. Measured to reject every swept-carrier track
@@ -1986,7 +1995,7 @@ impl Track {
     ) -> Vec<DecoderEvent> {
         self.drain_refiner_into_pending();
         let lead_in = std::mem::take(&mut self.lead_in);
-        let pending = std::mem::take(&mut self.pending);
+        let mut pending = std::mem::take(&mut self.pending);
         let Some(decoder) = self.decoder.as_mut() else {
             self.input_gaps.clear();
             return Vec::new();
@@ -1996,7 +2005,7 @@ impl Track {
         push_pending(
             decoder,
             &mut self.snr_peak_db,
-            pending,
+            &mut pending,
             &mut self.input_gaps,
             quality,
             &mut events,
@@ -5020,14 +5029,15 @@ impl TrackManager {
                     None
                 } else {
                     let lead_in = std::mem::take(&mut t.lead_in);
-                    let pending = std::mem::take(&mut t.pending);
+                    // MAN-117: drained in place by `push_pending`, which
+                    // keeps its capacity for the next batch.
                     Some((
                         decoder,
                         &mut t.snr_peak_db,
                         &mut t.garbles_published,
                         &mut t.input_gaps,
                         lead_in,
-                        pending,
+                        &mut t.pending,
                     ))
                 }
             })
@@ -5059,7 +5069,7 @@ fn push_lead_in(
     out: &mut Vec<DecoderEvent>,
 ) {
     for (amp, raw_power, ts) in lead_in {
-        out.extend(decoder.push_lead_in_hop(amp, raw_power, None, ts));
+        decoder.push_lead_in_hop_into(amp, raw_power, None, ts, out);
     }
 }
 
@@ -5086,15 +5096,18 @@ fn push_lead_in(
 /// MAN-202: every gap marker in `gaps` is applied
 /// (`TrackDecoder::note_input_gap`) before the first entry stamped at or
 /// after it, so one copy of this loop applies gaps for all three callers.
+///
+/// MAN-117: `pending` is drained in place and keeps its capacity up to
+/// `PENDING_RETAIN_ENTRIES`; each hop's events go straight into `out`.
 fn push_pending(
     decoder: &mut TrackDecoder,
     peak: &mut f32,
-    pending: Vec<(f32, f32, Option<f32>, u64, f32, f64)>,
+    pending: &mut Vec<PendingEntry>,
     gaps: &mut VecDeque<u64>,
     quality: Option<&DecodeQualityObserver>,
     out: &mut Vec<DecoderEvent>,
 ) {
-    for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending {
+    for (amp, raw_power, spectral_ref_power, ts, snr_db, freq_hz) in pending.drain(..) {
         while gaps.front().is_some_and(|&g| ts >= g) {
             gaps.pop_front();
             out.extend(decoder.note_input_gap());
@@ -5102,7 +5115,7 @@ fn push_pending(
         *peak = peak.max(snr_db);
         decoder.set_snr_2500_db(*peak - manta_decode::SNR_BW_CORR_DB);
         decoder.set_freq_hz(freq_hz);
-        let hop_events = decoder.push_hop(amp, raw_power, spectral_ref_power, ts);
+        decoder.push_hop_into(amp, raw_power, spectral_ref_power, ts, out);
         if decoder
             .hop_count()
             .is_multiple_of(manta_decode::META_INTERVAL_HOPS)
@@ -5110,8 +5123,8 @@ fn push_pending(
             *peak = f32::NEG_INFINITY;
         }
         sample_rail_ratio_at_boundary(decoder, quality);
-        out.extend(hop_events);
     }
+    pending.shrink_to(PENDING_RETAIN_ENTRIES);
 }
 
 /// MAN-202: a track closing before its decoder reached a gap marker's hop
@@ -11239,6 +11252,60 @@ mod tests {
         tm.tracks.insert(1, t);
         assert!(tm.drain_pool().is_empty());
         assert_eq!(tm.tracks[&1].pending.len(), 1);
+    }
+
+    /// MAN-117: a manager holding one decoding track (track 1, decoder
+    /// leased), for the `pending` recycling tests below.
+    fn mgr_with_one_decoding_track() -> TrackManager {
+        let mut tm = nc_mgr(DetectorConfig::default());
+        let cfg = tm.cfg;
+        let mut t = Track::new(1, 10, &cfg);
+        t.keying = Some(KeyingEvidence::new(0, 0.0, 0));
+        t.decoder = Some(TrackDecoder::new(1, DecodeConfig::default()));
+        tm.tracks.insert(1, t);
+        tm
+    }
+
+    /// MAN-117: queue `hops` entries on track 1 as `queue_input` would,
+    /// then run the decoder pool once, as `process_hops` does per batch.
+    fn queue_and_drain(tm: &mut TrackManager, first_hop: u64, hops: u64) {
+        let t = tm.tracks.get_mut(&1).unwrap();
+        for m in first_hop..first_hop + hops {
+            let amp = if (m / 20) % 2 == 0 { 1.0 } else { 0.05 };
+            t.pending
+                .push((amp, amp * amp, Some(1e-6), m * 256, 20.0, 14_000_000.0));
+        }
+        tm.drain_pool();
+    }
+
+    #[test]
+    fn drain_pool_keeps_each_decoding_tracks_pending_capacity() {
+        let mut tm = mgr_with_one_decoding_track();
+        for batch in 0..2u64 {
+            queue_and_drain(&mut tm, batch * 8, 8);
+            let t = &tm.tracks[&1];
+            assert_eq!(t.pending.len(), 0, "batch {batch}: pending not drained");
+            assert!(
+                t.pending.capacity() >= 8,
+                "batch {batch}: capacity {} after the pool ran",
+                t.pending.capacity()
+            );
+            assert_eq!(t.decoder.as_ref().unwrap().hop_count(), (batch + 1) * 8);
+        }
+    }
+
+    #[test]
+    fn drain_pool_releases_a_pending_backlog_above_the_retention_bound() {
+        let mut tm = mgr_with_one_decoding_track();
+        queue_and_drain(&mut tm, 0, 200);
+        let t = &tm.tracks[&1];
+        assert_eq!(t.pending.len(), 0);
+        assert!(
+            t.pending.capacity() <= PENDING_RETAIN_ENTRIES,
+            "capacity {} kept after a 200-hop backlog",
+            t.pending.capacity()
+        );
+        assert_eq!(t.decoder.as_ref().unwrap().hop_count(), 200);
     }
 
     #[test]

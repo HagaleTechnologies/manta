@@ -2,11 +2,12 @@
 //! Network operations and callbacks never hold the coordinator's state lock.
 
 use crate::config::HpsdrAllocation;
-use crate::reconnect::{InputHealthTotals, SendSource};
+use crate::reconnect::{loss_reason, InputHealthTotals, LossSink, SendSource};
 use crate::resolve::ResolvedInput;
 use anyhow::{anyhow, bail, Context, Result};
 use manta_input::IqSource;
 use manta_server::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
+use manta_server::metrics::SourceLossReason;
 use num_complex::Complex32;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -94,6 +95,9 @@ struct Group {
     opener: Mutex<Opener>,
     stop: Arc<AtomicBool>,
     health: Mutex<Vec<Health>>,
+    /// MAN-533 D10: each member's loss sink, told the failing member's
+    /// reason once per failed generation, before the health sinks.
+    loss: Mutex<Vec<LossSink>>,
     totals: Vec<OnceLock<Arc<InputHealthTotals>>>,
     attached: Vec<AtomicBool>,
     clock: Clock,
@@ -104,6 +108,7 @@ impl Group {
         opener: Opener,
         stop: Arc<AtomicBool>,
         mut health: Vec<Health>,
+        loss: Vec<LossSink>,
         clock: Clock,
     ) -> Arc<Self> {
         for sink in &mut health {
@@ -122,6 +127,7 @@ impl Group {
             opener: Mutex::new(opener),
             stop,
             health: Mutex::new(health),
+            loss: Mutex::new(loss),
             clock,
         })
     }
@@ -269,7 +275,16 @@ impl Group {
             Phase::Active(current) if current.id == generation.id)
     }
 
+    /// A generation failed for a cause other than a typed
+    /// no-usable-samples error (MAN-533 D10's shorthand).
     fn failed(&self, generation: &Arc<Generation>) {
+        self.failed_because(generation, SourceLossReason::ReadFailed);
+    }
+
+    /// MAN-533 D10: retire `generation`, recording `reason` for every
+    /// member before the health sinks report it down. A stale failure (the
+    /// generation is no longer current) records nothing.
+    fn failed_because(&self, generation: &Arc<Generation>, reason: SourceLossReason) {
         {
             let mut state = self.state.lock().expect("HPSDR group poisoned");
             if !matches!(&state.phase, Phase::Active(current) if current.id == generation.id) {
@@ -284,6 +299,9 @@ impl Group {
             if let Some(total) = total.get() {
                 total.retire_current();
             }
+        }
+        for sink in self.loss.lock().expect("HPSDR loss poisoned").iter_mut() {
+            sink(reason);
         }
         for sink in self
             .health
@@ -544,7 +562,11 @@ impl IqSource for GroupSource {
                     // stream rather than returning an unflagged zero.
                     continue;
                 }
-                Ok(_) | Err(_) => self.group.failed(generation),
+                // MAN-533 D10: a member's typed no-usable-samples error
+                // fails the generation with that reason; an unflagged zero
+                // or any other error is a read failure.
+                Err(e) => self.group.failed_because(generation, loss_reason(&e)),
+                Ok(_) => self.group.failed(generation),
             }
         }
     }
@@ -692,6 +714,7 @@ pub(crate) fn prepare(
     inputs: &[ResolvedInput],
     stop: Arc<AtomicBool>,
     mut health: impl FnMut(usize) -> Health,
+    mut loss: impl FnMut(usize) -> LossSink,
 ) -> Vec<Option<Member>> {
     let mut members: Vec<Option<Member>> = (0..inputs.len()).map(|_| None).collect();
     let endpoints = Arc::new(Endpoints {
@@ -831,6 +854,7 @@ pub(crate) fn prepare(
             opener,
             stop.clone(),
             indices.iter().map(|&i| health(i)).collect(),
+            indices.iter().map(|&i| loss(i)).collect(),
             Arc::new(Instant::now),
         );
         for (index, global) in indices.into_iter().enumerate() {
@@ -944,6 +968,7 @@ mod tests {
             }),
             Arc::new(AtomicBool::new(false)),
             sinks,
+            Vec::new(),
             Arc::new(move || *clock.lock().unwrap()),
         );
         Fixture {
@@ -1146,6 +1171,10 @@ mod tests {
         Stall,
         /// A real read error.
         Fail,
+        /// MAN-533: the typed no-usable-samples error.
+        Useless,
+        /// MAN-533: an unflagged `Ok(0)`.
+        Zero,
     }
 
     /// A member source whose reads follow a script the test controls; an
@@ -1176,6 +1205,13 @@ mod tests {
                         return Ok(0);
                     }
                     Some(Script::Fail) => bail!("radio lost"),
+                    Some(Script::Useless) => {
+                        return Err(manta_input::NoUsableSamples::new(
+                            "HPSDR device delivered no usable samples for 30 s",
+                        )
+                        .into())
+                    }
+                    Some(Script::Zero) => return Ok(0),
                     None => std::thread::sleep(Duration::from_millis(2)),
                 }
             }
@@ -1196,6 +1232,10 @@ mod tests {
         scripts: Vec<Arc<Mutex<VecDeque<Script>>>>,
         opens: Arc<AtomicUsize>,
         retires: Arc<AtomicUsize>,
+        /// Each member's health reports, in order.
+        health: Arc<Mutex<Vec<Vec<bool>>>>,
+        /// MAN-533: each member's loss reports, in order.
+        losses: Arc<Mutex<Vec<Vec<SourceLossReason>>>>,
     }
 
     fn scripted_group(scripts: Vec<Vec<Script>>) -> ScriptedFixture {
@@ -1209,6 +1249,10 @@ mod tests {
         let retires = Arc::new(AtomicUsize::new(0));
         let retired = retires.clone();
         let worker_handles = handles.clone();
+        let health_log = Arc::new(Mutex::new(vec![Vec::new(); members]));
+        let health_out = health_log.clone();
+        let loss_log = Arc::new(Mutex::new(vec![Vec::new(); members]));
+        let losses_out = loss_log.clone();
         let group = Group::new(
             Box::new(move || {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -1232,7 +1276,18 @@ mod tests {
                 })
             }),
             Arc::new(AtomicBool::new(false)),
-            (0..members).map(|_| Box::new(|_| {}) as Health).collect(),
+            (0..members)
+                .map(|i| {
+                    let health = health_log.clone();
+                    Box::new(move |up| health.lock().unwrap()[i].push(up)) as Health
+                })
+                .collect(),
+            (0..members)
+                .map(|i| {
+                    let losses = loss_log.clone();
+                    Box::new(move |reason| losses.lock().unwrap()[i].push(reason)) as LossSink
+                })
+                .collect(),
             Arc::new(Instant::now),
         );
         ScriptedFixture {
@@ -1240,6 +1295,8 @@ mod tests {
             scripts: handles,
             opens,
             retires,
+            health: health_out,
+            losses: losses_out,
         }
     }
 
@@ -1323,6 +1380,62 @@ mod tests {
         group.changed.notify_all();
     }
 
+    /// MAN-533 D10: a member's typed no-usable-samples error retires the
+    /// generation, and every member records that reason and goes down.
+    #[test]
+    fn a_member_no_usable_samples_error_fails_the_generation_with_its_reason() {
+        let f = scripted_group(vec![
+            vec![Script::Samples(1.0), Script::Useless],
+            vec![Script::Samples(1.0)],
+        ]);
+        let group = f.group.clone();
+        let mut sources = open_pair(&group);
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert_eq!(sources[1].read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        // Member 0's radio stream holds without usable samples: the
+        // productive member reports the outage once.
+        assert_eq!(sources[0].read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(sources[0].take_stalled());
+        assert_eq!(f.retires.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *f.losses.lock().unwrap(),
+            [
+                vec![SourceLossReason::NoUsableSamples],
+                vec![SourceLossReason::NoUsableSamples]
+            ]
+        );
+        for member in f.health.lock().unwrap().iter() {
+            assert_eq!(member.last(), Some(&false), "{member:?}");
+        }
+        group.stop.store(true, Ordering::Relaxed);
+        group.changed.notify_all();
+    }
+
+    /// MAN-533 D10: a member's unflagged `Ok(0)` fails the generation as
+    /// a read failure.
+    #[test]
+    fn a_member_unflagged_zero_reports_read_failed() {
+        let f = scripted_group(vec![vec![Script::Samples(1.0), Script::Zero]]);
+        let group = f.group.clone();
+        let mut source = Member {
+            group: group.clone(),
+            index: 0,
+        }
+        .open()
+        .unwrap();
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 4);
+        assert_eq!(source.read(&mut [Complex32::default(); 4]).unwrap(), 0);
+        assert!(source.take_stalled());
+        assert_eq!(f.retires.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *f.losses.lock().unwrap(),
+            [vec![SourceLossReason::ReadFailed]]
+        );
+        assert_eq!(f.health.lock().unwrap()[0].last(), Some(&false));
+        group.stop.store(true, Ordering::Relaxed);
+        group.changed.notify_all();
+    }
+
     /// MAN-489: a soft stall followed by generation loss does not produce
     /// a second report without fresh samples.
     #[test]
@@ -1381,6 +1494,7 @@ mod tests {
             }),
             stop.clone(),
             vec![Box::new(|_| {})],
+            Vec::new(),
             Arc::new(Instant::now),
         );
         let worker = std::thread::spawn(move || Member { group, index: 0 }.open().is_err());
@@ -1403,6 +1517,7 @@ mod tests {
                 }),
                 Arc::new(AtomicBool::new(false)),
                 vec![Box::new(|_| {})],
+                Vec::new(),
                 Arc::new(Instant::now),
             );
             let err = Member { group, index: 0 }.open().err().unwrap().to_string();
@@ -1487,6 +1602,7 @@ mod tests {
             }),
             Arc::new(AtomicBool::new(false)),
             vec![Box::new(|_| {})],
+            Vec::new(),
             Arc::new(Instant::now),
         );
         let mut source = Member {
@@ -1526,6 +1642,7 @@ mod tests {
             }),
             Arc::new(AtomicBool::new(false)),
             vec![Box::new(|_| {})],
+            Vec::new(),
             Arc::new(Instant::now),
         );
         let mut source = Member {

@@ -97,6 +97,34 @@ fn check_accepts_a_valid_config_and_exits_0() {
     );
 }
 
+/// MAN-536: `https://` list URLs pass the load-time check, and the note
+/// names HTTPS and port 443.
+#[test]
+fn check_accepts_https_list_urls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_cfg(
+        dir.path(),
+        "manta.toml",
+        "[spot]\nrefresh_lists = true\n\
+         cty_url = \"https://www.country-files.com/cty/cty.dat\"\n\
+         scp_url = \"https://www.supercheckpartial.com/MASTER.SCP\"\n",
+    );
+    let out = check_file(&path);
+    let all = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{all}");
+    assert!(
+        all.contains(" cty_url=https://www.country-files.com/cty/cty.dat "),
+        "{all}"
+    );
+    assert!(
+        all.contains(
+            "note: list refresh downloads over HTTPS from www.country-files.com and \
+             www.supercheckpartial.com (TCP port 443) while"
+        ),
+        "{all}"
+    );
+}
+
 #[test]
 fn check_binds_no_port_and_connects_to_no_receiver() {
     // Hold the three server ports: a bind attempt by check would fail

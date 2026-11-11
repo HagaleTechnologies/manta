@@ -16,8 +16,91 @@
 //! interval is the caller's clock, not the source's (each source keeps its
 //! own last-sample `Instant` and passes it in explicitly, so the helper
 //! itself stays free of any acquisition-clock or missing-sample arithmetic).
+//!
+//! MAN-533 adds the hard counterpart every live source shares: a stream
+//! that keeps reading -- frames arriving, a socket timing out, a device
+//! returning nothing -- without one usable sample for
+//! [`NO_USABLE_SAMPLES_AFTER`] gives its connection up with the typed
+//! [`NoUsableSamples`] error, which the reconnect layer recognises
+//! ([`is_no_usable_samples`]) and reopens. The window is measured as active
+//! read time ([`UsableSampleBudget`]), so a consumer parked away from
+//! `read()` spends none of it.
 
 use std::time::{Duration, Instant};
+
+/// MAN-533: how long a live source may keep reading -- frames arriving, a
+/// socket timing out, a device returning nothing -- without one usable
+/// sample before it gives the connection up with [`NoUsableSamples`].
+/// Longer than every soft report and silence bound, so a stream that
+/// paused reports through MAN-489's soft stall first.
+pub const NO_USABLE_SAMPLES_AFTER: Duration = Duration::from_secs(30);
+
+/// MAN-533: a live source's reads kept running for its bound without a
+/// usable sample. `Display` is the source's own message, unchanged; the
+/// type is what the reconnect layer recognises ([`is_no_usable_samples`]).
+#[derive(Debug)]
+pub struct NoUsableSamples {
+    detail: String,
+}
+
+impl NoUsableSamples {
+    /// Wrap the source's own message; it is shown verbatim.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NoUsableSamples {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for NoUsableSamples {}
+
+/// Whether `err`, or any cause under it, is [`NoUsableSamples`].
+pub fn is_no_usable_samples(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| cause.is::<NoUsableSamples>())
+}
+
+/// MAN-533: active read time spent with no usable sample since the last
+/// one (D1). Only time inside a receive loop is spent, so a consumer parked
+/// elsewhere spends nothing; a delivery refills it. Independent of the
+/// MAN-489 [`StallEpisode`] latch: a never-delivering stream spends it from
+/// open.
+#[derive(Debug)]
+pub(crate) struct UsableSampleBudget {
+    limit: Duration,
+    spent: Duration,
+}
+
+impl UsableSampleBudget {
+    pub(crate) fn new(limit: Duration) -> Self {
+        Self {
+            limit,
+            spent: Duration::ZERO,
+        }
+    }
+
+    /// Usable samples reached the source's output: refill the budget.
+    pub(crate) fn note_delivery(&mut self) {
+        self.spent = Duration::ZERO;
+    }
+
+    /// Spend `d` of active read time with no usable sample. Returns `true`
+    /// once the total spent since the last delivery reaches the limit.
+    pub(crate) fn spend(&mut self, d: Duration) -> bool {
+        self.spent = self.spent.saturating_add(d);
+        self.spent >= self.limit
+    }
+
+    /// The window this budget enforces, for the source's error message.
+    pub(crate) fn limit(&self) -> Duration {
+        self.limit
+    }
+}
 
 /// Default soft report deadline for network sources (Kiwi, both HPSDR
 /// protocols, audio): decision D3's 5 s held-call bound minus the 250 ms
@@ -217,5 +300,64 @@ mod tests {
         assert!(SOFT_STALL_AFTER < Duration::from_secs(5));
         // SoapySDR: 1 s soft, ahead of its ~2 s retry limit.
         assert!(Duration::from_secs(1) < Duration::from_millis(100 * 20));
+    }
+
+    #[test]
+    fn usable_sample_budget_is_not_spent_before_its_limit() {
+        let mut b = UsableSampleBudget::new(Duration::from_secs(30));
+        assert!(!b.spend(Duration::from_secs(29)));
+        assert!(!b.spend(Duration::from_millis(999)));
+    }
+
+    #[test]
+    fn usable_sample_budget_is_spent_at_its_limit() {
+        let mut b = UsableSampleBudget::new(Duration::from_secs(30));
+        assert!(!b.spend(Duration::from_secs(20)));
+        assert!(b.spend(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn a_delivery_refills_the_usable_sample_budget() {
+        let mut b = UsableSampleBudget::new(Duration::from_secs(30));
+        assert!(!b.spend(Duration::from_secs(29)));
+        b.note_delivery();
+        assert!(!b.spend(Duration::from_secs(29)));
+    }
+
+    /// D1: the budget is independent of the MAN-489 latch -- a soft report
+    /// neither refills nor pauses it, and a never-delivering stream spends it
+    /// from open.
+    #[test]
+    fn the_usable_sample_budget_ignores_the_soft_stall_latch() {
+        let mut b = UsableSampleBudget::new(Duration::from_secs(30));
+        let mut episode = StallEpisode::new(SOFT);
+        assert!(!b.spend(Duration::from_secs(10)));
+        episode.note_delivery();
+        episode.report();
+        assert!(episode.take());
+        assert!(b.spend(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn no_usable_samples_keeps_the_source_message_and_is_recognised_under_context() {
+        let err: anyhow::Error =
+            NoUsableSamples::new("KiwiSDR delivered no usable samples for 30 s").into();
+        assert_eq!(
+            err.to_string(),
+            "KiwiSDR delivered no usable samples for 30 s"
+        );
+        assert!(is_no_usable_samples(&err));
+        assert!(is_no_usable_samples(&err.context("decimating source")));
+        assert!(!is_no_usable_samples(&anyhow::anyhow!(
+            "KiwiSDR closed the connection"
+        )));
+    }
+
+    #[test]
+    fn the_no_usable_samples_window_exceeds_every_other_bound() {
+        assert_eq!(NO_USABLE_SAMPLES_AFTER, Duration::from_secs(30));
+        assert!(NO_USABLE_SAMPLES_AFTER > SOFT_STALL_AFTER);
+        assert!(NO_USABLE_SAMPLES_AFTER > Duration::from_millis(250 * 40)); // Kiwi / HPSDR p1 silence
+        assert!(NO_USABLE_SAMPLES_AFTER > Duration::from_secs(20)); // kiwi_stall_acceptance's pause gate
     }
 }

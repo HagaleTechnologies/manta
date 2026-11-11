@@ -452,3 +452,90 @@ async fn operator_get_status_sees_uplink_connection_state_and_counts() {
     assert_eq!(doc["uplink"]["sent_total"], 2);
     assert_eq!(doc["uplink"]["health"], "ok");
 }
+
+/// MAN-541 Scenario 2: a held RBN skew warning adds a `WARN rbn skew` line
+/// to `/healthz` over a real TCP connection, and the probe stays 200/`ok`;
+/// `/status` carries the `rbn_compare` object.
+#[tokio::test]
+async fn healthz_returns_200_ok_with_a_warn_line() {
+    use manta_server::rbn_compare::grade::{Grade, SpotGrade};
+    use std::time::Instant;
+    let metrics = Arc::new(Metrics::new());
+    metrics.set_source_health("kiwi", true);
+    metrics.set_listener_up("json", true);
+    metrics.enable_rbn_compare();
+    metrics.set_rbn_skew_warn_ppm(2.0);
+    // The 30-minute hold runs on the comparator's tick: start it 31 min
+    // in the past. A monotonic clock younger than that (a freshly booted
+    // runner) cannot hold an instant that early, so the WARN-line check
+    // below needs it; the hold itself is pinned by the synthetic-`Instant`
+    // unit tests in `metrics.rs`.
+    let started = Instant::now().checked_sub(Duration::from_secs(31 * 60));
+    let t0 = started.unwrap_or_else(Instant::now);
+    for _ in 0..40 {
+        metrics.record_rbn_grade_at(
+            &SpotGrade {
+                kind: "spotGrade",
+                seq: None,
+                spot_id: "W3XYZ-1:1:1:1:W1AW".to_string(),
+                call: "W1AW".to_string(),
+                band: "20m",
+                spot_time: 1_791_720_000,
+                window_close: 1_791_720_180,
+                window_s: 180,
+                grade: Grade::Match,
+                disagreements: Vec::new(),
+                manta_freq_hz: 14_025_042,
+                manta_wpm: Some(25),
+                rbn_modal_freq_hz: Some(14_025_000),
+                rbn_median_wpm: Some(24.0),
+                rbn_skimmers: 3,
+                rbn_reports: 3,
+                freq_offset_hz: Some(42),
+                rbn_bands: vec!["20m"],
+                spotter_filter: Vec::new(),
+                track_id: Some(1),
+            },
+            t0,
+        );
+    }
+    metrics.evaluate_rbn_skew_at(t0);
+    metrics.evaluate_rbn_skew();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let metrics2 = metrics.clone();
+    let limiter = manta_server::tasks::new_connection_limiter(
+        manta_server::metrics_http::MAX_METRICS_CONNECTIONS,
+    );
+    let ip_quota = manta_server::tasks::IpQuota::new(
+        manta_server::metrics_http::MAX_METRICS_CONNECTIONS_PER_IP,
+    );
+    tokio::spawn(async move {
+        manta_server::metrics_http::serve(
+            listener,
+            metrics2,
+            limiter,
+            ip_quota,
+            default_request_limiter(),
+        )
+        .await;
+    });
+
+    let (status, body) = get(addr, "/healthz").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "status: {status:?}");
+    assert!(body.starts_with("ok\n"), "body: {body}");
+    if started.is_some() {
+        let warn = body.lines().last().unwrap();
+        assert!(
+            warn.starts_with("WARN rbn skew 20m: +3.0 ppm for 31 min (median +42 Hz, 40 spots;"),
+            "body: {body}"
+        );
+    }
+    let (_, metrics_body) = get(addr, "/metrics").await;
+    assert!(metrics_body.contains("manta_healthy 1\n"), "{metrics_body}");
+    let (status, body) = get(addr, "/status").await;
+    assert!(status.starts_with("HTTP/1.1 200"), "status: {status:?}");
+    assert!(body.contains("\"rbn_compare\""), "body: {body}");
+    assert!(body.contains("\"median_ppm\": 2.995"), "body: {body}");
+}

@@ -29,6 +29,19 @@ with its type, labels and when it has samples.
   lines, otherwise — e.g. `source file: unhealthy`, `listener json: down`,
   `decode: stalled 12s`, or `decode: stopped` (the daemon has exited the
   decode loop and is draining shutdown).
+  A live source that keeps reading but delivers no usable sample for 30 s
+  is dropped and reconnected ([MAN-533](../DECISIONS/2026-11-09-man533-no-usable-samples-reconnect.md)),
+  so its `source <name>:` line turns `unhealthy` instead of the node
+  reporting only `decode: stalled`; `manta status`'s Sources table shows
+  the loss as `no usable samples`.
+
+- `WARN rbn skew <band>: ...` lines (MAN-541) may follow the checks in
+  either case, one per band whose RBN skew has stayed beyond
+  `[rbn_compare].skew_warn_ppm` for 30 minutes. They do not change the
+  verdict: the status code, the first line and `manta_healthy` are the
+  checks' alone, so `manta health` still exits 0 on an `ok` node with a
+  warning. [rbn-comparison.md](rbn-comparison.md#the-skew-reading-and-a-suggested-correction)
+  explains the reading.
 
 **The RBN uplink is deliberately not part of this verdict.** A dead uplink
 target does not make `/healthz` unhealthy — restarting a node that is
@@ -131,8 +144,10 @@ interval if you need an ongoing liveness check, not just a post-start one.)
   changes(manta_start_time_seconds[1h]) > 0
   ```
   `manta_build_info{git_sha="unknown"}` means the binary was built from a
-  context with no `.git` directory (e.g. a Docker build — `.dockerignore`
-  excludes `.git` on purpose) rather than a build failure.
+  context with no `.git` directory and no `MANTA_GIT_SHA`, rather than a
+  build failure. A local `docker build` without
+  `--build-arg MANTA_GIT_SHA=...` is one (`.dockerignore` excludes `.git` on
+  purpose); the published image passes the release commit and names it.
   `manta --version` on the host prints the same commit and feature list, and
   the same `unknown` caveat applies.
 - `manta_uplink_target_*{target="host:port"}` — every uplink counter now

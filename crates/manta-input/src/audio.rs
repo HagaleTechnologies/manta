@@ -13,22 +13,38 @@
 //! `center_freq_hz()` still reports `0.0` and downstream frequencies are
 //! bare baseband offsets.
 //!
-//! Live devices (`from_device`) sit behind coppa's non-blocking callback
-//! ring, where an empty read means "nothing captured yet", not end of
+//! Live devices (`from_device`) sit behind a non-blocking callback ring
+//! (MAN-530: manta's own capture-index-tagged ring in `audio_capture`),
+//! where an empty read means "nothing captured yet", not end of
 //! stream. `read` therefore waits for samples, and fails after
 //! `DEVICE_STALL_TIMEOUT` with an error naming the device, the rate and
 //! the likely cause, so the `IqSource` contract `0 = EOF` holds for every
 //! source (MAN-231, MAN-131). File-backed sources keep returning 0 at end
 //! of file.
+//!
+//! MAN-530: when the reader falls more than the ring's ~170 ms behind, the
+//! callback drops the newest frames. Each dropped frame is counted in
+//! `health_counters()` (`queue_dropped_samples`, one gap per contiguous
+//! loss episode) the moment it is dropped, and the hole is reported
+//! through the `IqSource` gap hooks on the first read that starts after
+//! it: a hole shorter than `AUDIO_DISCONTINUITY_FRAMES` as
+//! `take_missing_samples` plus `take_unknown_gap`, a longer one as
+//! `take_discontinuity`. A read never returns frames from both sides of a
+//! hole. The Hilbert state is kept across a short hole (its filter
+//! transient is the same tolerance MAN-202 accepts for unknown gaps) and
+//! restarted at a long one, which begins a fresh segment.
 
+use crate::audio_capture::{CaptureRing, CAPTURE_RING_FRAMES};
 use crate::devices::quoted_name;
-use crate::stall::{StallEpisode, SOFT_STALL_AFTER};
-use crate::IqSource;
+use crate::overflow::OVERFLOW_WARN_INTERVAL;
+use crate::stall::{NoUsableSamples, StallEpisode, SOFT_STALL_AFTER};
+use crate::{InputHealthCounters, IqSource};
 use anyhow::{anyhow, Context, Result};
 use coppa_audio::AudioSource;
 use manta_dsp::hilbert::HilbertTransformer;
 use num_complex::Complex32;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Fixed target sample rate for M1 audio decode: 48000 / 93.75 = 512 (a
@@ -65,8 +81,9 @@ pub const AUDIO_PASSBAND_HI_HZ: f64 = 3_000.0;
 /// delivering device each read returns within one callback period.
 pub const DEVICE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// Sleep between polls of an empty capture ring (matches `manta check`).
-/// The ring holds 8192 samples, ~170 ms at 48 kHz, so a 10 ms poll cannot
-/// let it overflow.
+/// The poll only paces an empty ring: the ring holds 8192 samples, ~170 ms
+/// at 48 kHz, and overflows whenever the decode thread itself falls that
+/// far behind -- counted and reported as a gap since MAN-530.
 const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// Exact-zero samples from open before the digital-silence notice fires:
 /// two seconds, the length of `listen`'s startup window.
@@ -75,6 +92,17 @@ const SILENCE_NOTICE_SAMPLES: u64 = 2 * TARGET_RATE_HZ as u64;
 /// Called at most once per opened device, with its quoted name. See
 /// `AudioIqSource::with_silence_notice`.
 pub type SilenceNotice = Box<dyn FnOnce(&str) + Send>;
+
+/// MAN-530: called with the device's quoted name when the capture ring has
+/// dropped frames, at most once per `OVERFLOW_WARN_INTERVAL` per opened
+/// source. See `AudioIqSource::with_overrun_notice`.
+pub type OverrunNotice = Box<dyn Fn(&str) + Send + Sync>;
+
+/// MAN-530: a capture hole at least this long (0.5 s at 48 kHz) is reported
+/// as `take_discontinuity`, a fresh segment; a shorter one as
+/// `take_missing_samples` plus `take_unknown_gap`, a clock advance and a
+/// continuity reset. The half-second line HPSDR protocol 2 draws too.
+pub const AUDIO_DISCONTINUITY_FRAMES: u64 = TARGET_RATE_HZ as u64 / 2;
 
 /// What a live audio input most likely needs checked when it fails to open
 /// or delivers nothing (MAN-131). macOS denies microphone access silently
@@ -130,21 +158,35 @@ fn wrong_rate(label: &str, native: u32) -> anyhow::Error {
     )
 }
 
-/// A live device delivered nothing for `waited`.
+/// A live device delivered nothing for `waited`. Typed as
+/// [`NoUsableSamples`] (MAN-533 D4) so the reconnect layer reports it as
+/// `no usable samples`; the text is unchanged.
 fn no_samples(label: &str, waited: Duration) -> anyhow::Error {
-    anyhow!(
+    NoUsableSamples::new(format!(
         "audio input {label} delivered no samples in {} s at {TARGET_RATE_HZ} Hz -- {}",
         waited.as_secs_f64(),
         audio_input_hint()
-    )
+    ))
+    .into()
 }
 
-/// A capture device behind a non-blocking callback ring (coppa's
-/// `CpalSource`): `read` must wait for samples, because an empty ring is
-/// not end of stream.
+/// A capture device behind a non-blocking callback ring (MAN-530's tagged
+/// `audio_capture` ring): `read` must wait for samples, because an empty
+/// ring is not end of stream.
 struct LiveDevice {
     /// The device's name as `manta devices` spells it (quoted).
     label: String,
+    /// Where samples come from: the tagged capture ring in production.
+    ring: Box<dyn CaptureRing>,
+    /// Keeps the cpal stream's owner thread alive; `None` in tests.
+    _stream: Option<crate::audio_capture::CaptureStream>,
+    /// MAN-530: capture-ring loss totals, shared with the callback.
+    health: Option<Arc<InputHealthCounters>>,
+    /// MAN-530: per-read gap reports for the hole before the last read.
+    gap: PendingGap,
+    /// MAN-530: rate-limited operator notice on capture-ring loss.
+    overrun_notice: Option<OverrunNotice>,
+    overrun_watch: OverrunWatch,
     stall_timeout: Duration,
     /// Armed until it fires or a non-zero sample arrives.
     silence_notice: Option<SilenceNotice>,
@@ -161,7 +203,83 @@ struct LiveDevice {
     last_delivery: Instant,
 }
 
+/// MAN-530: the gap reports one read left pending, each drained once.
+#[derive(Debug, Default)]
+struct PendingGap {
+    discontinuity: Option<u64>,
+    missing: Option<u64>,
+    unknown: bool,
+    /// The current read starts a fresh segment: restart the Hilbert
+    /// filter so no pre-hole audio leaks into it. Drained by `read`.
+    restart_filter: bool,
+}
+
+impl PendingGap {
+    /// Record a hole of `missing` frames immediately before the samples
+    /// the current read returns. Below the threshold: known count plus an
+    /// unknown-gap continuity reset (MAN-202 decision 7); at or above it: a
+    /// discontinuity only. A hole an earlier read left untaken is added in,
+    /// so a caller that skips a take never loses clock time.
+    fn note_hole(&mut self, missing: u64) {
+        if missing == 0 {
+            return;
+        }
+        let total = missing
+            .saturating_add(self.missing.take().unwrap_or(0))
+            .saturating_add(self.discontinuity.take().unwrap_or(0));
+        if total >= AUDIO_DISCONTINUITY_FRAMES {
+            self.discontinuity = Some(total);
+            self.unknown = false;
+            self.restart_filter = true;
+        } else {
+            self.missing = Some(total);
+            self.unknown = true;
+        }
+    }
+}
+
+/// MAN-530: decides when the overrun notice fires. Separate from gap
+/// delivery: counters can grow while a read still returns pre-hole audio.
+#[derive(Debug, Default)]
+struct OverrunWatch {
+    /// `queue_dropped_samples` when last observed.
+    seen: u64,
+    last_warn: Option<Instant>,
+}
+
+impl OverrunWatch {
+    /// `true` when the dropped total grew since the last observation and
+    /// the once-per-`OVERFLOW_WARN_INTERVAL` gate is open.
+    fn due(&mut self, dropped: u64, now: Instant) -> bool {
+        if dropped <= self.seen {
+            return false;
+        }
+        self.seen = dropped;
+        let open = self
+            .last_warn
+            .is_none_or(|last| now.duration_since(last) >= OVERFLOW_WARN_INTERVAL);
+        if open {
+            self.last_warn = Some(now);
+        }
+        open
+    }
+}
+
 impl LiveDevice {
+    /// MAN-530: fire the overrun notice if the ring dropped frames since
+    /// the last look and the rate limit allows.
+    fn watch_for_overrun(&mut self) {
+        let (Some(health), Some(notice)) = (&self.health, &self.overrun_notice) else {
+            return;
+        };
+        if self
+            .overrun_watch
+            .due(health.queue_dropped_samples(), Instant::now())
+        {
+            notice(&self.label);
+        }
+    }
+
     /// Fire the silence notice once `SILENCE_NOTICE_SAMPLES` exact zeros
     /// have arrived since open; disarm it on the first non-zero sample.
     fn watch_for_silence(&mut self, samples: &[f32]) {
@@ -184,7 +302,9 @@ impl LiveDevice {
 /// A real audio source (device or file) converted to analytic Complex32,
 /// implementing IqSource. ARCHITECTURE §3 "Audio passband" input.
 pub struct AudioIqSource {
-    src: Box<dyn AudioSource>,
+    /// The file-backed source; `None` for a live device, which reads
+    /// `live.ring` instead.
+    src: Option<Box<dyn AudioSource>>,
     hilbert: HilbertTransformer,
     /// Operator-supplied RF dial frequency this audio passband sits on, Hz.
     /// `0.0` = no RF reference supplied: reported frequencies are baseband
@@ -207,7 +327,7 @@ impl AudioIqSource {
             ));
         }
         Ok(AudioIqSource {
-            src,
+            src: Some(src),
             hilbert: HilbertTransformer::new(),
             center_freq_hz: 0.0,
             live: None,
@@ -220,23 +340,33 @@ impl AudioIqSource {
     /// `acquisition_start_offset` is how long the open took before the
     /// device was started (MAN-259).
     fn live(
-        src: Box<dyn AudioSource>,
+        ring: Box<dyn CaptureRing>,
         label: String,
         stall_timeout: Duration,
         acquisition_start_offset: Duration,
-    ) -> Result<Self> {
-        let mut source = Self::new(src)?;
-        source.acquisition_start_offset = acquisition_start_offset;
-        source.live = Some(LiveDevice {
-            label,
-            stall_timeout,
-            silence_notice: None,
-            zero_samples: 0,
-            stall: StallEpisode::new(SOFT_STALL_AFTER),
-            waiting_since: None,
-            last_delivery: Instant::now(),
-        });
-        Ok(source)
+        health: Option<Arc<InputHealthCounters>>,
+    ) -> Self {
+        AudioIqSource {
+            src: None,
+            hilbert: HilbertTransformer::new(),
+            center_freq_hz: 0.0,
+            acquisition_start_offset,
+            live: Some(LiveDevice {
+                label,
+                ring,
+                _stream: None,
+                health,
+                gap: PendingGap::default(),
+                overrun_notice: None,
+                overrun_watch: OverrunWatch::default(),
+                stall_timeout,
+                silence_notice: None,
+                zero_samples: 0,
+                stall: StallEpisode::new(SOFT_STALL_AFTER),
+                waiting_since: None,
+                last_delivery: Instant::now(),
+            }),
+        }
     }
 
     /// Call `notice` once, with the device's quoted name, if the first two
@@ -246,6 +376,18 @@ impl AudioIqSource {
     pub fn with_silence_notice(mut self, notice: SilenceNotice) -> Self {
         if let Some(live) = &mut self.live {
             live.silence_notice = Some(notice);
+        }
+        self
+    }
+
+    /// MAN-530: call `notice`, with the device's safely quoted name, when
+    /// the capture ring has dropped frames because the decode thread fell
+    /// behind: on the first observed loss, then at most once per 60 s. It
+    /// runs on the reading thread, possibly while that read still returns
+    /// audio from before the hole. A no-op for file-backed sources.
+    pub fn with_overrun_notice(mut self, notice: OverrunNotice) -> Self {
+        if let Some(live) = &mut self.live {
+            live.overrun_notice = Some(notice);
         }
         self
     }
@@ -285,42 +427,29 @@ impl AudioIqSource {
     /// to check next (MAN-131). The returned source is live: `read` waits
     /// for samples and fails after `DEVICE_STALL_TIMEOUT` of none (MAN-231).
     pub fn from_device(name: Option<&str>) -> Result<Self> {
-        use cpal::traits::{DeviceTrait, HostTrait};
         let entered = Instant::now();
-        let device = match name {
-            Some(n) => {
-                coppa_audio::find_input_device_by_name(n).ok_or_else(|| no_matching_input(n))?
-            }
-            None => cpal::default_host()
-                .default_input_device()
-                .ok_or_else(no_default_input)?,
-        };
-        let label = match device.description() {
-            Ok(description) => quoted_name(description.name()),
-            Err(_) => match name {
-                Some(n) => format!("matching {}", quoted_name(n)),
-                None => "(system default)".to_string(),
-            },
-        };
-        let native_rate = device
-            .default_input_config()
-            .context("query its default input config")
-            .map_err(|e| did_not_open(&label, &e))?
-            .sample_rate();
-        if native_rate != TARGET_RATE_HZ {
-            return Err(wrong_rate(&label, native_rate));
-        }
-        let mut cpal_src = coppa_audio::CpalSource::from_device(device, native_rate, 8192)
-            .map_err(|e| did_not_open(&label, &e))?;
-        // MAN-259: the capture ring fills from `start` on.
-        let acquisition_start_offset = entered.elapsed();
-        cpal_src.start().map_err(|e| did_not_open(&label, &e))?;
-        AudioIqSource::live(
-            Box::new(cpal_src),
-            label,
+        let health = Arc::new(InputHealthCounters::new());
+        let name = name.map(str::to_owned);
+        // MAN-530: device lookup, stream build/play and stream teardown all
+        // run on the capture owner thread; only the name, the health Arc,
+        // the ring consumer and the startup result cross threads.
+        let opened = crate::audio_capture::spawn_owner(
+            CAPTURE_RING_FRAMES,
+            Arc::clone(&health),
+            entered,
+            move |producer, entered| open_capture_stream(name.as_deref(), producer, entered),
+        )?;
+        let mut source = AudioIqSource::live(
+            Box::new(opened.consumer),
+            opened.label,
             DEVICE_STALL_TIMEOUT,
-            acquisition_start_offset,
-        )
+            opened.acquisition_start_offset,
+            Some(health),
+        );
+        if let Some(live) = &mut source.live {
+            live._stream = Some(opened.stream);
+        }
+        Ok(source)
     }
 
     /// Open a WAV file, replayed as an audio source (soak harness / `listen
@@ -329,6 +458,62 @@ impl AudioIqSource {
         let wav_src = coppa_audio::WavSource::open(path)?;
         AudioIqSource::new(Box::new(wav_src))
     }
+}
+
+/// MAN-530: runs on the capture owner thread. Find the input, check its
+/// rate, then build and play a 48 kHz mono f32 stream whose callback feeds
+/// `producer`. Every failure names the device, states the 48000 Hz
+/// requirement and says what to check next (MAN-131). Returns the playing
+/// stream (destroyed later on this same thread), the device label and the
+/// open time up to `play` (MAN-259).
+fn open_capture_stream(
+    name: Option<&str>,
+    mut producer: crate::audio_capture::CaptureProducer,
+    entered: Instant,
+) -> Result<(cpal::Stream, String, Duration)> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let device = match name {
+        Some(n) => coppa_audio::find_input_device_by_name(n).ok_or_else(|| no_matching_input(n))?,
+        None => cpal::default_host()
+            .default_input_device()
+            .ok_or_else(no_default_input)?,
+    };
+    let label = match device.description() {
+        Ok(description) => quoted_name(description.name()),
+        Err(_) => match name {
+            Some(n) => format!("matching {}", quoted_name(n)),
+            None => "(system default)".to_string(),
+        },
+    };
+    let native_rate = device
+        .default_input_config()
+        .context("query its default input config")
+        .map_err(|e| did_not_open(&label, &e))?
+        .sample_rate();
+    if native_rate != TARGET_RATE_HZ {
+        return Err(wrong_rate(&label, native_rate));
+    }
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: native_rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let stream = device
+        .build_input_stream(
+            config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| producer.write(data),
+            |err| eprintln!("CPAL input error: {err}"),
+            None,
+        )
+        .map_err(|e| anyhow!("Failed to build input stream: {e}"))
+        .map_err(|e| did_not_open(&label, &e))?;
+    // MAN-259: the capture ring fills from `play` on.
+    let acquisition_start_offset = entered.elapsed();
+    stream
+        .play()
+        .map_err(|e| anyhow!("Failed to start input stream: {e}"))
+        .map_err(|e| did_not_open(&label, &e))?;
+    Ok((stream, label, acquisition_start_offset))
 }
 
 impl IqSource for AudioIqSource {
@@ -363,6 +548,12 @@ impl IqSource for AudioIqSource {
             return Ok(0);
         }
         if let Some(live) = &mut self.live {
+            // MAN-530: a long hole starts a fresh segment; its first
+            // analytic samples must not mix in audio from before it. A
+            // short hole keeps the filter (MAN-202's transient tolerance).
+            if std::mem::take(&mut live.gap.restart_filter) {
+                self.hilbert = HilbertTransformer::new();
+            }
             live.watch_for_silence(&real[..got]);
         }
         let analytic = self.hilbert.process(&real[..got]);
@@ -376,6 +567,34 @@ impl IqSource for AudioIqSource {
     fn take_stalled(&mut self) -> bool {
         self.live.as_mut().is_some_and(|live| live.stall.take())
     }
+
+    /// MAN-530: a capture hole of `AUDIO_DISCONTINUITY_FRAMES` or more
+    /// immediately before the last read's samples. Live devices only.
+    fn take_discontinuity(&mut self) -> Option<u64> {
+        self.live
+            .as_mut()
+            .and_then(|live| live.gap.discontinuity.take())
+    }
+
+    /// MAN-530: the exact length of a shorter capture hole immediately
+    /// before the last read's samples, paired with `take_unknown_gap`.
+    fn take_missing_samples(&mut self) -> Option<u64> {
+        self.live.as_mut().and_then(|live| live.gap.missing.take())
+    }
+
+    /// MAN-530: `true` with a short capture hole's `take_missing_samples`,
+    /// so the engine resets continuity-dependent decode state at the hole
+    /// as well as advancing its clock.
+    fn take_unknown_gap(&mut self) -> bool {
+        self.live
+            .as_mut()
+            .is_some_and(|live| std::mem::take(&mut live.gap.unknown))
+    }
+
+    /// MAN-530: live capture-ring loss totals. `None` for files.
+    fn health_counters(&self) -> Option<Arc<InputHealthCounters>> {
+        self.live.as_ref().and_then(|live| live.health.clone())
+    }
 }
 
 impl AudioIqSource {
@@ -386,14 +605,22 @@ impl AudioIqSource {
     /// after its stall timeout. An empty request never waits.
     fn read_real(&mut self, real: &mut [f32]) -> Result<usize> {
         let Some(live) = &mut self.live else {
-            return self.src.read(real);
+            return match &mut self.src {
+                Some(src) => src.read(real),
+                None => Ok(0),
+            };
         };
         if real.is_empty() {
             return Ok(0);
         }
         loop {
-            let got = self.src.read(real)?;
+            let run = live.ring.read_run(real)?;
+            live.watch_for_overrun();
+            let got = run.got;
             if got > 0 {
+                // MAN-530: the run starts after `run.missing` lost frames;
+                // it never extends past a later hole.
+                live.gap.note_hole(run.missing);
                 // Delivery -- zero-valued samples included -- re-arms the
                 // episode and ends any wait episode, so the hard bound
                 // measures only genuine silence.
@@ -424,8 +651,9 @@ impl AudioIqSource {
 mod tests {
 
     use super::*;
+    use crate::audio_capture::{capture_ring, CaptureProducer, CaptureRead};
     use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
     /// A fake capture ring with the semantics of coppa's `CpalSource`: each
     /// read pops the next `(count, value)` (count 0 = empty ring) and fills
@@ -464,6 +692,15 @@ mod tests {
         }
     }
 
+    impl CaptureRing for ScriptedRing {
+        fn read_run(&mut self, out: &mut [f32]) -> Result<CaptureRead> {
+            Ok(CaptureRead {
+                got: AudioSource::read(self, out)?,
+                missing: 0,
+            })
+        }
+    }
+
     fn scripted(script: &[(usize, f32)], stall: Duration) -> AudioIqSource {
         let (aiq, _feeder) = scripted_ring(script, stall);
         aiq
@@ -484,8 +721,8 @@ mod tests {
                 "\"Test Mic\"".to_string(),
                 stall,
                 Duration::ZERO,
-            )
-            .unwrap(),
+                None,
+            ),
             feeder,
         )
     }
@@ -570,7 +807,10 @@ mod tests {
         assert_eq!(aiq.read(&mut buf).unwrap(), 256);
         assert_eq!(aiq.read(&mut buf).unwrap(), 0);
         assert!(aiq.take_stalled());
-        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        let err = aiq.read(&mut buf).unwrap_err();
+        // MAN-533 D4: the device-loss bound carries the shared type.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(err.contains("delivered no samples in 0.3 s"), "{err}");
     }
 
@@ -592,8 +832,12 @@ mod tests {
         let mut aiq = scripted(&[], stall);
         let mut buf = vec![Complex32::new(0.0, 0.0); 1024];
         let started = Instant::now();
-        let err = aiq.read(&mut buf).unwrap_err().to_string();
+        let err = aiq.read(&mut buf).unwrap_err();
         let elapsed = started.elapsed();
+        // MAN-533 scenario 2 (audio): reads succeed with nothing, and the
+        // bound ends in the shared type the reconnect layer reopens on.
+        assert!(crate::is_no_usable_samples(&err), "{err:#}");
+        let err = err.to_string();
         assert!(
             err.contains("delivered no samples in 0.05 s at 48000 Hz"),
             "{err}"
@@ -826,5 +1070,318 @@ mod tests {
             aiq.analytic_guard_hz(),
             manta_dsp::hilbert::hilbert_guard_hz(48_000.0)
         );
+    }
+
+    // ---- MAN-530: capture-ring overruns ----
+
+    /// A live source over the production tagged ring, plus the producer a
+    /// test drives as the capture callback and the shared counters.
+    fn tagged_live(stall: Duration) -> (AudioIqSource, CaptureProducer, Arc<InputHealthCounters>) {
+        tagged_live_with(CAPTURE_RING_FRAMES, stall)
+    }
+
+    fn tagged_live_with(
+        capacity: usize,
+        stall: Duration,
+    ) -> (AudioIqSource, CaptureProducer, Arc<InputHealthCounters>) {
+        let health = Arc::new(InputHealthCounters::new());
+        let (producer, consumer) = capture_ring(capacity, 0, Arc::clone(&health));
+        let aiq = AudioIqSource::live(
+            Box::new(consumer),
+            "\"USB \\\"Audio\\\"\"".to_string(),
+            stall,
+            Duration::ZERO,
+            Some(Arc::clone(&health)),
+        );
+        (aiq, producer, health)
+    }
+
+    /// Capture frames `from..from + n` in 480-frame (10 ms) callbacks;
+    /// each frame's value encodes its capture index.
+    fn capture(p: &mut CaptureProducer, from: usize, n: usize) {
+        let frames: Vec<f32> = (from..from + n)
+            .map(|i| (i % 1000) as f32 / 1000.0 + 0.001)
+            .collect();
+        for chunk in frames.chunks(480) {
+            p.write(chunk);
+        }
+    }
+
+    /// One read's length and the three hooks it left pending.
+    fn read_with_hooks(
+        aiq: &mut AudioIqSource,
+        want: usize,
+    ) -> (usize, Option<u64>, Option<u64>, bool) {
+        let mut buf = vec![Complex32::new(0.0, 0.0); want];
+        let got = aiq.read(&mut buf).unwrap();
+        (
+            got,
+            aiq.take_discontinuity(),
+            aiq.take_missing_samples(),
+            aiq.take_unknown_gap(),
+        )
+    }
+
+    /// Discontinuity, missing count and unknown-gap flag one read left.
+    type Hooks = (Option<u64>, Option<u64>, bool);
+
+    /// Park the reader while `parked_total` frames are captured (all but
+    /// the first ring's worth are lost), then read with the cycling
+    /// `request` sizes, resuming capture once the first read freed room.
+    /// Returns the frames read before the hole, the hooks the first
+    /// post-hole read left, and the counters.
+    fn park_and_resume(
+        parked_total: usize,
+        request: &[usize],
+    ) -> (usize, Hooks, Arc<InputHealthCounters>) {
+        let (mut aiq, mut p, health) = tagged_live(Duration::from_secs(1));
+        capture(&mut p, 0, parked_total);
+        let mut pre = 0;
+        let mut i = 0;
+        loop {
+            let want = request[i % request.len()];
+            i += 1;
+            let (got, disc, miss, unknown) = read_with_hooks(&mut aiq, want);
+            assert!(got <= want);
+            if i == 1 {
+                // Capture resumes into the room the first read freed, so
+                // the hole is exactly `parked_total - CAPTURE_RING_FRAMES`.
+                capture(&mut p, parked_total, got.min(480));
+            }
+            if pre < CAPTURE_RING_FRAMES {
+                // Pre-hole reads never carry a hook, whatever the counters say.
+                assert_eq!(
+                    (disc, miss, unknown),
+                    (None, None, false),
+                    "read {i} before the hole"
+                );
+                pre += got;
+                assert!(pre <= CAPTURE_RING_FRAMES, "a read straddled the hole");
+                continue;
+            }
+            return (pre, (disc, miss, unknown), health);
+        }
+    }
+
+    #[test]
+    fn a_500_ms_park_reports_15808_missing_at_the_first_post_hole_sample() {
+        for request in [
+            &[1usize, 4096, 4096][..],
+            &[2048],
+            &[4096],
+            &[1000, 3, 4096, 517],
+        ] {
+            let (pre, hooks, health) = park_and_resume(24_000, request);
+            assert_eq!(pre, CAPTURE_RING_FRAMES, "request {request:?}");
+            assert_eq!(hooks, (None, Some(15_808), true), "request {request:?}");
+            assert_eq!(health.queue_dropped_samples(), 15_808);
+            assert_eq!(health.gaps_detected(), 1);
+            assert_eq!(health.dropped_packets(), 0);
+            assert_eq!(health.malformed_packets(), 0);
+        }
+    }
+
+    #[test]
+    fn single_frame_reads_still_stop_at_the_hole() {
+        let (mut aiq, mut p, _health) = tagged_live(Duration::from_secs(1));
+        capture(&mut p, 0, CAPTURE_RING_FRAMES + 10);
+        assert_eq!(read_with_hooks(&mut aiq, 1), (1, None, None, false));
+        capture(&mut p, CAPTURE_RING_FRAMES + 10, 1);
+        for n in 1..CAPTURE_RING_FRAMES {
+            assert_eq!(
+                read_with_hooks(&mut aiq, 1),
+                (1, None, None, false),
+                "frame {n}"
+            );
+        }
+        assert_eq!(read_with_hooks(&mut aiq, 1), (1, None, Some(10), true));
+        assert_eq!(aiq.take_missing_samples(), None);
+    }
+
+    #[test]
+    fn the_discontinuity_threshold_is_half_a_second() {
+        for (hole, expected) in [
+            (23_999u64, (None, Some(23_999), true)),
+            (24_000, (Some(24_000), None, false)),
+            (24_001, (Some(24_001), None, false)),
+        ] {
+            let parked = CAPTURE_RING_FRAMES + hole as usize;
+            let (pre, hooks, health) = park_and_resume(parked, &[4096]);
+            assert_eq!(pre, CAPTURE_RING_FRAMES);
+            assert_eq!(hooks, expected, "hole {hole}");
+            assert_eq!(health.queue_dropped_samples(), hole);
+        }
+    }
+
+    #[test]
+    fn hooks_drain_once_and_holes_never_share_a_buffer() {
+        let (mut aiq, mut p, health) = tagged_live(Duration::from_secs(1));
+        capture(&mut p, 0, CAPTURE_RING_FRAMES + 100);
+        assert_eq!(read_with_hooks(&mut aiq, 8192).0, 8192);
+        capture(&mut p, 8292, 300); // accepted
+        capture(&mut p, 8592, CAPTURE_RING_FRAMES); // fills, then partly lost
+                                                    // 300 + 7892 contiguous frames after a 100-frame hole; the other
+                                                    // 300 offered frames were lost, a second episode.
+        let (got, disc, miss, unknown) = read_with_hooks(&mut aiq, 100_000);
+        assert_eq!(
+            (got, disc, miss, unknown),
+            (CAPTURE_RING_FRAMES, None, Some(100), true)
+        );
+        // Drained: a second take reports nothing.
+        assert_eq!(aiq.take_missing_samples(), None);
+        assert!(!aiq.take_unknown_gap());
+        assert_eq!(aiq.take_discontinuity(), None);
+        assert_eq!(health.gaps_detected(), 2);
+        assert_eq!(health.queue_dropped_samples(), 400);
+        capture(&mut p, 8592 + CAPTURE_RING_FRAMES, 10);
+        let (got, disc, miss, unknown) = read_with_hooks(&mut aiq, 100_000);
+        assert_eq!((got, disc, miss, unknown), (10, None, Some(300), true));
+    }
+
+    #[test]
+    fn an_empty_request_consumes_no_pending_marker() {
+        let (mut aiq, mut p, _health) = tagged_live(Duration::from_secs(1));
+        capture(&mut p, 0, CAPTURE_RING_FRAMES + 50);
+        assert_eq!(read_with_hooks(&mut aiq, 8192).0, 8192);
+        capture(&mut p, CAPTURE_RING_FRAMES + 50, 20);
+        assert_eq!(read_with_hooks(&mut aiq, 0), (0, None, None, false));
+        assert_eq!(read_with_hooks(&mut aiq, 64), (20, None, Some(50), true));
+    }
+
+    #[test]
+    fn an_overrun_live_ring_still_soft_stalls_and_hard_fails() {
+        let (mut aiq, mut p, health) = tagged_live(Duration::from_millis(300));
+        capture(&mut p, 0, CAPTURE_RING_FRAMES + 480);
+        assert_eq!(read_with_hooks(&mut aiq, 8192).0, 8192);
+        assert_eq!(health.queue_dropped_samples(), 480);
+        // Capture stops: the empty ring is a stall, never EOF-with-a-hook.
+        let mut buf = vec![Complex32::new(0.0, 0.0); 64];
+        let started = Instant::now();
+        loop {
+            match aiq.read(&mut buf) {
+                Ok(0) => {
+                    assert!(aiq.take_stalled() || started.elapsed() < Duration::from_secs(2));
+                    assert_eq!(aiq.take_missing_samples(), None);
+                }
+                Ok(n) => panic!("read {n} from an empty ring"),
+                Err(e) => {
+                    assert!(e.to_string().contains("delivered no samples"), "{e:#}");
+                    break;
+                }
+            }
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[test]
+    fn health_counters_exist_only_for_live_audio() {
+        let (aiq, _p, health) = tagged_live(Duration::from_secs(1));
+        let shared = aiq.health_counters().expect("live audio has counters");
+        assert!(Arc::ptr_eq(&shared, &health));
+        assert_eq!(shared.queue_dropped_samples(), 0);
+        let file = AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.1; 16],
+            TARGET_RATE_HZ,
+        )))
+        .unwrap();
+        assert!(file.health_counters().is_none());
+    }
+
+    fn recording_overrun() -> (OverrunNotice, Arc<Mutex<Vec<String>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        (
+            Box::new(move |label: &str| sink.lock().unwrap().push(label.to_string())),
+            seen,
+        )
+    }
+
+    #[test]
+    fn the_overrun_notice_fires_once_with_the_quoted_label() {
+        let (aiq, mut p, _health) = tagged_live(Duration::from_secs(1));
+        let (notice, seen) = recording_overrun();
+        let mut aiq = aiq.with_overrun_notice(notice);
+        capture(&mut p, 0, 4096);
+        let _ = read_with_hooks(&mut aiq, 1024);
+        assert!(seen.lock().unwrap().is_empty(), "no loss, no notice");
+        capture(&mut p, 4096, 24_000);
+        // Warns while still returning pre-hole audio.
+        let (got, disc, miss, unknown) = read_with_hooks(&mut aiq, 1024);
+        assert_eq!((got, disc, miss, unknown), (1024, None, None, false));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["\"USB \\\"Audio\\\"\"".to_string()]
+        );
+        let _ = read_with_hooks(&mut aiq, 1024);
+        capture(&mut p, 28_096, 24_000);
+        let _ = read_with_hooks(&mut aiq, 1024);
+        assert_eq!(seen.lock().unwrap().len(), 1, "rate-limited");
+    }
+
+    #[test]
+    fn the_overrun_gate_opens_once_per_60_seconds_on_growth_only() {
+        let mut watch = OverrunWatch::default();
+        let t0 = Instant::now();
+        assert!(!watch.due(0, t0), "a clean input never warns");
+        assert!(watch.due(10, t0));
+        assert!(
+            !watch.due(10, t0 + Duration::from_secs(120)),
+            "no growth, no warning"
+        );
+        assert!(!watch.due(20, t0 + Duration::from_secs(59)));
+        assert!(watch.due(30, t0 + Duration::from_secs(60)));
+        assert!(!watch.due(40, t0 + Duration::from_secs(61)));
+    }
+
+    #[test]
+    fn a_file_backed_source_ignores_an_overrun_notice() {
+        let (notice, seen) = recording_overrun();
+        let mut aiq = AudioIqSource::new(Box::new(coppa_audio::WavSource::from_samples(
+            vec![0.1; 64],
+            TARGET_RATE_HZ,
+        )))
+        .unwrap()
+        .with_overrun_notice(notice);
+        let mut buf = vec![Complex32::new(0.0, 0.0); 128];
+        assert_eq!(aiq.read(&mut buf).unwrap(), 64);
+        assert_eq!(aiq.read(&mut buf).unwrap(), 0);
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(aiq.take_missing_samples(), None);
+        assert!(!aiq.take_unknown_gap());
+        assert_eq!(aiq.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn untaken_holes_accumulate_instead_of_being_overwritten() {
+        let (mut aiq, mut p, _health) = tagged_live_with(4, Duration::from_secs(1));
+        let mut buf = vec![Complex32::new(0.0, 0.0); 8];
+        capture(&mut p, 0, 4 + 10); // 10 lost
+        assert_eq!(aiq.read(&mut buf).unwrap(), 4);
+        capture(&mut p, 14, 4 + 20); // 4 accepted, 20 lost
+        assert_eq!(aiq.read(&mut buf).unwrap(), 4); // after the 10-frame hole, not taken
+        capture(&mut p, 38, 1);
+        assert_eq!(aiq.read(&mut buf).unwrap(), 1); // after the 20-frame hole
+        assert_eq!(aiq.take_missing_samples(), Some(30));
+        assert!(aiq.take_unknown_gap());
+        assert_eq!(aiq.take_discontinuity(), None);
+    }
+
+    #[test]
+    fn a_long_hole_restarts_the_hilbert_filter_but_a_short_one_does_not() {
+        let value = |i: usize| (i % 1000) as f32 / 1000.0 + 0.001;
+        for (hole, restarted) in [(24_000usize, true), (100, false)] {
+            let (mut aiq, mut p, _health) = tagged_live(Duration::from_secs(1));
+            capture(&mut p, 0, CAPTURE_RING_FRAMES + hole);
+            let mut buf = vec![Complex32::new(0.0, 0.0); CAPTURE_RING_FRAMES];
+            assert_eq!(aiq.read(&mut buf).unwrap(), CAPTURE_RING_FRAMES);
+            let resume = CAPTURE_RING_FRAMES + hole;
+            capture(&mut p, resume, 480);
+            let mut post = vec![Complex32::new(0.0, 0.0); 480];
+            assert_eq!(aiq.read(&mut post).unwrap(), 480);
+            let real: Vec<f32> = (resume..resume + 480).map(value).collect();
+            let fresh = HilbertTransformer::new().process(&real);
+            let same = post.iter().zip(&fresh).all(|(a, b)| (a - b).norm() < 1e-6);
+            assert_eq!(same, restarted, "hole {hole}");
+        }
     }
 }

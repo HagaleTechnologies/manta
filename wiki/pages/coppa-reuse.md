@@ -27,4 +27,4 @@ manta consumes DSP building blocks from the sibling coppa repo rather than reimp
 
 ## Gotcha
 
-The single reuse mistake to avoid: assuming "FIR design → coppa-dsp::filter". The PFB prototype is new code (SPEC §10.1, and ARCHITECTURE §2's table now says so); only `FftProcessor` reuse stands. cross-repo references (coppa module names) are plain text here by design — never `[[...]]`.
+The single reuse mistake to avoid: assuming "FIR design → coppa-dsp::filter". The PFB prototype is new code (SPEC §10.1, and ARCHITECTURE §2's table now says so); only the `FftProcessor` plan reuse stands (the channelizer runs it in place, MAN-117). cross-repo references (coppa module names) are plain text here by design — never `[[...]]`.

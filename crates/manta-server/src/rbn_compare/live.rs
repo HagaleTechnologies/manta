@@ -226,6 +226,9 @@ async fn run_ticks(
                 };
                 emit(&grades, &bus, &metrics);
                 metrics.set_rbn_pending(pending);
+                // MAN-541: the skew warning's 30-minute hold advances on
+                // this tick, not on a scrape.
+                metrics.evaluate_rbn_skew();
             }
         }
     }
@@ -290,6 +293,7 @@ mod tests {
                 time: 0,
                 freq_hz: 14_025_000,
                 wpm: Some(20),
+                track_id: None,
             });
             // The next tick fires, and shutdown lands, before the next poll.
             tokio::time::advance(Duration::from_secs(1)).await;
@@ -304,5 +308,62 @@ mod tests {
             );
             assert_eq!(lock(&grader).pending(), 1, "round {round}");
         }
+    }
+    /// MAN-541: the comparator's tick evaluates the skew rule, so the
+    /// 30-minute hold advances without a scrape.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_evaluates_rbn_skew() {
+        use crate::rbn_compare::grade::{Grade, SpotGrade, SPOT_GRADE_KIND};
+        let bus = Arc::new(SpotBus::new(1.0, std::time::SystemTime::UNIX_EPOCH, 0));
+        let metrics = Arc::new(Metrics::new());
+        metrics.enable_rbn_compare();
+        for _ in 0..40 {
+            metrics.record_rbn_grade(&SpotGrade {
+                kind: SPOT_GRADE_KIND,
+                seq: None,
+                spot_id: "s".into(),
+                call: "W1AW".into(),
+                band: "20m",
+                spot_time: 0,
+                window_close: 0,
+                window_s: 180,
+                grade: Grade::Match,
+                disagreements: Vec::new(),
+                manta_freq_hz: 14_025_420,
+                manta_wpm: None,
+                rbn_modal_freq_hz: Some(14_025_000),
+                rbn_median_wpm: None,
+                rbn_skimmers: 1,
+                rbn_reports: 1,
+                freq_offset_hz: Some(420),
+                rbn_bands: vec!["20m"],
+                spotter_filter: Vec::new(),
+                track_id: None,
+            });
+        }
+        let over = |m: &Metrics| {
+            m.rbn_skew_snapshot_at(std::time::Instant::now())
+                .unwrap()
+                .bands[0]
+                .over_limit_seconds
+        };
+        assert_eq!(over(&metrics), None, "not evaluated yet");
+        let grader: SharedGrader = Arc::new(Mutex::new(Grader::new(GradeConfig::default())));
+        let (tx, rx) = watch::channel(false);
+        let clock: Clock = Arc::new(|| 10_000);
+        let ticks = run_ticks(
+            Duration::from_secs(1),
+            grader,
+            bus,
+            Arc::clone(&metrics),
+            clock,
+            rx,
+        );
+        tokio::pin!(ticks);
+        // The interval's first tick is immediate.
+        assert!(!poll_once(ticks.as_mut()).await);
+        assert!(over(&metrics).is_some(), "the tick evaluated the band");
+        tx.send(true).unwrap();
+        assert!(poll_once(ticks.as_mut()).await);
     }
 }
