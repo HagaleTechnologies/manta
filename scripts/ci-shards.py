@@ -76,7 +76,7 @@ def assign(items, weights, count):
     shards, loads = [[] for _ in range(count)], [0] * count
     for item in sorted(items, key=lambda x: (-weights.get(x['name'], 30), x['key'])):
         weight = weights.get(item['name'], 30)
-        index = 0 if item['name'] == 'golden_v8_v8w' else min(range(1, count), key=lambda i: (loads[i], i))
+        index = min(range(count), key=lambda i: (loads[i], i))
         shards[index].append(item)
         loads[index] += weight
     assert collections.Counter(x['key'] for group in shards for x in group) == collections.Counter(x['key'] for x in items)

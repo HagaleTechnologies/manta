@@ -1,0 +1,9 @@
+#!/bin/sh
+# manta's prerm (MAN-540): debhelper 13.14 prerm-systemd-restart; stops only on remove.
+# Where debhelper ignores the stop's exit status, this prints the failure and
+# carries on, so a failed stop does not fail the removal.
+set -e
+if [ -z "${DPKG_ROOT:-}" ] && [ "$1" = remove ] && [ -d /run/systemd/system ] ; then
+	deb-systemd-invoke stop 'manta.service' >/dev/null ||
+		echo "manta: stopping manta.service failed (exit $?); continuing." >&2
+fi

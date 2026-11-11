@@ -24,6 +24,10 @@ the git history and `docs/DECISIONS/`.
 
 ### Added
 
+- MAN-540: Debian packages for x86-64 and arm64 (`manta-linux-x86_64.deb`,
+  `manta-linux-arm64.deb`). `sudo apt install ./<file>` installs
+  `/usr/bin/manta`, the systemd service (enabled, not started) and
+  `/etc/manta/manta.toml`, which upgrades never replace.
 - MAN-546: a telnet client can send `set/dx/filter cq`, `band <list>` and
   `snr <n>` (combinable) to receive only matching spots on its own
   connection, live and from `sh/dx`; `set/dx/filter off` clears it, and

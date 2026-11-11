@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-11-03T06:45:00Z",
-  "head_commit": "212fa51",
+  "head_commit": "acbc00f",
   "pages": [
     {
       "hash": "sha256:a77216f2c07a8f129b8b188dd6425862dd2838e26a245539efdbc07cf7b866fe",
@@ -66,7 +66,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:d47cbfbada9012ef5cef9ae283ec47ef70a0f65e51b48f2f6bd27cf4391d481b",
+      "hash": "sha256:53dae587af74c9bc2b757b03f8dd1c8fa8a437e11bf3e1098066c5df51d76697",
       "id": "detector-tracks",
       "kind": "subsystem",
       "links": [
@@ -327,7 +327,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:01886833aad16b7c670218d5120c825166c7eaed4b330e38cc9419812c552b1d",
+      "hash": "sha256:1d0141a2d7e64a3237c929f953f3e8c2617c873f631efb12ace98196814b6c73",
       "id": "spot-validation",
       "kind": "subsystem",
       "links": [

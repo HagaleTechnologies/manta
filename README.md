@@ -81,6 +81,8 @@ clone of this repository.
 | Windows x86-64 | `manta-windows-x86_64.zip` |
 | Linux x86-64 with SoapySDR, Ubuntu 24.04 | `manta-linux-x86_64-soapy.tar.gz` |
 | Linux arm64 with SoapySDR, 64-bit Raspberry Pi OS bookworm | `manta-linux-arm64-soapy.tar.gz` |
+| Debian package, Linux x86-64 (Debian 12+, Ubuntu 24.04) | `manta-linux-x86_64.deb` |
+| Debian package, Linux arm64 (64-bit Raspberry Pi OS bookworm, Debian 12+) | `manta-linux-arm64.deb` |
 
 On Linux or macOS, put your archive's name in place of
 `manta-linux-x86_64.tar.gz`:
@@ -113,6 +115,32 @@ Linux binaries need the ALSA runtime library (`libasound2`, see the notes
 below). macOS binaries are not signed or notarized: if macOS refuses to run
 one you downloaded in a browser, clear the flag with
 `xattr -d com.apple.quarantine ./manta`.
+
+### Debian, Ubuntu and Raspberry Pi OS package
+
+On Debian 12 (bookworm) or later, Ubuntu 24.04 and 64-bit Raspberry Pi OS,
+the Debian package installs manta and its systemd service in one step. Use
+`manta-linux-arm64.deb` on a Pi or other arm64 board and
+`manta-linux-x86_64.deb` on a PC:
+
+```sh
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/manta-linux-arm64.deb
+curl -fLO https://github.com/HagaleTechnologies/manta/releases/latest/download/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+sudo apt install ./manta-linux-arm64.deb
+sudoedit /etc/manta/manta.toml
+sudo manta config check --config /etc/manta/manta.toml
+sudo systemctl start manta
+```
+
+The package installs `/usr/bin/manta`, its man pages, the systemd unit
+(enabled, not started) and `/etc/manta/manta.toml`, a copy of the
+`manta config init` scaffold. Set your callsign and receiver in that file
+before you start the service. Upgrading to a newer `.deb` never replaces
+your edited config. The package supports KiwiSDR, HPSDR, ka9q-radio, audio
+and WAV input; for SoapySDR use the archives below. Upgrading, moving from
+an archive install and removal are in
+[packaging/README.md](packaging/README.md#debian-ubuntu-and-raspberry-pi-os-the-package).
 
 ### SoapySDR on Linux x86_64
 

@@ -476,6 +476,21 @@ fn raspberry_pi_guide_explains_hpsdr_discovery_and_mac_pinning() {
     assert!(!guide.contains("host = \"<your-hpsdr-host>\""));
 }
 
+/// MAN-540: a Pi operator with a network receiver can install the arm64
+/// Debian package, which puts the config and the service in place.
+#[test]
+fn raspberry_pi_guide_offers_the_debian_package() {
+    let guide = doc(GUIDES[2]);
+    for needle in [
+        "manta-linux-arm64.deb",
+        "sudo apt install ./manta-linux-arm64.deb",
+        "/etc/manta/manta.toml",
+        "sudo systemctl start manta",
+    ] {
+        assert!(guide.contains(needle), "Pi guide omits {needle:?}");
+    }
+}
+
 /// MAN-539: a Pi operator installs from the arm64 release archives, and the
 /// USB-SDR route uses the SoapySDR archive, not a source build.
 #[test]

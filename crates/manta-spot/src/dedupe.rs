@@ -26,6 +26,9 @@
 //! the two spots (this bucket's and the joined one across the edge), so a
 //! station wobbling `Cq -> De -> Cq` across the edge re-emits as it does
 //! at one frequency.
+//!
+//! MAN-534: the validator's sample-time sweep forgets entries once no
+//! candidate can fall inside their suppression window.
 
 use crate::context::SpotType;
 use std::collections::BTreeMap;
@@ -73,6 +76,25 @@ impl Dedupe {
             suppression_window_samples: (SUPPRESSION_SECONDS * fs) as u64,
             last: BTreeMap::new(),
         }
+    }
+
+    /// Number of retained pairs, for tests and future observability.
+    pub fn len(&self) -> usize {
+        self.last.len()
+    }
+
+    /// Whether there are no retained pairs, for tests and future observability.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Forget spots older than the window before the oldest candidate timestamp.
+    pub(crate) fn sweep(&mut self, floor_ts: u64) {
+        if self.is_empty() {
+            return;
+        }
+        let cutoff = floor_ts.saturating_sub(self.suppression_window_samples);
+        self.last.retain(|_, spot| spot.sample_ts >= cutoff);
     }
 
     fn bucket(freq_hz: f64) -> i64 {
@@ -561,6 +583,84 @@ mod tests {
                 emitted,
                 outcome == DedupeOutcome::Emit,
                 "{freq} {ts} {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_forgets_pairs_older_than_the_window_before_the_floor() {
+        let mut d = Dedupe::new(FS);
+        let end = (7.0 * 86400.0 * FS) as u64;
+        let window = (SUPPRESSION_SECONDS * FS) as u64;
+        let mut expected = 0;
+        for i in 0..50_000u64 {
+            let ts = i * end / 49_999;
+            assert!(d.should_emit(&format!("K{i}A"), 14_000_000.0, 20.0, SpotType::Cq, ts, 0));
+            expected += usize::from(ts >= end - window);
+        }
+        assert!(d.should_emit(
+            "BOUNDARY",
+            14_000_000.0,
+            20.0,
+            SpotType::Cq,
+            end - window,
+            0
+        ));
+        assert!(d.should_emit(
+            "OLDER",
+            14_000_000.0,
+            20.0,
+            SpotType::Cq,
+            end - window - 1,
+            0
+        ));
+        d.sweep(end);
+        assert_eq!(d.len(), expected + 1);
+        assert!(!d.is_empty());
+        assert_eq!(d.last_sample_ts("K0A", 14_000_000.0, 0), None);
+        assert_eq!(d.last_sample_ts("OLDER", 14_000_000.0, 0), None);
+        assert_eq!(
+            d.last_sample_ts("BOUNDARY", 14_000_000.0, 0),
+            Some(end - window)
+        );
+    }
+
+    #[test]
+    fn sweeping_never_changes_a_decision_at_or_after_the_floor() {
+        let mut baseline = Dedupe::new(FS);
+        let mut swept = Dedupe::new(FS);
+        let mut rng = 534u64;
+        let mut last_sweep = 0;
+        for second in 0..7200u64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let ts = second * FS as u64;
+            if ts - last_sweep >= (10.0 * FS) as u64 {
+                swept.sweep(ts);
+                last_sweep = ts;
+            }
+            let call = if second % 901 == 0 {
+                "K9RARE"
+            } else {
+                ["K5ARH", "W1AW", "K3ABC"][(rng >> 32) as usize % 3]
+            };
+            let freq = [14_012_549.0, 14_012_551.0][(rng >> 40) as usize % 2];
+            let input = ((rng >> 48) % 2) as u32;
+            let snr = 20.0 + ((rng >> 50) % 12) as f32;
+            let ty = if rng & 1 == 0 {
+                SpotType::Cq
+            } else {
+                SpotType::De
+            };
+            // None and an old watermark both permit the candidate's stale guard.
+            let stale = |d: &Dedupe| {
+                d.last_sample_ts(call, freq, input)
+                    .is_some_and(|last| ts < last)
+            };
+            assert_eq!(stale(&baseline), stale(&swept), "guard at {second}");
+            assert_eq!(
+                baseline.assess(call, freq, snr, ty, ts, input),
+                swept.assess(call, freq, snr, ty, ts, input),
+                "decision at {second}"
             );
         }
     }

@@ -337,6 +337,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -533,6 +537,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
@@ -1047,6 +1055,10 @@ jobs:
           py=python3
           if [ "${{ runner.os }}" = "Windows" ]; then py=python; fi
           "$py" -m unittest scripts.tests.test_package_release -v
+      # MAN-540: the Debian package builder, its maintainer scripts (real dpkg-deb and a scratch dpkg
+      # root on Linux, static checks on macOS), the release-time checker and the release wiring.
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest scripts.tests.test_package_deb -v
       # MAN-301: score-against-rbn.py --node-log's wrapper around `manta grade` (stub binary).
       - if: runner.os != 'Windows'
         run: python3 -m unittest scripts.tests.test_score_against_rbn_replay -v
