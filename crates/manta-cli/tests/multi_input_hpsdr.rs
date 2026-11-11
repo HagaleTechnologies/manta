@@ -1,7 +1,13 @@
 //! MAN-307 acceptance against real child processes and a loopback Protocol 1 radio.
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{free_ports, manta};
+use launch::manta;
+// MAN-523: the child daemons bind these ports. `launch::free_ports` drops
+// its ephemeral listeners first, and MAN-542 saw a sibling take one
+// ("Address already in use", port 38257). The claimed band issues each
+// number once per process and keeps cooperating test processes off it.
+#[path = "../src/test_ports.rs"]
+mod test_ports;
 
 use num_complex::Complex32;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +35,7 @@ fn config(
     declaration: Option<usize>,
     transforms: bool,
 ) -> [u16; 3] {
-    let ports: [u16; 3] = free_ports();
+    let ports: [u16; 3] = std::array::from_fn(|_| test_ports::free_port());
     let mut text = format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {}\njson_port = {}\nmetrics_port = {}\nstatus_interval_secs = 1\n", ports[0], ports[1], ports[2]);
     for i in 0..count {
         let name = NAMES

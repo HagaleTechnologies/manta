@@ -1448,9 +1448,60 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 command = (wf.run_body(step) or '').strip()
                 if not command or command == 'cargo test --workspace --locked':
                     continue
+                if '--repeat-base' in command:
+                    continue  # MAN-523: the Unix home of Windows's repeat is each shard's own repeat
                 matches = steps_running(support, command)
                 self.assertEqual(len(matches), 1, command)
                 self.assertEqual(wf.field(matches[0], 'if'), wf.field(step, 'if'), command)
+
+
+class SocketTestRepeatTests(unittest.TestCase):
+    """MAN-523: every OS repeats the socket tests a change adds or edits, from the event's base."""
+
+    BASE = ("${{ github.event_name == 'workflow_dispatch' && github.sha || "
+            "github.event_name == 'pull_request' && github.event.pull_request.base.sha || "
+            "github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}")
+
+    def repeat_steps(self, block):
+        return [s for s in wf.steps(block) if '--repeat-base "$REPEAT_BASE"' in (wf.run_body(s) or '')]
+
+    def test_unix_shards_repeat_from_their_bundle_with_the_event_base(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            steps = self.repeat_steps(wf.job_block(text, f'{platform}-shards'))
+            self.assertEqual(len(steps), 1, platform)
+            body = wf.run_body(steps[0])
+            self.assertIn('scripts/ci-shards.py', body)
+            self.assertIn('--from-bundle', body)
+            self.assertNotIn('--repeat-count', body)  # fixed at ten in the script
+            self.assertEqual(wf.field(wf.sub(steps[0], 'env'), 'REPEAT_BASE'), self.BASE)
+            self.assertIsNone(wf.field(steps[0], 'continue-on-error'))
+            uploads = [s for s in wf.steps(wf.job_block(text, f'{platform}-shards'))
+                       if (wf.field(s, 'uses') or '').startswith('actions/upload-artifact@')]
+            self.assertEqual([wf.field(s, 'if') for s in uploads], ['always()'], platform)
+
+    def test_windows_repeats_after_its_ordinary_suite(self):
+        block = wf.job_block(wf.read('ci-full.yml'), 'test')
+        steps = wf.steps(block)
+        repeats = self.repeat_steps(block)
+        self.assertEqual(len(repeats), 1)
+        body = wf.run_body(repeats[0])
+        self.assertIn('scripts/ci-shards.py', body)
+        self.assertIn('--inventory-only', body)
+        self.assertEqual(wf.field(wf.sub(repeats[0], 'env'), 'REPEAT_BASE'), self.BASE)
+        self.assertIsNone(wf.field(repeats[0], 'continue-on-error'))
+        ordinary = [i for i, s in enumerate(steps) if (wf.run_body(s) or '').strip() == 'cargo test --workspace --locked']
+        self.assertEqual(len(ordinary), 1)
+        self.assertLess(ordinary[0], steps.index(repeats[0]))
+        uploads = [s for s in steps if any('repeat-evidence' in line for line in s)]
+        self.assertEqual(len(uploads), 2)  # written by the repeat, uploaded even on failure
+        self.assertTrue(wf.field(uploads[1], 'if').startswith('always()'))
+
+    def test_the_selector_suite_runs_on_both_unix_supports(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos'):
+            support = wf.job_block(text, f'{platform}-support')
+            self.assertEqual(len(steps_running(support, 'python3 -m unittest scripts.tests.test_socket_test_repeat -v')), 1)
 
 
 if __name__ == '__main__':

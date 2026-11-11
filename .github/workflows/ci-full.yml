@@ -283,6 +283,20 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
       - run: cargo test --workspace --locked
+      # MAN-523: then repeat each socket test this change adds or edits ten more times, from the
+      # executables the step above built (the Unix shards do the same from their bundles). The
+      # base is the event's own; an unavailable base fails the step rather than passing.
+      - if: runner.os == 'Windows'
+        shell: bash
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+        run: python scripts/ci-shards.py --count 2 --shard 0 --inventory-only --repeat-base "$REPEAT_BASE" --output repeat-evidence/windows.json
+      - if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: socket-test-repeats-${{ matrix.os }}
+          path: repeat-evidence/*.json
+          if-no-files-found: ignore
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
       - if: runner.os != 'Windows'
@@ -557,6 +571,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
+      # MAN-523: the changed-socket-test selector and its ten-repeat runner.
+      - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
         if: always()
         env:
@@ -837,7 +853,13 @@ jobs:
         with:
           name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
           path: test-bundle
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+      # MAN-523: then repeat each socket test this change adds or edits ten more times. The base
+      # is the event's own: the main commit a dispatch merged in, the PR or merge-group base, or
+      # the commit a push replaced. scripts/socket-test-repeat.py fetches it into this shallow
+      # checkout; an unavailable base fails the shard rather than passing an empty diff.
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --repeat-base "$REPEAT_BASE" --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -1060,6 +1082,8 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
+      # MAN-523: the changed-socket-test selector and its ten-repeat runner.
+      - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
         if: always()
         env:
@@ -1340,7 +1364,13 @@ jobs:
         with:
           name: test-bundle-${{ matrix.os }}-${{ matrix.shard }}
           path: test-bundle
-      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+      # MAN-523: then repeat each socket test this change adds or edits ten more times. The base
+      # is the event's own: the main commit a dispatch merged in, the PR or merge-group base, or
+      # the commit a push replaced. scripts/socket-test-repeat.py fetches it into this shallow
+      # checkout; an unavailable base fails the shard rather than passing an empty diff.
+      - run: python3 scripts/ci-shards.py --count 8 --shard ${{ matrix.shard }} --from-bundle test-bundle/slice-${{ matrix.shard }}.tar.gz --repeat-base "$REPEAT_BASE" --output shard-evidence/${{ matrix.os }}-${{ matrix.shard }}.json
+        env:
+          REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

@@ -985,10 +985,11 @@ mod tests {
 
     #[test]
     fn a_closed_port_is_connection_refused() {
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            listener.local_addr().unwrap().port()
-        };
+        // MAN-523: a port from the claimed band, never bound for TCP, so
+        // nothing listens on it. Binding `127.0.0.1:0` and dropping the
+        // listener let a sibling test take the freed number before the
+        // probe. Holding the listener instead would accept the connection.
+        let port = crate::test_ports::free_port();
         let url = HttpUrl::parse(&format!("http://127.0.0.1:{port}/cty.dat")).unwrap();
         let err = fetch_err(&url, &quick());
         assert!(

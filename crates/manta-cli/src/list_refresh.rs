@@ -1195,11 +1195,13 @@ mod tests {
         out
     }
 
+    /// MAN-523: a URL on a port from the claimed band (`crate::test_ports`),
+    /// which nothing binds for TCP, so connecting is refused. Binding
+    /// `127.0.0.1:0` and dropping the listener let a sibling test take the
+    /// freed number before the refresher probed it.
     fn closed_url() -> HttpUrl {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        HttpUrl::parse(&format!("http://{addr}/MASTER.SCP")).unwrap()
+        let port = crate::test_ports::free_port();
+        HttpUrl::parse(&format!("http://127.0.0.1:{port}/MASTER.SCP")).unwrap()
     }
 
     fn fast_limits() -> FetchLimits {
