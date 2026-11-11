@@ -3025,3 +3025,46 @@ fn spot_bus_for_uses_configured_history_or_the_default() {
 fn load_decode_config_file(config: Option<&Path>) -> Result<manta_decode::decoder::DecodeConfig> {
     Ok(config::load(config, config::Env::Ignore)?.decode)
 }
+
+#[test]
+fn track_closes_of_maps_every_reason_to_its_label() {
+    let c = manta_engine::CloseCounts {
+        restricted: 1,
+        unconfirmed: 2,
+        hang_expired: 3,
+        silent: 4,
+        merged: 5,
+        evicted: 6,
+        rtty: 7,
+        not_cw: 8,
+        unkeyed: 9,
+        source_end: 10,
+        reconnect: 11,
+        false_lease_hops: 999,
+    };
+    let m = manta_server::metrics::Metrics::new();
+    m.set_track_closes_total(track_closes_of(&c));
+    let text = m.render_prometheus_text();
+    for (i, reason) in [
+        "restricted",
+        "unconfirmed",
+        "hang_expired",
+        "silent",
+        "merged",
+        "evicted",
+        "rtty",
+        "not_cw",
+        "unkeyed",
+        "source_end",
+        "reconnect",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert!(text.contains(&format!(
+            "manta_track_closes_total{{reason=\"{reason}\"}} {}\n",
+            i + 1
+        )));
+    }
+    assert!(!text.contains("false_lease_hops"));
+}

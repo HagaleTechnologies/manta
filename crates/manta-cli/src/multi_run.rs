@@ -472,6 +472,9 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
     let bad_warned: Vec<std::cell::Cell<u64>> = (0..n).map(|_| std::cell::Cell::new(0)).collect();
     // Each input's active-track count; `manta_active_tracks` is their sum
     // (D9). A lost input's health sink zeroes only its own count.
+    let lifecycles: Vec<_> = (0..n)
+        .map(|_| Arc::new(manta_engine::TrackLifecycleObserver::default()))
+        .collect();
     let tracks: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
     // MAN-314: each input's marked RTTY set; the metric is their union.
     let rtty_observers: Vec<Arc<RttyObserver>> =
@@ -573,6 +576,7 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
                 spawn_band_hz: input.spawn_band_hz,
                 observers: manta_engine::InputObservers {
                     static_crashes: Some(crashes[index].clone()),
+                    track_lifecycle: Some(lifecycles[index].clone()),
                     bad_samples: Some(bad),
                     conditioned: Some(conditioned[index].clone()),
                     rtty: Some(rtty_observers[index].clone()),
@@ -1135,6 +1139,14 @@ pub(crate) fn run(m: MultiRun<'_>) -> Result<std::process::ExitCode> {
             if let Some((_, server)) = &server {
                 server.metrics.set_active_tracks(sum(&tracks));
                 server.metrics.set_static_crashes_total(sum(&crashes));
+                let closes = lifecycles
+                    .iter()
+                    .fold(manta_engine::CloseCounts::default(), |sum, obs| {
+                        sum + obs.snapshot().close_counts
+                    });
+                server
+                    .metrics
+                    .set_track_closes_total(crate::track_closes_of(&closes));
                 server.metrics.record_pipeline_batch();
             }
             if !ready[input] && !stop_ready.load(Ordering::Relaxed) {

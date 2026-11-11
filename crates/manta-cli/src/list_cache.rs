@@ -2,16 +2,17 @@
 //! `[spot].list_cache_dir`. Version files are immutable and named by the
 //! SHA-256 of their bytes (`cty/<sha>.dat`, `scp/<sha>.scp` and, with
 //! `pattern_url` set, `patterns/<sha>.lst` since MAN-542); `state.json`
-//! names the current one. Every write goes to a unique temporary name and
-//! is renamed into place, so a crash or two daemons sharing the directory
-//! never leave a half-written file. See the MAN-316 plan, Design §6.
+//! names the current one. Every write goes to a fresh, unpredictable
+//! temporary name, created exclusively, and is renamed into place, so a
+//! crash or two daemons sharing the directory never leave a half-written
+//! file, and a planted file or symlink is never followed (MAN-538). See the
+//! MAN-316 plan, Design §6.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Versions of each list kept by `prune`: about 3 MB of cty, about 11 MB
@@ -20,10 +21,6 @@ pub(crate) const KEPT_VERSIONS: usize = 30;
 
 const STATE_FILE: &str = "state.json";
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// Makes temporary names unique between threads of one process; the pid
-/// separates processes.
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ListKind {
@@ -291,25 +288,50 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Writes `.<name>.tmp.<pid>.<counter>` beside `path`, flushes it to disk
-/// and renames it over `path`. On failure the temporary is removed.
+/// Temp names a write tries before it gives up (as `config_edit`'s save).
+const TEMP_ATTEMPTS: usize = 16;
+
+/// Writes `bytes` to `path` through a fresh temporary beside it, flushed to
+/// disk and renamed over `path`. On failure the temporary is removed.
 fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_with(path, bytes, &mut crate::config_edit::random_suffix)
+}
+
+/// `write_atomic` with the temp-name suffix source injected (tests plant a
+/// taken name). The temporary is `.<name>.tmp.<pid>.<16 hex>`, opened with
+/// `create_new` (`O_EXCL`): a file or symlink already at that name, live or
+/// dangling, is never opened or followed, and another name is tried. The
+/// random suffix also keeps a killed run's leftover (same PID 1 in a
+/// container) from blocking every later write (MAN-538).
+fn write_atomic_with(path: &Path, bytes: &[u8], suffix: &mut dyn FnMut() -> u64) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let tmp = dir.join(format!(
-        ".{name}.tmp.{}.{}",
-        std::process::id(),
-        TMP_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut attempts = 1;
+    let (tmp, mut file) = loop {
+        let tmp = dir.join(format!(
+            ".{name}.tmp.{}.{:016x}",
+            std::process::id(),
+            suffix()
+        ));
+        match options.open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < TEMP_ATTEMPTS => {
+                attempts += 1;
+            }
+            // Not ours: a name this call did not create is never removed.
+            Err(e) => return Err(e),
+        }
+    };
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    // Closed before the rename or the cleanup: Windows will not delete or
+    // replace a file that still has an open handle.
+    drop(file);
+    let result = written.and_then(|()| fs::rename(&tmp, path));
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -671,5 +693,128 @@ mod tests {
         let names = files(tmp.path());
         assert_eq!(names.len(), 41, "{names:?}");
         assert!(names.iter().all(|f| !f.contains(".tmp.")), "{names:?}");
+    }
+
+    /// MAN-538: the names `write_atomic` used before (`pid.counter`) are
+    /// predictable; symlinks planted there are neither followed nor touched.
+    #[cfg(unix)]
+    #[test]
+    fn store_ignores_symlinks_at_the_old_predictable_names() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let cache = Cache::new(tmp.path().join("lists"));
+        let victim = tmp.path().join("victim.txt");
+        fs::write(&victim, "PRECIOUS").unwrap();
+        let missing = tmp.path().join("dangling-target");
+        let bytes = b"version a;\n".as_slice();
+        let sha = sha256_hex(bytes);
+        let dir = cache.list_dir(ListKind::Cty);
+        fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        for n in 0..4 {
+            symlink(&victim, dir.join(format!(".{sha}.dat.tmp.{pid}.{n}"))).unwrap();
+            symlink(&missing, dir.join(format!(".state.json.tmp.{pid}.{n}"))).unwrap();
+        }
+
+        cache
+            .store(ListKind::Cty, bytes, &state_for(bytes, 1))
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+        assert!(!missing.exists());
+        let version = cache.version_path(ListKind::Cty, &sha);
+        let meta = fs::symlink_metadata(&version).unwrap();
+        assert!(meta.file_type().is_file(), "{meta:?}");
+        assert_eq!(fs::read(&version).unwrap(), bytes);
+        assert_eq!(
+            cache.load_current(ListKind::Cty),
+            Ok(Some((state_for(bytes, 1), bytes.to_vec())))
+        );
+    }
+
+    /// MAN-538: a guessed temp name (live or dangling symlink) is skipped
+    /// and left alone; the write lands through the next free name.
+    #[cfg(unix)]
+    #[test]
+    fn a_guessed_temp_name_is_skipped_never_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let pid = std::process::id();
+        let victim = dir.join("victim.txt");
+        fs::write(&victim, "PRECIOUS").unwrap();
+        let missing = dir.join("dangling-target");
+        let at = |n: u64| dir.join(format!(".state.json.tmp.{pid}.{n:016x}"));
+        symlink(&missing, at(9)).unwrap();
+        symlink(&victim, at(7)).unwrap();
+
+        let mut suffixes = [9u64, 7, 11].into_iter();
+        write_atomic_with(&dir.join("state.json"), b"new\n", &mut || {
+            suffixes.next().unwrap()
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(dir.join("state.json")).unwrap(), "new\n");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+        assert!(!missing.exists());
+        for n in [7, 9] {
+            assert!(fs::symlink_metadata(at(n))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                format!(".state.json.tmp.{pid}.0000000000000007"),
+                format!(".state.json.tmp.{pid}.0000000000000009"),
+                "state.json".to_string(),
+                "victim.txt".to_string(),
+            ]
+        );
+    }
+
+    /// MAN-538: with every name taken, the write fails closed with
+    /// `AlreadyExists` and never opens, follows or removes what is there.
+    #[test]
+    fn a_write_fails_closed_when_every_temp_name_is_taken() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let target = dir.join("state.json");
+        let taken = dir.join(format!(".state.json.tmp.{}.{:016x}", std::process::id(), 7));
+        fs::write(&taken, "half-written").unwrap();
+
+        let mut calls = 0;
+        let err = write_atomic_with(&target, b"new\n", &mut || {
+            calls += 1;
+            7
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(calls, TEMP_ATTEMPTS);
+        assert!(!target.exists());
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "half-written");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let victim = dir.join("victim.txt");
+            fs::write(&victim, "PRECIOUS").unwrap();
+            fs::remove_file(&taken).unwrap();
+            symlink(&victim, &taken).unwrap();
+            let err = write_atomic_with(&target, b"new\n", &mut || 7).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+            assert!(!target.exists());
+            assert_eq!(fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+            assert!(fs::symlink_metadata(&taken)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
     }
 }

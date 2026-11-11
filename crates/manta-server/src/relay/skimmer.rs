@@ -12,7 +12,7 @@
 //! keepalive write ends the session. No `SKIMMER/SETT`, no password.
 
 use crate::backoff::{next_backoff, AttemptOutcome, INITIAL_BACKOFF};
-use crate::bounded_io::{read_line_bounded, MAX_LINE_BYTES};
+use crate::bounded_io::{read_line_bounded, Utf8Tail, MAX_LINE_BYTES};
 use crate::bus::SpotBus;
 use crate::metrics::{DropReason, RelayStats};
 use crate::rbn_compare::feed::{connect, ends_like_a_prompt, shutdown_signalled};
@@ -204,6 +204,7 @@ async fn session(
 
     let mut reader = BufReader::new(rd);
     let mut line = String::new();
+    let mut tail = Utf8Tail::default();
     let mut warned_other_spotter = false;
     let mut keepalive = tokio::time::interval_at(
         tokio::time::Instant::now() + keepalive_every,
@@ -215,7 +216,7 @@ async fn session(
         // whole line is in, so losing a race never drops consumed bytes.
         // No idle timeout (D10).
         let read = tokio::select! {
-            r = read_line_bounded(&mut reader, &mut line) => r,
+            r = read_line_bounded(&mut reader, &mut line, &mut tail) => r,
             _ = keepalive.tick() => {
                 match tokio::time::timeout(WRITE_TIMEOUT, wr.write_all(b"\r\n")).await {
                     Ok(Ok(())) => continue,

@@ -469,6 +469,8 @@ fn main() -> Result<()> {
                 "rtty": s.close_counts.rtty,
                 "not_cw": s.close_counts.not_cw,
                 "unkeyed": s.close_counts.unkeyed,
+                "source_end": s.close_counts.source_end,
+                "reconnect": s.close_counts.reconnect,
             },
             "static_crashes": s.static_crashes,
         });

@@ -386,7 +386,7 @@ pub(crate) async fn http_get(
     String,
     tokio::io::BufReader<tokio::net::TcpStream>,
 )> {
-    use manta_server::bounded_io::read_line_bounded;
+    use manta_server::bounded_io::{read_line_bounded, Utf8Tail};
     use tokio::io::{AsyncWriteExt, BufReader};
 
     let (mut stream, addr) = connect_any(addrs, timeout)
@@ -401,7 +401,7 @@ pub(crate) async fn http_get(
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    read_line_bounded(&mut reader, &mut status_line)
+    read_line_bounded(&mut reader, &mut status_line, &mut Utf8Tail::default())
         .await
         .context("reading the status line")?;
     Ok((addr, status_line, reader))
@@ -415,12 +415,13 @@ pub(crate) async fn read_http_body(
     max_body: u64,
     what: &str,
 ) -> Result<String> {
-    use manta_server::bounded_io::read_line_bounded;
+    use manta_server::bounded_io::{read_line_bounded, Utf8Tail};
     use tokio::io::AsyncReadExt;
 
+    let mut tail = Utf8Tail::default();
     for _ in 0..MAX_STATUS_HEADER_LINES {
         let mut line = String::new();
-        let n = read_line_bounded(&mut reader, &mut line)
+        let n = read_line_bounded(&mut reader, &mut line, &mut tail)
             .await
             .context("reading response headers")?;
         if n == 0 || line == "\r\n" {

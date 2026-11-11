@@ -1053,6 +1053,8 @@ pub(crate) fn json_keys_in_order(json: &str) -> Vec<String> {
     serde_json::from_str::<Keys>(json).unwrap().0
 }
 
+pub use track::CloseCounts;
+
 #[cfg(test)]
 mod tests {
     use super::*;

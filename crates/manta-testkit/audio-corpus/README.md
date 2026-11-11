@@ -168,8 +168,8 @@ the detector closed in the same configuration with
 `TrackManager::close_counts()` (`crates/manta-engine/examples/
 close_counts.rs`). That is a different population from the 41,174 above,
 about ten times larger: the detector gives every CANDIDATE its own
-`track_id`, and `close_counts()` counts each one once, when it closes (a
-track still open when the stream ends is not counted), but only promoted
+`track_id`, and `close_counts()` counts each one once, when it closes (before MAN-535,
+tracks still open at stream end were omitted; they now count as `source_end`), but only promoted
 tracks reach `manta decode --json`. `unconfirmed` (a CANDIDATE that never
 sustains `confirm_hops`, so never promoted) was 286,196 closes, 68.8% of
 the total; `evicted` (71,149, `track_cap=500` pinned at its ceiling the
