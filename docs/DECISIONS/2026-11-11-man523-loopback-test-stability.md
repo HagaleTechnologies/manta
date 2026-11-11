@@ -41,6 +41,13 @@ number later, the race MAN-410 named: `list_http.rs`'s
 | health escaping | Uses the fake server, which binds and holds its listener. No mechanism found. | None to the test. The binary's other two released ports are gone (overlay config: held socket; real daemon: claimed band). | Unexplained. |
 | recording | A filesystem and thread test with no socket. No mechanism found. | None. | Unexplained. |
 
+PR #584's macOS run also exposed a separate capacity-test race: the
+listening log could precede the fake radio receiving START, leaving
+`generations()` empty. The test now waits for the radio's START observation
+before inspecting allocation. A delayed-START regression failed with the
+original indexing and passed with the wait. This fixes the observed empty
+session assertion; it does not establish the cause of every earlier report.
+
 A green run is not a root-cause proof. The two unexplained reports keep their
 assertions unchanged and stay open until the observation in D5.
 
@@ -48,8 +55,10 @@ assertions unchanged and stay open until the observation in D5.
 
 - A port that must refuse connections is a bound, non-listening TCP socket
   held for the probe's lifetime (`health_command.rs`'s `unreachable_port`,
-  as MAN-508's `refused_source`). Linux and Windows refuse; macOS drops the
-  SYN and the dial times out, so assertions allow both. A competing bind
+  as MAN-508's `refused_source`). Linux refuses; Windows may reach the
+  connect deadline, and macOS drops the SYN and the dial times out. The
+  reservation regression accepts refusal or timeout and still rejects a
+  successful connection or a competing listener. A competing bind
   fails while the guard lives.
 - A port a child daemon must bind comes from the claimed band 20256-20511
   (`src/test_ports.rs`). The UDP claim keeps cooperating test processes off

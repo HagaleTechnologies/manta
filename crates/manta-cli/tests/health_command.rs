@@ -30,8 +30,8 @@ fn stderr(o: &Output) -> String {
 /// caller drops the socket. Bound but never listening, without address
 /// reuse, so a competing bind fails while the guard lives. Binding
 /// `127.0.0.1:0` and dropping the listener let a sibling test's listener
-/// take the number before `manta health` dialled it. Linux and Windows
-/// refuse the connection; macOS drops the SYN and the dial times out.
+/// take the number before `manta health` dialled it. A connection must
+/// fail, either by refusal or when the finite connect deadline expires.
 fn unreachable_port() -> (socket2::Socket, u16) {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -49,17 +49,15 @@ fn unreachable_port() -> (socket2::Socket, u16) {
 fn an_unreachable_port_stays_reserved_and_unreachable_while_held() {
     let (_guard, port) = unreachable_port();
     let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let expected = if cfg!(target_os = "macos") {
-        std::io::ErrorKind::TimedOut
-    } else {
-        std::io::ErrorKind::ConnectionRefused
-    };
-    assert_eq!(
-        TcpStream::connect_timeout(&address, Duration::from_secs(1))
-            .unwrap_err()
-            .kind(),
-        expected,
-        "{address} must stay unreachable"
+    let error = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap_err();
+    // Windows can exhaust this deadline before its refusal is reported;
+    // macOS drops SYNs to a bound non-listening socket. Both are unreachable.
+    assert!(
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "{address} must stay unreachable: {error}"
     );
     assert_eq!(
         TcpListener::bind(address).unwrap_err().kind(),

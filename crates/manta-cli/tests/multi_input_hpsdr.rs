@@ -239,6 +239,22 @@ impl Radio {
             worker: Some(worker),
         }
     }
+    fn started_session(&self) -> Session {
+        // The daemon's listening log does not acknowledge UDP delivery.
+        // Wait for this fixture to observe START before inspecting it.
+        wait_until(
+            Duration::from_secs(15),
+            || !self.generations().is_empty(),
+            || {
+                format!(
+                    "radio has not received START: {:?}",
+                    self.sessions.lock().unwrap()
+                )
+            },
+        );
+        self.generations()[0].clone()
+    }
+
     fn generations(&self) -> Vec<Session> {
         self.sessions
             .lock()
@@ -605,6 +621,24 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
 }
 
 #[test]
+fn a_started_session_waits_for_the_radio_to_receive_start() {
+    let radio = Radio::start(None, None);
+    let port = radio.port;
+    let sender = thread::spawn(move || {
+        // Listening readiness in the daemon can precede the fixture's
+        // receipt of START. Delay that receipt independently of readiness.
+        thread::sleep(Duration::from_millis(100));
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut start = [0; 60];
+        start[..4].copy_from_slice(&[0xef, 0xfe, 4, 1]);
+        socket.send_to(&start, ("127.0.0.1", port)).unwrap();
+    });
+    let session = radio.started_session();
+    sender.join().unwrap();
+    assert_eq!(session.starts, 1);
+}
+
+#[test]
 fn six_bands_on_four_hardware_receivers_refuse_before_control_or_listeners() {
     for declaration in [None, Some(6)] {
         let radio = Radio::start(Some(4), None);
@@ -643,7 +677,7 @@ fn declared_capacity_refuses_offline_and_unknown_capacity_requires_fallback() {
     config(&path, radio.port, 4, Some(4), false);
     let daemon = Daemon::start(&path);
     daemon.ready();
-    assert_allocation(&radio.generations()[0], &FREQUENCIES);
+    assert_allocation(&radio.started_session(), &FREQUENCIES);
 }
 
 #[test]
