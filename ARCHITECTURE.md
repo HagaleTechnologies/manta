@@ -622,7 +622,8 @@ transmission may never produce again).
 5. **Dedupe/aggregation**: key = (callsign, freq bucket ±0.3 kHz); suppress
    re-spots for 10 min unless SNR improves ≥ 6 dB or type changes. Emitted spot
    carries freq (from PFB bin + track centroid, ~10 Hz absolute accuracy), SNR,
-   WPM, type, confidence.
+   WPM, type, confidence. A sample-time sweep forgets dedupe entries once no
+   candidate can fall inside their window (MAN-534).
 6. **Callsign lookup (MAN-318, opt-in, live only)**: with `[callsign_lookup]`
    on, a spot that passed every step above is checked against QRZ.com
    through `manta_spot::CallsignLookup`. A call QRZ.com does not list is
