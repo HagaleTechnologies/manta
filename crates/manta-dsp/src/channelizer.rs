@@ -29,6 +29,12 @@ pub fn power_db(power: f32) -> f64 {
     10.0 * (power as f64 + POWER_DB_EPSILON).log10()
 }
 
+/// MAN-526: `P + epsilon`, the linear value `power_db` takes the log of.
+/// What `10^(power_db(p)/10)` approximates, without either transcendental.
+pub fn power_linear(power: f32) -> f64 {
+    power as f64 + POWER_DB_EPSILON
+}
+
 /// SPEC §1.3 step 2's circular rotation (`r = (m*hop) mod N`, `hop = N/4`)
 /// leaves a residual checkerboard sign artifact on `HopOutput::x[k]`: odd
 /// channels at odd hops come out negated relative to what a phase-
@@ -633,6 +639,29 @@ mod tests {
             "{} spare hops kept",
             ch.spare.len()
         );
+    }
+
+    /// MAN-526: `power_linear` is the value the old `10^(power_db/10)`
+    /// round trip approximated, to a few f64 ulp, digital silence included.
+    #[test]
+    fn power_linear_matches_the_db_round_trip_it_replaces() {
+        for p in [
+            0.0f32,
+            1e-30,
+            1e-20,
+            1e-12,
+            1.7e-9,
+            3.3e-7,
+            1e-3,
+            0.5,
+            1.0,
+            9.9e5,
+            f32::MAX,
+        ] {
+            let old = 10.0_f64.powf(power_db(p) / 10.0);
+            let new = power_linear(p);
+            assert!(((old - new) / new).abs() < 1e-13, "p={p}: {old} vs {new}");
+        }
     }
 
     const FS: f64 = 96_000.0;

@@ -19,7 +19,7 @@ fn detect(iq: &[Complex32], fs: f64) -> (Vec<FskSignal>, Vec<bool>) {
     for chunk in iq.chunks(4096) {
         for h in ch.process(chunk) {
             let p: Vec<f64> = h.power.iter().map(|&x| power_db(x)).collect();
-            floor.update(&p);
+            floor.update(&p, &h.power);
             det.push_hop(&h, &p, &floor);
         }
     }
