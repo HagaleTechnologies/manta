@@ -105,7 +105,7 @@ jobs:
 
       # MAN-156: a prebuilt, checksum-verified cargo-deny (taiki-e/install-action's manifest carries
       # its SHA-256), not a 4-minute source build; this workflow keeps no build cache (MAN-243).
-      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         if: needs.changes.result == 'success' && needs.changes.outputs.deps == 'true'
         with:
           tool: cargo-deny@0.20.2
