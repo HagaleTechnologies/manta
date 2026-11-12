@@ -2,13 +2,19 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    cooldown:
+      default-days: 4   # skip releases younger than 4 days (pulled/yanked releases, fresh supply-chain attacks)
     schedule:
       interval: weekly
   - package-ecosystem: github-actions
     directory: /
+    cooldown:
+      default-days: 4
     schedule:
       interval: weekly
   - package-ecosystem: docker
     directory: /
+    cooldown:
+      default-days: 4
     schedule:
       interval: weekly
