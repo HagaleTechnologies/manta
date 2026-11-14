@@ -44,6 +44,22 @@
 //! 7. `back` is a sign-off (`TU <call>`): `self_id` with no spot type.
 //! 8. Otherwise `relayed_mention` when an earlier occurrence in the same turn
 //!    is the `self_id` of a different, plausible call, else `uncertain`.
+//!    MAN-490's one exception, read only by `interpret_with_damage`: a
+//!    plausible, undamaged run directly after one damaged copy of itself
+//!    takes that copy's `CQ`/`DE` frame as a `self_id`, when no other
+//!    station's self-ID makes it a mention (see "Damaged copies" below).
+//!
+//! Damaged copies (MAN-490). The caller may say that a word carried one
+//! `AR`/`SK` glyph *inside* it, between two characters, and that the word
+//! with the glyph stripped is call-shaped but not a plausible call
+//! (`N<SK>NXI` read as `NNXI`): the decoder garbled one character, so the
+//! glyph neither ends the turn nor is part of the call. The run right after it inherits its frame
+//! only when removing the run's one character at the glyph's position gives
+//! the damaged spelling exactly, that character is a letter or digit, the
+//! damaged word is not `corrected`, and the damaged word's own back-scan
+//! reaches a `DE` or a `CQ` (through fillers) with no correction skipped and
+//! no turn end crossed. One damaged word, one glyph, one character: edit
+//! distance, dictionaries and every other damage shape stay rule 8 losses.
 //!
 //! A run is settled once a word follows it, its last word ends a turn, or
 //! the caller says the window is complete. Every rule reads only the words
@@ -219,6 +235,14 @@ fn classify(word: &str) -> Tok {
     Tok::Other
 }
 
+/// MAN-490: whether `word` reads as a call-shaped word and no keyword,
+/// report, serial, Q-code or correction: the only kind of word whose
+/// embedded `AR`/`SK` glyph the `Validator` may keep as damage. A stripped
+/// `DE`, `CQ` or `5NN` keeps its glyph's turn end.
+pub(crate) fn is_call_shaped(word: &str) -> bool {
+    classify(word) == Tok::Call
+}
+
 /// `QRZ`, `QRZ?`, `QRL?`, `QSY`: ITU reserves the Q-series for codes, so no
 /// callsign starts with `Q`.
 fn is_q_code(w: &str) -> bool {
@@ -243,9 +267,72 @@ enum Back {
 struct Window<'w, 'a> {
     words: &'w [ExchangeWord<'a>],
     toks: Vec<Tok>,
+    /// MAN-490: per word, the position of its one embedded `AR`/`SK` glyph
+    /// (characters before it) when the caller kept that evidence. Shorter
+    /// than `words` means `None` for the rest.
+    damage: &'w [Option<usize>],
+}
+
+/// The frame and basis a `back` result gives a run, `fwd` being the token
+/// after it (rule 3's mapping; MAN-490 reuses it for an inherited frame).
+fn frame_of(back: Back, fwd: Option<Tok>) -> Option<(Frame, Basis)> {
+    match back {
+        Back::De(true) => Some((Frame::Cq, Basis::AfterDe)),
+        Back::De(false) if fwd == Some(Tok::Cq) => Some((Frame::Cq, Basis::AfterDe)),
+        Back::De(false) => Some((Frame::De, Basis::AfterDe)),
+        Back::Cq => Some((Frame::Cq, Basis::AfterCq)),
+        Back::Test => Some((Frame::Cq, Basis::AfterTest)),
+        Back::Beacon => Some((Frame::Beacon, Basis::BeaconPreamble)),
+        _ => None,
+    }
 }
 
 impl Window<'_, '_> {
+    fn damage_at(&self, i: usize) -> Option<usize> {
+        self.damage.get(i).copied().flatten()
+    }
+
+    /// MAN-490: the `DE`/`CQ` frame, and its first word, that the clean run
+    /// starting at `a` inherits across one damaged copy of itself directly
+    /// before it. `None` unless every condition of the module doc's
+    /// "Damaged copies" holds.
+    fn inherited_back(&self, a: usize, call: &str) -> Option<(Back, usize)> {
+        if self.damage_at(a).is_some() || !grammar::is_plausible(call) {
+            return None;
+        }
+        if !self.joined_to_previous(a) {
+            return None;
+        }
+        let d = a - 1;
+        let pos = self.damage_at(d)?;
+        if self.toks[d] != Tok::Call || self.words[d].corrected {
+            return None;
+        }
+        let damaged = self.upper(d);
+        if pos == 0 || pos >= damaged.len() || grammar::is_plausible(&damaged) {
+            return None;
+        }
+        let (clean, damaged) = (call.as_bytes(), damaged.as_bytes());
+        if clean.len() != damaged.len() + 1
+            || !clean[pos].is_ascii_alphanumeric()
+            || clean[..pos] != damaged[..pos]
+            || clean[pos + 1..] != damaged[pos..]
+        {
+            return None;
+        }
+        // The damaged word's own frame, read directly: no correction or
+        // second damaged word skipped on the way.
+        if !self.joined_to_previous(d)
+            || !matches!(self.toks[d - 1], Tok::De | Tok::Cq | Tok::Filler)
+        {
+            return None;
+        }
+        match self.back(d, call) {
+            (back @ (Back::De(_) | Back::Cq), start) => Some((back, start)),
+            _ => None,
+        }
+    }
+
     /// Whether word `i - 1` is in the same turn as word `i`.
     fn joined_to_previous(&self, i: usize) -> bool {
         i > 0 && !self.words[i - 1].ends_turn && self.toks[i - 1] != Tok::TurnEnd
@@ -364,9 +451,21 @@ impl Window<'_, '_> {
 /// no further word will follow (the track is closing), which settles the
 /// window's last run. Pure and deterministic: no clock, no hashing.
 pub fn interpret(words: &[ExchangeWord<'_>], complete: bool) -> Vec<Occurrence> {
+    interpret_with_damage(words, &[], complete)
+}
+
+/// `interpret`, with MAN-490's damage evidence: `damage[i]` is the position
+/// of word `i`'s one embedded `AR`/`SK` glyph (characters before it), which
+/// only the `Validator` retains. A missing entry is `None`.
+pub(crate) fn interpret_with_damage(
+    words: &[ExchangeWord<'_>],
+    damage: &[Option<usize>],
+    complete: bool,
+) -> Vec<Occurrence> {
     let w = Window {
         words,
         toks: words.iter().map(|w| classify(w.text)).collect(),
+        damage,
     };
     let n = words.len();
     let mut out: Vec<Occurrence> = Vec::new();
@@ -399,15 +498,7 @@ pub fn interpret(words: &[ExchangeWord<'_>], complete: bool) -> Vec<Occurrence> 
         } else {
             b + 1
         };
-        let back_frame = match back {
-            Back::De(true) => Some((Frame::Cq, Basis::AfterDe)),
-            Back::De(false) if fwd == Some(Tok::Cq) => Some((Frame::Cq, Basis::AfterDe)),
-            Back::De(false) => Some((Frame::De, Basis::AfterDe)),
-            Back::Cq => Some((Frame::Cq, Basis::AfterCq)),
-            Back::Test => Some((Frame::Cq, Basis::AfterTest)),
-            Back::Beacon => Some((Frame::Beacon, Basis::BeaconPreamble)),
-            _ => None,
-        };
+        let back_frame = frame_of(back, fwd);
         // Rule 8's test, read before `push` borrows `out`: an earlier
         // occurrence in this turn is another plausible station's self-ID.
         let mention = out.iter().any(|o| {
@@ -485,14 +576,31 @@ pub fn interpret(words: &[ExchangeWord<'_>], complete: bool) -> Vec<Occurrence> 
                 );
             }
         // 8. Named after another station's own self-ID in the same turn.
-        } else {
-            let (role, basis) = if mention {
-                (Role::RelayedMention, Basis::MentionInTurn)
-            } else {
-                (Role::Uncertain, Basis::NoFrame)
-            };
+        } else if mention {
             for i in a..=b {
-                push(i, role, None, basis, b + 1);
+                push(i, Role::RelayedMention, None, Basis::MentionInTurn, b + 1);
+            }
+        // 8, MAN-490: a clean repeat of the damaged copy directly before it
+        // takes that copy's frame.
+        } else if let Some((frame, basis, start)) = w
+            .inherited_back(a, &call)
+            .and_then(|(back, start)| frame_of(back, fwd).map(|(f, bs)| (f, bs, start)))
+        {
+            let end = if fwd == Some(Tok::Cq) { fwd_end } else { b + 1 };
+            for i in a..=b {
+                out.push(Occurrence {
+                    index: i,
+                    call: call.clone(),
+                    role: Role::SelfId,
+                    frame: Some(frame),
+                    basis,
+                    settled,
+                    span: start..end,
+                });
+            }
+        } else {
+            for i in a..=b {
+                push(i, Role::Uncertain, None, Basis::NoFrame, b + 1);
             }
         }
         a = b + 1;
@@ -858,6 +966,220 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    /// MAN-490: `text`'s occurrences with `damage` as (word index, glyph
+    /// position) pairs and `ends` as word indices flagged `ends_turn`.
+    fn damaged(
+        text: &str,
+        damage: &[(usize, usize)],
+        ends: &[usize],
+        complete: bool,
+    ) -> Vec<Occurrence> {
+        let mut ws = words(text);
+        for &i in ends {
+            ws[i].ends_turn = true;
+        }
+        let mut at = vec![None; ws.len()];
+        for &(i, pos) in damage {
+            at[i] = Some(pos);
+        }
+        interpret_with_damage(&ws, &at, complete)
+    }
+
+    fn damaged3(text: &str, damage: &[(usize, usize)], ends: &[usize]) -> Vec<Expected> {
+        damaged(text, damage, ends, true)
+            .iter()
+            .map(|o| (o.call.clone(), o.role, o.frame.and_then(Frame::spot_type)))
+            .collect()
+    }
+
+    #[test]
+    fn man490_damage_match_requires_exact_surrounding_letters() {
+        // The ticket's case and a second call: the clean repeat inherits.
+        assert_eq!(
+            damaged3("CQ CQ DE NNXI N3NXI K", &[(3, 1)], &[]),
+            vec![r("NNXI", SelfId, CQ), r("N3NXI", SelfId, CQ)]
+        );
+        assert_eq!(
+            damaged3("DE KABC K1ABC K", &[(1, 1)], &[]),
+            vec![r("KABC", SelfId, DE), r("K1ABC", SelfId, DE)]
+        );
+        assert_eq!(
+            damaged3("CQ WAW W1AW K", &[(1, 1)], &[]),
+            vec![r("WAW", SelfId, CQ), r("W1AW", SelfId, CQ)]
+        );
+        let uncertain = |pre: &str| vec![r(pre, SelfId, CQ), r("N3NXI", Uncertain, None)];
+        // Mismatching prefix, suffix, or position.
+        assert_eq!(
+            damaged3("CQ DE MNXI N3NXI K", &[(2, 1)], &[]),
+            uncertain("MNXI")
+        );
+        assert_eq!(
+            damaged3("CQ DE NNXE N3NXI K", &[(2, 1)], &[]),
+            uncertain("NNXE")
+        );
+        assert_eq!(
+            damaged3("CQ DE NNXI N3NXI K", &[(2, 2)], &[]),
+            uncertain("NNXI")
+        );
+        // A damaged word that is not call-shaped passes nothing on.
+        assert!(!is_call_shaped("5NN") && !is_call_shaped("DE"));
+        assert!(is_call_shaped("NNXI"));
+        assert!(grammar::is_plausible("W1W") && !is_call_shaped("WW"));
+        assert_eq!(
+            damaged3("CQ DE WW W1W K", &[(2, 1)], &[]),
+            vec![r("W1W", Uncertain, None)]
+        );
+        // Missing glyph evidence: today's rule 8.
+        assert_eq!(damaged3("CQ DE NNXI N3NXI K", &[], &[]), uncertain("NNXI"));
+        // A leading or terminal position is not embedded.
+        assert_eq!(
+            damaged3("CQ DE NXI N3NXI K", &[(2, 0)], &[]),
+            vec![r("NXI", SelfId, CQ), r("N3NXI", Uncertain, None)]
+        );
+        assert_eq!(
+            damaged3("CQ DE AB1 AB1C K", &[(2, 3)], &[]),
+            vec![r("AB1", SelfId, CQ), r("AB1C", Uncertain, None)]
+        );
+        // A plausible predecessor is a different call, not damage: mention.
+        assert_eq!(
+            damaged3("CQ DE N3N6I N3NXI K", &[(2, 3)], &[]),
+            vec![r("N3N6I", SelfId, CQ), r("N3NXI", RelayedMention, None)]
+        );
+        // A damaged repeat of the damaged word: no second skip.
+        assert_eq!(
+            damaged3("CQ DE NNXI NNXI N3NXI K", &[(2, 1), (3, 1)], &[]),
+            vec![
+                r("NNXI", SelfId, CQ),
+                r("NNXI", SelfId, CQ),
+                r("N3NXI", Uncertain, None),
+            ]
+        );
+        // The clean word must itself carry no damage, and be plausible.
+        assert_eq!(
+            damaged3("CQ DE NNXI N3NXI K", &[(2, 1), (3, 1)], &[]),
+            uncertain("NNXI")
+        );
+        assert_eq!(
+            damaged3("CQ DE ABCD ABXCD K", &[(2, 2)], &[]),
+            vec![r("ABCD", SelfId, CQ), r("ABXCD", Uncertain, None)]
+        );
+    }
+
+    #[test]
+    fn man490_recovery_is_bounded() {
+        let uncertain = vec![r("NNXI", SelfId, CQ), r("N3NXI", Uncertain, None)];
+        // A turn end word or a flagged turn end between the copies.
+        for end in ["K", "KN", "BK", "AR", "SK"] {
+            let text = format!("CQ DE NNXI {end} N3NXI K");
+            assert_eq!(damaged3(&text, &[(2, 1)], &[]), uncertain, "{text:?}");
+        }
+        assert_eq!(damaged3("CQ DE NNXI N3NXI K", &[(2, 1)], &[2]), uncertain);
+        // A turn end or silence before the damaged word: no frame to pass.
+        assert_eq!(
+            damaged3("CQ DE NNXI N3NXI K", &[(2, 1)], &[1]),
+            vec![r("NNXI", Uncertain, None), r("N3NXI", Uncertain, None)]
+        );
+        // An unrelated word between the copies, or before the damaged one.
+        assert_eq!(damaged3("CQ DE NNXI OP N3NXI K", &[(2, 1)], &[]), uncertain);
+        assert_eq!(
+            damaged3("CQ DE OP NNXI N3NXI K", &[(3, 1)], &[]),
+            vec![r("NNXI", Uncertain, None), r("N3NXI", Uncertain, None)]
+        );
+        // No correction is skipped with it, and a corrected copy is left to
+        // the existing correction rule, damage or not.
+        assert_eq!(
+            damaged3("CQ DE W1AX EEEEE NNXI N3NXI K", &[(4, 1)], &[]),
+            vec![
+                r("W1AX", Uncertain, None),
+                r("NNXI", SelfId, CQ),
+                r("N3NXI", Uncertain, None),
+            ]
+        );
+        let mut ws = words("CQ DE NNXI N3NXI K");
+        ws[2].corrected = true;
+        assert_eq!(
+            interpret_with_damage(&ws, &[None, None, Some(1)], true),
+            interpret(&ws, true)
+        );
+        // No sign-off, TEST or beacon frame is inherited.
+        for pre in ["TU", "TEST", "V V V"] {
+            let text = format!("{pre} NNXI N3NXI K");
+            let i = text.split_whitespace().count() - 3;
+            let got = damaged3(&text, &[(i, 1)], &[]);
+            assert_ne!(got.last().unwrap().1, SelfId, "{text:?}: {got:?}");
+        }
+        // A following DE, report or query keeps its rule.
+        assert_eq!(
+            damaged3("CQ DE NNXI N3NXI DE W1AW K", &[(2, 1)], &[]),
+            vec![
+                r("NNXI", SelfId, CQ),
+                r("N3NXI", Addressee, None),
+                r("W1AW", SelfId, DE),
+            ]
+        );
+        for next in ["5NN", "001", "?"] {
+            let text = format!("CQ DE NNXI N3NXI {next}");
+            let got = damaged3(&text, &[(2, 1)], &[]);
+            assert_eq!(got[1].1, Addressee, "{text:?}");
+        }
+        // Another station's self-ID earlier in the turn keeps it a mention.
+        assert_eq!(
+            damaged3("DE W1AW CQ DE NNXI N3NXI K", &[(4, 1)], &[]),
+            vec![
+                r("W1AW", SelfId, CQ),
+                r("NNXI", SelfId, CQ),
+                r("N3NXI", RelayedMention, None),
+            ]
+        );
+        // Without its evidence, the public entry point is unchanged.
+        assert_eq!(
+            roles3("CQ CQ DE NNXI N3NXI K"),
+            vec![r("NNXI", SelfId, CQ), r("N3NXI", Uncertain, None)]
+        );
+    }
+
+    #[test]
+    fn man490_settled_recovery_is_stable() {
+        let text = "CQ CQ DE NNXI N3NXI N3NXI K CQ CQ DE NNXI N3NXI K";
+        let damage = [(3, 1), (10, 1)];
+        let full = damaged(text, &damage, &[], true);
+        let recovered: Vec<_> = full.iter().filter(|o| o.call == "N3NXI").collect();
+        assert_eq!(recovered.len(), 3);
+        for o in &recovered {
+            assert_eq!(
+                (o.role, o.frame, o.basis),
+                (SelfId, Some(Frame::Cq), Basis::AfterDe)
+            );
+            // The deciding words start at the frame and include the
+            // damaged copy.
+            let (first, damaged_at) = if o.index < 7 { (0, 3) } else { (7, 10) };
+            assert_eq!(o.span.start, first, "{o:?}");
+            assert!(o.span.contains(&damaged_at), "{o:?}");
+        }
+        // Settled-prefix invariant on the damage path.
+        let n = text.split_whitespace().count();
+        for len in 1..=n {
+            let prefix: Vec<&str> = text.split_whitespace().take(len).collect();
+            let prefix = prefix.join(" ");
+            let d: Vec<(usize, usize)> = damage.iter().copied().filter(|&(i, _)| i < len).collect();
+            for o in damaged(&prefix, &d, &[], false)
+                .into_iter()
+                .filter(|o| o.settled)
+            {
+                let f = full.iter().find(|f| f.index == o.index).unwrap();
+                assert_eq!(
+                    (o.role, o.frame, o.basis, o.span.clone()),
+                    (f.role, f.frame, f.basis, f.span.clone()),
+                    "prefix {len}, word {}",
+                    o.index
+                );
+            }
+        }
+        // The window's unsettled tail stays pending.
+        let tail = damaged("CQ DE NNXI N3NXI", &[(2, 1)], &[], false);
+        assert_eq!((tail[1].role, tail[1].settled), (SelfId, false));
     }
 
     #[test]

@@ -494,7 +494,16 @@ transmission may never produce again).
    with a spot form is a candidate, so `DE W1AW DE K1ABC K` spots K1ABC.
 
    A turn ends at `K`, `KN`, `BK`, `AR` or `SK`, and after 5 s with no decoded
-   character; frames and mentions never cross a turn end. A call is decided
+   character; frames and mentions never cross a turn end. One exception
+   (MAN-490): an `AR`/`SK` glyph decoded *inside* a word, between two
+   characters, in a word that is call-shaped but not a plausible call with the
+   glyph stripped (`N<SK>NXI`), is a garbled character, not a turn end. The validator keeps
+   its position, and a clean repeat right after it (`N3NXI`) takes the damaged
+   copy's `CQ`/`DE` frame when dropping the repeat's character at that
+   position spells the damaged copy exactly. Nothing else is skipped: one
+   damaged word, one glyph, one character, no correction, turn end or other
+   word crossed, and a following `DE`, report or query, or another station's
+   self-ID earlier in the turn, keeps its rule. A call is decided
    once it is settled: another word follows its run, its turn ends, or the
    track ends. An input that stalls or fails closes its tracks, so it settles
    their last calls too. A settled role is latched on its word, and a spot
