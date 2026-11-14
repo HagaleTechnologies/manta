@@ -9,8 +9,8 @@ Linux/ARM/headless platforms it has no native build for.
 
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run this list; `ci-full.yml`'s `*-support` and
-`*-shards` jobs cover it for `test (ubuntu-latest)`/`test (macos-latest)`. On
-Windows CI runs only `test_package_release` of the script suites; `ci_gates`,
+`*-shards` jobs cover the three OS checks. Windows support runs
+`test_package_release`; native smoke runs `ci_shards_windows`. `ci_gates`,
 `decisions_index` and `verify_dependabot_diff_safe` are Linux-only.
 
 ```sh
@@ -21,7 +21,7 @@ bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestr
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
 packaging,package_release,score_against_rbn_replay,corpus,score_transcript,ci_gates,\
 verify_dependabot_diff_safe,decisions_index,field_node,engine_overlap,ci_shards,release_profile_ab,\
-socket_test_repeat,package_deb}
+socket_test_repeat,package_deb,ci_shards_windows}
 # MAN-323 (Linux/macOS only): the FT8/FT4 decoder behind the `ftx` feature
 cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
 cargo test -p manta-engine --features ftx --locked --lib ftx

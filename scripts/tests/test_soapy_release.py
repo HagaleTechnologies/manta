@@ -642,7 +642,7 @@ class ImageCheckWiringTests(unittest.TestCase):
 class CiWiringTests(unittest.TestCase):
     def test_runs_in_required_test_job_on_unix_legs(self):
         wanted = "python3 -m unittest scripts.tests.test_soapy_release -v"
-        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), "test"))
+        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), "windows-support"))
         matches = [s for s in steps if wf.field(s, "run") == wanted]
         self.assertEqual(len(matches), 1, f"ci-full.yml job test has no step running {wanted!r}")
         self.assertEqual(wf.field(matches[0], "if"), "runner.os != 'Windows'")

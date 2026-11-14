@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('ci_shards', ROOT / 'scripts/ci-shards.py')
@@ -65,6 +66,54 @@ def no_compiler_path(directory):
 
 
 class ShardTests(unittest.TestCase):
+    def test_library_paths_for_each_platform(self):
+        for platform, separator, name in [('win32', ';', 'PATH'), ('darwin', ':', 'DYLD_FALLBACK_LIBRARY_PATH'), ('linux', ':', 'LD_LIBRARY_PATH')]:
+            with self.subTest(platform=platform), mock.patch.object(s.sys, 'platform', platform), mock.patch.object(s.os, 'pathsep', separator):
+                env = s.compose_env({name: 'inherited', 'KEEP': 'yes'}, {'CARGO_PKG_NAME': 'p'}, ['lib1', 'lib2'])
+                self.assertEqual(env[name], separator.join(['lib1', 'lib2', 'inherited']))
+                self.assertEqual(env['KEEP'], 'yes')
+                env = s.run_env(dict(env={'CARGO_PKG_NAME': 'p'}, libraryPath=['lib1']), Path('guard'))
+                self.assertEqual(env['PATH'].split(separator)[0], 'guard')
+                self.assertTrue(env['CARGO'].endswith('cargo.exe' if platform == 'win32' else 'cargo'))
+
+    def test_windows_tripwire_names_and_missing_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            helper = root/'native.exe'
+            helper.write_bytes(b'native-helper')
+            guard = root/'guard'
+            guard.mkdir()
+            with mock.patch.object(s.sys, 'platform', 'win32'):
+                with self.assertRaises(ValueError):
+                    s.make_tripwire(guard)
+                s.make_tripwire(guard, helper)
+                self.assertEqual(sorted(p.name for p in guard.iterdir()), ['cargo.exe', 'rustc.exe', 'rustup.exe'])
+                self.assertTrue(all(p.read_bytes() == b'native-helper' for p in guard.iterdir()))
+
+    def test_windows_build_includes_helper_in_every_slice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            fixture_crate(root)
+            git(root, 'init', '-q')
+            git(root, 'add', '-A')
+            git(root, 'commit', '-qm', 'fixture')
+            args = type('Args', (), dict(build_bundles=root/'bundles', count=2))()
+            previous = Path.cwd()
+            try:
+                os.chdir(root)
+                cargo_path = shutil.which('cargo')
+                with mock.patch.object(s.sys, 'platform', 'win32'), mock.patch.object(s.shutil, 'which', return_value=cargo_path):
+                    self.assertEqual(s.build_bundles(args, dict(index=0)), 0)
+            finally:
+                os.chdir(previous)
+            for index in range(2):
+                with tarfile.open(root/f'bundles/slice-{index}.tar.gz') as tar:
+                    plan = s.read_plan(tar)
+                    self.assertEqual(plan['tripwireExecutable'], 'target/ci-shard-tripwire.exe')
+                    member = tar.getmember(plan['tripwireExecutable'])
+                    self.assertTrue(member.isfile())
+                    self.assertGreater(member.size, 0)
+
     def test_discovery_deduplicates_and_rejects_ambiguity(self):
         a = artifact()
         self.assertEqual(len(s.parse_artifacts('\n'.join(map(json.dumps, [a, a])))), 1)

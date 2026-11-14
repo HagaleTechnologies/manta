@@ -39,7 +39,7 @@ _PASSED = re.compile(r'^test result: ok\. (\d+) passed;', re.M)
 
 
 def git(cwd, *args):
-    return subprocess.run(['git', *args], cwd=cwd, check=True, text=True,
+    return subprocess.run(['git', *args], cwd=cwd, check=True, text=True, encoding='utf-8',
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
 
 
@@ -181,7 +181,7 @@ def integration_closure(tests_dir, target):
         if path in seen or not path.exists():
             continue
         seen.add(path)
-        text = path.read_text(errors='replace')
+        text = path.read_text(encoding='utf-8')
         for rel, _ in _PATH_ATTR.findall(text):
             todo.append((path.parent / rel).resolve())
         base = path.parent if path.name in ('main.rs', 'mod.rs') or path == root else path.parent / path.stem
@@ -235,7 +235,7 @@ def _test_only_file(src_dir, path):
 
 @functools.lru_cache(maxsize=None)
 def _code(path):
-    return _blank_strings_and_comments(path.read_text(errors='replace'))
+    return _blank_strings_and_comments(path.read_text(encoding='utf-8'))
 
 
 def select(root, item, changed):
@@ -257,7 +257,7 @@ def select(root, item, changed):
             path = (root / rel).resolve()
             if path not in closure:
                 continue
-            text = path.read_text(errors='replace')
+            text = path.read_text(encoding='utf-8')
             lines = _meaningful(text, lines)
             if not lines:
                 continue
@@ -282,7 +282,7 @@ def select(root, item, changed):
             path = (root / rel).resolve()
             if src_dir not in path.parents:
                 continue
-            text = path.read_text(errors='replace')
+            text = path.read_text(encoding='utf-8')
             lines = _meaningful(text, lines)
             prefix = module_prefix(src_dir, path)
             spans = test_functions(text)
@@ -361,7 +361,7 @@ def repeat(item, test, cwd, env, count=REPEAT_COUNT, runner=subprocess.run):
     runs = []
     for iteration in range(1, count + 1):
         started = time.monotonic()
-        proc = runner(command, cwd=cwd, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = runner(command, cwd=cwd, env=env, text=True, encoding='utf-8', stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         output = proc.stdout or ''
         passed = _PASSED.search(output)
         ok = proc.returncode == 0 and passed is not None and int(passed.group(1)) == 1
@@ -391,11 +391,13 @@ def audit_repeats(repeat_plan, results, count=REPEAT_COUNT):
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     # Dry run: print what a diff would select for an inventory JSON (ci-shards.py evidence).
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', required=True)
     parser.add_argument('--inventory', type=Path, required=True)
     args = parser.parse_args()
-    evidence = json.loads(args.inventory.read_text())
+    evidence = json.loads(args.inventory.read_text(encoding='utf-8'))
     print(json.dumps(plan(Path.cwd(), evidence['inventory'], args.base), indent=2))

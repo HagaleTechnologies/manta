@@ -4290,6 +4290,22 @@ fn claude_md_pre_push_commands_are_ci_full_commands() {
         }
         for cmd in line.split(" && ") {
             let cmd = strip(&env.replace(cmd, ""));
+            // MAN-565: all OSes now execute the ordinary suite through prebuilt slices.
+            // Keep the contributor's full cargo test command, but prove its CI equivalent:
+            // one workspace compilation, whole-binary shard runs, and separate doctests.
+            if cmd == "cargo test --workspace --locked" {
+                assert!(ci_runs.iter().any(|run| run
+                    .contains("scripts/ci-shards.py --count 8 --build-bundles test-bundles")));
+                assert!(ci_runs
+                    .iter()
+                    .any(|run| run.contains("scripts/ci-shards.py --count 8 --shard")
+                        && run.contains("--from-bundle")));
+                assert!(doc("scripts/ci-shards.py").contains(
+                    "['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json']"
+                ));
+                assert!(ci_runs.contains("cargo test --workspace --doc --locked"));
+                continue;
+            }
             assert!(
                 ci_runs.contains(&cmd),
                 "CLAUDE.md's Build and test runs `{cmd}`, which no ci-full.yml job runs"

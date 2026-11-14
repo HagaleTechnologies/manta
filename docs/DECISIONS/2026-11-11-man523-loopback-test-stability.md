@@ -1,5 +1,7 @@
 # MAN-523: loopback tests hold their ports, and changed socket tests run ten more times
 
+> Windows update (MAN-565, 2026-11-14). Windows now repeats changed socket tests from its assigned slices, just like Unix, rather than from an inventory-only serial job. See [MAN-565](2026-11-14-man565-windows-build-once-shards.md). Historical measurements below are unchanged.
+
 Date: 2026-11-11
 Ticket: MAN-523 (review 2026-11-07, CI/bugs)
 Status: decided and built; proved on Linux only. The twenty-run main

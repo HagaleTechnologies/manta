@@ -23,10 +23,11 @@ REPO = "HagaleTechnologies/manta"
 TRUSTED = {"thagale", "catalyst-cloud-connector[bot]"}
 DISPATCH_CALL = "actions/workflows/ci-full.yml/dispatches"
 BLOCK_SCALARS = {"|", "|-", "|+", ">", ">-", ">+"}
-CI_TEST_JOBS = ("test", "ubuntu-support", "ubuntu-build", "ubuntu-shards", "macos-support", "macos-build",
+CI_TEST_JOBS = ("windows-support", "windows-build", "windows-shards",
+                "ubuntu-support", "ubuntu-build", "ubuntu-shards", "macos-support", "macos-build",
                 "macos-shards", "test-soapy")
 # MAN-518: the shards run executables their OS's build job compiled, so they carry no build cache.
-PREBUILT_SHARD_JOBS = ("ubuntu-shards", "macos-shards")
+PREBUILT_SHARD_JOBS = ("windows-shards", "ubuntu-shards", "macos-shards")
 SAVE_IF = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
 NATIVE_IF = ("github.event_name != 'pull_request' || "
              "github.event.pull_request.head.repo.full_name != github.repository || "
@@ -370,13 +371,14 @@ class CiFullCacheTests(unittest.TestCase):
         # MAN-518: the build job reuses the key the shards wrote (`shared-key` replaces the job id
         # in rust-cache's key), so its first runs after landing restore warm dependencies.
         found = dict(rust_cache_steps(read("ci-full.yml")))
-        for platform in ("ubuntu", "macos"):
+        for platform in ("ubuntu", "macos", "windows"):
             with self.subTest(platform=platform):
                 step = found.get(f"{platform}-build")
                 self.assertIsNotNone(step, f"{platform}-build: no rust-cache step")
                 with_block = sub(step, "with")
                 self.assertIsNotNone(with_block, f"{platform}-build: rust-cache step has no with: block")
-                self.assertEqual(field(with_block, "shared-key"), f"{platform}-shards")
+                expected = "test" if platform == "windows" else f"{platform}-shards"
+                self.assertEqual(field(with_block, "shared-key"), expected)
                 self.assertEqual(field(with_block, "save-if"), SAVE_IF)
 
     def test_soapy_cache_is_keyed_to_the_installed_soapysdr(self):
@@ -422,8 +424,11 @@ class CiFullNativePathTests(unittest.TestCase):
         command = re.search(r'^name = "test-workspace"\nrun = (\[[^\n]*\])$', config, re.M)
         self.assertIsNotNone(command, "Catalyst must retain the workspace test gate")
         self.assertEqual(json.loads(command.group(1)), ["cargo", "test", "--workspace", "--locked"])
-        self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --locked"
-                            for s in steps(job_block(self.text, "test"))))
+        for platform in ("ubuntu", "macos", "windows"):
+            self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --doc --locked"
+                                for s in steps(job_block(self.text, f"{platform}-support"))))
+            self.assertTrue(any("--build-bundles" in (run_body(s) or "")
+                                for s in steps(job_block(self.text, f"{platform}-build"))))
 
     def test_test_jobs_run_natively_for_non_dispatch_eligible_prs(self):
         for job in CI_TEST_JOBS:
@@ -479,8 +484,8 @@ def test_job_head(job):
 
 
 def merge_step_body():
-    """The run: body of the merge-main step in ci-full.yml's `test` job, or None."""
-    step = step_by_id(job_block(read("ci-full.yml"), "test"), MERGE_STEP_ID)
+    """The run: body of the merge-main step in ci-full.yml's `windows-support` job, or None."""
+    step = step_by_id(job_block(read("ci-full.yml"), "windows-support"), MERGE_STEP_ID)
     return None if step is None else run_body(step)
 
 

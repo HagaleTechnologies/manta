@@ -792,7 +792,7 @@ class BuildSoapyArm64JobTests(unittest.TestCase):
 
 class CiFullTests(unittest.TestCase):
     def runs(self, module):
-        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), "test"))
+        steps = wf.steps(wf.job_block(wf.read("ci-full.yml"), "windows-support"))
         return [s for s in steps if f"-m unittest scripts.tests.{module} -v" in executable(wf.run_body(s))]
 
     def test_packaging_tests_run_on_unix_legs(self):

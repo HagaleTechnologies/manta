@@ -768,7 +768,7 @@ class CiRegistrationTests(unittest.TestCase):
 
     def test_module_runs_in_test_and_both_support_jobs(self):
         text = wf.read("ci-full.yml")
-        for job in ("test", "ubuntu-support", "macos-support"):
+        for job in ("windows-support", "ubuntu-support", "macos-support"):
             with self.subTest(job=job):
                 hits = [s for s in wf.steps(wf.job_block(text, job)) if (wf.run_body(s) or "").strip() == self.COMMAND]
                 self.assertEqual(len(hits), 1)

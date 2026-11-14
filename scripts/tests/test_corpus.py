@@ -573,7 +573,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(ROOT, ref)), f"corpus.yml names missing {ref}")
 
     def test_ci_full_runs_both_unittest_modules(self):
-        test_job = wf.job_block(wf.read("ci-full.yml"), "test")
+        test_job = wf.job_block(wf.read("ci-full.yml"), "windows-support")
         for module in ("scripts.tests.test_corpus", "scripts.tests.test_score_transcript"):
             wanted = "python3 -m unittest %s -v" % module
             with self.subTest(module=module):

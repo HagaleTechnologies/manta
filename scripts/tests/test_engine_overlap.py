@@ -978,7 +978,7 @@ Reading: below the adoption bar: net gain below 0.25 pp or its interval not abov
 
 class WiringTests(unittest.TestCase):
     def test_this_module_runs_in_the_required_test_job(self):
-        job = wf.job_block(wf.read("ci-full.yml"), "test")
+        job = wf.job_block(wf.read("ci-full.yml"), "windows-support")
         all_steps = wf.steps(job)
         found = [s for s in all_steps if (wf.run_body(s) or "").strip() == TEST_COMMAND]
         self.assertEqual(len(found), 1)

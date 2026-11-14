@@ -399,7 +399,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:f345de9c7831ff99be14b2fdc033b8732cef2e65ba68e2dc08e261da7d2a2e5d",
+      "hash": "sha256:ef6ae6744c3b16990f6401078887cc4b2b6dea045b2fe221a0fcd82dd35ad8df",
       "id": "windows-build-setup",
       "kind": "howto",
       "links": [
@@ -416,7 +416,8 @@
         "scripts/check-soapy-release.py",
         "docs/archive/plans/specs/2026-09-11-man212-windows-platform-support-design.md",
         "docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md",
-        "docs/DECISIONS/2026-10-15-man371-windows-required-check.md"
+        "docs/DECISIONS/2026-10-15-man371-windows-required-check.md",
+        "docs/DECISIONS/2026-11-14-man565-windows-build-once-shards.md"
       ],
       "status": "current",
       "title": "How do I build and test manta on Windows?",
