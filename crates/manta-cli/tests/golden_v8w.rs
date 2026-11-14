@@ -7,10 +7,18 @@
 //! (`common::pileup::fixture`).
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 mod common;
 use common::decode::per_track;
 use common::pileup::*;
+
+/// The V8w scene decoded once per binary with default settings, shared by
+/// the bogus gate and MAN-490's recovery check.
+fn default_report() -> &'static serde_json::Value {
+    static REPORT: OnceLock<serde_json::Value> = OnceLock::new();
+    REPORT.get_or_init(|| decode_json(&fixture("V8w").wav, &[]))
+}
 
 /// SPEC §7's V8w row states three independent pass criteria; this is the
 /// second, "0 bogus callsigns". It is deliberately a test of its own, NOT
@@ -22,8 +30,8 @@ use common::pileup::*;
 #[test]
 fn v8w_pileup_fading_spots_no_bogus_callsigns() {
     let fx = fixture("V8w");
-    let report = decode_json(&fx.wav, &[]);
-    let failures = v8w_scene_failures(&report, &fx.manifest, "V8w");
+    let report = default_report();
+    let failures = v8w_scene_failures(report, &fx.manifest, "V8w");
     assert!(failures.is_empty(), "V8w: {}", failures.join(" | "));
 }
 
@@ -229,4 +237,32 @@ fn v8w_with_prior_on_stays_at_zero_bogus() {
 #[test]
 fn v8w_with_repetition_fusion_on_stays_at_zero_bogus() {
     repetition_fusion_on_stays_at_zero_bogus("V8w");
+}
+
+/// MAN-490: the V8w scene's `CQ CQ DE N<SK>NXI N3NXI K` -- a clean copy
+/// right after a copy the decoder garbled with an `SK` glyph inside the
+/// word -- spots N3NXI through the clean copy, with default settings
+/// (fusion and prior off), and adds no bogus call. Measured at `0fab172`,
+/// before the fix: 28/50 genuine, 0 bogus, N3NXI absent, VE3QHG present
+/// (docs/DECISIONS/2026-11-14-man490-clean-repeat-recovery.md).
+#[test]
+fn man490_v8w_recovers_n3nxi_without_bogus() {
+    let fx = fixture("V8w");
+    let report = default_report();
+    let (bogus, validated, _) = bogus_and_validated(report, &fx.manifest, "V8w");
+    let spotted: HashSet<String> = spotted_calls(report)
+        .into_iter()
+        .map(|(call, _)| call)
+        .collect();
+    let mut sorted: Vec<&String> = spotted.iter().collect();
+    sorted.sort_unstable();
+    eprintln!("MAN-490 V8w: bogus={bogus:?}, validated={validated}, spotted={sorted:?}");
+    assert!(bogus.is_empty(), "V8w must spot 0 bogus calls: {bogus:?}");
+    for call in ["N3NXI", "VE3QHG"] {
+        assert!(spotted.contains(call), "{call} missing: {sorted:?}");
+    }
+    assert!(
+        validated >= 29,
+        "MAN-490 needs at least 29/50 genuine calls on V8w (28 before), got {validated}"
+    );
 }

@@ -1647,7 +1647,10 @@ ARCHITECTURE §6 steps 1 (context parse -- tagged `SpotType::Unknown` when no
 CQ/DE/UP/beacon pattern matched) and 2 (grammar/cty) entirely, but not role:
 a listed call heard only as the station called or mentioned is not spotted.
 Every candidate is decided at settle, once another word follows its run, its
-turn ends or its track ends (MAN-201). A `BEACON` tag needs `V V V` or an
+turn ends or its track ends (MAN-201). An `AR`/`SK` glyph between two
+characters of a word that is call-shaped but no plausible call stripped of
+it is a garbled character, not a turn end, and a clean repeat of the call right after that
+word takes its `CQ`/`DE` frame (MAN-490, ARCHITECTURE §6.1). A `BEACON` tag needs `V V V` or an
 allowlisted power-step ID.
 
 **Beacon emission timing (amended 2026-09-09, see
