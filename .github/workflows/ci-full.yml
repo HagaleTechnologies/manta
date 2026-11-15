@@ -894,7 +894,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
-      - run: python3 -m unittest -v scripts.tests.test_ci_shards_windows
+      - run: python3 -m unittest scripts.tests.test_ci_shards_windows -v
       # MAN-523: the changed-socket-test selector and its ten-repeat runner.
       - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
@@ -1421,7 +1421,7 @@ jobs:
       - if: runner.os == 'Linux'
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
-      - run: python3 -m unittest -v scripts.tests.test_ci_shards_windows
+      - run: python3 -m unittest scripts.tests.test_ci_shards_windows -v
       # MAN-523: the changed-socket-test selector and its ten-repeat runner.
       - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
