@@ -126,7 +126,9 @@ Build `windows-audit-input.json` with `shards` holding all eight records,
 epoch timestamps, `build` holding the build record, and `reference` holding an
 independent same-source unsharded inventory. Obtain that reference through a
 separately authorized hosted validation run with the same toolchain and default
-features, using `--inventory-only`. Then run:
+features, using `--inventory-only`. Every support record carries `started`,
+taken just after checkout, so it audits as uploaded. For the support duration,
+use the support job's Jobs API `started_at`, which includes checkout. Then run:
 
 ```sh
 python scripts/ci-shards.py --audit windows-audit-input.json --output windows-audit.json

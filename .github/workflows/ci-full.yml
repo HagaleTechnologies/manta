@@ -238,6 +238,12 @@ jobs:
             exit 1
           fi
           echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
+      # MAN-565 (Codex, PR #591): `ci-shards.py --audit` checks the support record's `started`
+      # against the workflow interval. Taken after checkout, so it trails the Jobs API `started_at`.
+      - name: Record support start time
+        id: support-start
+        shell: bash
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -368,12 +374,14 @@ jobs:
         env:
           SUPPORT_RESULT: ${{ job.status }}
           DOCTEST_RESULT: ${{ steps.doctests.outcome }}
+          SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python - <<'PYTHON'
           import json, os, time
           from pathlib import Path
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -752,6 +760,12 @@ jobs:
             exit 1
           fi
           echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
+      # MAN-565 (Codex, PR #591): `ci-shards.py --audit` checks the support record's `started`
+      # against the workflow interval. Taken after checkout, so it trails the Jobs API `started_at`.
+      - name: Record support start time
+        id: support-start
+        shell: bash
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -888,12 +902,14 @@ jobs:
         env:
           SUPPORT_RESULT: ${{ job.status }}
           DOCTEST_RESULT: ${{ steps.doctests.outcome }}
+          SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python3 - <<'PYTHON'
           import json, os, time
           from pathlib import Path
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1271,6 +1287,12 @@ jobs:
             exit 1
           fi
           echo "::notice title=Tested with main merged in::$HEAD_SHA merged with $BASE_SHA as $(git rev-parse HEAD)"
+      # MAN-565 (Codex, PR #591): `ci-shards.py --audit` checks the support record's `started`
+      # against the workflow interval. Taken after checkout, so it trails the Jobs API `started_at`.
+      - name: Record support start time
+        id: support-start
+        shell: bash
+        run: echo "epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
@@ -1407,12 +1429,14 @@ jobs:
         env:
           SUPPORT_RESULT: ${{ job.status }}
           DOCTEST_RESULT: ${{ steps.doctests.outcome }}
+          SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python3 - <<'PYTHON'
           import json, os, time
           from pathlib import Path
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

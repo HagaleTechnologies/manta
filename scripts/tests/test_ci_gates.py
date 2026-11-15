@@ -16,7 +16,9 @@ import os
 import re
 import shlex
 import subprocess
+import sys
 import tempfile
+import time
 import tomllib
 import unittest
 
@@ -1304,6 +1306,45 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                     results[f'{platform}-shards'] = {'result': shard}
                 proc = subprocess.run(['bash', '-c', body], env={**os.environ, 'RESULTS': json.dumps(results)}, capture_output=True)
                 self.assertEqual(proc.returncode, expected, (build, shard, support, proc.stderr))
+
+    def test_support_record_passes_the_audit_as_uploaded(self):
+        # MAN-565 (Codex, PR #591): `ci-shards.py --audit` reads the support record's `started`, so
+        # each support job records its own start time and the uploaded record audits unrepaired.
+        ci_shards = _load('ci_shards', os.path.join(ROOT, 'scripts', 'ci-shards.py'))
+        records = [dict(index=i, count=2, inventory=[], selected=[], results=[]) for i in range(2)]
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos', 'windows'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                support = wf.job_block(text, f'{platform}-support')
+                start = wf.step_by_id(support, 'support-start')
+                self.assertIsNotNone(start, f'{platform}-support: no support-start step')
+                self.assertIsNone(wf.field(start, 'if'))
+                ids = [wf.field(s, 'id') for s in wf.steps(support)]
+                self.assertLess(ids.index('support-start'), ids.index('doctests'))
+                record = next(s for s in wf.steps(support)
+                              if wf.field(s, 'name') == 'Record support and doctest results')
+                self.assertEqual(wf.field(wf.sub(record, 'env'), 'SUPPORT_STARTED'),
+                                 '${{ steps.support-start.outputs.epoch }}')
+                bindir = os.path.join(tmp, 'bin')
+                os.mkdir(bindir)
+                for name in ('python', 'python3'):
+                    os.symlink(sys.executable, os.path.join(bindir, name))
+                output = os.path.join(tmp, 'github-output')
+                env = {**os.environ, 'PATH': bindir + os.pathsep + os.environ['PATH'], 'GITHUB_OUTPUT': output}
+                workflow_started = int(time.time())
+                subprocess.run(['bash', '-c', wf.run_body(start)], env=env, check=True)
+                with open(output, encoding='utf-8') as f:
+                    outputs = dict(line.rstrip('\n').split('=', 1) for line in f if line.strip())
+                env.update(SUPPORT_RESULT='success', DOCTEST_RESULT='success', SUPPORT_STARTED=outputs['epoch'],
+                           GITHUB_RUN_ID='1', RUNNER_OS=platform)
+                subprocess.run(['bash', '-c', wf.run_body(record)], cwd=tmp, env=env, check=True)
+                completed = time.time()
+                with open(os.path.join(tmp, 'support-evidence.json'), encoding='utf-8') as f:
+                    evidence = json.load(f)
+                self.assertEqual(evidence['started'], int(outputs['epoch']))
+                # Real wall-clock bounds around the two steps, as the hosted audit uses.
+                self.assertEqual(ci_shards.audit_evidence(records, evidence, workflow_started, completed),
+                                 completed - workflow_started)
 
     def test_build_job_uploads_one_bundle_per_shard(self):
         # MAN-518: the build job cuts one slice per shard; every shard index has its own upload.
