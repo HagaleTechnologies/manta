@@ -7,18 +7,10 @@
 //! (`common::pileup::fixture`).
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 mod common;
 use common::decode::per_track;
 use common::pileup::*;
-
-/// The V8w scene decoded once per binary with default settings, shared by
-/// the bogus gate and MAN-490's recovery check.
-fn default_report() -> &'static serde_json::Value {
-    static REPORT: OnceLock<serde_json::Value> = OnceLock::new();
-    REPORT.get_or_init(|| decode_json(&fixture("V8w").wav, &[]))
-}
 
 /// SPEC §7's V8w row states three independent pass criteria; this is the
 /// second, "0 bogus callsigns". It is deliberately a test of its own, NOT
@@ -30,8 +22,8 @@ fn default_report() -> &'static serde_json::Value {
 #[test]
 fn v8w_pileup_fading_spots_no_bogus_callsigns() {
     let fx = fixture("V8w");
-    let report = default_report();
-    let failures = v8w_scene_failures(report, &fx.manifest, "V8w");
+    let report = decode_json(&fx.wav, &[]);
+    let failures = v8w_scene_failures(&report, &fx.manifest, "V8w");
     assert!(failures.is_empty(), "V8w: {}", failures.join(" | "));
 }
 
@@ -248,9 +240,9 @@ fn v8w_with_repetition_fusion_on_stays_at_zero_bogus() {
 #[test]
 fn man490_v8w_recovers_n3nxi_without_bogus() {
     let fx = fixture("V8w");
-    let report = default_report();
-    let (bogus, validated, _) = bogus_and_validated(report, &fx.manifest, "V8w");
-    let spotted: HashSet<String> = spotted_calls(report)
+    let report = decode_json(&fx.wav, &[]);
+    let (bogus, validated, _) = bogus_and_validated(&report, &fx.manifest, "V8w");
+    let spotted: HashSet<String> = spotted_calls(&report)
         .into_iter()
         .map(|(call, _)| call)
         .collect();
