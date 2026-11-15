@@ -327,3 +327,207 @@ fn v57_a_call_is_decided_once_its_role_is_settled() {
     assert!(calls(&spots).iter().all(|(c, _)| *c != "W1AW"), "{spots:?}");
     assert!(v.take_decisions().iter().all(|d| d.call != "W1AW"));
 }
+
+// MAN-490: a clean copy of a call right after a copy of it that the decoder
+// garbled with an `AR`/`SK` glyph inside the word (`N<SK>NXI N3NXI`).
+
+/// One word's glyphs: `<SK>` and `<AR>` in `text` become real
+/// `Glyph::Prosign` events, never the literal characters.
+fn glyphs(text: &str) -> Vec<Glyph> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix("<SK>") {
+            out.push(Glyph::Prosign(Prosign::Sk));
+            rest = tail;
+        } else if let Some(tail) = rest.strip_prefix("<AR>") {
+            out.push(Glyph::Prosign(Prosign::Ar));
+            rest = tail;
+        } else {
+            let c = rest.chars().next().expect("non-empty");
+            out.push(Glyph::Char(c));
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// `transmission_events` with glyph-aware words; also each word's boundary
+/// `sample_ts`. A glyph takes a 100-sample step like a character.
+fn glyph_transmission(words: &[&str], start_ts: u64) -> (Vec<DecoderEvent>, Vec<u64>) {
+    let mut events = Vec::new();
+    let mut bounds = Vec::new();
+    let mut ts = start_ts;
+    for word in words {
+        for glyph in glyphs(word) {
+            events.push(DecoderEvent::char_decoded(1, ts, glyph, 0.95));
+            ts += 100;
+        }
+        events.push(DecoderEvent::word_boundary(1, ts));
+        bounds.push(ts);
+        ts += 100;
+    }
+    (events, bounds)
+}
+
+/// The bundled tables (the V8w pipeline's), no allowlist, fusion off.
+fn bundled() -> Validator {
+    let mut v = Validator::bundled(FS);
+    v.record_decisions(true);
+    seed_meta(&mut v, 1);
+    v
+}
+
+const LOOP: u64 = 2_000_000;
+
+/// `words` sent `loops` times, 2,000,000 samples (20.8 s) apart, then the
+/// track's close; every spot.
+fn looped(v: &mut Validator, words: &[&str], loops: u64) -> Vec<Spot> {
+    let mut spots = Vec::new();
+    for i in 0..loops {
+        spots.extend(run(&glyph_transmission(words, i * LOOP).0, v));
+    }
+    spots.extend(close_track(v, 1, ClosureKind::SignalEnded));
+    spots
+}
+
+#[test]
+fn man490_glyph_words_are_real_prosign_events() {
+    assert_eq!(
+        glyphs("N<SK>NXI"),
+        vec![
+            Glyph::Char('N'),
+            Glyph::Prosign(Prosign::Sk),
+            Glyph::Char('N'),
+            Glyph::Char('X'),
+            Glyph::Char('I'),
+        ]
+    );
+    assert_eq!(glyphs("<AR>"), vec![Glyph::Prosign(Prosign::Ar)]);
+}
+
+#[test]
+fn man490_clean_copy_after_embedded_prosign_spots() {
+    for damaged in ["N<SK>NXI", "N<AR>NXI"] {
+        let mut v = bundled();
+        let words = ["CQ", "CQ", "DE", damaged, "N3NXI", "K"];
+        let spots = looped(&mut v, &words, 8);
+        assert_eq!(calls(&spots), vec![("N3NXI", SpotType::Cq)], "{damaged}");
+        assert_eq!(
+            spots[0].emission_state,
+            manta_spot::EmissionState::Confirmed,
+            "{damaged}"
+        );
+        let log = v.take_decisions();
+        assert!(
+            log.iter().all(|d| d.call == "N3NXI" || d.spot.is_none()),
+            "{damaged}: {log:?}"
+        );
+    }
+    // A second call, in a `DE` frame: nothing in the rule names N3NXI.
+    let mut v = bundled();
+    let words = ["DE", "W<SK>REB", "W5REB", "K"];
+    let spots = looped(&mut v, &words, 8);
+    assert_eq!(calls(&spots), vec![("W5REB", SpotType::De)]);
+}
+
+#[test]
+fn man490_recovery_counts_messages_not_words() {
+    // One transmission, two clean copies after the damaged one: one
+    // message, one repetition, below the common tier's two.
+    let words = ["CQ", "CQ", "DE", "N<SK>NXI", "N3NXI", "N3NXI", "K"];
+    let mut v = bundled();
+    let spots = looped(&mut v, &words, 1);
+    assert!(spots.is_empty(), "{spots:?}");
+    let log: Vec<_> = v
+        .take_decisions()
+        .into_iter()
+        .filter(|d| d.call == "N3NXI")
+        .collect();
+    assert!(!log.is_empty(), "the clean copies are candidates");
+    for d in &log {
+        assert_eq!(d.reason, Some(manta_spot::Reason::Repetition), "{d:?}");
+        assert_eq!((d.reps, d.required_reps), (Some(1), 2), "{d:?}");
+    }
+
+    // Two transmissions inside the 90 s window confirm it, at the second
+    // transmission's first clean word's own boundary.
+    let words = ["CQ", "CQ", "DE", "N<SK>NXI", "N3NXI", "K"];
+    let mut v = bundled();
+    let spots = looped(&mut v, &words, 2);
+    assert_eq!(calls(&spots), vec![("N3NXI", SpotType::Cq)]);
+    let (_, bounds) = glyph_transmission(&words, LOOP);
+    assert_eq!(spots[0].sample_ts, bounds[4]);
+    let spotted: Vec<_> = v
+        .take_decisions()
+        .into_iter()
+        .filter(|d| d.spot.is_some())
+        .collect();
+    assert_eq!(spotted.len(), 1);
+    assert_eq!(
+        (spotted[0].reps, spotted[0].sample_ts),
+        (Some(2), bounds[4])
+    );
+}
+
+#[test]
+fn man490_real_turn_ends_and_mentions_stay_excluded() {
+    let n3nxi = |spots: &[Spot]| spots.iter().any(|s| s.callsign == "N3NXI");
+    // The glyph after the last character, standalone, leading, or twice in
+    // the word: a turn end, as before.
+    for damaged in [
+        &["NNXI<SK>"][..],
+        &["NNXI", "<SK>"][..],
+        &["<SK>NNXI"][..],
+        &["N<SK>N<AR>XI"][..],
+    ] {
+        let mut words = vec!["CQ", "CQ", "DE"];
+        words.extend_from_slice(damaged);
+        words.extend(["N3NXI", "K"]);
+        let mut v = bundled();
+        let spots = looped(&mut v, &words, 8);
+        assert!(!n3nxi(&spots), "{words:?}: {spots:?}");
+    }
+    // Ordinary `SK`/`AR` words, a `K`, and an unrelated word between the
+    // copies.
+    for between in ["SK", "AR", "K", "OP"] {
+        let words = ["CQ", "CQ", "DE", "N<SK>NXI", between, "N3NXI", "K"];
+        let mut v = bundled();
+        let spots = looped(&mut v, &words, 8);
+        assert!(!n3nxi(&spots), "{words:?}: {spots:?}");
+    }
+    // A stripped keyword is not call-shaped: its glyph still ends the turn,
+    // so it frames nothing.
+    for words in [
+        &["CQ", "D<SK>E", "W1AW", "K"][..],
+        &["C<AR>Q", "W1AW", "K"][..],
+    ] {
+        let mut v = bundled();
+        let spots = looped(&mut v, words, 8);
+        assert!(spots.is_empty(), "{words:?}: {spots:?}");
+    }
+    // Five seconds of silence between the copies.
+    let mut v = bundled();
+    let mut spots = Vec::new();
+    for i in 0..8 {
+        let (events, bounds) = glyph_transmission(&["CQ", "CQ", "DE", "N<SK>NXI"], i * LOOP);
+        spots.extend(run(&events, &mut v));
+        let after = bounds[3] + 500_000;
+        spots.extend(run(&glyph_transmission(&["N3NXI", "K"], after).0, &mut v));
+    }
+    spots.extend(close_track(&mut v, 1, ClosureKind::SignalEnded));
+    assert!(!n3nxi(&spots), "{spots:?}");
+    // A plausible different first copy keeps the clean call a mention, a
+    // following `DE` keeps it the addressee, and a report the station sent
+    // to.
+    for words in [
+        &["CQ", "CQ", "DE", "N3N6I", "N3NXI", "K"][..],
+        &["CQ", "DE", "N<SK>NXI", "N3NXI", "DE", "K1ABC", "K"][..],
+        &["CQ", "DE", "N<SK>NXI", "N3NXI", "5NN", "K"][..],
+        &["DE", "W1AW", "CQ", "DE", "N<SK>NXI", "N3NXI", "K"][..],
+    ] {
+        let mut v = bundled();
+        let spots = looped(&mut v, words, 8);
+        assert!(!n3nxi(&spots), "{words:?}: {spots:?}");
+    }
+}

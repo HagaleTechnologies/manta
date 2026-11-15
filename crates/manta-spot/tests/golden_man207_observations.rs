@@ -606,3 +606,150 @@ fn observation_detail_never_changes_spots() {
         }
     }
 }
+
+/// MAN-490: `CQ CQ DE <word> <then...>` where `<word>` is the decoder's
+/// `N<SK>NXI`-shaped reading: `before`, an `SK` glyph, `after`. Ends 100
+/// samples after its last boundary.
+fn with_embedded_sk(start: u64, before: &str, after: &str, then: &[&str]) -> Vec<DecoderEvent> {
+    let mut events = transmission_events(1, &["CQ", "CQ", "DE"], start);
+    let mut ts = start + 900;
+    let mut push = |events: &mut Vec<DecoderEvent>, glyph: Glyph| {
+        events.push(DecoderEvent::char_decoded(1, ts, glyph, 0.95));
+        ts += 100;
+    };
+    for c in before.chars() {
+        push(&mut events, Glyph::Char(c));
+    }
+    push(&mut events, Glyph::Prosign(manta_decode::tree::Prosign::Sk));
+    for c in after.chars() {
+        push(&mut events, Glyph::Char(c));
+    }
+    events.push(DecoderEvent::word_boundary(1, ts));
+    events.extend(transmission_events(1, then, ts + 100));
+    events
+}
+
+/// MAN-490: three `CQ CQ DE N<SK>NXI N3NXI K` transmissions 20.8 s apart,
+/// then 17 more words, so the damaged copies scroll out of the window.
+fn damaged_repeat(v: &mut Validator) -> Vec<Spot> {
+    let mut spots = Vec::new();
+    for i in 0..3u64 {
+        spots.extend(run(
+            &with_embedded_sk(i * 2_000_000, "N", "NXI", &["N3NXI", "K"]),
+            v,
+        ));
+    }
+    spots.extend(run(&transmission_events(1, &["RRR"; 17], 7_000_000), v));
+    spots.extend(close_track(v, 1, 20.0, ClosureKind::SignalEnded));
+    spots
+}
+
+#[test]
+fn man490_recovery_observations_preserve_spots_and_provenance() {
+    let spots_at = |policy: Option<ObservationPolicy>, decisions: bool| {
+        let mut v = Validator::new(FS, CTY_FIXTURE, None);
+        if let Some(policy) = policy {
+            v = v.with_observations(policy);
+        }
+        v.record_decisions(decisions);
+        seed_meta(&mut v, 1);
+        damaged_repeat(&mut v)
+    };
+    let baseline = spots_at(None, false);
+    let spotted: Vec<(&str, SpotType)> = baseline
+        .iter()
+        .map(|s| (s.callsign.as_str(), s.spot_type))
+        .collect();
+    assert_eq!(spotted, vec![("N3NXI", SpotType::Cq)]);
+    for policy in [
+        ObservationPolicy::summary(),
+        ObservationPolicy::records(),
+        ObservationPolicy::text(),
+    ] {
+        for decisions in [false, true] {
+            assert_eq!(
+                spots_at(Some(policy), decisions),
+                baseline,
+                "{policy:?}, decisions {decisions}"
+            );
+        }
+    }
+
+    // Provenance: a settled self-ID in its inherited `CQ` frame, decided by
+    // the words from that frame through the damaged copy.
+    let mut v = observing(ObservationPolicy::text());
+    damaged_repeat(&mut v);
+    let records = records_for(&v, "N3NXI");
+    assert_eq!(records.len(), 3, "{records:#?}");
+    for r in &records {
+        assert_eq!(
+            r.draft.role,
+            Some(RoleEvidence {
+                role: Role::SelfId,
+                frame: Some(Frame::Cq),
+                basis: Some(Basis::AfterDe),
+            })
+        );
+        let context = &r.draft.trace.as_ref().expect("a text trace").context;
+        assert_eq!(context, &["CQ", "CQ", "DE", "NNXI", "N3NXI"], "{r:#?}");
+    }
+    // Latched: no N3NXI occurrence is ever role-skipped, even once its
+    // frame and damaged copy have left the window.
+    assert!(
+        v.observations().iter().all(|o| o.draft.call() != "N3NXI"
+            || !matches!(o.draft.finding, Finding::NotCandidate { .. })),
+        "{:#?}",
+        v.observations().iter().collect::<Vec<_>>()
+    );
+    man490_refinement_clears_the_damaged_reading_s_glyph_position();
+}
+
+/// MAN-490: replacing a damaged word through refinement clears its glyph
+/// position, so a later rescan cannot pass a frame on from the old reading.
+fn man490_refinement_clears_the_damaged_reading_s_glyph_position() {
+    let w1aw = |v: &Validator| -> Vec<Observation> {
+        v.observations()
+            .iter()
+            .filter(|o| o.draft.call() == "W1AW")
+            .cloned()
+            .collect()
+    };
+    // Control: `W<SK>AW W1AW` frames the clean W1AW.
+    let mut v = observing(ObservationPolicy::records());
+    run(&with_embedded_sk(0, "W", "AW", &["W1AW", "K"]), &mut v);
+    let records = w1aw(&v);
+    assert!(!records.is_empty());
+    assert!(records
+        .iter()
+        .all(|o| matches!(o.draft.finding, Finding::Decided(_))));
+
+    // `N<SK>NXI` refined to `WAW` before `W1AW` arrives: the glyph position
+    // described `NNXI`, so `WAW` passes no frame on.
+    let mut v = observing(ObservationPolicy::records());
+    let events = with_embedded_sk(0, "N", "NXI", &[]);
+    run(&events, &mut v);
+    // CQ, CQ, DE are words 0 to 2; the damaged word spans 900 to 1400.
+    v.apply_refinement(
+        1,
+        3,
+        manta_spot::RefinedWord {
+            call: "WAW".to_string(),
+            confidences: vec![0.9; 3],
+            span: (900, 1_400),
+            word_confidence: 0.9,
+            hypothesis: "wpm-seed",
+        },
+        1_500,
+    );
+    run(&transmission_events(1, &["W1AW", "K"], 1_500), &mut v);
+    let records = w1aw(&v);
+    assert_eq!(records.len(), 1, "{records:#?}");
+    assert!(matches!(
+        records[0].draft.finding,
+        Finding::NotCandidate { .. }
+    ));
+    assert_eq!(
+        records[0].draft.role.map(|r| (r.role, r.basis)),
+        Some((Role::Uncertain, Some(Basis::NoFrame)))
+    );
+}
