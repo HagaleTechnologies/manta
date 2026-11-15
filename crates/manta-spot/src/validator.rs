@@ -268,7 +268,20 @@ struct Word {
     alternatives: Vec<Vec<(Glyph, f32)>>,
     /// MAN-201: a turn ends after this word -- an `AR`/`SK` prosign glyph,
     /// or `TURN_SILENCE_SECONDS` with no decoded character after it.
+    /// MAN-490: not for a glyph that `damage_at` keeps as damage.
     ends_turn: bool,
+    /// MAN-490: the `AR`/`SK` glyphs decoded while this word was buffered:
+    /// the first one's position (characters before it), and whether a
+    /// second one arrived. Read once, when the word completes.
+    turn_glyph: Option<(usize, bool)>,
+    /// MAN-490: the position of this word's one embedded `AR`/`SK` glyph --
+    /// a character on each side, no second glyph, and the stripped word
+    /// call-shaped but not a plausible call (`N<SK>NXI` kept as `NNXI` at 1). Such a glyph is a
+    /// garbled character, not a turn end, and `exchange` may pass this
+    /// word's frame to a clean repeat of the call right after it. Kept at
+    /// every observation detail level; cleared when refinement replaces the
+    /// text it describes.
+    damage_at: Option<usize>,
     /// MAN-201: an `<ERR>` prosign arrived right after this word.
     corrected: bool,
     /// MAN-201 D6a: the role and frame `exchange::interpret` gave this word
@@ -1399,6 +1412,8 @@ impl Validator {
                 word.confidences = refined.confidences.clone();
                 word.char_alternatives = Vec::new();
                 word.refine_hint = false;
+                // MAN-490: the glyph position described the old reading.
+                word.damage_at = None;
             }
         }
         let call = refined.call.clone();
@@ -1921,10 +1936,16 @@ impl Validator {
                         }
                         track.current = Word::default();
                     }
-                    // MAN-201 D3: `AR`/`SK` end the turn.
+                    // MAN-201 D3: `AR`/`SK` end the turn. Inside a word,
+                    // MAN-490 decides at the word's completion whether the
+                    // glyph was a turn end or a garbled character.
                     Glyph::Prosign(Prosign::Ar | Prosign::Sk) => {
                         if !buffer_empty {
-                            track.current.ends_turn = true;
+                            let current = &mut track.current;
+                            current.turn_glyph = Some(match current.turn_glyph {
+                                None => (current.text.chars().count(), false),
+                                Some((pos, _)) => (pos, true),
+                            });
                         } else if let Some(back) = track.words.back_mut() {
                             back.ends_turn = true;
                         }
@@ -1950,6 +1971,23 @@ impl Validator {
                         track.rst = Some(rst);
                     }
                     track.qrl_query |= message::is_qrl_query(&word.text);
+                    // MAN-490: a glyph with characters on both sides of it,
+                    // alone in a word that stripped is call-shaped but no
+                    // plausible call, is damage; any other `AR`/`SK` ends
+                    // the turn as before. A silence turn end is set on the
+                    // completed word later, independently of this.
+                    if let Some((pos, multiple)) = word.turn_glyph.take() {
+                        let embedded = !multiple
+                            && pos > 0
+                            && pos < word.text.chars().count()
+                            && exchange::is_call_shaped(&word.text)
+                            && !grammar::is_plausible(&word.text);
+                        if embedded {
+                            word.damage_at = Some(pos);
+                        } else {
+                            word.ends_turn = true;
+                        }
+                    }
                     word.seq = track.next_word_seq;
                     word.end_ts = *sample_ts;
                     word.decoded_wpm = track.wpm;
@@ -2269,7 +2307,9 @@ impl Validator {
                     corrected: w.corrected,
                 })
                 .collect();
-            exchange::interpret(&words, complete)
+            // MAN-490: each word's retained embedded-glyph position.
+            let damage: Vec<Option<usize>> = track.words.iter().map(|w| w.damage_at).collect();
+            exchange::interpret_with_damage(&words, &damage, complete)
         };
         let seqs: Vec<u64> = track.words.iter().map(|w| w.seq).collect();
         // (role, frame, involved_max_seq) per word index, settled only.
