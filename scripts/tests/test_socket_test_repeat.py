@@ -8,6 +8,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -145,6 +146,18 @@ class Selection(unittest.TestCase):
 
     def tearDown(self):
         self.tmp.cleanup()
+
+    def test_utf8_source_is_read_explicitly(self):
+        path = self.repo.root/'crates/p/tests/sock.rs'
+        path.write_text(SOCKET_TEST.replace('assert_eq!(1, 1);', 'let 漢字 = 1; assert_eq!(漢字, 1);'), encoding='utf-8')
+        git(self.repo.root, 'commit', '-qam', 'unicode edit')
+        original = Path.read_text
+        def locale_read(p, *args, **kwargs):
+            kwargs.setdefault('encoding', 'cp1252')
+            return original(p, *args, **kwargs)
+        with mock.patch.object(Path, 'read_text', locale_read):
+            self.assertEqual(self.repo.selected(), [('p::test::sock', 'second')])
+            self.assertIn('漢字', r._code(path))
 
     def test_an_edited_socket_test_selects_only_that_test(self):
         self.repo.edit('crates/p/tests/sock.rs', 'assert_eq!(1, 1);', 'assert_eq!(2, 2);')

@@ -13,6 +13,7 @@ sources:
   - docs/archive/plans/specs/2026-09-11-man212-windows-platform-support-design.md
   - docs/DECISIONS/2026-10-13-man156-ci-regression-gates.md
   - docs/DECISIONS/2026-10-15-man371-windows-required-check.md
+  - docs/DECISIONS/2026-11-14-man565-windows-build-once-shards.md
 verified:
   commit: 799379d
   date: 2026-10-16
@@ -70,7 +71,30 @@ When removing feature gates around clap attributes, preserve each option's
 `long`, `requires` and conflict attributes, including the Soapy combinations.
 
 The verification commit above identifies the inspected baseline; this page
-also records the MAN-239 build migration applied to that baseline.
+also records the MAN-239 build migration applied to that baseline. The MAN-565
+CI additions below are documented in their decision record; hosted verification
+is still pending.
+
+## Windows CI bundles
+
+`ci-full.yml` builds the ordinary Windows test executables once in
+`windows-build`, then runs them across eight `windows-shards` jobs. The
+independent `windows-support` job keeps formatting, clippy, doctests and release
+archive tests. The aggregate keeps the check name `test (windows-latest)` and
+fails unless support, build and all shards succeed. MAN-516's Unix relay stays
+independent; the Windows relay waits for this aggregate.
+
+The shard processes use a native `.exe` tripwire for `cargo`, `rustc` and
+`rustup`, with the tripwire directory ahead of DLL directories on `PATH`.
+Tests run as whole executables, and a failed executable does not hide later
+ones. Changed socket tests run ten additional times within their assigned slice.
+The separate read-only `Windows bundle smoke` PR check exercises a tiny native
+fixture, including Rust process lookup, tar extraction and UTF-8 selection.
+
+See [MAN-565](../../docs/DECISIONS/2026-11-14-man565-windows-build-once-shards.md)
+for audit commands, same-checkout-root constraints, expired artifact recovery
+and the under-35-minute hosted timing definition. Native smoke and full hosted
+timing remain unverified until actual Windows runs provide evidence.
 
 ## `--features soapy`
 

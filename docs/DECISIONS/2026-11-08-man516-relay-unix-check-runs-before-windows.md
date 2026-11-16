@@ -1,5 +1,7 @@
 # MAN-516: relay Linux and macOS check-runs before the Windows leg ends
 
+> Windows update (MAN-565, 2026-11-14). The Windows relay now needs `windows-aggregate` instead of `test`; the independent Unix relay is unchanged. See [MAN-565](2026-11-14-man565-windows-build-once-shards.md). Historical measurements below are unchanged.
+
 Date: 2026-11-08. Ticket: MAN-516.
 
 ## Context

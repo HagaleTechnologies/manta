@@ -1,5 +1,7 @@
 # MAN-498: shard required Unix workspace tests by executable
 
+> Windows update (MAN-565, 2026-11-14). Windows now uses one build and eight prebuilt shards instead of the serial Cargo job. See [MAN-565](2026-11-14-man565-windows-build-once-shards.md). Historical measurements below are unchanged.
+
 > **Superseded in part (MAN-518, 2026-11-08).** Shards no longer compile; one build job per OS does, and each shard runs a prebuilt slice. See [MAN-518](2026-11-08-man518-build-test-executables-once-per-os.md).
 
 Required Ubuntu and macOS CI now use eight whole-binary shards and a concurrent

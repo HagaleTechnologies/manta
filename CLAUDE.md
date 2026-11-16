@@ -10,8 +10,8 @@ Linux/ARM/headless platforms it has no native build for.
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run `bash scripts/pre-push.sh`: this list in
 CI order, stopping at the first failure (`--fast`: fmt, clippy on changed crates).
-`ci-full.yml`'s `*-support` and `*-shards` jobs cover `test`. Windows CI runs only
-`test_package_release`; `ci_gates`, `decisions_index` and `verify_dependabot_diff_safe` are Linux-only.
+`ci-full.yml`'s `*-support` and `*-shards` jobs cover the three OS checks. Windows support
+runs only `test_package_release`; native smoke runs `ci_shards_windows`. Linux-only: `ci_gates`, `decisions_index`, `verify_dependabot_diff_safe`.
 
 ```sh
 bash scripts/check-rust-toolchain-pin.sh && cargo fmt --all --check
@@ -21,7 +21,7 @@ bash scripts/tests/release-version.test.sh && bash scripts/tests/release-ancestr
 python3 -m unittest -v scripts.tests.test_{ci_trust_boundary,release_checksums,soapy_release,\
 packaging,package_release,score_against_rbn_replay,corpus,score_transcript,ci_gates,\
 verify_dependabot_diff_safe,decisions_index,field_node,engine_overlap,ci_shards,release_profile_ab,\
-socket_test_repeat,package_deb}
+socket_test_repeat,package_deb,ci_shards_windows}
 # MAN-323 (Linux/macOS only): the FT8/FT4 decoder behind the `ftx` feature
 cargo clippy -p manta-engine -p manta-cli --all-targets --features manta-cli/ftx --locked -- -D warnings
 cargo test -p manta-engine --features ftx --locked --lib ftx

@@ -14,7 +14,7 @@ Three modes (MAN-518):
 
 `--repeat-base SHA` (MAN-523) then runs each socket test the diff from SHA to HEAD adds or
 edits ten more times (scripts/socket-test-repeat.py). With `--from-bundle` it repeats the
-slice's tests after their ordinary run; with `--inventory-only` (the Windows job, after its
+slice's tests after their ordinary run; with `--inventory-only` (legacy callers, after an
 ordinary `cargo test --workspace`) it repeats them across the whole inventory, reusing the
 built executables. The evidence keeps those runs in `repeatResults`, apart from the ordinary
 `results`; any failed run fails the command.
@@ -26,7 +26,7 @@ import importlib.util
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import shutil
 import sys
@@ -107,10 +107,14 @@ def cargo_env(package, target_dir, rustlib, cargo):
     return variables, paths
 
 
+def library_variable(platform):
+    return {'win32': 'PATH', 'darwin': 'DYLD_FALLBACK_LIBRARY_PATH'}.get(platform, 'LD_LIBRARY_PATH')
+
+
 def compose_env(base, variables, paths):
     env = dict(base)
     env.update(variables)
-    name = 'DYLD_FALLBACK_LIBRARY_PATH' if sys.platform == 'darwin' else 'LD_LIBRARY_PATH'
+    name = library_variable(sys.platform)
     env[name] = os.pathsep.join(list(paths) + ([base[name]] if base.get(name) else []))
     return env
 
@@ -121,7 +125,7 @@ def child_env(package, target_dir, rustlib):
 
 def listing(item, cwd, env, ignored=False):
     command = [item['executable'], '--list', '--format', 'terse'] + (['--ignored'] if ignored else [])
-    proc = subprocess.run(command, cwd=cwd, env=env, text=True, capture_output=True, check=True)
+    proc = subprocess.run(command, cwd=cwd, env=env, text=True, encoding='utf-8', capture_output=True, check=True)
     names = []
     for line in proc.stdout.splitlines():
         if not line:
@@ -147,7 +151,7 @@ def inventory_view(item):
 def git_identity(cwd, required):
     """`HEAD` and its tree; required in both bundle modes, best effort in the default mode."""
     try:
-        head, tree = (subprocess.check_output(['git', 'rev-parse', rev], cwd=cwd, text=True, stderr=subprocess.PIPE).strip()
+        head, tree = (subprocess.check_output(['git', 'rev-parse', rev], cwd=cwd, text=True, encoding='utf-8', stderr=subprocess.PIPE).strip()
                       for rev in ('HEAD', 'HEAD^{tree}'))
         return head, tree
     except (OSError, subprocess.CalledProcessError) as error:
@@ -219,7 +223,7 @@ def safe_members(tar, target_rel):
             continue
         name = member.name
         parts = Path(name).parts
-        if name.startswith('/') or '..' in parts or not member.isreg() or not name.startswith(target):
+        if name.startswith('/') or PureWindowsPath(name).drive or '\\' in name or '..' in parts or not member.isreg() or not name.startswith(target):
             raise ValueError(f'unsafe bundle member: {name}')
         members.append(member)
     return members
@@ -232,11 +236,28 @@ def extract_members(tar, members, root):
         tar.extractall(str(root), members=members)
 
 
-def make_tripwire(directory):
+def validate_tripwire(plan, root, target_dir, members):
+    name = plan.get('tripwireExecutable')
+    if not isinstance(name, str) or not name:
+        raise ValueError('missing Windows tripwire executable')
+    relative = Path(name)
+    if (relative.is_absolute() or PureWindowsPath(name).drive or '\\' in name
+            or '..' in relative.parts or target_dir.resolve() not in (root/relative).resolve().parents
+            or name not in {m.name for m in members}):
+        raise ValueError(f'unsafe or missing Windows tripwire executable: {name}')
+    return root/relative
+
+
+def make_tripwire(directory, executable=None):
     directory = Path(directory)
     for tool in TRIPWIRE_TOOLS:
+        if sys.platform == 'win32':
+            if executable is None or not Path(executable).is_file() or Path(executable).is_symlink():
+                raise ValueError('missing Windows tripwire executable')
+            shutil.copyfile(executable, directory/f'{tool}.exe')
+            continue
         shim = directory/tool
-        shim.write_text(f'#!/bin/sh\necho "MAN-518 tripwire: a shard invoked {tool}" >&2\nexit {TRIPWIRE_EXIT}\n')
+        shim.write_text(f'#!/bin/sh\necho "MAN-518 tripwire: a shard invoked {tool}" >&2\nexit {TRIPWIRE_EXIT}\n', encoding='utf-8')
         shim.chmod(0o755)
     return directory
 
@@ -244,7 +265,7 @@ def make_tripwire(directory):
 def run_env(item, tripwire):
     """The child environment of a prebuilt binary: the build's Cargo variables, no compiler."""
     variables = dict(item['env'])
-    variables['CARGO'] = str(Path(tripwire)/'cargo')
+    variables['CARGO'] = str(Path(tripwire)/('cargo.exe' if sys.platform == 'win32' else 'cargo'))
     env = compose_env(os.environ, variables, item['libraryPath'])
     env['PATH'] = os.pathsep.join([str(tripwire)] + ([env['PATH']] if env.get('PATH') else []))
     return env
@@ -260,7 +281,7 @@ def run_item(item, cwd, env):
 
 def cargo_build(record):
     started = time.monotonic()
-    proc = subprocess.run(['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json'], text=True, stdout=subprocess.PIPE)
+    proc = subprocess.run(['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json'], text=True, encoding='utf-8', stdout=subprocess.PIPE)
     record['buildSeconds'] = time.monotonic() - started
     if proc.returncode:
         raise RuntimeError(f'Cargo build exited {proc.returncode}')
@@ -268,7 +289,7 @@ def cargo_build(record):
 
 
 def load_weights():
-    return json.loads(Path(__file__).with_name('ci-test-weights.json').read_text())['weights']
+    return json.loads(Path(__file__).with_name('ci-test-weights.json').read_text(encoding='utf-8'))['weights']
 
 
 def build_bundles(args, record):
@@ -285,7 +306,7 @@ def build_bundles(args, record):
         raise ValueError('empty workspace inventory')
     bins = parse_bins(raw)
     packages = {p['id']: p for p in meta['packages']}
-    sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True).strip()
+    sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True, encoding='utf-8').strip()
     cargo = shutil.which('cargo') or 'cargo'
     for item in items:
         package = packages[item['package']]
@@ -293,6 +314,11 @@ def build_bundles(args, record):
         cwd = Path(package['manifest_path']).parent
         item['tests'], item['ignored'] = list_item(item, cwd, compose_env(os.environ, variables, paths))
         item.update(cwd=cwd.resolve().relative_to(root).as_posix(), env=variables, libraryPath=paths)
+    tripwire = None
+    if sys.platform == 'win32':
+        tripwire = target_dir/'ci-shard-tripwire.exe'
+        subprocess.run(['rustc', str(Path(__file__).with_name('ci-shard-tripwire.rs')),
+                        '-o', str(tripwire)], check=True)
     groups = assign(items, load_weights(), args.count)
     inventory = [inventory_view(x) for x in items]
     record.update(role='build', inventory=inventory, groups=[[x['key'] for x in group] for group in groups])
@@ -305,6 +331,9 @@ def build_bundles(args, record):
             files.update(bins.get(package, []))
         plan = dict(version=1, index=index, count=args.count, workspaceRoot=str(root), targetDirectory=str(target_dir),
                     gitHead=record['gitHead'], gitTree=record['gitTree'], inventory=inventory, selected=group)
+        if tripwire is not None:
+            plan['tripwireExecutable'] = tripwire.relative_to(root).as_posix()
+            files.add(str(tripwire))
         return write_slice(args.build_bundles/f'slice-{index}.tar.gz', plan, root, sorted(files))
 
     started = time.monotonic()
@@ -357,6 +386,7 @@ def run_bundle(args, record):
         record.update(gitHead=head, gitTree=tree, buildSeconds=0.0)
         target_dir = Path(plan['targetDirectory'])
         members = safe_members(tar, target_dir.relative_to(Path(plan['workspaceRoot'])))
+        helper = validate_tripwire(plan, root, target_dir, members) if sys.platform == 'win32' else None
         started = time.monotonic()
         extract_members(tar, members, root)
         record['extractSeconds'] = time.monotonic() - started
@@ -364,7 +394,7 @@ def run_bundle(args, record):
     record['inventory'] = [inventory_view(x) for x in plan['inventory']]
     record['selected'] = [inventory_view(x) for x in plan['selected']]
     with tempfile.TemporaryDirectory(prefix='man518-tripwire-') as tmp:
-        tripwire = make_tripwire(tmp)
+        tripwire = make_tripwire(tmp, helper)
         runs = [(item, root/item['cwd'], run_env(item, tripwire)) for item in plan['selected']]
         # MAN-498: list before execution, on the host that runs the tests.
         for item, cwd, env in runs:
@@ -388,7 +418,7 @@ def run_legacy(args, record):
     if not items:
         raise ValueError('empty workspace inventory')
     packages = {p['id']: p for p in meta['packages']}
-    sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True).strip()
+    sysroot = subprocess.check_output(['rustc', '--print', 'target-libdir'], text=True, encoding='utf-8').strip()
     for item in items:
         package = packages[item['package']]
         env = child_env(package, Path(meta['target_directory']), sysroot)
@@ -415,6 +445,9 @@ def run_legacy(args, record):
 
 
 def main():
+    # Pipes use the Windows locale by default; listings and repeat names are UTF-8.
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--count', type=int, default=8)
     parser.add_argument('--shard', type=int, default=0)
@@ -431,10 +464,10 @@ def main():
     if args.repeat_base is not None and not (args.from_bundle or args.inventory_only):
         parser.error('--repeat-base needs --from-bundle or --inventory-only')
     if args.audit:
-        bundle = json.loads(args.audit.read_text())
+        bundle = json.loads(args.audit.read_text(encoding='utf-8'))
         elapsed = audit_evidence(bundle['shards'], bundle['support'], bundle['workflowStarted'], bundle['completed'],
                                  bundle['reference'], bundle.get('build'))
-        args.output.write_text(json.dumps(dict(coverage='complete', elapsedSeconds=elapsed)) + '\n')
+        args.output.write_text(json.dumps(dict(coverage='complete', elapsedSeconds=elapsed)) + '\n', encoding='utf-8')
         return 0
     if args.count < 2 or not 0 <= args.shard < args.count:
         parser.error('require count >= 2 and 0 <= shard < count')
@@ -453,7 +486,7 @@ def main():
         return 1
     finally:
         record['completed'] = time.time()
-        args.output.write_text(json.dumps(record, indent=2) + '\n')
+        args.output.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
 
 
 if __name__ == '__main__':

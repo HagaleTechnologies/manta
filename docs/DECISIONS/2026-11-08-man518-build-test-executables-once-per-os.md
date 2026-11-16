@@ -1,5 +1,7 @@
 # MAN-518: build the test executables once per OS and run each shard from a prebuilt slice
 
+> Windows update (MAN-565, 2026-11-14). The build-once slice model now also applies to Windows, with native compiler tripwires and DLL paths. See [MAN-565](2026-11-14-man565-windows-build-once-shards.md). Historical measurements below are unchanged.
+
 Required Ubuntu and macOS CI used to compile every test executable on each of
 the eight shards of each OS (`cargo test --workspace --locked --no-run` in
 `scripts/ci-shards.py`), then run about an eighth of them. In run 42339317970

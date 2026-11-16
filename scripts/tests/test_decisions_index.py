@@ -358,7 +358,7 @@ class CliTests(unittest.TestCase):
 
 class WiringTests(unittest.TestCase):
     def test_this_module_runs_in_the_required_test_job(self):
-        job = wf.job_block(wf.read("ci-full.yml"), "test")
+        job = wf.job_block(wf.read("ci-full.yml"), "windows-support")
         found = gates.steps_running(job, TEST_COMMAND)
         self.assertEqual(len(found), 1)
         self.assertEqual(wf.field(found[0], "if"), "runner.os == 'Linux'")
