@@ -269,7 +269,7 @@ jobs:
       # pull_request runs restore and never save. Not a security boundary on its own -- code
       # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
       # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
@@ -494,7 +494,7 @@ jobs:
       # dispatches trusted heads.
       # MAN-565: reuse the serial Windows job's cache under its old job key.
       # The support job keeps its own new key.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           shared-key: test
@@ -791,7 +791,7 @@ jobs:
       # pull_request runs restore and never save. Not a security boundary on its own -- code
       # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
       # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
@@ -1022,7 +1022,7 @@ jobs:
       # dispatches trusted heads.
       # MAN-518: the build job restores and saves under the key the shards used to write
       # (`v0-rust-ubuntu-shards-...`), so its first runs start from warm dependencies.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           shared-key: ubuntu-shards
@@ -1318,7 +1318,7 @@ jobs:
       # pull_request runs restore and never save. Not a security boundary on its own -- code
       # running in a job can reach the cache credentials -- which is why wait-for-codex.yml only
       # dispatches trusted heads.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
@@ -1549,7 +1549,7 @@ jobs:
       # dispatches trusted heads.
       # MAN-518: the build job restores and saves under the key the shards used to write
       # (`v0-rust-macos-shards-...`), so its first runs start from warm dependencies.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           shared-key: macos-shards
@@ -1816,7 +1816,7 @@ jobs:
         with:
           components: rustfmt, clippy
       # MAN-243: same restore-only rule as `test`'s cache step.
-      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2.9.1
+      - uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2.9.1
         with:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           env-vars: SOAPYSDR_BREW_VERSION
