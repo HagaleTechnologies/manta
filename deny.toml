@@ -13,6 +13,10 @@ yanked = "deny"
 # Every ignore needs a reason. Re-check it whenever its parent crate moves.
 ignore = [
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml is unmaintained and has no fixed release; it reaches only manta-cli's tests, through the dev-dependency serde_yaml_ng" },
+    # chrono has no known vulnerability; RUSTSEC-2026-0543 flags it unmaintained. Accepted by the
+    # owner on 2026-11-18 (same decision as pancetta PAN-430/431). Remove once manta and its
+    # dependencies no longer pull chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained but has no known vulnerability; owner-accepted 2026-11-18 (same decision as pancetta PAN-430/431) until manta and its deps drop chrono" },
 ]
 
 [licenses]
