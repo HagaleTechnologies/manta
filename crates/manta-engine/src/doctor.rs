@@ -1004,8 +1004,9 @@ mod tests {
             freq_correction_ppm: f64::NAN,
             ..Default::default()
         };
+        let source = v1_source();
         let start = Instant::now();
-        let result = doctor(v1_source(), &cfg, Duration::from_secs(20));
+        let result = doctor(source, &cfg, Duration::from_secs(20));
         assert!(result.is_err());
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -1332,9 +1333,10 @@ mod tests {
 
     #[test]
     fn doctor_rejects_a_duration_longer_than_the_max() {
+        let source = v1_source();
         let start = Instant::now();
         let result = doctor(
-            v1_source(),
+            source,
             &PipelineConfig::default(),
             MAX_DURATION + Duration::from_secs(1),
         );
@@ -1362,12 +1364,9 @@ mod tests {
 
     #[test]
     fn doctor_rejects_a_duration_shorter_than_startup_calibration() {
+        let source = v1_source();
         let start = Instant::now();
-        let result = doctor(
-            v1_source(),
-            &PipelineConfig::default(),
-            Duration::from_secs(1),
-        );
+        let result = doctor(source, &PipelineConfig::default(), Duration::from_secs(1));
         assert!(result.is_err());
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -1382,6 +1381,7 @@ mod tests {
     /// returned (EOF on a short file, well before `duration` elapses).
     #[test]
     fn doctor_returns_promptly_when_the_source_ends_well_before_duration() {
+        let source = v1_source();
         let start = Instant::now();
         // v1_source() is actually 120s of audio (vectors::v1()'s own
         // duration_s) -- delivered unpaced (as fast as processing allows,
@@ -1393,12 +1393,7 @@ mod tests {
         // different things on purpose: this call must be fast (wall clock),
         // but must still faithfully report having analyzed close to the
         // full requested 30s of audio content.
-        let report = doctor(
-            v1_source(),
-            &PipelineConfig::default(),
-            Duration::from_secs(30),
-        )
-        .unwrap();
+        let report = doctor(source, &PipelineConfig::default(), Duration::from_secs(30)).unwrap();
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "doctor() took {:?} against a source that ended well within its 30s --duration -- \

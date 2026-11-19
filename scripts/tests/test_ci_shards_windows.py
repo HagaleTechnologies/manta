@@ -86,6 +86,70 @@ class WindowsBundleTests(unittest.TestCase):
         self.assertEqual(results['ccc'], 0)
         self.assertEqual((self.root/'passed-marker').read_text(encoding='utf-8'), 'ok')
         self.assertEqual([x['key'] for x in record['results']], keys)
+        output = proc.stdout
+        self.assertLess(output.index('deliberate failure'), output.index('Running ' + next(k for k in keys if k.endswith('::ccc'))))
+        self.assertIn('test result: ok', output[output.index('Running ' + next(k for k in keys if k.endswith('::ccc'))):])
+
+    def test_failing_tests_are_named_in_the_evidence(self):
+        (self.root/'tests/aaa.rs').write_text('''
+#[test] fn port_reuse() { panic!("os error 10048"); }
+#[test] fn crlf() { assert_eq!("a\\r\\nb", "a\\nb"); }
+#[test] fn timing() { assert_eq!(0, 32); }
+''', encoding='utf-8')
+        git(self.root, 'commit', '-qam', 'fail fixture')
+        build = self.build()
+        index = next(i for i, group in enumerate(build['groups']) if any(k.endswith('::aaa') for k in group))
+        proc, record = self.run_slice(index)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        failed = next(x for x in record['results'] if x['key'].endswith('::aaa'))
+        self.assertEqual(set(failed['failedTests']), {'port_reuse', 'crlf', 'timing'})
+        self.assertIn('os error 10048', failed['failureExcerpts']['port_reuse'])
+        self.assertIn('a\\r\\nb', failed['failureExcerpts']['crlf'])
+        self.assertIn('left: 0', failed['failureExcerpts']['timing'])
+
+    def test_summary_names_test_os_and_class(self):
+        (self.root/'tests/aaa.rs').write_text('#[test] fn broken() { panic!("os error 10048"); }', encoding='utf-8')
+        git(self.root, 'commit', '-qam', 'fail fixture')
+        build = self.build()
+        index = next(i for i, group in enumerate(build['groups']) if any(k.endswith('::aaa') for k in group))
+        self.run_slice(index)
+        summary = subprocess.run([sys.executable, str(ROOT/'scripts/ci-failure-summary.py'), '--os', 'windows-latest',
+                                  str(self.root/f'shard-{index}.json')], capture_output=True, text=True)
+        self.assertEqual(summary.returncode, 0, summary.stderr)
+        self.assertIn('Windows (windows-latest)', summary.stdout)
+        self.assertIn('broken', summary.stdout)
+        self.assertIn('port reuse', summary.stdout)
+
+    def test_a_lingering_descendant_does_not_hold_the_shard(self):
+        (self.root/'tests/aaa.rs').write_text('''
+#[test]
+fn parent() {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "sleeper", "--ignored", "--nocapture"])
+        .spawn().unwrap();
+}
+#[test]
+#[ignore]
+fn sleeper() {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    std::fs::write("sleeper-done", "ok").unwrap();
+}
+''', encoding='utf-8')
+        git(self.root, 'commit', '-qam', 'lingering descendant fixture')
+        build = self.build()
+        index = next(i for i, group in enumerate(build['groups']) if any(k.endswith('::aaa') for k in group))
+        import time
+        started = time.monotonic()
+        proc, record = self.run_slice(index)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertLess(time.monotonic()-started, 10)
+        self.assertEqual(next(x for x in record['results'] if x['key'].endswith('::aaa'))['exitCode'], 0)
+        # On Windows the running executable cannot be removed with the test
+        # fixture directory, so wait only after measuring the shard's return.
+        deadline = time.monotonic() + 35
+        while not (self.root/'sleeper-done').exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue((self.root/'sleeper-done').exists())
 
     def test_utf8_listing_and_repeat(self):
         source = self.root/'tests/ccc.rs'
@@ -174,16 +238,21 @@ fn main() {
     def test_run_bundle_never_calls_a_compiler(self):
         self.build()
         original = s.subprocess.run
+        original_popen = s.subprocess.Popen
         calls = []
         def spy(command, *args, **kwargs):
             calls.append(command)
             self.assertNotIn(Path(command[0]).stem.lower(), s.TRIPWIRE_TOOLS)
             return original(command, *args, **kwargs)
+        def spy_popen(command, *args, **kwargs):
+            calls.append(command)
+            self.assertNotIn(Path(command[0]).stem.lower(), s.TRIPWIRE_TOOLS)
+            return original_popen(command, *args, **kwargs)
         args = types.SimpleNamespace(from_bundle=self.root/'bundles/slice-0.tar.gz', shard=0, count=2, repeat_base=None)
         before = Path.cwd()
         try:
             os.chdir(self.root)
-            with mock.patch.object(s.subprocess, 'run', spy):
+            with mock.patch.object(s.subprocess, 'run', spy), mock.patch.object(s.subprocess, 'Popen', spy_popen):
                 self.assertEqual(s.run_bundle(args, dict(results=[])), 0)
         finally:
             os.chdir(before)

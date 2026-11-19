@@ -21,15 +21,73 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-11-19 | MAN-551 | [MAN-551: Windows O1 readout and failure audit](2026-11-19-man551-windows-o1-readout.md) |
+| 2026-11-19 | MAN-143 | [MAN-143: a spot carries no signal snippet today, and clip work stays parked](2026-11-19-man143-spot-snippet-verification.md) |
+| 2026-11-19 | MAN-17 | [MAN-17: Aggregator swap validation runbook](2026-11-19-man17-aggregator-swap-runbook.md) |
+| 2026-11-14 | MAN-565 | [MAN-565: build Windows test executables once and run eight prebuilt shards](2026-11-14-man565-windows-build-once-shards.md) |
+| 2026-11-14 | MAN-490 | [MAN-490: a clean repeat after an `AR`/`SK`-damaged copy of the same call takes its frame](2026-11-14-man490-clean-repeat-recovery.md) |
+| 2026-11-11 | MAN-535 | [MAN-535: count source-end and reconnect track closes](2026-11-11-man535-close-all-close-counts.md) |
+| 2026-11-11 | MAN-534 | [MAN-534: dedupe forgets a call once no candidate can still fall inside its window](2026-11-11-man534-dedupe-forgets-expired-calls.md) |
+| 2026-11-11 | MAN-523 | [MAN-523: loopback tests hold their ports, and changed socket tests run ten more times](2026-11-11-man523-loopback-test-stability.md) |
+| 2026-11-10 | MAN-546 | [MAN-546: per-connection telnet filters for CQ, bands and minimum SNR](2026-11-10-man546-telnet-client-filters.md) |
+| 2026-11-10 | MAN-538 | [MAN-538: list-cache temp files are exclusive, source Debug hides the Kiwi password, and a character split across reads is accepted](2026-11-10-man538-cache-temp-debug-redaction-utf8-carry.md) |
+| 2026-11-10 | MAN-529 | [MAN-529: KiwiSDR and ka9q-radio report lost packets to the sample clock](2026-11-10-man529-kiwi-ka9q-lost-packet-clock.md) |
+| 2026-11-10 | MAN-528 | [MAN-528: release binaries build with lto = "fat" and codegen-units = 1, chosen by measurement; panic stays unwind](2026-11-10-man528-release-profile.md) |
+| 2026-11-10 | MAN-527 | [MAN-527: slab-by-slab channelizer fold and recycled hop buffers](2026-11-10-man527-channelizer-slab-fold-and-hop-recycling.md) |
+| 2026-11-10 | MAN-522 | [MAN-522: one command runs the pre-push gate in CI order](2026-11-10-man522-pre-push-script.md) |
+| 2026-11-10 | MAN-521 | [MAN-521: one test binary per golden pileup scene, each rendered once](2026-11-10-man521-split-golden-pileup-binaries.md) |
+| 2026-11-10 | MAN-520 | [MAN-520: CI's test-soapy leg runs only the tests the soapy feature can change](2026-11-10-man520-soapy-ci-test-selection.md) |
+| 2026-11-10 | MAN-519 | [MAN-519: every text file checks out with LF; the vendored cty.dat and master.scp keep upstream's CRLF](2026-11-10-man519-lf-checkouts.md) |
+| 2026-11-09 | MAN-545 | [MAN-545: fusing legacy and HSMM evidence loses identities on the bench (net -34 and -48 of 2430); below the bar, item 16 closed](2026-11-09-man545-evidence-fusion-oracle-gap.md) |
+| 2026-11-09 | MAN-542 | [MAN-542: scheduled refresh of the callsign-pattern list](2026-11-09-man542-pattern-list-refresh.md) |
+| 2026-11-09 | MAN-541 | [MAN-541: an RBN skew reading in ppm, a `/healthz` warning and a shipped alert](2026-11-09-man541-rbn-skew.md) |
+| 2026-11-09 | MAN-540 | [MAN-540: a Debian package for Debian, Ubuntu and 64-bit Raspberry Pi OS](2026-11-09-man540-debian-package.md) |
+| 2026-11-09 | MAN-537 | [MAN-537: the Docker image pins its base images by digest, Dependabot moves them, and the image names its commit](2026-11-09-man537-docker-image-pins-and-build-identity.md) |
+| 2026-11-09 | MAN-536 | [MAN-536: cty.dat and MASTER.SCP download over HTTPS by default](2026-11-09-man536-https-list-downloads.md) |
+| 2026-11-09 | MAN-533 | [MAN-533: a live input that delivers no usable samples for 30 s is reconnected](2026-11-09-man533-no-usable-samples-reconnect.md) |
+| 2026-11-09 | MAN-532 | [MAN-532: full-duration beacon fading regression](2026-11-09-man532-beacon-fading-regression.md) |
+| 2026-11-09 | MAN-531 | [MAN-531: blocklisted calls cannot supply variant support](2026-11-09-man531-blocklisted-variant-support.md) |
+| 2026-11-09 | MAN-530 | [MAN-530: live audio capture-ring overruns are counted, warned and reported to the engine at the exact sample](2026-11-09-man530-audio-ring-overrun-visibility.md) |
+| 2026-11-09 | MAN-515 | [MAN-515: Refinement replays only where the engine flip can change a word](2026-11-09-man515-refine-replay-gate.md) |
+| 2026-11-09 | MAN-117 | [MAN-117: per-hop allocations in the channelizer, decoder and pool handoff](2026-11-09-man117-per-hop-allocations.md) |
+| 2026-11-08 | MAN-550 | [MAN-550: SoapySDR gating in manta-cli lives in one soapy_opts module](2026-11-08-man550-soapy-opts-module.md) |
+| 2026-11-08 | MAN-549 | [MAN-549: integration tests share one manta launcher, port reservation and word_boundary_fraction](2026-11-08-man549-shared-integration-test-helpers.md) |
+| 2026-11-08 | MAN-548 | [MAN-548: main.rs keeps the clap tree and dispatch; each command's wiring lives in its own module](2026-11-08-man548-main-rs-split.md) |
+| 2026-11-08 | MAN-547 | [MAN-547: CLAUDE.md's pre-push list matches ci-full.yml and the brief stays at 100 lines](2026-11-08-man547-brief-matches-ci.md) |
+| 2026-11-08 | MAN-544 | [MAN-544: a bounded bank of speed and timing hypotheses](2026-11-08-man544-speed-hypothesis-bank.md) |
+| 2026-11-08 | MAN-543 | [MAN-543: 6m is a named band, and "all" adds it only when the tuning range reaches it](2026-11-08-man543-6m-band.md) |
+| 2026-11-08 | MAN-539 | [MAN-539: an arm64 SoapySDR release archive, and SoapySDR in the Docker image](2026-11-08-man539-arm64-soapy-archive-and-image.md) |
+| 2026-11-08 | MAN-526 | [MAN-526: the detector judges channel power in linear units](2026-11-08-man526-linear-channel-power.md) |
+| 2026-11-08 | MAN-525 | [MAN-525: constant-cost refinement bookkeeping](2026-11-08-man525-refine-bookkeeping-cost.md) |
+| 2026-11-08 | MAN-524 | [MAN-524: ownership, spawn admission and merge read only nearby tracks](2026-11-08-man524-linear-track-neighbour-queries.md) |
+| 2026-11-08 | MAN-518 | [MAN-518: build the test executables once per OS and run each shard from a prebuilt slice](2026-11-08-man518-build-test-executables-once-per-os.md) |
+| 2026-11-08 | MAN-516 | [MAN-516: relay Linux and macOS check-runs before the Windows leg ends](2026-11-08-man516-relay-unix-check-runs-before-windows.md) |
+| 2026-11-06 | MAN-474 | [MAN-474: protocol-1 stop retransmission window](2026-11-06-man474-protocol-1-stop-retransmit-window.md) |
+| 2026-11-06 | MAN-471 | [MAN-471: multicast relay port sharing](2026-11-06-man471-multicast-relay-port-sharing.md) |
+| 2026-11-05 | MAN-505 | [MAN-505: protocol-2 acceptance fixtures stream at real time](2026-11-05-man505-protocol2-acceptance-pacing.md) |
+| 2026-11-05 | MAN-503 | [MAN-503: deterministic directed-discovery retry test](2026-11-05-man503-deterministic-discovery-retry-test.md) |
+| 2026-11-05 | MAN-498 | [MAN-498: shard required Unix workspace tests by executable](2026-11-05-man498-required-ci-runtime.md) |
+| 2026-11-05 | MAN-497 | [MAN-497: four loopback UDP flakes](2026-11-05-man497-loopback-test-flakes.md) |
+| 2026-11-05 | MAN-494 | [MAN-494: calibrated IQ conditioning](2026-11-05-man494-calibrated-iq-conditioning.md) |
+| 2026-11-05 | MAN-482 | [MAN-482: PR #469 fixed the skirt-wrap residual; the spec and Gate docs now match the rise rules](2026-11-05-man482-recheck-residual-already-fixed.md) |
+| 2026-11-05 | MAN-208 | [MAN-208: bounded delayed refinement](2026-11-05-man208-delayed-refinement.md) |
+| 2026-11-04 | MAN-489 | [MAN-489: every live input reports a stalled stream inside the 5 s bound](2026-11-04-man489-live-source-stall-settlement.md) |
+| 2026-11-04 | MAN-157 | [MAN-157: a logo mark that reads at 16 px, and a wordmark lockup](2026-11-04-man157-logo-small-mark-and-lockup.md) |
+| 2026-11-04 | MAN-30 | [MAN-30: CW sub-segments and UTC schedules](2026-11-04-man30-cw-segments.md) |
 | 2026-11-03 | MAN-407 | [MAN-407: the ka9q startup stash stamps each packet no later than its arrival](2026-11-03-man407-ka9q-stash-stamps-a-lower-bound-on-arrival.md) |
 | 2026-11-03 | MAN-207 | [MAN-207: a bounded, local record of why each callsign candidate was or was not spotted](2026-11-03-man207-observation-record.md) |
 | 2026-11-03 | MAN-206 | [MAN-206: an independent synthetic generator checks the testkit, and failing scenes shrink to synthetic repros](2026-11-03-man206-independent-generator-and-scene-minimizer.md) |
 | 2026-11-03 | MAN-205 | [MAN-205: legacy and HSMM rarely recover a call the other misses; fusion is not worth building on the bench](2026-11-03-man205-legacy-hsmm-engine-overlap.md) |
 | 2026-11-03 | MAN-204 | [MAN-204: guarded two-stage cancellation recovers a weak CW station beside a strong one (offline experiment)](2026-11-03-man204-guarded-two-stage-cancellation.md) |
+| 2026-11-03 | MAN-203 | [MAN-203: reversible input conditioning, first slices (DC removal and impulse suppression)](2026-11-03-man203-reversible-input-conditioning.md) |
 | 2026-11-03 | MAN-200 | [MAN-200: damaged repetitions of one self-ID can confirm the call](2026-11-03-man200-repetition-evidence-fusion.md) |
+| 2026-11-03 | MAN-198 | [MAN-198: a stage-attributed loss funnel for `manta oracle`](2026-11-03-man198-loss-funnel.md) |
+| 2026-11-03 | MAN-186 | [MAN-186: the decimator's CPU cost, measured on a host (no Pi4 claim)](2026-11-03-man186-decimator-cost.md) |
 | 2026-11-03 | MAN-180 | [MAN-180: `--soapy-gain` help warns that an SDRplay reads it as attenuation](2026-11-03-man180-soapy-gain-help-warning.md) |
+| 2026-11-03 | MAN-142 | [MAN-142: manta reports spots to PSKReporter and sends them to LAN loggers as WSJT-X UDP](2026-11-03-man142-pskreporter-and-wsjtx-udp-outputs.md) |
 | 2026-11-02 | MAN-459 | [MAN-459: the protocol-2 acceptance fake follows manta across a reconnect, and every live-run failure explains itself](2026-11-02-man459-protocol2-fake-follows-reconnects.md) |
 | 2026-11-02 | MAN-201 | [MAN-201: who sent a callsign, not only which callsign](2026-11-02-man201-callsign-roles.md) |
+| 2026-11-02 | MAN-199 | [MAN-199: a promoted track replays its recorded lead-in, and every track closes through one routine](2026-11-02-man199-lead-in-replay-and-one-close-routine.md) |
 | 2026-11-01 | MAN-453 | [MAN-453: raw IQ recording reports its true outcome, and a stop ends a paced replay's wait](2026-11-01-man453-recording-and-replay-edge-cases.md) |
 | 2026-11-01 | MAN-449 | [MAN-449: the keepalive-cadence test counts what the source issued and re-observes only a lost datagram](2026-11-01-man449-keepalive-test-counts-what-the-source-issued.md) |
 | 2026-11-01 | MAN-323 | [MAN-323: FT8 and FT4 spots from the band streams manta already receives](2026-11-01-man323-ft8-ft4-from-band-streams.md) |

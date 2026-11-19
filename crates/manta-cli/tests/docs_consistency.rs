@@ -4340,3 +4340,21 @@ fn claude_md_lists_every_ci_script_suite() {
         "CLAUDE.md's unittest brace list vs ci-full.yml's suites"
     );
 }
+
+#[test]
+fn man17_record_and_runbook_link_each_other_and_their_neighbors() {
+    let record = doc("docs/DECISIONS/2026-11-19-man17-aggregator-swap-runbook.md");
+    for link in [
+        "../RUNBOOKS/aggregator-swap.md",
+        "2026-09-07-man86-aggregator-sett-handshake.md",
+        "2026-10-11-man90-uplink-protocol-verification.md",
+    ] {
+        assert!(record.contains(link), "record missing {link}");
+    }
+    let runbook = doc("docs/RUNBOOKS/aggregator-swap.md");
+    assert!(runbook.contains("../DECISIONS/2026-11-19-man17-aggregator-swap-runbook.md"));
+    let page = doc("wiki/pages/spot-output-contract.md");
+    assert!(!page.contains("with zero changes"));
+    assert!(page.contains("docs/RUNBOOKS/aggregator-swap.md"));
+    assert!(page.contains("verified:"));
+}

@@ -3492,10 +3492,19 @@ mod open_receiver_tests {
 
     #[test]
     fn auto_refuses_a_busy_protocol_2_radio() {
-        let fake = FakeP2Radio::with_discovery(vec![(
-            Duration::ZERO,
-            p2_reply(discovery::STATUS_BUSY, 5),
-        )]);
+        // Repeat the same busy answer: one dropped loopback reply must not turn
+        // this into a false "no radio" result under Windows runner load.
+        let fake = FakeP2Radio::with_discovery(vec![
+            (Duration::ZERO, p2_reply(discovery::STATUS_BUSY, 5)),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+        ]);
         let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast(), Instant::now())
             .err()
             .expect("a busy radio is refused under auto");
@@ -3511,6 +3520,33 @@ mod open_receiver_tests {
         // Nothing was started: no bring-up reached the radio.
         thread::sleep(Duration::from_millis(50));
         assert!(fake.received(3).is_empty());
+    }
+
+    /// MAN-551: the 2026-10-23 Windows run lost the single busy discovery
+    /// reply on loopback, so auto read a busy radio as unanswered. One
+    /// dropped reply must not change the verdict; this control fails when
+    /// the fake schedules only one busy reply.
+    #[test]
+    fn auto_refuses_a_busy_protocol_2_radio_after_a_lost_reply() {
+        let fake = FakeP2Radio::with_discovery(vec![
+            (Duration::ZERO, p2_reply(discovery::STATUS_BUSY, 5)),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+        ]);
+        fake.drop_first_discovery_reply();
+        let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast(), Instant::now())
+            .err()
+            .expect("a busy radio is still refused after one lost reply");
+        assert!(
+            format!("{err:#}").contains("already streaming to another program"),
+            "{err:#}"
+        );
     }
 
     #[test]

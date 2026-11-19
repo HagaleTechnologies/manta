@@ -846,6 +846,7 @@ impl Drop for Protocol2IqSource {
 pub(crate) mod fake {
     use super::wire;
     use crate::hpsdr::HpsdrConfig;
+    use std::io;
     use std::net::{SocketAddr, UdpSocket};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -874,6 +875,9 @@ pub(crate) mod fake {
         /// Records before this index are ignored by `wait_for_run`, so a
         /// reopen streams to the new socket (MAN-308).
         run_floor: Mutex<usize>,
+        /// MAN-551: drop the first discovery reply, emulating the one lost
+        /// loopback datagram of the 2026-10-23 Windows run.
+        drop_first: Arc<AtomicBool>,
     }
 
     /// Stops a background sender when dropped.
@@ -924,11 +928,13 @@ pub(crate) mod fake {
             let stop = Arc::new(AtomicBool::new(false));
             let mut threads = Vec::new();
             let answers = Arc::new(Mutex::new(Some(answers)));
+            let drop_first = Arc::new(AtomicBool::new(false));
             for (offset, sock) in (0u16..).zip(cmd.iter()) {
                 let sock = sock.try_clone().unwrap();
                 sock.set_read_timeout(Some(Duration::from_millis(10)))
                     .unwrap();
                 let (log, stop, answers) = (log.clone(), stop.clone(), answers.clone());
+                let drop_first = drop_first.clone();
                 threads.push(thread::spawn(move || {
                     let mut buf = vec![0u8; 65536];
                     while !stop.load(Ordering::SeqCst) {
@@ -940,8 +946,11 @@ pub(crate) mod fake {
                         log.lock().unwrap().push((offset, d, from));
                         if discovery {
                             if let Some(list) = answers.lock().unwrap().take() {
-                                for (delay, reply) in list {
+                                for (index, (delay, reply)) in list.into_iter().enumerate() {
                                     thread::sleep(delay);
+                                    if index == 0 && drop_first.load(Ordering::SeqCst) {
+                                        continue;
+                                    }
                                     let _ = sock.send_to(&reply, from);
                                 }
                             }
@@ -957,12 +966,30 @@ pub(crate) mod fake {
                 stop,
                 threads,
                 run_floor: Mutex::new(0),
+                drop_first,
             }
         }
 
-        fn bind() -> (u16, Vec<UdpSocket>, UdpSocket) {
+        /// MAN-551: emulate one lost loopback discovery reply. The responder
+        /// skips the first scheduled reply; later replies still arrive.
+        pub(crate) fn drop_first_discovery_reply(&self) {
+            self.drop_first.store(true, Ordering::SeqCst);
+        }
+
+        /// MAN-551: the first bind goes through an injectable attempt so the
+        /// transient-failure retry is testable. Windows can temporarily
+        /// exhaust its UDP buffer pool when the test runner opens many fake
+        /// radios in parallel (WSAENOBUFS, the 2026-11-01 run's os error
+        /// 10055); a first-attempt unwrap turned that into a test panic.
+        pub(crate) fn bind_with<F>(mut first_bind: F) -> (u16, Vec<UdpSocket>, UdpSocket)
+        where
+            F: FnMut() -> io::Result<UdpSocket>,
+        {
             for _ in 0..200 {
-                let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let Ok(first) = first_bind() else {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
                 let base = first.local_addr().unwrap().port();
                 if base > u16::MAX - FOREIGN_PORT_OFFSET {
                     continue;
@@ -979,6 +1006,10 @@ pub(crate) mod fake {
                 return (base, cmd, iq);
             }
             panic!("no free base port for FakeP2Radio");
+        }
+
+        fn bind() -> (u16, Vec<UdpSocket>, UdpSocket) {
+            Self::bind_with(|| UdpSocket::bind("127.0.0.1:0"))
         }
 
         /// A one-DDC, 192 kHz, 7.03 MHz config pointing at this fake.
@@ -1812,17 +1843,48 @@ mod tests {
         assert_eq!(src.gap_stats().malformed_packets, 0);
     }
 
+    /// MAN-551: the fake's first bind retries the transient Windows UDP
+    /// buffer-pool exhaustion of the 2026-11-01 run (WSAENOBUFS, os error
+    /// 10055). The pre-fix first-attempt unwrap panicked on this control.
+    #[test]
+    fn fake_radio_first_bind_survives_transient_exhaustion() {
+        let failures = std::cell::Cell::new(0u32);
+        let (_base, _cmd, _iq) = FakeP2Radio::bind_with(|| {
+            if failures.replace(failures.get() + 1) < 2 {
+                Err(io::Error::from_raw_os_error(10055))
+            } else {
+                UdpSocket::bind("127.0.0.1:0")
+            }
+        });
+        assert!(failures.get() >= 3);
+    }
+
     #[test]
     fn malformed_flood_errors_after_the_bound() {
         assert_eq!(MAX_CONSECUTIVE_MALFORMED, 10_000);
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
         src.max_consecutive_malformed = 50;
-        for _ in 0..60 {
-            fake.send_iq_bytes(&[0u8; 1443]);
-        }
+        // Pin the receive queue below the Windows-runner condition of the
+        // 2026-10-26 failure (fewer than 50 of a pre-read 60-datagram burst
+        // deliverable), so the pacing below is load-bearing on every OS: an
+        // un-paced burst loses its tail here and the drain starves into the
+        // no-IQ watchdog instead of the malformed bound.
+        socket2::SockRef::from(&src.socket)
+            .set_recv_buffer_size(32 * 1024)
+            .unwrap();
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
-        let err = src.read(&mut buf).unwrap_err();
+        // Send while the receiver drains. A pre-read burst can overflow the
+        // Windows UDP queue before this test ever checks the malformed bound.
+        let err = thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..60 {
+                    fake.send_iq_bytes(&[0u8; 1443]);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+            src.read(&mut buf).unwrap_err()
+        });
         // MAN-533 D4: the malformed bound carries the shared type.
         assert!(crate::is_no_usable_samples(&err), "{err:#}");
         let err = err.to_string();
@@ -2267,11 +2329,24 @@ mod tests {
         fake.send_iq(0);
         read_one(&mut src);
         thread::sleep(Duration::from_secs(4));
-        for s in 1..101 {
+        // Two 50-datagram batches, not one un-drained burst of 100: the
+        // 2026-10-29 Windows run lost the tail of the 100-datagram burst
+        // (about 229 KB of kernel receive accounting against a capped
+        // effective buffer; MAN-497 measured the 4 MiB request capped near
+        // 425 KB on Linux), the drain starved, and read_one panicked on the
+        // no-IQ watchdog. The parked 4 s itself never ticks that clock
+        // (D13): the stall clock runs only while a read waits. Splitting
+        // the sends halves the peak queue while keeping the datagram
+        // order, both pauses, and the 50 datagrams queued across the
+        // second pause.
+        for s in 1..51 {
             fake.send_iq(s);
         }
         for _ in 0..50 {
             read_one(&mut src);
+        }
+        for s in 51..101 {
+            fake.send_iq(s);
         }
         thread::sleep(Duration::from_millis(200));
         for _ in 0..50 {
