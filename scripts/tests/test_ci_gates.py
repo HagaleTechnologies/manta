@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import re
 import shlex
 import subprocess
@@ -1238,9 +1239,14 @@ class ShardedRequiredChecksTests(unittest.TestCase):
         for platform in ('ubuntu', 'macos', 'windows'):
             support = wf.job_block(text, f'{platform}-support')
             command = 'cargo test --workspace --doc --locked' + (' --no-fail-fast' if platform == 'windows' else '')
-            matches = steps_running(support, command)
+            matches = [step for step in wf.steps(support) if
+                       (wf.run_body(step) or '').strip() == command or
+                       (platform == 'windows' and
+                        f'{command} 2>&1 | tee doctest-output.log' in (wf.run_body(step) or ''))]
             self.assertEqual(len(matches), 1)
             self.assertEqual(wf.field(matches[0], 'id'), 'doctests')
+            if platform == 'windows':
+                self.assertIn('set -o pipefail', wf.run_body(matches[0]))
 
     def test_windows_failure_summary_is_wired_fail_open(self):
         text = wf.read('ci-full.yml')
@@ -1294,7 +1300,11 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertEqual(wf.field(upload, 'if'), 'always()')
             support = wf.job_block(text, f'{platform}-support')
             doctest_command = 'cargo test --workspace --doc --locked' + (' --no-fail-fast' if platform == 'windows' else '')
-            self.assertEqual(len(steps_running(support, doctest_command)), 1)
+            doctest_steps = [step for step in wf.steps(support) if
+                             (wf.run_body(step) or '').strip() == doctest_command or
+                             (platform == 'windows' and
+                              f'{doctest_command} 2>&1 | tee doctest-output.log' in (wf.run_body(step) or ''))]
+            self.assertEqual(len(doctest_steps), 1)
             self.assertEqual(steps_running(support, 'cargo test --workspace --locked'), [])
             self.assertFalse(any('--no-run' in (wf.run_body(s) or '') or 'ci-shards.py' in (wf.run_body(s) or '')
                                  for s in wf.steps(support)))
@@ -1371,6 +1381,10 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                     outputs = dict(line.rstrip('\n').split('=', 1) for line in f if line.strip())
                 env.update(SUPPORT_RESULT='success', DOCTEST_RESULT='success', SUPPORT_STARTED=outputs['epoch'],
                            GITHUB_RUN_ID='1', RUNNER_OS=platform)
+                if platform == 'windows':
+                    os.mkdir(os.path.join(tmp, 'scripts'))
+                    for name in ('ci-failure-summary.py', 'ci-flake-classes.json'):
+                        shutil.copyfile(os.path.join(ROOT, 'scripts', name), os.path.join(tmp, 'scripts', name))
                 subprocess.run(['bash', '-c', wf.run_body(record)], cwd=tmp, env=env, check=True)
                 completed = time.time()
                 with open(os.path.join(tmp, 'support-evidence.json'), encoding='utf-8') as f:

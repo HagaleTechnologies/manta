@@ -30,6 +30,17 @@ def records(paths):
                 yield file, {'readError': str(exc)}
 
 
+def parse_doctest_failures(output):
+    """Extract failed rustdoc test names and their bounded failure blocks."""
+    names = list(dict.fromkeys(re.findall(r'^test (.+?) \.\.\. FAILED\s*$', output, re.M)))
+    failures = []
+    for name in names[:50]:
+        marker = f'---- {name} stdout ----'
+        excerpt = output.split(marker, 1)[1].split('\n---- ', 1)[0][:4000] if marker in output else ''
+        failures.append({'name': name, 'excerpt': excerpt})
+    return failures
+
+
 def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
     rows, other, details = [], [], []
     seen, binaries = set(), 0
@@ -47,16 +58,44 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
             for field in ('conclusion', 'doctests'):
                 if record.get(field) != 'success':
                     other.append(f'support {field}: {record.get(field, "missing")}')
+            if record.get('doctests') != 'success':
+                failures = record.get('doctestFailures', [])
+                if isinstance(failures, list):
+                    for failure in failures:
+                        if not isinstance(failure, dict) or not isinstance(failure.get('name'), str):
+                            other.append('support doctests: malformed failure entry')
+                            continue
+                        name = failure['name']
+                        excerpt = str(failure.get('excerpt', ''))[:4000]
+                        label, rule = classify('doctest', name, excerpt)
+                        rows.append(('support', 'doctest', name, label, rule))
+                        details.append((name, excerpt))
+                else:
+                    other.append('support doctests: malformed failure list')
         elif 'index' in record and 'results' in record:
             index = record['index']
+            if not isinstance(index, int):
+                other.append(f'{path}: malformed shard index')
+                continue
             seen.add(index)
             if record.get('error'):
                 other.append(f'shard {index} runner error: {record["error"]}')
+            if not isinstance(record['results'], list):
+                other.append(f'shard {index}: malformed results list')
+                continue
             for result in record['results']:
+                if not isinstance(result, dict):
+                    other.append(f'shard {index}: malformed result entry')
+                    continue
                 binaries += 1
                 key = result.get('key', 'unknown::unknown')
+                if not isinstance(key, str):
+                    key = 'unknown::unknown'
                 target = key.rsplit('::', 1)[-1]
                 exit_code = result.get('exitCode', 0)
+                if not isinstance(exit_code, int):
+                    other.append(f'shard {index} {target}: malformed exit code')
+                    continue
                 if result.get('parseError'):
                     other.append(f'shard {index} {target}: failure parser error: {result["parseError"]}')
                 if exit_code == 97:
@@ -64,24 +103,45 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
                 if not exit_code:
                     continue
                 names = result.get('failedTests', [])
+                if not isinstance(names, list):
+                    other.append(f'shard {index} {target}: malformed failed test list')
+                    continue
                 if result.get('omittedFailedTests'):
                     other.append(f'shard {index} {target}: {result["omittedFailedTests"]} additional failed tests omitted from evidence')
                 if not names:
-                    other.append(f'shard {index} {target}: exit {exit_code} (0x{exit_code & 0xffffffff:08X}); {result.get("outputTail", "no failure list")[:500]}')
+                    tail = str(result.get('outputTail') or 'no failure list')[:500]
+                    other.append(f'shard {index} {target}: exit {exit_code} (0x{exit_code & 0xffffffff:08X}); {tail}')
                 for name in names:
-                    excerpt = result.get('failureExcerpts', {}).get(name, '')
+                    if not isinstance(name, str):
+                        other.append(f'shard {index} {target}: malformed failed test name')
+                        continue
+                    excerpts = result.get('failureExcerpts') or {}
+                    excerpt = excerpts.get(name, '') if isinstance(excerpts, dict) else ''
+                    excerpt = str(excerpt)[:4000]
                     label, rule = classify(target, name, excerpt)
                     rows.append((index, target, name, label, rule))
                     details.append((name, excerpt))
-            for repeat in record.get('repeatResults', []):
+            repeats = record.get('repeatResults') or []
+            if not isinstance(repeats, list):
+                other.append(f'shard {index}: malformed repeat results')
+                repeats = []
+            for repeat in repeats:
+                if not isinstance(repeat, dict):
+                    other.append(f'shard {index}: malformed repeat entry')
+                    continue
                 if not repeat.get('ok'):
                     # A failed repeat is a failing test: name its binary,
                     # classify it from the failed iteration's excerpt
                     # (socket-test-repeat.py writes it), and show the excerpt.
                     key = repeat.get('key', 'unknown::unknown')
+                    if not isinstance(key, str):
+                        key = 'unknown::unknown'
                     target = key.rsplit('::', 1)[-1]
-                    name = repeat.get('test', 'unknown')
-                    excerpt = next((run.get('excerpt', '') for run in repeat.get('runs', [])
+                    name = str(repeat.get('test', 'unknown'))
+                    runs = repeat.get('runs') or []
+                    if not isinstance(runs, list):
+                        runs = []
+                    excerpt = next((str(run.get('excerpt', '')) for run in runs
                                     if isinstance(run, dict) and not run.get('ok')), '')
                     label, rule = classify(target, name, excerpt)
                     other.append(f'shard {index} socket-test repeat failed: {name} in {target}; class: {label} ({rule})')

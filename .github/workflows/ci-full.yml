@@ -288,7 +288,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
-      - run: cargo test --workspace --doc --locked --no-fail-fast
+      - run: |
+          set -o pipefail
+          cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log
+        shell: bash
         id: doctests
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
@@ -377,10 +380,14 @@ jobs:
           SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python - <<'PYTHON'
-          import json, os, time
+          import json, os, runpy, time
           from pathlib import Path
+          output = Path('doctest-output.log')
+          failures = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+              output.read_text(encoding='utf-8', errors='replace') if output.exists() else '')
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              doctestFailures=failures,
               started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON

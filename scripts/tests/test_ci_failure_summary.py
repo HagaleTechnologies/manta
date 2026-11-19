@@ -54,6 +54,23 @@ class ClassifyTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_failed_doctest_is_named_and_classified(self):
+        output = 'test src/lib.rs - example (line 12) ... FAILED\n\nfailures:\n\n---- src/lib.rs - example (line 12) stdout ----\nthread panicked: os error 10048\n'
+        failures = s.parse_doctest_failures(output)
+        self.assertEqual([item['name'] for item in failures], ['src/lib.rs - example (line 12)'])
+        summary = s.render('windows-latest', [(Path('support.json'), {'conclusion': 'failure', 'doctests': 'failure', 'doctestFailures': failures})])
+        self.assertIn('| support | doctest | src/lib.rs - example (line 12) | port reuse |', summary)
+
+    def test_malformed_nested_shard_keeps_valid_failure(self):
+        valid = {'index': 1, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
+                 'failedTests': ['health_escapes_peer_text'], 'failureExcerpts': {}}]}
+        out = s.render('windows-latest', [(Path('bad.json'), {'index': 0, 'results': None}),
+                                           (Path('mixed.json'), {'index': 2, 'results': [None]}),
+                                           (Path('valid.json'), valid)])
+        self.assertIn('malformed results list', out)
+        self.assertIn('malformed result entry', out)
+        self.assertIn('health_escapes_peer_text', out)
+
     def test_failing_test_row_names_os_shard_binary_test_and_class(self):
         record = {'index': 2, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
                    'failedTests': ['health_escapes_peer_text'], 'failureExcerpts': {'health_escapes_peer_text': 'panic'}}]}
