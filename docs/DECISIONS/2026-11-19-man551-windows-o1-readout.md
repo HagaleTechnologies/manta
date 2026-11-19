@@ -2,7 +2,7 @@
 
 ## Context
 
-MAN-371 O1 requires six green recent Windows jobs and a diagnosis fixed on main for every older failure. The six recent jobs were green at this readout. The proposed MAN-551 fixes for historical groups 2, 3, 9, 11, 15 and 17 are still on this branch, so O1 step 2 must wait until they merge and are checked on main.
+MAN-371 O1 requires six green recent Windows jobs and a diagnosis fixed on main for every older failure. The six recent jobs were green at the first readout (15:37Z); the 20:20Z readout below has one Windows failure (group 21, a test-fixture disk leak, diagnosed and fixed on this branch). The proposed MAN-551 fixes for groups 2, 3, 9, 11, 15, 17 and 21 are still on this branch, so O1 step 2 must wait until they merge and five fresh merge-group runs plus the newest push are green on main.
 
 ## O1 readout
 
@@ -17,9 +17,20 @@ UTC: 2026-11-19 15:37Z. Commands: `gh run list --repo HagaleTechnologies/manta -
 push 44530446269 success
 ```
 
+Re-read at 2026-11-19 20:20Z with the same commands:
+
+```text
+44603599417 2026-11-19T19:57:09Z success
+44593384647 2026-11-19T18:58:19Z failure   (group 21 below)
+44570075624 2026-11-19T16:47:33Z success
+44527644539 2026-11-19T12:50:33Z success
+44483581301 2026-11-19T07:57:14Z success
+push 44606674273 success
+```
+
 ## Failure audit
 
-Window: `ci-full.yml` merge-group and push-to-main runs created at or after 2026-10-14T19:57:00Z. Queried 309 merge-group and 258 push runs using `gh run list --limit 500`; queried Jobs API for all 176 runs with a non-success workflow conclusion. Exactly 77 Windows jobs failed. The table has one row per failed Windows run. Compare status is from GitHub's compare API; `behind` or `diverged` means the failing head lacked the mapped fix, and `ahead` means the pinned main tip `d555c72` contains it. Entries marked proposed are not claimed fixed on main.
+Window: `ci-full.yml` merge-group and push-to-main runs created at or after 2026-10-14T19:57:00Z. Queried 309 merge-group and 258 push runs using `gh run list --limit 500`; queried Jobs API for all 176 runs with a non-success workflow conclusion. Exactly 77 Windows jobs failed by the 05:11Z audit; run 44593384647 (18:58Z) is the 78th, added as group 21. The table has one row per failed Windows run. Compare status is from GitHub's compare API; `behind` or `diverged` means the failing head lacked the mapped fix, and `ahead` means the pinned main tip `d555c72` contains it. Entries marked proposed are not claimed fixed on main.
 
 | Run | Event | UTC | Failing test or step | Cause | Class | Fix and compare evidence |
 |---|---|---|---|---|---|---|
@@ -101,6 +112,7 @@ Window: `ci-full.yml` merge-group and push-to-main runs created at or after 2026
 | 42333277076 | push | 2026-11-07T03:16:54Z | cw_segments_documented_example_parses (manta-cli config_command) | #20: Windows checked the documented example out CRLF, from #510 (MAN-30) | CRLF | #20: `0d4ced9` (#530), compare/0d4ced9...c0198dd=`behind`, compare/0d4ced9...d555c72=`ahead` |
 | 42522911633 | push | 2026-11-08T20:59:58Z | health_against_a_closed_port_exits_one_not_two and health_escapes_peer_text (manta-cli health_command) | #12: One port collision: the closed-port test dialled a released port that the escape test's fake server had just bound. Its probe took that server's one connection, got the 503 body, exited 1 with empty stderr (panic at `:155`, empty message); the escape test's own probe got nothing (`""` at `:94`). The two failed together in all three runs | port reuse | #12: `46096dc` (#584), compare/46096dc...59910c0=`behind`, compare/46096dc...d555c72=`ahead` |
 
+| 44593384647 | merge_group | 2026-11-19T18:58:19Z | multi_input_daemon_publishes_each_inputs_hearing, multi_input_daemon_serves_one_stream, multi_input_replay_stdout_is_byte_identical_across_three_runs, single_input_banner_and_metrics_labels_are_unchanged, two_overlapping_file_inputs_spot_the_shared_station_once (manta-cli multi_input, shard 6's socket-test repeat: PR #601 changed `tests/common/launch.rs`) | #21: `There is not enough space on the disk. (os error 112)` at `multi_input.rs:70:14` (the fixture's `write_fixture` unwrap). The fixture lived in a `static` `TempDir`, and Rust never drops statics, so each test process leaked its ~264 MB WAV pair (396 MB with per-test copies, measured locally) into the temp directory; the repeat runner starts one process per test per iteration (160 here) and filled the disk partway through. The shard's ordinary run of the same tests passed. Not a timing or port class | unknown | #21: MAN-551 proposed fix; not yet on main |
 
 The completeness command used for this readout is:
 
@@ -148,7 +160,8 @@ Output at 2026-11-19 05:11Z: `77 failed Windows jobs, 0 missing`. That run used 
 - Rows 2 and 3: `doctor.rs` constructs `v1_source()` before starting the wall clock. A six-second source-construction probe failed three pre-watchdog tests before the change and passed all 34 doctor tests afterward. The fourth promptness test stayed within its ten-second bound even before the change.
 - Row 9: the fake radio now repeats the busy discovery reply three times over the same held socket, so one lost loopback datagram does not turn a busy answer into a false no-answer result. Failing control: `auto_refuses_a_busy_protocol_2_radio_after_a_lost_reply` drops the first reply through the fake's new `drop_first_discovery_reply` knob (the logged condition); with the fixture reverted to the pre-fix single reply it fails at its `expect`, with the three replies it passes.
 - Row 11: the malformed-flood test sends datagrams on a scoped thread while the receiver reads, with one millisecond between sends. The test now also pins its receive queue to 32 KiB, where fewer than 50 of a pre-read 60-datagram burst are deliverable, so the pacing is load-bearing on every OS. Failing control: with the sender reverted to the pre-read burst under that pin, the run ends in the recorded `stalled: no IQ datagram for 10 s` error instead of the 50-datagram malformed bound; with the paced sender it passes.
-- Row 15: the parked-window test sends its backlog as two 50-datagram batches around the first drain instead of one un-drained burst of 100, halving the peak kernel receive accounting (about 229 KB to about 114 KB) while keeping the datagram order, both pauses, and the 50 datagrams queued across the second pause. The earlier proposed `stall_after` raise is withdrawn: the parked 4 s never ticks the stall clock (D13), so a longer watchdog only delayed the same panic. Failing control: with the receive queue pinned to 96 KiB (192 KiB effective on Linux), the un-split burst starves the drain and panics in `read_one`'s path; the committed two-batch shape passes under the same pin.
+- Row 15: the parked-window test sends its backlog as two 50-datagram batches around the first drain instead of one un-drained burst of 100, halving the peak kernel receive accounting (about 229 KB to about 114 KB) while keeping the datagram order, both pauses, and the 50 datagrams queued across the second pause. The earlier proposed `stall_after` raise is withdrawn: the parked 4 s never ticks the stall clock (D13), so a longer watchdog only delayed the same panic. Failing control: with the receive queue pinned to 96 KiB (192 KiB effective on Linux), the un-split burst starves the drain and panics in `read_one`'s path; the committed two-batch shape passes under the same pin. That control is not committed: a fixed byte pin is not portable to macOS's per-datagram accounting (MAN-583).
+- Row 21: `multi_input.rs` writes its overlap WAVs and `overlap.toml` once under `CARGO_TARGET_TMPDIR` (staged and atomically renamed, the `common::fixture_wav` pattern), and each test writes its own configs and copies into a per-test `tempfile::tempdir()` that is dropped at test end. `man532_beacon_fading.rs` had the same static-`TempDir` leak (four 120 s, 96 kS/s scenes per process) and gets the same fix. Control: with the system temp directory pointed at an empty directory, one run of the `multi_input` binary on the pre-fix file left 396 MB there; on the fixed file it left 0 B and the shared cache held 264 MB.
 - Row 17: the fake's first bind retries a temporary Windows UDP buffer exhaustion (WSAENOBUFS) for up to 200 attempts with a five-millisecond pause instead of panicking at the first transient bind error. The bind is now an injectable `bind_with`, and `fake_radio_first_bind_survives_transient_exhaustion` feeds it two `os error 10055` failures before a success; with the retry reverted to the pre-fix first-attempt unwrap, that control panics.
 
 These changes are not yet on main. The four HPSDR tests and both new failing controls passed locally with `cargo test -p manta-input --lib <test name> --locked`; native Windows verification is the PR's own `test (windows-latest)` job (the full sharded workspace suite, including `manta-input`'s lib tests) and the merge-group run. `Windows bundle smoke` runs packaging fixtures only and is not HPSDR evidence.
@@ -165,7 +178,7 @@ After MAN-551 merges and the newly fixed groups are proven on main, rerun MAN-37
 
 ## Not done
 
-The ruleset flip, native Windows merge-group confirmation of these new workflow steps, and Unix parity are outside this branch. The Unix parity follow-up was filed as `a4bca696-d241-402c-8361-cc49b1ed73d8` (Catalyst create response).
+The ruleset flip, native Windows merge-group confirmation of these new workflow steps, and Unix parity are outside this branch. The Unix parity follow-up is MAN-575.
 
 ## Verification
 
