@@ -37,14 +37,38 @@ fn station(text: &str, offset_hz: f64) -> SignalSpec {
 
 const W1AW_HZ: f64 = 14_012_340.0;
 
+/// Bump when the overlap fixture's scenes or the overlap config change, so a
+/// `CARGO_TARGET_TMPDIR` cache written by an older build is not reused.
+const FIXTURE_VERSION: u32 = 1;
+
 /// The overlap fixture of the MAN-13 plan: `seg_a.wav` 96 kS/s at
 /// 14.000 MHz (W1AW, JA1ABC), `seg_b.wav` 192 kS/s at 14.060 MHz (W1AW,
-/// ZL2XYZ), 120 s, 20 dB, 20 WPM, each with its frequency sidecar.
-fn fixtures() -> &'static (tempfile::TempDir, PathBuf, PathBuf) {
-    static F: OnceLock<(tempfile::TempDir, PathBuf, PathBuf)> = OnceLock::new();
+/// ZL2XYZ), 120 s, 20 dB, 20 WPM, each with its frequency sidecar, plus
+/// `overlap.toml` naming both.
+///
+/// MAN-551: about 276 MB of float WAVs, so it is written once under
+/// `CARGO_TARGET_TMPDIR` and shared by every process, as
+/// `common::fixture_wav` does. It used to live in a `static` `TempDir`, but
+/// Rust never runs destructors for statics, so every test process leaked
+/// the pair into the system temp directory. The Windows socket-test repeat
+/// runner starts this binary once per test and iteration, and merge-group
+/// run 44593384647 filled the runner's disk (`os error 112`) partway
+/// through. Rendered to a process-unique staging name and atomically
+/// renamed into place, so concurrent processes never see a half-written
+/// WAV. Per-test files go in each test's own `tempfile::tempdir()`.
+fn fixtures() -> &'static (PathBuf, PathBuf) {
+    static F: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     F.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
-        let (a, _) = render_scene(
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("man13-multi-input-overlap-v{FIXTURE_VERSION}"));
+        let (a, b) = (root.join("seg_a.wav"), root.join("seg_b.wav"));
+        if root.join("overlap.toml").exists() {
+            return (a, b);
+        }
+        let staging = root.with_extension(format!("staging.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).unwrap();
+        let (sa, _) = render_scene(
             &[
                 station("CQ CQ DE W1AW W1AW K", W1AW_HZ - 14_000_000.0),
                 station("CQ CQ DE JA1ABC JA1ABC K", -20_000.0),
@@ -54,9 +78,9 @@ fn fixtures() -> &'static (tempfile::TempDir, PathBuf, PathBuf) {
             Some(11),
         )
         .unwrap();
-        let a = manta_testkit::wav::write_fixture(dir.path(), "seg_a", &a, 96_000.0, 14_000_000.0)
-            .unwrap();
-        let (b, _) = render_scene(
+        manta_testkit::wav::write_fixture(&staging, "seg_a", &sa, 96_000.0, 14_000_000.0).unwrap();
+        drop(sa);
+        let (sb, _) = render_scene(
             &[
                 station("CQ CQ DE W1AW W1AW K", W1AW_HZ - 14_060_000.0),
                 station("CQ CQ DE ZL2XYZ ZL2XYZ K", 25_000.0),
@@ -66,9 +90,30 @@ fn fixtures() -> &'static (tempfile::TempDir, PathBuf, PathBuf) {
             Some(22),
         )
         .unwrap();
-        let b = manta_testkit::wav::write_fixture(dir.path(), "seg_b", &b, 192_000.0, 14_060_000.0)
-            .unwrap();
-        (dir, a, b)
+        manta_testkit::wav::write_fixture(&staging, "seg_b", &sb, 192_000.0, 14_060_000.0).unwrap();
+        drop(sb);
+        // Written last and checked first: its presence marks a complete
+        // directory. The paths name the published location, not staging.
+        write_config(
+            &staging,
+            "overlap.toml",
+            &format!(
+                "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
+                 [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
+                toml_path(&a),
+                toml_path(&b)
+            ),
+        );
+        // Loser of a rename race: another process already published one.
+        if std::fs::rename(&staging, &root).is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        assert!(
+            root.join("overlap.toml").exists(),
+            "fixture missing after publish: {}",
+            root.display()
+        );
+        (a, b)
     })
 }
 
@@ -82,25 +127,12 @@ fn write_config(dir: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// Written once: tests run in parallel, and rewriting the file while
-/// another test's `manta` reads it would hand that run a truncated config.
+/// Published once with the fixture: tests run in parallel, and rewriting
+/// the file while another test's `manta` reads it would hand that run a
+/// truncated config.
 fn overlap_config() -> PathBuf {
-    static CONFIG: OnceLock<PathBuf> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let (dir, a, b) = fixtures();
-            write_config(
-                dir.path(),
-                "overlap.toml",
-                &format!(
-                    "[[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
-                     [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
-                    toml_path(a),
-                    toml_path(b)
-                ),
-            )
-        })
-        .clone()
+    let (a, _) = fixtures();
+    a.with_file_name("overlap.toml")
 }
 
 fn run_config(config: &Path) -> Output {
@@ -145,7 +177,8 @@ fn two_overlapping_file_inputs_spot_the_shared_station_once() {
 
 #[test]
 fn multi_input_daemon_serves_one_stream() {
-    let (dir, a, b) = fixtures();
+    let (a, b) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let config = write_config(
         dir.path(),
         "daemon.toml",
@@ -211,7 +244,8 @@ fn banner_lists_every_input_and_each_input_gets_a_ready_line() {
 /// MAN-13: one input keeps today's banner, source name and metrics label.
 #[test]
 fn single_input_banner_and_metrics_labels_are_unchanged() {
-    let (dir, a, _) = fixtures();
+    let (a, _) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let config = write_config(
         dir.path(),
         "single.toml",
@@ -276,7 +310,8 @@ const HEARING_FAMILIES: [&str; 4] = [
 /// the exact attribution is pinned by the unit tests beside each counter.
 #[test]
 fn multi_input_daemon_publishes_each_inputs_hearing() {
-    let (dir, a, b) = fixtures();
+    let (a, b) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let [telnet_port, json_port, metrics_port] = free_ports();
     let config = write_config(
         dir.path(),
@@ -381,7 +416,8 @@ fn multi_input_replay_stdout_is_byte_identical_across_three_runs() {
 
 #[test]
 fn file_input_without_a_frequency_is_refused_naming_it() {
-    let (dir, a, _) = fixtures();
+    let (a, _) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     // A copy of seg_a without its sidecar.
     let bare = dir.path().join("bare.wav");
     std::fs::copy(a, &bare).unwrap();
@@ -411,7 +447,8 @@ fn file_input_without_a_frequency_is_refused_naming_it() {
 
 #[test]
 fn an_input_that_fails_to_open_stops_startup_naming_it() {
-    let (dir, a, _) = fixtures();
+    let (a, _) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("missing.wav");
     let config = write_config(
         dir.path(),
@@ -503,7 +540,7 @@ fn check_with_input_reports_that_inputs_rate() {
 /// `--input` with several entries.
 #[test]
 fn a_source_flag_needs_no_input_with_several_entries() {
-    let (_, _, b) = fixtures();
+    let (_, b) = fixtures();
     let out = manta()
         .args(["check", "--duration", "1", "--source-iq", "--source"])
         .arg(b)
@@ -523,7 +560,8 @@ fn a_source_flag_needs_no_input_with_several_entries() {
 /// applied; `--freq-correction-ppm` gives the right one.
 #[test]
 fn decode_refuses_several_inputs_without_a_correction() {
-    let (dir, a, b) = fixtures();
+    let (a, b) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let two_ppm = |name: &str, ppm_a: f64, ppm_b: f64| {
         write_config(
             dir.path(),
@@ -618,7 +656,8 @@ fn json_log_format_keeps_decoded_text_a_json_record() {
 /// undecimated input beside it says nothing.
 #[test]
 fn a_decimated_input_states_its_usable_passband() {
-    let (dir, a, b) = fixtures();
+    let (a, b) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let config = write_config(
         dir.path(),
         "decimated.toml",
@@ -648,7 +687,8 @@ fn a_decimated_input_states_its_usable_passband() {
 /// clean input beside it warns nothing.
 #[test]
 fn bad_samples_in_one_input_warn_naming_it() {
-    let (dir, a, _) = fixtures();
+    let (a, _) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     let (samples, _) = render_scene(
         &[station("CQ CQ DE ZL2XYZ ZL2XYZ K", 25_000.0)],
         192_000.0,

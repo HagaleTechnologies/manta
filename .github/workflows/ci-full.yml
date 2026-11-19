@@ -288,7 +288,10 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
-      - run: cargo test --workspace --doc --locked
+      - run: |
+          set -o pipefail
+          cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log
+        shell: bash
         id: doctests
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
@@ -377,10 +380,16 @@ jobs:
           SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python - <<'PYTHON'
-          import json, os, time
+          import json, os, runpy, time
           from pathlib import Path
+          output = Path('doctest-output.log')
+          failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+              output.read_text(encoding='utf-8', errors='replace') if output.exists() else '')
+          if os.environ['DOCTEST_RESULT'] == 'success':
+              tail = ''
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              doctestFailures=failures, omittedDoctestFailures=omitted, doctestOutputTail=tail,
               started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
@@ -662,6 +671,12 @@ jobs:
         shell: pwsh
         env:
           REPEAT_BASE: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.event_name == 'pull_request' && 'HEAD^1' || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+      # MAN-551: diagnostics are fail-open; the shard result remains the verdict.
+      - run: python scripts/ci-failure-summary.py --os ${{ matrix.os }} --shard ${{ matrix.shard }} --append "$GITHUB_STEP_SUMMARY" shard-evidence
+        shell: bash
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -677,13 +692,51 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login))
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every OS dependency to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS" | jq -e 'length == 3 and all(.[]; .result == "success")'
+      # MAN-551: the verdict above stays first; evidence and summary are fail-open.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/ci-failure-summary.py
+            scripts/ci-flake-classes.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          pattern: shard-windows-latest-*
+          path: windows-evidence/shards
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: build-windows-latest
+          path: windows-evidence/build
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: support-windows
+          path: windows-evidence/support
+      - run: python3 scripts/ci-failure-summary.py --os windows-latest --expect-shards 8 --needs-env RESULTS --append "$GITHUB_STEP_SUMMARY" windows-evidence
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          RESULTS: ${{ toJSON(needs) }}
   ubuntu-support:
     if: >-
       github.event_name != 'pull_request' ||
@@ -895,6 +948,7 @@ jobs:
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
       - run: python3 -m unittest scripts.tests.test_ci_shards_windows -v
+      - run: python3 -m unittest scripts.tests.test_ci_failure_summary -v
       # MAN-523: the changed-socket-test selector and its ten-repeat runner.
       - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results
@@ -1422,6 +1476,7 @@ jobs:
         run: python3 -m unittest scripts.tests.test_verify_dependabot_diff_safe -v
       - run: python3 -m unittest scripts.tests.test_ci_shards -v
       - run: python3 -m unittest scripts.tests.test_ci_shards_windows -v
+      - run: python3 -m unittest scripts.tests.test_ci_failure_summary -v
       # MAN-523: the changed-socket-test selector and its ten-repeat runner.
       - run: python3 -m unittest scripts.tests.test_socket_test_repeat -v
       - name: Record support and doctest results

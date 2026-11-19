@@ -1,5 +1,7 @@
 # MAN-523: loopback tests hold their ports, and changed socket tests run ten more times
 
+> 2026-11-19 MAN-551: [the Windows audit](2026-11-19-man551-windows-o1-readout.md) explains `health_escapes_peer_text` and the `recording` failure in rows 12 and 13.
+
 > Windows update (MAN-565, 2026-11-14). Windows now repeats changed socket tests from its assigned slices, just like Unix, rather than from an inventory-only serial job. See [MAN-565](2026-11-14-man565-windows-build-once-shards.md). Historical measurements below are unchanged.
 
 Date: 2026-11-11

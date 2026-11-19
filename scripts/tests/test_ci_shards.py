@@ -414,3 +414,62 @@ class ShardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class LibtestFailureParseTests(unittest.TestCase):
+    def test_names_and_excerpts_from_a_libtest_report(self):
+        output = 'running 1 test\ntest tests::broken ... FAILED\n\nfailures:\n\n---- tests::broken stdout ----\npanic: os error 10048\n\nfailures:\n    tests::broken\n\ntest result: FAILED\n'
+        parsed = s.parse_libtest_failures(output)
+        self.assertEqual(parsed['failedTests'], ['tests::broken'])
+        self.assertIn('os error 10048', parsed['failureExcerpts']['tests::broken'])
+
+    def test_report_cut_off_before_the_failure_list(self):
+        self.assertEqual(s.parse_libtest_failures('test broken ... FAILED\n')['failedTests'], ['broken'])
+
+    def test_interrupted_final_list_keeps_already_failed_names(self):
+        # A real two-failure report whose final list was cut off after the
+        # first entry: `beta` already printed FAILED and must not disappear.
+        output = ('test alpha ... FAILED\ntest beta ... FAILED\n\nfailures:\n\n'
+                  '---- alpha stdout ----\nboom\n\nfailures:\n    alpha\n')
+        self.assertEqual(s.parse_libtest_failures(output)['failedTests'], ['alpha', 'beta'])
+
+    def test_separator_line_inside_failure_block_stays_in_the_excerpt(self):
+        output = ('test alpha ... FAILED\n\nfailures:\n\n---- alpha stdout ----\n'
+                  '---- section two ----\nthird send failed: os error 10048\n\n'
+                  'failures:\n    alpha\n\ntest result: FAILED. 1 failed\n')
+        excerpt = s.parse_libtest_failures(output)['failureExcerpts']['alpha']
+        self.assertIn('---- section two ----', excerpt)
+        self.assertIn('os error 10048', excerpt)
+
+    def test_crash_without_a_failure_list_keeps_the_tail(self):
+        self.assertEqual(s.parse_libtest_failures('crashed')['outputTail'], 'crashed')
+
+    def test_excerpts_are_bounded(self):
+        text = 'test broken ... FAILED\n---- broken stdout ----\n' + ('x'*500+'\n')*100
+        self.assertLessEqual(len(s.parse_libtest_failures(text)['failureExcerpts']['broken']), 4000)
+        many = ''.join(f'test test_{i} ... FAILED\n' for i in range(200))
+        parsed = s.parse_libtest_failures(many)
+        self.assertEqual(len(parsed['failedTests']), 50)
+        self.assertEqual(parsed['omittedFailedTests'], 150)
+
+    def test_noisy_failure_block_keeps_the_panic_at_its_end(self):
+        # MAN-551: a test that prints before panicking must not lose the
+        # panic message (and so its flake class) to a head-only cut.
+        noise = ''.join(f'noise line {i} xxxxxxxxxxxxxxxxxxxxxxxx\n' for i in range(300))
+        text = ('test tests::bind ... FAILED\n\nfailures:\n\n---- tests::bind stdout ----\n' + noise +
+                "\nthread 'tests::bind' panicked at src/lib.rs:9:32:\n"
+                'called `Result::unwrap()` on an `Err` value: Os { code: 10048, kind: AddrInUse }\n\n'
+                'failures:\n    tests::bind\n\ntest result: FAILED. 0 passed; 1 failed\n')
+        excerpt = s.parse_libtest_failures(text)['failureExcerpts']['tests::bind']
+        self.assertIn('AddrInUse', excerpt)
+        self.assertIn('noise line 0 ', excerpt)
+        self.assertIn('lines elided', excerpt)
+        self.assertLessEqual(len(excerpt), 4000)
+
+    def test_invalid_utf8_is_replaced(self):
+        self.assertIn('\ufffd', s.parse_libtest_failures(b'\xff'.decode('utf-8', errors='replace'))['outputTail'])
+
+    def test_passing_result_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = s.run_item({'key': 'fixture::test::pass', 'executable': sys.executable}, directory, os.environ)
+            self.assertEqual(result['exitCode'], 0)
+            self.assertNotIn('failedTests', result)

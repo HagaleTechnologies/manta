@@ -2,6 +2,7 @@
 //! Watterson uses coppa f8a4d16d; SNR is referenced to 2500 Hz.
 //! EOF completes track closure. Test every output spot, regardless of type.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -41,19 +42,29 @@ fn spec(snr_db: f32, watterson: Option<WattersonFade>) -> VectorSpec {
     }
 }
 
-// Process-local fixtures cannot reuse the old 40-second MAN-120 cache.
-// Each directory identifies SNR and channel; all other parameters are fixed
-// above. OnceLock shares each rendered scene across allowlist variants.
-fn fixtures() -> &'static tempfile::TempDir {
-    static FIXTURES: OnceLock<tempfile::TempDir> = OnceLock::new();
+// The old 40-second MAN-120 cache does not fit these 120 s scenes, so they
+// get their own. Each subdirectory identifies SNR and channel; all other
+// parameters are fixed above (bump the version when they change). OnceLock
+// shares each rendered scene across allowlist variants.
+//
+// MAN-551: written once under `CARGO_TARGET_TMPDIR` and shared across
+// processes, as `common::fixture_wav` does, not kept in a `static`
+// `TempDir`: Rust never runs destructors for statics, so each test process
+// leaked four 120 s, 96 kS/s float WAVs into the system temp directory.
+// Rendered to a process-unique staging name and atomically renamed into
+// place; `complete` is written last and marks a whole set.
+fn fixtures() -> &'static Path {
+    static FIXTURES: OnceLock<PathBuf> = OnceLock::new();
     FIXTURES.get_or_init(|| {
-        let root = tempfile::Builder::new()
-            .prefix("man532-120s-")
-            .tempdir()
-            .unwrap();
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("man532-120s-v1");
+        if root.join("complete").exists() {
+            return root;
+        }
+        let staging = root.with_extension(format!("staging.{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
         for snr in [6, 10] {
             for faded in [false, true] {
-                let dir = root.path().join(format!("snr{snr}-poor{faded}"));
+                let dir = staging.join(format!("snr{snr}-poor{faded}"));
                 std::fs::create_dir_all(&dir).unwrap();
                 let fade = faded.then_some(WattersonFade {
                     preset: WattersonPreset::Poor,
@@ -65,6 +76,16 @@ fn fixtures() -> &'static tempfile::TempDir {
                 assert!(dir.join(format!("{}.manifest.json", scene.name)).is_file());
             }
         }
+        std::fs::write(staging.join("complete"), b"").unwrap();
+        // Loser of a rename race: another process already published one.
+        if std::fs::rename(&staging, &root).is_err() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        assert!(
+            root.join("complete").exists(),
+            "fixture missing after publish: {}",
+            root.display()
+        );
         root
     })
 }
@@ -76,7 +97,6 @@ fn decode(snr: u32, faded: bool, listed: bool) -> Vec<(String, String, f64)> {
         "man532-beacon-awgn"
     };
     let wav = fixtures()
-        .path()
         .join(format!("snr{snr}-poor{faded}"))
         .join(format!("{name}.wav"));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_manta"));

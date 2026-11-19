@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run complete Cargo test executables, preserving libtest's process-local locks.
+"""Run complete Cargo test executables, streaming output and recording bounded failure details.
 
 Doctests are deliberately a separate required `cargo test --workspace --doc --locked`.
 Timing weights affect placement only. Every discovered executable is always assigned.
@@ -26,6 +26,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path, PureWindowsPath
 import subprocess
 import shutil
@@ -275,8 +276,86 @@ def run_item(item, cwd, env):
     command = [item['executable']]
     print(f"Running {item['key']} from {cwd}", flush=True)
     started = time.monotonic()
-    result = subprocess.run(command, cwd=cwd, env=env)
-    return dict(key=item['key'], command=command, cwd=str(cwd), seconds=time.monotonic()-started, exitCode=result.returncode)
+    with tempfile.TemporaryDirectory(prefix='man551-', ignore_cleanup_errors=True) as tmp:
+        path = Path(tmp)/'output.log'
+        with path.open('wb') as log, path.open('rb') as reader:
+            proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=log, stderr=subprocess.STDOUT)
+            while True:
+                chunk = reader.read()
+                if chunk:
+                    sys.stdout.flush()
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                if proc.poll() is not None:
+                    chunk = reader.read()
+                    if chunk:
+                        sys.stdout.buffer.write(chunk)
+                        sys.stdout.buffer.flush()
+                    break
+                time.sleep(0.2)
+            result = dict(key=item['key'], command=command, cwd=str(cwd), seconds=time.monotonic()-started, exitCode=proc.returncode)
+            if proc.returncode:
+                try:
+                    result.update(parse_libtest_failures(path.read_text(encoding='utf-8', errors='replace')))
+                except Exception as exc:
+                    result['parseError'] = str(exc)
+            return result
+
+
+def bounded_excerpt(lines, limit=40, chars=4000):
+    """Bound a failure block without losing its end.
+
+    The panic or assertion message closes a libtest failure block, after
+    whatever the test printed; a head-only cut drops exactly the text that
+    names the failure and its flake class (MAN-551). Mirrors
+    ``bounded_excerpt`` in ``ci-failure-summary.py``.
+    """
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    if len(lines) > limit:
+        head, tail = lines[:8], lines[-(limit - 9):]
+        lines = head + [f'... ({len(lines) - len(head) - len(tail)} lines elided) ...'] + tail
+    text = '\n'.join(lines)
+    if len(text) > chars:
+        text = text[:1000] + '\n... (elided) ...\n' + text[-(chars - 1020):]
+    return text
+
+
+def parse_libtest_failures(text):
+    """Keep bounded names and output for a failed libtest executable."""
+    lines = text.splitlines()
+    names = []
+    # The final failures list is authoritative only when the report is
+    # complete: a `test result:` line must follow it. A list cut off partway
+    # (an interrupted report) loses names libtest already printed as FAILED
+    # lines, so those lines stay the source of names instead.
+    results = [m.start() for m in re.finditer(r'^test result: ', text, re.M)]
+    for match in reversed(list(re.finditer(r'^failures:\s*\n((?:[ \t]+[^\n]+\n)+)', text, re.M))):
+        if any(pos > match.end() for pos in results):
+            names = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+            break
+    if not names:
+        names = re.findall(r'^test (.+?) \.\.\. FAILED\s*$', text, re.M)
+    names = list(dict.fromkeys(names))
+    if not names:
+        return {'outputTail': '\n'.join(lines[-40:])[-4000:]}
+    omitted = max(0, len(names) - 50)
+    names = names[:50]
+    excerpts = {}
+    for name in names:
+        marker = f'---- {name} stdout ----'
+        if marker in lines:
+            start = lines.index(marker) + 1
+            # Only an actual libtest boundary ends the block: another
+            # `---- <name> stdout ----` header or the final `failures:` list.
+            # A separator the test itself printed stays inside the excerpt.
+            end = next((i for i in range(start, len(lines))
+                        if re.match(r'^---- .* stdout ----$', lines[i]) or lines[i] == 'failures:'), len(lines))
+            excerpts[name] = bounded_excerpt(lines[start:end])
+    result = {'failedTests': names, 'failureExcerpts': excerpts}
+    if omitted:
+        result['omittedFailedTests'] = omitted
+    return result
 
 
 def cargo_build(record):
@@ -294,6 +373,7 @@ def load_weights():
 
 def build_bundles(args, record):
     record.pop('index')  # a build record is no shard's evidence
+    record['role'] = 'build'  # preserve the role if an early build step fails
     meta = json.loads(subprocess.check_output(['cargo', 'metadata', '--no-deps', '--locked', '--format-version=1']))
     root = Path(meta['workspace_root']).resolve()
     target_dir = Path(meta['target_directory']).resolve()

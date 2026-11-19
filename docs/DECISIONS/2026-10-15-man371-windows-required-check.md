@@ -1,5 +1,7 @@
 # 2026-10-15 — MAN-371: `test (windows-latest)` becomes a required check
 
+> 2026-11-19 MAN-551: [Windows O1 readout and failure audit](2026-11-19-man551-windows-o1-readout.md) records the current precondition and owner hand-off.
+
 **Status:** Implemented (branch `MAN-371`). The ruleset change and the
 live acceptance checks are owner steps O1–O4 below. They need
 repository-admin rights or hosted runs, and the change does not perform

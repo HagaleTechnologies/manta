@@ -293,6 +293,7 @@ class Repetition(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertEqual(result['passes'], 6)
         self.assertEqual(len(calls), 7)
+        self.assertIn('excerpt', result['runs'][-1])
         with self.assertRaises(ValueError):
             r.audit_repeats(dict(selected=[dict(key='k', test='name')]), [result])
 
