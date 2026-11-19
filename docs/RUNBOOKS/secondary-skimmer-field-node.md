@@ -1,5 +1,7 @@
 # Secondary-skimmer field node runbook (MAN-96)
 
+For a swap of an existing admitted Aggregator rather than adding a secondary, see the [Aggregator swap runbook](aggregator-swap.md).
+
 How to run a real manta node for 30 days as a secondary skimmer behind an RBN Aggregator, next
 to a trusted primary CW Skimmer/SkimSrv, and how to record the evidence that it worked. Every
 command below is meant to be copied as written, after replacing the example values set at the

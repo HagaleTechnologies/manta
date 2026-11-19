@@ -2591,3 +2591,90 @@ async fn sh_dx_honours_the_connection_filter() {
     );
     assert_eq!(rows_for(&mut reader, &mut wr, "sh/dx").await, rows);
 }
+
+/// MAN-17: Aggregator manual v6.0 §9.2 (SETT and spot forwarding), RFC 854
+/// (CR NUL), ARCHITECTURE §7 (DX lines), and legacy capability matrix row 99
+/// (unique filter) describe one continuous client session.
+#[tokio::test]
+async fn aggregator_session_survives_banner_to_bye_on_one_connection() {
+    let (addr, bus, _metrics, _shutdown_tx, _tasks) = spawn_server().await;
+    let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
+    let mut reader = BufReader::new(rd);
+    for expected in [
+        "Welcome to the manta Telnet cluster port!\r\n",
+        "",
+        "Please enter your callsign: \r\n",
+    ] {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        if expected.is_empty() {
+            assert!(
+                line.starts_with("manta ")
+                    && line.contains("is operated by")
+                    && line.contains(STATION_CALL)
+            );
+        } else {
+            assert_eq!(line, expected);
+        }
+    }
+    wr.write_all(b"N0CALL\r\x00").await.unwrap();
+    read_lines_until(&mut reader, "post-login station prompt", |line| {
+        line.contains(STATION_CALL)
+    })
+    .await;
+    wr.write_all(b"SKIMMER/SETT\r\x00").await.unwrap();
+    let mut sett = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut sett))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(sett, "SETT: vlNormal 14000.0-14088.0\r\n");
+    wr.write_all(b"set dx filter unique > 1\r\n").await.unwrap();
+    let mut ack = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut ack))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ack.to_lowercase().contains("filter"), "{ack:?}");
+    let spot = sample_spot();
+    let unix_ts = bus.unix_ts_for(spot.sample_ts);
+    bus.publish(spot.clone());
+    let mut first = String::new();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), reader.read_line(&mut first))
+            .await
+            .is_err(),
+        "first occurrence leaked: {first:?}"
+    );
+    bus.publish(spot);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        .await
+        .unwrap()
+        .unwrap();
+    let line = line.trim_end();
+    assert!(line.starts_with("DX de W3XYZ-#:"), "{line:?}");
+    let secs = unix_ts.rem_euclid(86_400);
+    let zulu = format!("{:02}{:02}Z", secs / 3600, (secs % 3600) / 60);
+    assert_eq!(line.find("CW").unwrap() + 1, 42, "{line:?}");
+    assert_eq!(line.find(&zulu).unwrap() + 1, 71, "{line:?}");
+    assert!(line.contains("14027.10"), "{line:?}");
+    wr.write_all(b"BYE\r\x00").await.unwrap();
+    let mut bye = String::new();
+    tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut bye))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bye, "CU AGN!\r\n");
+    let mut eof = String::new();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut eof))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+}

@@ -10,7 +10,9 @@ What this guide does not do: it does not get you admitted to the Reverse Beacon
 Network. The RBN team admits skimmers. The supported route into RBN is an RBN
 Aggregator reading manta's telnet server: follow steps 1–4 here, then the
 [secondary-skimmer field-node runbook](../RUNBOOKS/secondary-skimmer-field-node.md),
-which adds the private soak and spot-quality checks that path requires. Step 5's
+which adds the private soak and spot-quality checks that path requires. If your
+Aggregator already feeds RBN, validate an upstream swap with the
+[Aggregator swap runbook](../RUNBOOKS/aggregator-swap.md). Step 5's
 direct uplink is experimental. Its login and spot format are unverified against
 RBN's real ingest, so this guide keeps it in dry-run. Arrange a collector and
 login with its operator before step 5.

@@ -16,13 +16,17 @@ sources:
   - docs/DECISIONS/2026-10-14-man137-json-stream-resume.md
   - docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md
   - docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md
+  - docs/DECISIONS/2026-11-19-man17-aggregator-swap-runbook.md
+  - docs/RUNBOOKS/aggregator-swap.md
 verified:
-  commit: acbc00f
-  date: 2026-11-10
+  commit: d555c72
+  date: 2026-11-19
 links:
   - spot-validation
 ---
-manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines — the drop-in compatibility surface existing aggregators consume with zero changes — and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both. Both are thin fan-out consumers of the spot bus (telnet on `SpotBus::subscribe()`, JSON on `subscribe_json()`, which also carries MAN-301 grade records) — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7. manta also reads RBN's spots, to grade its own (MAN-301, below): with `[rbn_compare]` enabled, a `[server]` daemon parses RBN's public CW telnet feed (AK1A `DX de` lines, `crates/manta-server/src/rbn_compare/ak1a.rs`), and `manta grade` reads RBN's daily CSV offline.
+manta produces spots on two surfaces: a **telnet DX cluster server** (default :7300) emitting standard RBN-format `DX de` lines and a **JSON Lines stream** (TCP + WebSocket, default :7301) carrying full-fidelity spot objects for modern consumers like cqdx. This repo *produces* both. Both are thin fan-out consumers of the spot bus (telnet on `SpotBus::subscribe()`, JSON on `subscribe_json()`, which also carries MAN-301 grade records) — slow clients are dropped, never back-pressured, and at shutdown each client's queued backlog is drained best-effort under its own bounded deadline (ARCHITECTURE §7/§8). The formats and ports are described in ARCHITECTURE §7. manta also reads RBN's spots, to grade its own (MAN-301, below): with `[rbn_compare]` enabled, a `[server]` daemon parses RBN's public CW telnet feed (AK1A `DX de` lines, `crates/manta-server/src/rbn_compare/ak1a.rs`), and `manta grade` reads RBN's daily CSV offline.
+
+The telnet format is built to the Aggregator compatibility contract (MAN-86 through MAN-89) and pinned by a composed session test. No real Aggregator has connected to manta yet. The pending swap validation is the [Aggregator swap runbook](../../docs/RUNBOOKS/aggregator-swap.md).
 
 ## Pointers
 
