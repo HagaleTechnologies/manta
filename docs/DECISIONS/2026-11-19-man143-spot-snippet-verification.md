@@ -60,19 +60,19 @@ on the metrics port returned `HTTP/1.1 200 OK` and a JSON body.
 `GET /snippets/verification-probe` returned `HTTP/1.1 404 Not Found`.
 The probe path is only a probe, not a proposed route. The source agrees:
 `route` in `crates/manta-server/src/metrics_http.rs` matches `/metrics`,
-`/healthz` and `/status` and answers 404 to everything else.
+`/healthz` and `/status` and answers 404 to everything else, which its
+unit test `route_serves_status_json_metrics_text_and_404s_everything_else`
+also asserts.
 
 **WebSocket resume.** `cargo test -p manta-server --locked --test
 json_stream_acceptance a_reconnecting_ws_client_receives_what_it_missed`
 passed: a client that reconnects with `?session=&since=` gets the records
-it missed, in `seq` order, then live ones. The test checks order, not
-bytes. That a retained record keeps its original contents comes from the
-schema ("Replay uses the original seq and record contents") and from the
-bus, which keeps each spot's first rendering (`JsonItem::Spot` in
-`crates/manta-server/src/bus.rs`). D2 relies on it.
+it missed, in `seq` order, then live ones.
 
-The daemon exited 0 on SIGTERM. Nothing diverged from the documented
-baseline.
+The daemon exited 0 on SIGTERM. Nothing diverged from what was compared:
+the hello's six keys and the spot's 30 keys, both in the order
+`docs/SPOT-SCHEMA.md` gives, and the three metrics routes
+`docs/RUNBOOKS/network-exposure.md` names.
 
 ## D2. What the source says a future clip has to carry (source findings)
 
@@ -97,14 +97,19 @@ These are read from the code, not observed at runtime.
 - Multi-input sessions map each input's sample clock onto a common clock
   (`SourceClock` in `crates/manta-engine/src/multi.rs`). A common-clock
   timestamp alone does not name the input or its own sample index.
-- With `[callsign_lookup]` on (MAN-318) a spot can publish about 10 s after
-  its `timestamp`. WebSocket resume replays retained records, by default
-  30 minutes of them, with their original rendering
-  (`docs/SPOT-SCHEMA.md`, stream section). A URL rendered into a record
-  would be replayed after it expired.
-- File replay gives byte-identical spot logs and deterministic spot IDs
-  (CLAUDE.md, "Deterministic decode"). An expiring URL or a wall-clock
-  token in the record would break that unless file replay leaves it out.
+- With `[callsign_lookup]` on (MAN-318) a spot can publish up to about
+  10 s after its `timestamp`. WebSocket resume replays retained records,
+  by default 30 minutes of them. The schema says "Replay uses the original
+  seq and record contents" (`docs/SPOT-SCHEMA.md`, stream section), and
+  the bus keeps each spot's first rendering (`JsonItem::Spot` in
+  `crates/manta-server/src/bus.rs`). The resume test in D1 checks order,
+  not bytes. On that reading, a URL rendered into a record would be
+  replayed after it expired.
+- File replay must give byte-identical spot logs (CLAUDE.md,
+  "Deterministic decode"), and its spot IDs are deterministic because the
+  session nonce is a hash of the file (`docs/SPOT-SCHEMA.md`, the `id`
+  row). An expiring URL or a wall-clock token in the record would break
+  that unless file replay leaves it out.
 
 A future clip therefore needs, per spot: the word's sample span, the input
 it came from, and that input's clock, held across stalls and delayed
@@ -122,7 +127,16 @@ spot today: by re-running the decoder on the recorded signal. Each
 observation record carries the input, the track, and the word's
 `startSampleTs` and `endSampleTs`, which are `null` once the word has
 left its track's 16-word window (`docs/OBSERVATIONS.md`). It is the step
-the ticket wants to remove, and it works now.
+the ticket wants to remove, and it works now, within two limits:
+
+- It is a fresh decode of the recording, not the live decode that made
+  the spot.
+- A recording replayed on its own puts the spans on that recording's
+  sample clock, so they index the file directly. A multi-input session
+  records one file per `[[input]]`. Replaying several of them together
+  starts every file at the first input's start time, not at each
+  receiver's original start (MAN-13, the same guide). Spans from a joint
+  replay then need D2's clock mapping before they index a file.
 
 ## D4. Disposition
 
