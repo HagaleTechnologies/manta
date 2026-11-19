@@ -1,6 +1,6 @@
 {
   "generated_at": "2026-11-03T06:45:00Z",
-  "head_commit": "acbc00f",
+  "head_commit": "d555c72",
   "pages": [
     {
       "hash": "sha256:a77216f2c07a8f129b8b188dd6425862dd2838e26a245539efdbc07cf7b866fe",
@@ -298,7 +298,7 @@
       "visibility": "public"
     },
     {
-      "hash": "sha256:fc8206b042c942e3fd01916c22b13ee5baa2b2cd912eea04b0325a726bec92b3",
+      "hash": "sha256:d6a661d7aac382abed908b9914bc29f0a688e125c3a57bdef63cf002e642589a",
       "id": "spot-output-contract",
       "kind": "interface",
       "links": [
@@ -318,12 +318,14 @@
         "docs/SPOT-SCHEMA.md",
         "docs/DECISIONS/2026-10-14-man137-json-stream-resume.md",
         "docs/DECISIONS/2026-10-16-man272-rst-and-qrl-on-spots.md",
-        "docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md"
+        "docs/DECISIONS/2026-11-10-man546-telnet-client-filters.md",
+        "docs/DECISIONS/2026-11-19-man17-aggregator-swap-runbook.md",
+        "docs/RUNBOOKS/aggregator-swap.md"
       ],
       "status": "current",
       "title": "What spot-output contracts does manta expose (telnet RBN + JSON)?",
-      "verified_commit": "acbc00f",
-      "verified_date": "2026-11-10",
+      "verified_commit": "d555c72",
+      "verified_date": "2026-11-19",
       "visibility": "public"
     },
     {
