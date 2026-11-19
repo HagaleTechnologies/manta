@@ -102,8 +102,9 @@ fn a_kiwi_sending_only_unknown_tags_is_reconnected_with_reason_no_usable_samples
     )
     .unwrap();
     let mut cmd = common::manta();
-    cmd.env("RUST_LOG", "info")
-        .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
+    // No `RUST_LOG` here: the launcher pins the child's filter so the
+    // banner it waits for always passes it.
+    cmd.args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())
         .args(["--kiwi-freq-hz", "14025000", "--config"])
         .arg(&cfg)
@@ -120,11 +121,17 @@ fn a_kiwi_sending_only_unknown_tags_is_reconnected_with_reason_no_usable_samples
         &["source kiwi lost:", "no usable samples"],
         WAIT.saturating_sub(started.elapsed()),
     );
+    // Keep every line before THE matching loss -- an earlier loss with a
+    // different reason must land in `before` and fail the assertion
+    // below, not end the window early and hide itself (round 2: the
+    // slice stopped at a loss of any reason).
+    let is_expected_loss =
+        |line: &str| line.contains("source kiwi lost:") && line.contains("no usable samples");
     let before: Vec<String> = child
         .stderr_lines_so_far()
         .into_iter()
         .map(|(_, line)| line)
-        .take_while(|line| !line.contains("source kiwi lost:"))
+        .take_while(|line| !is_expected_loss(line))
         .collect();
     let after = listening.elapsed();
     assert!(

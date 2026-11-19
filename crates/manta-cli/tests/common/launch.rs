@@ -9,9 +9,9 @@
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 /// The binary under test, with every `MANTA_*` variable of the test
@@ -40,14 +40,49 @@ pub fn without_manta_env(mut cmd: Command) -> Command {
 /// binding the next lets the OS hand the same port out twice (Windows
 /// does, and then the config is rejected as "two servers cannot share a
 /// port", MAN-371). MAN-570: the ports are free only until this returns,
-/// so they are for targets that must stay unreachable (connect targets
-/// the daemon dials), never for a bind the daemon performs -- a daemon
-/// gets `*_port = 0` and reports what it bound via
-/// [`spawn_daemon_reporting_ports`].
+/// so they are for numbers nobody must claim or dial back, never for a
+/// bind the daemon performs -- a daemon gets `*_port = 0` and reports
+/// what it bound via [`spawn_daemon_reporting_ports`] -- and never for a
+/// connect target the daemon dials: the kernel can re-deal a released
+/// number to that very daemon's port-0 bind, so a target that must stay
+/// unreachable takes [`unreachable_target_ports`] instead.
 /// `doctor_checks.rs` keeps its own band allocator (MAN-333, MAN-410).
 pub fn free_ports<const N: usize>() -> [u16; N] {
     let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
     held.map(|l| l.local_addr().unwrap().port())
+}
+
+/// A loopback port that stays dialable-but-unreachable, and unclaimable,
+/// until this guard is dropped (MAN-570 round 2). The port is pinned by
+/// one side of a connected socket pair: an established socket keeps the
+/// port bound -- so the kernel's port-0 allocator can never hand it to
+/// the daemon the test points at it -- while the listener that produced
+/// it is gone, so every connect is refused.
+pub struct UnreachableTarget {
+    /// The pinned port, for the daemon's connect-target config.
+    pub port: u16,
+    _client: TcpStream,
+    _accepted: TcpStream,
+}
+
+/// `N` loopback ports a daemon dials but never reaches, and no other
+/// process can claim either. [`free_ports`] releases its numbers, and a
+/// released number is exactly what the allocator loves to re-deal to a
+/// port-0 bind (observed on loopback: the daemon's own telnet listener
+/// answered its uplink dial).
+pub fn unreachable_target_ports<const N: usize>() -> [UnreachableTarget; N] {
+    std::array::from_fn(|_| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _peer) = listener.accept().unwrap();
+        let port = accepted.local_addr().unwrap().port();
+        drop(listener);
+        UnreachableTarget {
+            port,
+            _client: client,
+            _accepted: accepted,
+        }
+    })
 }
 
 /// The loopback listener ports a daemon named in its `listening:` banner
@@ -93,17 +128,23 @@ impl StderrLog {
     }
 
     fn record(&self, line: String) {
-        self.state
-            .lock()
-            .unwrap()
-            .lines
-            .push((Instant::now(), line));
+        self.lock_state().lines.push((Instant::now(), line));
         self.changed.notify_all();
     }
 
     fn ended(&self) {
-        self.state.lock().unwrap().eof = true;
+        self.lock_state().eof = true;
         self.changed.notify_all();
+    }
+
+    /// Locks the state, surviving another thread's panic while it held
+    /// the mutex: a failed banner wait must not cascade into the reader
+    /// thread's own panic from the poisoned lock (observed in the
+    /// MAN-570 round-2 reproduction, while the daemon was being reaped).
+    fn lock_state(&self) -> MutexGuard<'_, StderrState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn dump_state(&self, state: &StderrState) -> String {
@@ -136,7 +177,7 @@ impl StderrLog {
     ) -> String {
         let matches = |line: &str| needles.iter().all(|n| line.contains(n));
         let deadline = Instant::now() + timeout;
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.lock_state();
         loop {
             if let Some((_, line)) = state.lines.iter().find(|(_, l)| matches(l)) {
                 return line.clone();
@@ -158,7 +199,10 @@ impl StderrLog {
                     self.dump_state(&state)
                 )
             };
-            let (guard, _) = self.changed.wait_timeout(state, left).unwrap();
+            let (guard, _) = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state = guard;
         }
     }
@@ -191,12 +235,18 @@ impl DaemonHandle {
         &mut self.child
     }
 
+    /// The child's piped stdout, when the caller configured
+    /// `Stdio::piped()` before spawning: a test that reads the daemon's
+    /// JSON spot lines takes its reading end here. The launcher owns
+    /// stderr; stdout is the caller's.
+    pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
     /// Every stderr line so far, ANSI-stripped and joined by newlines.
     pub fn stderr_so_far(&self) -> String {
         self.log
-            .state
-            .lock()
-            .unwrap()
+            .lock_state()
             .lines
             .iter()
             .map(|(_, l)| l.as_str())
@@ -207,7 +257,7 @@ impl DaemonHandle {
     /// Every stderr line so far with the time it arrived, for ordering
     /// assertions against other events.
     pub fn stderr_lines_so_far(&self) -> Vec<(Instant, String)> {
-        self.log.state.lock().unwrap().lines.clone()
+        self.log.lock_state().lines.clone()
     }
 
     /// Waits up to `timeout` for a stderr line containing every one of
@@ -273,6 +323,14 @@ fn banner_ports(banner: &str) -> ReportedPorts {
 pub fn spawn_daemon_reporting_ports(mut cmd: Command, banner_timeout: Duration) -> DaemonHandle {
     // Overwrites whatever the caller set: the banner is read from stderr.
     cmd.stderr(Stdio::piped());
+    // The banner the wait below needs is an INFO `tracing` record, and
+    // the child inherits the runner's `RUST_LOG`: a `RUST_LOG=warn` in
+    // the test environment silently drops the banner and the wait times
+    // out on a daemon that bound everything and is decoding happily
+    // (reproduced in the MAN-570 round-2 review). Pin the filter like
+    // the pipe: this launcher's contract is to read that banner. A
+    // `-q`/`--log-level` argv flag still overrides it, as before.
+    cmd.env("RUST_LOG", "info");
     // A failed banner wait panics. Keep the child guarded until the handle
     // takes ownership so that failure cannot leave a daemon in the suite.
     struct PendingChild(Option<Child>);

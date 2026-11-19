@@ -30,7 +30,8 @@ mod launch;
 // Unused in the roots that include `common` for its other helpers only.
 #[allow(unused_imports)]
 pub use launch::{
-    free_ports, manta, spawn_daemon_reporting_ports, without_manta_env, DaemonHandle, ReportedPorts,
+    free_ports, manta, spawn_daemon_reporting_ports, unreachable_target_ports, without_manta_env,
+    DaemonHandle, ReportedPorts, UnreachableTarget,
 };
 
 use std::io::{BufRead, BufReader, Read, Write};

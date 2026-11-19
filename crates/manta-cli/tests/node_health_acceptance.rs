@@ -14,7 +14,7 @@
 
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{free_ports, manta, spawn_daemon_reporting_ports};
+use launch::{manta, spawn_daemon_reporting_ports, unreachable_target_ports};
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::io::{Read, Write};
@@ -103,10 +103,17 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
     let wav_path = tmp.path().join("cw48k.wav");
     write_cw_fixture(&wav_path);
 
-    // MAN-570: the daemon trio binds port 0 and reports the ports it got;
-    // the two uplink targets stay on `free_ports()` -- they are connect
-    // targets that must stay unreachable, not binds.
-    let [uplink1_port, uplink2_port] = free_ports();
+    // MAN-570: the daemon trio binds port 0 and reports the ports it got.
+    // MAN-570 round 2: the two uplink targets are connect targets that
+    // must stay unreachable, and a merely released `free_ports()` number
+    // can be re-dealt by the kernel to this daemon's own port-0 bind --
+    // observed as its telnet listener answering the dial and
+    // `manta_uplink_target_connected` reporting 1. Each target port is
+    // pinned bound with no listener, so it is never claimed and never
+    // answers. The guards outlive the daemon (declared before, dropped
+    // after it).
+    let [uplink1, uplink2] = unreachable_target_ports();
+    let (uplink1_port, uplink2_port) = (uplink1.port, uplink2.port);
 
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     write!(

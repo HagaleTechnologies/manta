@@ -95,7 +95,22 @@ fn two_simultaneous_daemons_get_distinct_reported_ports() {
 
     let a_ports = (a.ports.telnet, a.ports.json, a.ports.metrics);
     let b_ports = (b.ports.telnet, b.ports.json, b.ports.metrics);
-    assert_ne!(a_ports, b_ports, "the daemons must not share a listener");
+    // Distinct per listener, not merely as a triple: equal metrics ports
+    // with one other port differing would pass a triple comparison and
+    // both scrapes below could hit the same daemon (the round-2 proof
+    // gap).
+    assert_ne!(
+        a.ports.metrics, b.ports.metrics,
+        "the daemons share a metrics listener"
+    );
+    assert_ne!(
+        a.ports.telnet, b.ports.telnet,
+        "the daemons share a telnet listener"
+    );
+    assert_ne!(
+        a.ports.json, b.ports.json,
+        "the daemons share a JSON listener"
+    );
     for (name, ports) in [("a", a_ports), ("b", b_ports)] {
         assert!(
             ports.0 != 0 && ports.1 != 0 && ports.2 != 0,
