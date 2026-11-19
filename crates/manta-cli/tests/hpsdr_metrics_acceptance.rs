@@ -17,11 +17,11 @@
 
 #[path = "common/launch.rs"]
 mod launch;
-use launch::free_ports;
+use launch::{manta, spawn_daemon_reporting_ports};
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -35,21 +35,8 @@ use std::time::{Duration, Instant};
 /// check at that length is equally "malformed" to the framing validator.
 const FAKE_METIS_PACKET_LEN: usize = 1032;
 
-/// Kills and reaps the daemon child process on drop, including on a
-/// failing assertion (Rust's default unwind panic strategy still runs
-/// `Drop` impls during unwinding) -- so a failing assert never leaks a
-/// `manta` process into the CI runner.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-/// Stops and joins the fake-device thread on drop, same rationale as
-/// `ChildGuard`.
+/// Stops and joins the fake-device thread on drop, so a failing assert
+/// never leaks it into the CI runner.
 struct DeviceGuard {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -130,27 +117,29 @@ fn malformed_hpsdr_datagrams_are_visible_on_the_metrics_endpoint() {
         handle: Some(handle),
     };
 
-    // 2. Config: three distinct free ports, all held until read (no fixed
-    //    ports -- CLAUDE.md multi-agent hygiene).
-    let [telnet_port, json_port, metrics_port] = free_ports();
+    // 2. Config: port 0 on every listener, the ports the daemon really
+    //    bound come from its `listening:` banner (MAN-570: a released
+    //    port number can be claimed by another process first).
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
-    write!(
-        cfg_file,
-        r#"
+    cfg_file
+        .write_all(
+            r#"
         [server]
         station_callsign = "W1AW"
         bind_addr = "127.0.0.1"
-        telnet_port = {telnet_port}
-        json_port = {json_port}
-        metrics_port = {metrics_port}
+        telnet_port = 0
+        json_port = 0
+        metrics_port = 0
         "#
-    )
-    .unwrap();
+            .as_bytes(),
+        )
+        .unwrap();
     cfg_file.flush().unwrap();
 
-    // 3. Spawn the daemon as a real child process against the fake device.
-    let child = Command::new(env!("CARGO_BIN_EXE_manta"))
-        .arg("run")
+    // 3. Spawn the daemon as a real child process against the fake device,
+    //    and wait for the banner that names the ports it bound.
+    let mut cmd = manta();
+    cmd.arg("run")
         .arg("--hpsdr-host")
         .arg("127.0.0.1")
         .arg("--hpsdr-port")
@@ -161,11 +150,9 @@ fn malformed_hpsdr_datagrams_are_visible_on_the_metrics_endpoint() {
         .arg("192000")
         .arg("--config")
         .arg(cfg_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn manta run child process");
-    let _child_guard = ChildGuard(child);
+        .stdout(Stdio::null());
+    let _daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(20));
+    let metrics_port = _daemon.ports.metrics;
 
     // 4. Poll /metrics for up to 20 s, succeeding as soon as the
     //    malformed-packet counter is observed > 0. Polling a monotonic

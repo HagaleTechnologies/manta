@@ -4,7 +4,7 @@
 //! File inputs only, so it runs on every platform.
 
 mod common;
-use common::{free_ports, manta};
+use common::{manta, spawn_daemon_reporting_ports};
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::collections::BTreeMap;
@@ -312,14 +312,14 @@ const HEARING_FAMILIES: [&str; 4] = [
 fn multi_input_daemon_publishes_each_inputs_hearing() {
     let (a, b) = fixtures();
     let dir = tempfile::tempdir().unwrap();
-    let [telnet_port, json_port, metrics_port] = free_ports();
+
     let config = write_config(
         dir.path(),
         "hearing.toml",
         &format!(
             "[server]\nstation_callsign = \"K5TR\"\nbind_addr = \"127.0.0.1\"\n\
-             metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\n\
-             json_port = {json_port}\nmetrics_port = {metrics_port}\n\
+             metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\n\
+             json_port = 0\nmetrics_port = 0\n\
              status_interval_secs = 1\n\n\
              [[input]]\nname = \"a\"\ntype = \"file\"\npath = \"{}\"\niq = true\n\n\
              [[input]]\nname = \"b\"\ntype = \"file\"\npath = \"{}\"\niq = true\n",
@@ -329,34 +329,32 @@ fn multi_input_daemon_publishes_each_inputs_hearing() {
     );
     let logs = tempfile::tempdir().unwrap();
     let stdout_path = logs.path().join("stdout");
-    let stderr_path = logs.path().join("stderr");
-    let mut child = manta()
-        .args(["run", "--config"])
+    let mut cmd = manta();
+    cmd.args(["run", "--config"])
         .arg(&config)
         .env("RUST_LOG", "info")
-        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
-        .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()));
+    let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
     let deadline = Instant::now() + Duration::from_secs(300);
     let mut scrapes = Vec::new();
     let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
+        if let Some(status) = daemon.child().try_wait().unwrap() {
             break status;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            // The handle's drop kills and reaps the daemon on unwind.
             panic!("manta run did not finish within 300 s");
         }
-        if let Some(body) = scrape_metrics(metrics_port) {
+        if let Some(body) = scrape_metrics(daemon.ports.metrics) {
             if body.contains("manta_input_spots_total{") {
                 scrapes.push(body);
             }
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let stderr = std::fs::read_to_string(&stderr_path).unwrap();
+    // The pipe may still hold the daemon's final lines right after exit.
+    std::thread::sleep(Duration::from_millis(200));
+    let stderr = daemon.stderr_so_far();
     assert!(status.success(), "{stderr}");
     let stdout = std::fs::read_to_string(&stdout_path).unwrap();
     let want: BTreeMap<String, usize> = [("JA1ABC", 1), ("W1AW", 1), ("ZL2XYZ", 1)]
