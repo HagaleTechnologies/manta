@@ -130,8 +130,10 @@ A session with one input applies no clock mapping, so it is. In a
 multi-input replay it is for each input at the session's highest rate
 (scale 1, offset 0, because every replay offset is 0) and not for a slower
 input, whose `sample_ts` is multiplied by the rate ratio. In a live
-multi-input session it is not for an input that opened after the earliest
-one, because its open delay is added (`SourceClock`,
+multi-input session, inputs at the session's highest rate keep their own
+sample indices when their offset is zero. The engine adds each input's
+delay from the session's start, rounded to the nearest whole sample on
+the common clock. A short positive delay can round to zero (`SourceClock`,
 `crates/manta-engine/src/multi.rs`;
 `docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md` D2).
 
