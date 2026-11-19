@@ -34,6 +34,42 @@ fn the_swap_runbook_exists_with_its_sections_and_links() {
 }
 
 #[test]
+fn the_live_swap_requires_source_attributed_evidence_before_and_after_cutover() {
+    let text = doc(RUNBOOK);
+    let (_, live) = text.split_once("## Stage B. Live swap").unwrap();
+    let (live, evidence) = live.split_once("## Stage C. Evidence").unwrap();
+    let (evidence, _) = evidence.split_once("## Incompatibilities found").unwrap();
+
+    let (startup, steps) = live.split_once("\n1. ").unwrap();
+    let (secondary, cutover) = steps.split_once("\n3. ").unwrap();
+    assert!(
+        startup.contains("manta run --config"),
+        "missing live startup"
+    );
+    assert!(startup.contains("live SDR"), "missing live input");
+    assert!(secondary.contains("secondary source number"));
+    for field in ["spotted callsign", "frequency", "UTC"] {
+        assert!(secondary.contains(field), "missing match field: {field}");
+    }
+    for link in [
+        "https://reversebeacon.net/pages/Telnet%2Bservers%2B30",
+        "https://reversebeacon.net/raw_data/",
+    ] {
+        assert!(
+            secondary.contains(link),
+            "missing RBN evidence link: {link}"
+        );
+    }
+    assert!(secondary.contains("unanswered SETT"));
+    assert!(!secondary.contains("five minutes"));
+    assert!(cutover.contains("Primary Skimmer Connection"));
+    assert!(cutover.contains("source `0`"));
+    assert!(cutover.contains("after cutover"));
+    assert!(cutover.contains("restore the saved primary settings"));
+    assert!(evidence.contains("rollback"));
+}
+
+#[test]
 fn every_manta_command_in_the_runbook_runs_or_matches_help() {
     let text = doc(RUNBOOK);
     let mut checked = 0;
@@ -51,8 +87,14 @@ fn every_manta_command_in_the_runbook_runs_or_matches_help() {
             continue;
         }
         let parts: Vec<_> = line.split_whitespace().collect();
+        let subcommands = parts
+            .iter()
+            .copied()
+            .skip(1)
+            .take_while(|arg| !arg.starts_with('-'));
         let output = Command::new(env!("CARGO_BIN_EXE_manta"))
-            .args([parts[1], "--help"])
+            .args(subcommands)
+            .arg("--help")
             .output()
             .unwrap();
         assert!(output.status.success(), "{line}");
@@ -60,13 +102,12 @@ fn every_manta_command_in_the_runbook_runs_or_matches_help() {
         for flag in parts.iter().filter(|s| s.starts_with("--")) {
             assert!(
                 help.contains(flag),
-                "{flag} absent from manta {} --help",
-                parts[1]
+                "{flag} absent from command help: {line}"
             );
         }
         checked += 1;
     }
-    assert_eq!(checked, 2);
+    assert_eq!(checked, 4);
 }
 
 #[test]

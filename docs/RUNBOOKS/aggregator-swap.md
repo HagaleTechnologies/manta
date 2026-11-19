@@ -48,14 +48,26 @@ CU AGN!
 
 ## Stage B. Live swap at the operator site
 
-1. Add a second Skimmer entry in Aggregator pointing to manta's host and port 7300. Leave the existing primary entry in place during the check.
-2. In Aggregator's Skimmer Traffic tab, confirm its `SKIMMER/SETT` probe receives `SETT: vlNormal ...` and spots appear within minutes. Aggregator manual v6.0 §9.2 says an unanswered SETT causes spots from that source to be dropped after about five minutes; the [MAN-86 record](../DECISIONS/2026-09-07-man86-aggregator-sett-handshake.md) documents the rule.
-3. Confirm RBN Connection Status stays green and the old entry still works. Check the [RBN public telnet feed](https://www.reversebeacon.net/pages/telnet+39) or [daily CSV](https://www.reversebeacon.net/pages/skimmer-records+105) for spots under the operator's call.
-4. Only after the checks pass, repoint or retire the old Skimmer entry. If they fail, restore the old entry and record the mismatch below.
+Configure the live SDR and `[server]` using the [RBN node guide](../GUIDES/rbn-node.md#3-write-the-config). For Hermes or Hermes-Lite, use the [OpenHPSDR input example](../GUIDES/raspberry-pi.md#3-configure-your-receiver). Use the operator's spotter callsign and a receiver that can run alongside the original Skimmer. Bind manta's telnet listener to a LAN address reachable from the Aggregator host on port 7300, or use loopback if both run on the same host. Apply the [firewall rules](../GUIDES/rbn-node.md#6-firewall-and-exposure) before starting. Leave direct RBN uplink disabled.
+
+Check the config, then start manta once the check passes.
+
+```sh
+manta config check --config manta.toml
+manta run --config manta.toml
+```
+
+From the Aggregator host, connect with `telnet <manta-host> 7300` and confirm that fresh `DX de` spots arrive from live CW. Close the test connection. Save the original primary connection settings and confirm that the existing feed is publishing fresh spots before proceeding.
+
+1. Add manta on Aggregator's Secondary Skimmers tab. Note its secondary source number and keep the original primary connected. In Skimmer Traffic, use manta's source number to find its `SETT: vlNormal ...` reply and `DX de` rows. An unanswered SETT prevents forwarding from that source. See the [Aggregator v6.0 manual](https://cms.reversebeacon.net/sites/cms.reversebeacon.net/files/2019/12/21/Using%20Aggregator%20-%20v6.0.pdf), §§6 and 9.2.
+2. Check that RBN Connection Status stays green. In Skimmer Traffic, `+` marks a row selected for forwarding. Match those rows from manta to spots under the operator's spotter callsign on the [RBN public CW telnet feed](https://reversebeacon.net/pages/Telnet%2Bservers%2B30) (`telnet.reversebeacon.net:7000`) by spotted callsign, forwarded frequency and UTC time at the feed's precision. The [daily RBN CSV](https://reversebeacon.net/raw_data/) can corroborate the match when available. Exclude matches that could also come from the original primary or another source. If you cannot verify a manta match within the agreed window, remove the temporary secondary and record what happened.
+3. After a confirmed match, remove the temporary manta secondary. On the Connections tab, disconnect the Primary Skimmer Connection, set its address and port to manta's, and reconnect. Keep the original Skimmer running for rollback. The manual's §9.1 explains why manta must move to the primary slot before the old Skimmer can be retired.
+4. Record the UTC cutover time. Confirm the primary reconnects, manta answers SETT and RBN Connection Status is green. Repeat step 2's match with fresh `+` rows from source `0` received after cutover. Retire the old Skimmer only after those rows match new public spots.
+5. If the post-cutover check fails or the observation window expires without a confirmed match, restore the saved primary settings and reconnect to the original Skimmer. Verify fresh spots from that Skimmer reach the public feed again and record the rollback result and any mismatch below.
 
 ## Stage C. Evidence to record
 
-Record UTC dates, manta and Aggregator versions, source and band, exact SETT reply bytes, sample `DX de` lines as Aggregator received them, RBN telnet or daily CSV sightings under the operator's call, and how long the swap ran. Record the old feed's status and the rollback result. Redact credentials and private addresses.
+Record UTC dates and the cutover time, manta and Aggregator versions, SDR and band, and exact SETT reply bytes. Keep paired samples from before and after cutover, including the Skimmer Traffic source number and `+` marker, the raw `DX de` line, and the matching public RBN row. Record how long the swap ran, the old feed's status and the rollback result if applicable. Redact credentials and private addresses.
 
 ## Incompatibilities found
 
