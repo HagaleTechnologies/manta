@@ -302,6 +302,25 @@ def run_item(item, cwd, env):
             return result
 
 
+def bounded_excerpt(lines, limit=40, chars=4000):
+    """Bound a failure block without losing its end.
+
+    The panic or assertion message closes a libtest failure block, after
+    whatever the test printed; a head-only cut drops exactly the text that
+    names the failure and its flake class (MAN-551). Mirrors
+    ``bounded_excerpt`` in ``ci-failure-summary.py``.
+    """
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    if len(lines) > limit:
+        head, tail = lines[:8], lines[-(limit - 9):]
+        lines = head + [f'... ({len(lines) - len(head) - len(tail)} lines elided) ...'] + tail
+    text = '\n'.join(lines)
+    if len(text) > chars:
+        text = text[:1000] + '\n... (elided) ...\n' + text[-(chars - 1020):]
+    return text
+
+
 def parse_libtest_failures(text):
     """Keep bounded names and output for a failed libtest executable."""
     lines = text.splitlines()
@@ -332,7 +351,7 @@ def parse_libtest_failures(text):
             # A separator the test itself printed stays inside the excerpt.
             end = next((i for i in range(start, len(lines))
                         if re.match(r'^---- .* stdout ----$', lines[i]) or lines[i] == 'failures:'), len(lines))
-            excerpts[name] = '\n'.join(lines[start:min(end, start+40)])[:4000]
+            excerpts[name] = bounded_excerpt(lines[start:end])
     result = {'failedTests': names, 'failureExcerpts': excerpts}
     if omitted:
         result['omittedFailedTests'] = omitted

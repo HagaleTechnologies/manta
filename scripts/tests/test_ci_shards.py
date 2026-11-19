@@ -451,6 +451,20 @@ class LibtestFailureParseTests(unittest.TestCase):
         self.assertEqual(len(parsed['failedTests']), 50)
         self.assertEqual(parsed['omittedFailedTests'], 150)
 
+    def test_noisy_failure_block_keeps_the_panic_at_its_end(self):
+        # MAN-551: a test that prints before panicking must not lose the
+        # panic message (and so its flake class) to a head-only cut.
+        noise = ''.join(f'noise line {i} xxxxxxxxxxxxxxxxxxxxxxxx\n' for i in range(300))
+        text = ('test tests::bind ... FAILED\n\nfailures:\n\n---- tests::bind stdout ----\n' + noise +
+                "\nthread 'tests::bind' panicked at src/lib.rs:9:32:\n"
+                'called `Result::unwrap()` on an `Err` value: Os { code: 10048, kind: AddrInUse }\n\n'
+                'failures:\n    tests::bind\n\ntest result: FAILED. 0 passed; 1 failed\n')
+        excerpt = s.parse_libtest_failures(text)['failureExcerpts']['tests::bind']
+        self.assertIn('AddrInUse', excerpt)
+        self.assertIn('noise line 0 ', excerpt)
+        self.assertIn('lines elided', excerpt)
+        self.assertLessEqual(len(excerpt), 4000)
+
     def test_invalid_utf8_is_replaced(self):
         self.assertIn('\ufffd', s.parse_libtest_failures(b'\xff'.decode('utf-8', errors='replace'))['outputTail'])
 

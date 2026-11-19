@@ -30,15 +30,70 @@ def records(paths):
                 yield file, {'readError': str(exc)}
 
 
+MAX_FAILURES = 50
+EXCERPT_LINES = 40
+EXCERPT_CHARS = 4000
+
+
+def bounded_excerpt(lines):
+    """Bound a failure block without losing its end.
+
+    A panic or assertion message comes last in a failure block, after
+    anything the test printed. Keeping only the head of a noisy block drops
+    exactly the text the classifier needs (e.g. ``AddrInUse``), so a long
+    block keeps a short head and the tail.
+    """
+    while lines and not lines[-1].strip():
+        lines = lines[:-1]
+    if len(lines) > EXCERPT_LINES:
+        head, tail = lines[:8], lines[-(EXCERPT_LINES - 9):]
+        lines = head + [f'... ({len(lines) - len(head) - len(tail)} lines elided) ...'] + tail
+    return clip('\n'.join(lines))
+
+
+def clip(text):
+    """Bound text to EXCERPT_CHARS, keeping a short head and the tail."""
+    text = str(text)
+    if len(text) <= EXCERPT_CHARS:
+        return text
+    return text[:1000] + '\n... (elided) ...\n' + text[-(EXCERPT_CHARS - 1020):]
+
+
 def parse_doctest_failures(output):
-    """Extract failed rustdoc test names and their bounded failure blocks."""
-    names = list(dict.fromkeys(re.findall(r'^test (.+?) \.\.\. FAILED\s*$', output, re.M)))
-    failures = []
-    for name in names[:50]:
-        marker = f'---- {name} stdout ----'
-        excerpt = output.split(marker, 1)[1].split('\n---- ', 1)[0][:4000] if marker in output else ''
-        failures.append({'name': name, 'excerpt': excerpt})
-    return failures
+    """Extract failed rustdoc tests, their bounded failure blocks and the
+    count of failures past the evidence cap.
+
+    ``cargo test --doc --no-fail-fast`` prints one report per crate, each
+    opened by a ``Doc-tests <crate>`` line. Names are parsed per report so a
+    name two crates share (``src/lib.rs - f (line 3)``) keeps its own block.
+    Returns ``(failures, omitted, tail)``: ``tail`` is the end of the log
+    when the step failed without naming a test (a build error).
+    """
+    output = output.replace('\r\n', '\n')
+    sections = re.split(r'^\s*Doc-tests (\S+)\s*$', output, flags=re.M)
+    reports = [(None, sections[0])] + list(zip(sections[1::2], sections[2::2]))
+    failures, total = [], 0
+    for crate, text in reports:
+        lines = text.split('\n')
+        names = list(dict.fromkeys(re.findall(r'^test (.+?) \.\.\. FAILED\s*$', text, re.M)))
+        for name in names:
+            total += 1
+            if len(failures) >= MAX_FAILURES:
+                continue
+            marker = f'---- {name} stdout ----'
+            excerpt = ''
+            if marker in lines:
+                start = lines.index(marker) + 1
+                end = next((i for i in range(start, len(lines))
+                            if re.match(r'^---- .* stdout ----$', lines[i]) or lines[i] == 'failures:'),
+                           len(lines))
+                excerpt = bounded_excerpt(lines[start:end])
+            failure = {'name': name, 'excerpt': excerpt}
+            if crate:
+                failure['crate'] = crate
+            failures.append(failure)
+    tail = '' if total else bounded_excerpt(output.split('\n')[-EXCERPT_LINES:])
+    return failures, total - len(failures), tail
 
 
 def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
@@ -59,6 +114,12 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
                 if record.get(field) != 'success':
                     other.append(f'support {field}: {record.get(field, "missing")}')
             if record.get('doctests') != 'success':
+                omitted = record.get('omittedDoctestFailures')
+                if isinstance(omitted, int) and omitted > 0:
+                    other.append(f'support doctests: {omitted} additional failed doctests omitted from evidence')
+                tail = record.get('doctestOutputTail')
+                if tail and not record.get('doctestFailures'):
+                    other.append(f'support doctests: no failing doctest named; {str(tail)[-500:]}')
                 failures = record.get('doctestFailures', [])
                 if isinstance(failures, list):
                     for failure in failures:
@@ -66,9 +127,11 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
                             other.append('support doctests: malformed failure entry')
                             continue
                         name = failure['name']
-                        excerpt = str(failure.get('excerpt', ''))[:4000]
+                        excerpt = clip(failure.get('excerpt', ''))
+                        crate = failure.get('crate')
                         label, rule = classify('doctest', name, excerpt)
-                        rows.append(('support', 'doctest', name, label, rule))
+                        rows.append(('support', f'doctest {crate}' if isinstance(crate, str) else 'doctest',
+                                     name, label, rule))
                         details.append((name, excerpt))
                 else:
                     other.append('support doctests: malformed failure list')
@@ -117,7 +180,7 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
                         continue
                     excerpts = result.get('failureExcerpts') or {}
                     excerpt = excerpts.get(name, '') if isinstance(excerpts, dict) else ''
-                    excerpt = str(excerpt)[:4000]
+                    excerpt = clip(excerpt)
                     label, rule = classify(target, name, excerpt)
                     rows.append((index, target, name, label, rule))
                     details.append((name, excerpt))
@@ -163,15 +226,17 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
     if not rows and not other:
         return title + f'no failures ({len(seen)} shards, {binaries} binaries)\n'
     lines = [title + f'{len(rows)} failing tests, {len(other)} other failures', '', '| Shard | Binary | Test | Class | Matched by |', '|---|---|---|---|---|']
-    for index, target, name, label, rule in rows[:50]:
+    for index, target, name, label, rule in rows[:MAX_FAILURES]:
         safe = lambda value: str(value).replace('|', '\\|').replace('\n', ' ')
         lines.append(f'| {index} | {safe(target)} | {safe(name)} | {label} | {safe(rule)} |')
-    if len(rows) > 50:
-        lines.append(f'{len(rows)-50} more failing tests omitted from table')
+    if len(rows) > MAX_FAILURES:
+        lines.append(f'{len(rows) - MAX_FAILURES} more failing tests omitted from table')
     for failure in other:
         lines.append(f'- {failure}')
-    for name, excerpt in details[:50]:
-        lines.extend([f'<details><summary>{name}</summary>', '', '```text', excerpt[:4000].replace('```', "'''"), '```', '</details>'])
+    for name, excerpt in details[:MAX_FAILURES]:
+        lines.extend([f'<details><summary>{name}</summary>', '', '```text', clip(excerpt).replace('```', "'''"), '```', '</details>'])
+    if len(details) > MAX_FAILURES:
+        lines.append(f'{len(details) - MAX_FAILURES} more failure excerpts omitted')
     return '\n'.join(lines) + '\n'
 
 

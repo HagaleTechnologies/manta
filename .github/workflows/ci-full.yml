@@ -383,11 +383,13 @@ jobs:
           import json, os, runpy, time
           from pathlib import Path
           output = Path('doctest-output.log')
-          failures = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+          failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
               output.read_text(encoding='utf-8', errors='replace') if output.exists() else '')
+          if os.environ['DOCTEST_RESULT'] == 'success':
+              tail = ''
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
-              doctestFailures=failures,
+              doctestFailures=failures, omittedDoctestFailures=omitted, doctestOutputTail=tail,
               started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON

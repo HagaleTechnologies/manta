@@ -56,10 +56,81 @@ class ClassifyTests(unittest.TestCase):
 class RenderTests(unittest.TestCase):
     def test_failed_doctest_is_named_and_classified(self):
         output = 'test src/lib.rs - example (line 12) ... FAILED\n\nfailures:\n\n---- src/lib.rs - example (line 12) stdout ----\nthread panicked: os error 10048\n'
-        failures = s.parse_doctest_failures(output)
+        failures, omitted, tail = s.parse_doctest_failures(output)
+        self.assertEqual((omitted, tail), (0, ''))
         self.assertEqual([item['name'] for item in failures], ['src/lib.rs - example (line 12)'])
         summary = s.render('windows-latest', [(Path('support.json'), {'conclusion': 'failure', 'doctests': 'failure', 'doctestFailures': failures})])
         self.assertIn('| support | doctest | src/lib.rs - example (line 12) | port reuse |', summary)
+
+    # A real `cargo test --doc --no-fail-fast` report (rustc 1.98, edition
+    # 2024 merged doctests): the port-reuse doctest prints 300 lines before
+    # the AddrInUse panic. A head-only excerpt cut it off and classified the
+    # failure `unknown` (MAN-551 validate).
+    NOISY = ('   Doc-tests manta_a\n\nrunning 2 tests\n'
+             'test src/lib.rs - (line 8) ... FAILED\ntest src/lib.rs - (line 1) ... FAILED\n\nfailures:\n\n'
+             '---- src/lib.rs - (line 1) stdout ----\nTest executable failed (exit code: 101).\n\nstdout:\n'
+             + ''.join(f'noise line {i} xxxxxxxxxxxxxxxxxxxxxxxx\n' for i in range(300)) +
+             "\nstderr:\n\nthread 'main' (41065276) panicked at doctest_bundle_2024.rs:9:32:\n"
+             'called `Result::unwrap()` on an `Err` value: Os { code: 48, kind: AddrInUse, message: "Address already in use" }\n'
+             'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\n'
+             '---- src/lib.rs - (line 8) stdout ----\n\nthread \'main\' panicked at src/lib.rs:9:1:\n'
+             'assertion `left == right` failed\n  left: 1\n right: 2\n\n'
+             'failures:\n    src/lib.rs - (line 1)\n    src/lib.rs - (line 8)\n\n'
+             'test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n')
+
+    def test_noisy_port_reuse_doctest_is_classified_port_reuse(self):
+        failures, omitted, _ = s.parse_doctest_failures(self.NOISY)
+        by_name = {item['name']: item for item in failures}
+        self.assertEqual(omitted, 0)
+        self.assertEqual(s.classify('doctest', 'src/lib.rs - (line 1)', by_name['src/lib.rs - (line 1)']['excerpt'])[0],
+                         'port reuse')
+        self.assertEqual(s.classify('doctest', 'src/lib.rs - (line 8)', by_name['src/lib.rs - (line 8)']['excerpt'])[0],
+                         'unknown')
+        self.assertLessEqual(len(by_name['src/lib.rs - (line 1)']['excerpt']), 4000)
+        summary = s.render('windows-latest', [(Path('support.json'), {'conclusion': 'failure', 'doctests': 'failure',
+                                                                     'doctestFailures': failures})])
+        self.assertIn('| support | doctest manta_a | src/lib.rs - (line 1) | port reuse |', summary)
+
+    def test_same_doctest_name_in_two_crates_keeps_each_block(self):
+        report = ('   Doc-tests a\ntest src/lib.rs - f (line 3) ... FAILED\n\nfailures:\n\n'
+                  '---- src/lib.rs - f (line 3) stdout ----\nleft: 1 right: 2\n\nfailures:\n    src/lib.rs - f (line 3)\n\n'
+                  'test result: FAILED. 0 passed; 1 failed\n'
+                  '   Doc-tests b\ntest src/lib.rs - f (line 3) ... FAILED\n\nfailures:\n\n'
+                  '---- src/lib.rs - f (line 3) stdout ----\nos error 10048\n\nfailures:\n    src/lib.rs - f (line 3)\n\n'
+                  'test result: FAILED. 0 passed; 1 failed\n')
+        failures, _, _ = s.parse_doctest_failures(report)
+        self.assertEqual([(f['crate'], s.classify('doctest', f['name'], f['excerpt'])[0]) for f in failures],
+                         [('a', 'unknown'), ('b', 'port reuse')])
+
+    def test_doctest_failures_past_the_cap_are_counted_and_reported(self):
+        report = '   Doc-tests a\n' + ''.join(f'test src/lib.rs - f{i} (line {i}) ... FAILED\n' for i in range(70))
+        failures, omitted, _ = s.parse_doctest_failures(report)
+        self.assertEqual((len(failures), omitted), (50, 20))
+        summary = s.render('windows-latest', [(Path('support.json'), {
+            'conclusion': 'failure', 'doctests': 'failure', 'doctestFailures': failures,
+            'omittedDoctestFailures': omitted})])
+        self.assertIn('20 additional failed doctests omitted from evidence', summary)
+
+    def test_doctest_step_failing_without_a_name_reports_the_log_tail(self):
+        log = 'error[E0425]: cannot find value `x` in this scope\nerror: could not compile `a`\n'
+        failures, omitted, tail = s.parse_doctest_failures(log)
+        self.assertEqual((failures, omitted), ([], 0))
+        summary = s.render('windows-latest', [(Path('support.json'), {
+            'conclusion': 'failure', 'doctests': 'failure', 'doctestFailures': failures,
+            'doctestOutputTail': tail})])
+        self.assertIn('could not compile', summary)
+
+    def test_crlf_doctest_log_parses(self):
+        failures, _, _ = s.parse_doctest_failures(self.NOISY.replace('\n', '\r\n'))
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(all(f['excerpt'] for f in failures))
+
+    def test_excerpts_past_the_cap_are_counted(self):
+        results = [{'key': f'pkg::test::t{i}', 'exitCode': 1, 'failedTests': ['x'],
+                    'failureExcerpts': {'x': 'boom'}} for i in range(55)]
+        out = s.render('windows-latest', [(Path('shard.json'), {'index': 0, 'results': results})])
+        self.assertIn('5 more failing tests omitted from table', out)
+        self.assertIn('5 more failure excerpts omitted', out)
 
     def test_malformed_nested_shard_keeps_valid_failure(self):
         valid = {'index': 1, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
