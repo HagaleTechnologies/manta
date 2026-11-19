@@ -144,11 +144,13 @@ the ticket wants to remove, and it works now, within two limits:
 - It is a fresh decode of the recording, not the live decode that made
   the spot.
 - A recording replayed on its own puts the spans on that recording's
-  sample clock, so a span indexes the file directly only while no `gap`
-  record precedes it. After one, the span sits ahead of its file index
-  by the sum of the `missing_samples` of all earlier gaps: the file
-  stores only the samples received, while replay timestamps continue
-  past the missing ones (the same guide). A multi-input session records
+  sample clock. A span indexes the file directly until a `gap` record
+  with `missing_samples` above 0 precedes it. After such a gap, the span
+  sits ahead of its file index by the sum of the `missing_samples` of all
+  earlier gaps. A zero-length gap, which a stalled stream leaves when it
+  resumes with no reconnect (MAN-201), starts a new epoch but adds
+  nothing to that sum. The file stores only the samples received, while
+  replay timestamps continue past the missing ones (the same guide). A multi-input session records
   one file per `[[input]]` that sets `record_iq`; recording is opt-in
   per input.
   Replaying several files together starts every file at the first
