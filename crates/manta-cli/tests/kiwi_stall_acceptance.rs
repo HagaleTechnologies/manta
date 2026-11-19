@@ -83,11 +83,8 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             std::thread::sleep(Duration::from_millis(25));
         }
     });
-    // MAN-570: port 0 on every listener; the daemon reports the ports it
-    // really bound in its `listening:` banner (read by
-    // `spawn_daemon_reporting_ports`, which also waits out this test's
-    // old readiness channel), so no released port number is handed on
-    // for another process to claim first.
+    // MAN-570: the daemon binds port 0 on every listener and reports the
+    // assigned ports in its `listening:` banner.
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(&cfg, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n").unwrap();
@@ -110,6 +107,8 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             }
         }
     });
+    // Start the timed stream only after the daemon reaches its readiness marker.
+    daemon.next_line_containing(&["manta: listening;"], Duration::from_secs(30));
     go.send(()).unwrap();
     let mut previous_ts = None;
     for call in ["W1AW", "K1ABC"] {
