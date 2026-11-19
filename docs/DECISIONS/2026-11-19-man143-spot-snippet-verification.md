@@ -122,10 +122,20 @@ These are read from the code, not observed at runtime.
 
 A future clip therefore needs, per spot: the word's sample span, the input
 it came from, and that input's clock, held across stalls and delayed
-publication. The spot carries none of the three: `timestamp` and
-`frequency` locate the signal only coarsely, and only a single-input
-session's `sample_ts` is already on that input's own clock
-(`SourceClock::IDENTITY`).
+publication. The JSON spot has no field for any of the three. `timestamp`
+and `frequency` locate the signal only coarsely, and the `id` embeds a
+track ID and one `sample_ts` that the schema calls opaque. Whether that
+`sample_ts` is already the input's own sample index depends on the session.
+A session with one input applies no clock mapping, so it is. In a
+multi-input replay it is for each input at the session's highest rate
+(scale 1, offset 0, because every replay offset is 0) and not for a slower
+input, whose `sample_ts` is multiplied by the rate ratio. In a live
+multi-input session, inputs at the session's highest rate keep their own
+sample indices when their offset is zero. The engine adds each input's
+delay from the session's start, rounded to the nearest whole sample on
+the common clock. A short positive delay can round to zero (`SourceClock`,
+`crates/manta-engine/src/multi.rs`;
+`docs/DECISIONS/2026-10-15-man13-multi-input-daemon.md` D2).
 
 ## D3. The workaround an operator has today
 
