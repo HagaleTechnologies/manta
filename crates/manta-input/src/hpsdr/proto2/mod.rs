@@ -962,7 +962,12 @@ pub(crate) mod fake {
 
         fn bind() -> (u16, Vec<UdpSocket>, UdpSocket) {
             for _ in 0..200 {
-                let first = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let Ok(first) = UdpSocket::bind("127.0.0.1:0") else {
+                    // Windows can temporarily exhaust its UDP buffer pool when
+                    // the test runner opens many fake radios in parallel.
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
                 let base = first.local_addr().unwrap().port();
                 if base > u16::MAX - FOREIGN_PORT_OFFSET {
                     continue;
@@ -1818,11 +1823,18 @@ mod tests {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
         src.max_consecutive_malformed = 50;
-        for _ in 0..60 {
-            fake.send_iq_bytes(&[0u8; 1443]);
-        }
         let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
-        let err = src.read(&mut buf).unwrap_err();
+        // Send while the receiver drains. A pre-read burst can overflow the
+        // Windows UDP queue before this test ever checks the malformed bound.
+        let err = thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..60 {
+                    fake.send_iq_bytes(&[0u8; 1443]);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            });
+            src.read(&mut buf).unwrap_err()
+        });
         // MAN-533 D4: the malformed bound carries the shared type.
         assert!(crate::is_no_usable_samples(&err), "{err:#}");
         let err = err.to_string();
@@ -2264,6 +2276,9 @@ mod tests {
     fn a_second_pause_while_a_park_drains_keeps_its_anchor() {
         let fake = FakeP2Radio::start();
         let mut src = open(&fake);
+        // This scenario intentionally parks for four seconds. A starved CI
+        // runner must not trip the unrelated ten-second no-IQ watchdog.
+        src.stall_after = Duration::from_secs(30);
         fake.send_iq(0);
         read_one(&mut src);
         thread::sleep(Duration::from_secs(4));

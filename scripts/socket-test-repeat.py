@@ -367,6 +367,7 @@ def repeat(item, test, cwd, env, count=REPEAT_COUNT, runner=subprocess.run):
         ok = proc.returncode == 0 and passed is not None and int(passed.group(1)) == 1
         runs.append(dict(iteration=iteration, exitCode=proc.returncode, seconds=time.monotonic() - started, ok=ok))
         if not ok:
+            runs[-1]['excerpt'] = '\n'.join(output.splitlines()[-40:])[-4000:]
             sys.stdout.write(output)
             print(f'::error title=Socket test repeat failed::{test} in {item["key"]} failed on iteration '
                   f'{iteration} of {count}', flush=True)

@@ -414,3 +414,33 @@ class ShardTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class LibtestFailureParseTests(unittest.TestCase):
+    def test_names_and_excerpts_from_a_libtest_report(self):
+        output = 'running 1 test\ntest tests::broken ... FAILED\n\nfailures:\n\n---- tests::broken stdout ----\npanic: os error 10048\n\nfailures:\n    tests::broken\n\ntest result: FAILED\n'
+        parsed = s.parse_libtest_failures(output)
+        self.assertEqual(parsed['failedTests'], ['tests::broken'])
+        self.assertIn('os error 10048', parsed['failureExcerpts']['tests::broken'])
+
+    def test_report_cut_off_before_the_failure_list(self):
+        self.assertEqual(s.parse_libtest_failures('test broken ... FAILED\n')['failedTests'], ['broken'])
+
+    def test_crash_without_a_failure_list_keeps_the_tail(self):
+        self.assertEqual(s.parse_libtest_failures('crashed')['outputTail'], 'crashed')
+
+    def test_excerpts_are_bounded(self):
+        text = 'test broken ... FAILED\n---- broken stdout ----\n' + ('x'*500+'\n')*100
+        self.assertLessEqual(len(s.parse_libtest_failures(text)['failureExcerpts']['broken']), 4000)
+        many = ''.join(f'test test_{i} ... FAILED\n' for i in range(200))
+        parsed = s.parse_libtest_failures(many)
+        self.assertEqual(len(parsed['failedTests']), 50)
+        self.assertEqual(parsed['omittedFailedTests'], 150)
+
+    def test_invalid_utf8_is_replaced(self):
+        self.assertIn('\ufffd', s.parse_libtest_failures(b'\xff'.decode('utf-8', errors='replace'))['outputTail'])
+
+    def test_passing_result_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = s.run_item({'key': 'fixture::test::pass', 'executable': sys.executable}, directory, os.environ)
+            self.assertEqual(result['exitCode'], 0)
+            self.assertNotIn('failedTests', result)

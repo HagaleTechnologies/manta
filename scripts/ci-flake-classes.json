@@ -1,0 +1,104 @@
+{
+  "version": 1,
+  "record": "docs/DECISIONS/2026-11-19-man551-windows-o1-readout.md",
+  "tests": [
+    {
+      "target": "health_command",
+      "test": "health_escapes_peer_text",
+      "class": "port reuse",
+      "ticket": "MAN-523",
+      "fix": "46096dc"
+    },
+    {
+      "target": "health_command",
+      "test": "health_against_a_closed_port_exits_one_not_two",
+      "class": "port reuse",
+      "ticket": "MAN-523",
+      "fix": "46096dc"
+    },
+    {
+      "target": "live_state_acceptance",
+      "test": "the_live_listener_admits_at_most_32_clients",
+      "class": "loopback timing",
+      "ticket": "MAN-523",
+      "fix": "46096dc"
+    },
+    {
+      "target": "kiwi_ws_size_bound",
+      "test": "frame_larger_than_the_bound_is_rejected_not_buffered",
+      "class": "loopback timing",
+      "ticket": "MAN-420",
+      "fix": "f4742c3"
+    },
+    {
+      "target": "config_command",
+      "test": "cw_segments_documented_example_parses",
+      "class": "CRLF",
+      "ticket": "MAN-519",
+      "fix": "c096096"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::discovery::tests::auto_retries_discovery_four_times_within_the_window",
+      "class": "loopback timing",
+      "ticket": "MAN-503",
+      "fix": "5c3c315"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::proto2::tests::keepalive_resends_on_cadence",
+      "class": "loopback timing",
+      "ticket": "MAN-449",
+      "fix": "3dcda0c"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::open_receiver_tests::dropping_a_lone_protocol_1_receiver_stops_the_radio_for_rediscovery",
+      "class": "loopback timing",
+      "ticket": "MAN-497",
+      "fix": "d1fe0cf"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::open_receiver_tests::auto_refuses_a_busy_protocol_2_radio",
+      "class": "loopback timing",
+      "ticket": "MAN-551",
+      "fix": "pending"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::proto2::tests::malformed_flood_errors_after_the_bound",
+      "class": "loopback timing",
+      "ticket": "MAN-551",
+      "fix": "pending"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::proto2::tests::a_second_pause_while_a_park_drains_keeps_its_anchor",
+      "class": "loopback timing",
+      "ticket": "MAN-551",
+      "fix": "pending"
+    },
+    {
+      "target": "manta_input",
+      "test": "hpsdr::open_receiver_tests::auto_open_of_a_protocol_1_radio_leaves_the_handle_unengaged",
+      "class": "loopback timing",
+      "ticket": "MAN-551",
+      "fix": "pending"
+    }
+  ],
+  "signatures": [
+    {
+      "class": "port reuse",
+      "regex": "(?i)(os error 10048|Address already in use|AddrInUse|Only one usage of each socket address)"
+    },
+    {
+      "class": "loopback timing",
+      "regex": "(?i)(os error 1005[34]|os error 1006[01]|forcibly closed by the remote host|ConnectionReset|ConnectionAborted|ConnectionRefused)"
+    },
+    {
+      "class": "CRLF",
+      "regex": "\\\\r\\\\n|\\\\r\\\""
+    }
+  ]
+}

@@ -3492,10 +3492,19 @@ mod open_receiver_tests {
 
     #[test]
     fn auto_refuses_a_busy_protocol_2_radio() {
-        let fake = FakeP2Radio::with_discovery(vec![(
-            Duration::ZERO,
-            p2_reply(discovery::STATUS_BUSY, 5),
-        )]);
+        // Repeat the same busy answer: one dropped loopback reply must not turn
+        // this into a false "no radio" result under Windows runner load.
+        let fake = FakeP2Radio::with_discovery(vec![
+            (Duration::ZERO, p2_reply(discovery::STATUS_BUSY, 5)),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+            (
+                Duration::from_millis(5),
+                p2_reply(discovery::STATUS_BUSY, 5),
+            ),
+        ]);
         let err = open_receiver_with(&fake.cfg(), HpsdrProtocol::Auto, &fast(), Instant::now())
             .err()
             .expect("a busy radio is refused under auto");

@@ -105,6 +105,7 @@ else
   linux_suite verify_dependabot_diff_safe
   suite ci_shards
   suite ci_shards_windows
+  suite ci_failure_summary
   suite socket_test_repeat
   step "cargo test --workspace --locked"
 fi

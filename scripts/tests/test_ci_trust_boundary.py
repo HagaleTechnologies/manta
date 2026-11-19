@@ -425,7 +425,8 @@ class CiFullNativePathTests(unittest.TestCase):
         self.assertIsNotNone(command, "Catalyst must retain the workspace test gate")
         self.assertEqual(json.loads(command.group(1)), ["cargo", "test", "--workspace", "--locked"])
         for platform in ("ubuntu", "macos", "windows"):
-            self.assertTrue(any((run_body(s) or "").strip() == "cargo test --workspace --doc --locked"
+            command = "cargo test --workspace --doc --locked" + (" --no-fail-fast" if platform == "windows" else "")
+            self.assertTrue(any((run_body(s) or "").strip() == command
                                 for s in steps(job_block(self.text, f"{platform}-support"))))
             self.assertTrue(any("--build-bundles" in (run_body(s) or "")
                                 for s in steps(job_block(self.text, f"{platform}-build"))))
