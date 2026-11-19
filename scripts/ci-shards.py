@@ -306,9 +306,15 @@ def parse_libtest_failures(text):
     """Keep bounded names and output for a failed libtest executable."""
     lines = text.splitlines()
     names = []
-    # The final failures list is authoritative; an interrupted report only has FAILED lines.
-    for match in re.finditer(r'^failures:\s*\n((?:[ \t]+[^\n]+\n)+)', text, re.M):
-        names = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+    # The final failures list is authoritative only when the report is
+    # complete: a `test result:` line must follow it. A list cut off partway
+    # (an interrupted report) loses names libtest already printed as FAILED
+    # lines, so those lines stay the source of names instead.
+    results = [m.start() for m in re.finditer(r'^test result: ', text, re.M)]
+    for match in reversed(list(re.finditer(r'^failures:\s*\n((?:[ \t]+[^\n]+\n)+)', text, re.M))):
+        if any(pos > match.end() for pos in results):
+            names = [line.strip() for line in match.group(1).splitlines() if line.strip()]
+            break
     if not names:
         names = re.findall(r'^test (.+?) \.\.\. FAILED\s*$', text, re.M)
     names = list(dict.fromkeys(names))
@@ -321,7 +327,11 @@ def parse_libtest_failures(text):
         marker = f'---- {name} stdout ----'
         if marker in lines:
             start = lines.index(marker) + 1
-            end = next((i for i in range(start, len(lines)) if lines[i].startswith('---- ') or lines[i] == 'failures:'), len(lines))
+            # Only an actual libtest boundary ends the block: another
+            # `---- <name> stdout ----` header or the final `failures:` list.
+            # A separator the test itself printed stays inside the excerpt.
+            end = next((i for i in range(start, len(lines))
+                        if re.match(r'^---- .* stdout ----$', lines[i]) or lines[i] == 'failures:'), len(lines))
             excerpts[name] = '\n'.join(lines[start:min(end, start+40)])[:4000]
     result = {'failedTests': names, 'failureExcerpts': excerpts}
     if omitted:

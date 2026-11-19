@@ -34,6 +34,9 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
     rows, other, details = [], [], []
     seen, binaries = set(), 0
     for path, record in evidence:
+        if not isinstance(record, dict):
+            other.append(f'{path}: unrecognized evidence (not a JSON object)')
+            continue
         if 'readError' in record:
             other.append(f'{path}: evidence unreadable: {record["readError"]}')
             continue
@@ -72,7 +75,18 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
                     details.append((name, excerpt))
             for repeat in record.get('repeatResults', []):
                 if not repeat.get('ok'):
-                    other.append(f'shard {index} socket-test repeat failed: {repeat.get("test", "unknown")}')
+                    # A failed repeat is a failing test: name its binary,
+                    # classify it from the failed iteration's excerpt
+                    # (socket-test-repeat.py writes it), and show the excerpt.
+                    key = repeat.get('key', 'unknown::unknown')
+                    target = key.rsplit('::', 1)[-1]
+                    name = repeat.get('test', 'unknown')
+                    excerpt = next((run.get('excerpt', '') for run in repeat.get('runs', [])
+                                    if isinstance(run, dict) and not run.get('ok')), '')
+                    label, rule = classify(target, name, excerpt)
+                    other.append(f'shard {index} socket-test repeat failed: {name} in {target}; class: {label} ({rule})')
+                    if excerpt:
+                        details.append((f'{name} (repeat)', excerpt))
         else:
             other.append(f'{path}: unrecognized evidence')
     if shard is not None and shard not in seen:

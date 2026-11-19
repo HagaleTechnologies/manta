@@ -37,6 +37,21 @@ class ClassifyTests(unittest.TestCase):
         for entry in s.REGISTRY['tests']:
             self.assertIn(entry['test'], record)
 
+    def test_registry_fix_commits_carry_their_own_ticket(self):
+        import subprocess
+        for entry in s.REGISTRY['tests']:
+            if entry['fix'] == 'pending':
+                continue
+            # CI checks out depth 1, where the pinned history is absent;
+            # run the pairing check wherever the commits resolve.
+            probe = subprocess.run(['git', 'cat-file', '-e', entry['fix']], cwd=ROOT,
+                                   capture_output=True)
+            if probe.returncode != 0:
+                self.skipTest(f"{entry['fix']} is not in this clone")
+            subject = subprocess.check_output(
+                ['git', 'log', '--format=%s', '-1', entry['fix']], cwd=ROOT, text=True)
+            self.assertIn(entry['ticket'], subject, f"{entry['fix']} is not {entry['ticket']}")
+
 
 class RenderTests(unittest.TestCase):
     def test_failing_test_row_names_os_shard_binary_test_and_class(self):
@@ -66,6 +81,30 @@ class RenderTests(unittest.TestCase):
         out = s.render('windows-latest', [(Path('shard'), {'index': 0, 'results': [],
                                                       'repeatResults': [{'ok': False, 'test': 'socket'}]})])
         self.assertIn('socket-test repeat failed: socket', out)
+
+    def test_repeat_failure_carries_class_and_excerpt(self):
+        repeat = {'ok': False, 'key': 'pkg::test::health_command', 'test': 'health_escapes_peer_text',
+                  'runs': [{'iteration': 3, 'ok': False, 'excerpt': 'bind: os error 10048'}]}
+        out = s.render('windows-latest', [(Path('shard'), {'index': 2, 'results': [], 'repeatResults': [repeat]})])
+        self.assertIn('socket-test repeat failed: health_escapes_peer_text in health_command', out)
+        self.assertIn('class: port reuse', out)
+        self.assertIn('os error 10048', out)
+
+    def test_non_object_evidence_does_not_suppress_valid_failures(self):
+        record = {'index': 2, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
+                   'failedTests': ['health_escapes_peer_text'], 'failureExcerpts': {'health_escapes_peer_text': 'panic'}}]}
+        out = s.render('windows-latest', [(Path('array.json'), [1, 2]), (Path('shard.json'), record)])
+        self.assertIn('| 2 | health_command | health_escapes_peer_text | port reuse |', out)
+        self.assertIn('array.json', out)
+        self.assertIn('not a JSON object', out)
+
+    def test_non_object_evidence_file_exits_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            array = Path(directory)/'array.json'
+            array.write_text('[1, 2]', encoding='utf-8')
+            output = Path(directory)/'summary'
+            self.assertEqual(s.main(['--os', 'windows-latest', '--append', str(output), str(array)]), 0)
+            self.assertIn('not a JSON object', output.read_text(encoding='utf-8'))
 
     def test_all_green_is_one_line(self):
         out = s.render('windows-latest', [(Path('shard'), {'index': 0, 'results': [{'exitCode': 0}]})])

@@ -425,6 +425,21 @@ class LibtestFailureParseTests(unittest.TestCase):
     def test_report_cut_off_before_the_failure_list(self):
         self.assertEqual(s.parse_libtest_failures('test broken ... FAILED\n')['failedTests'], ['broken'])
 
+    def test_interrupted_final_list_keeps_already_failed_names(self):
+        # A real two-failure report whose final list was cut off after the
+        # first entry: `beta` already printed FAILED and must not disappear.
+        output = ('test alpha ... FAILED\ntest beta ... FAILED\n\nfailures:\n\n'
+                  '---- alpha stdout ----\nboom\n\nfailures:\n    alpha\n')
+        self.assertEqual(s.parse_libtest_failures(output)['failedTests'], ['alpha', 'beta'])
+
+    def test_separator_line_inside_failure_block_stays_in_the_excerpt(self):
+        output = ('test alpha ... FAILED\n\nfailures:\n\n---- alpha stdout ----\n'
+                  '---- section two ----\nthird send failed: os error 10048\n\n'
+                  'failures:\n    alpha\n\ntest result: FAILED. 1 failed\n')
+        excerpt = s.parse_libtest_failures(output)['failureExcerpts']['alpha']
+        self.assertIn('---- section two ----', excerpt)
+        self.assertIn('os error 10048', excerpt)
+
     def test_crash_without_a_failure_list_keeps_the_tail(self):
         self.assertEqual(s.parse_libtest_failures('crashed')['outputTail'], 'crashed')
 

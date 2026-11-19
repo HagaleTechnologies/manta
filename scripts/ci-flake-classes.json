@@ -55,7 +55,7 @@
       "target": "manta_input",
       "test": "hpsdr::open_receiver_tests::dropping_a_lone_protocol_1_receiver_stops_the_radio_for_rediscovery",
       "class": "loopback timing",
-      "ticket": "MAN-497",
+      "ticket": "MAN-474",
       "fix": "d1fe0cf"
     },
     {
