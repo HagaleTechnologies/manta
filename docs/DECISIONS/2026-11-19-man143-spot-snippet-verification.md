@@ -53,16 +53,18 @@ played.
   value named a URL, snippet, clip or audio.
 
 The track ID (`1`) and the sample timestamp (`2006272`) in the `id` are
-the only pointers back to the signal. The schema calls `id` opaque.
+the closest pointers back to the signal; `timestamp` and `frequency`
+locate it only coarsely. The schema calls `id` opaque.
 
 **V1 metrics route smoke.** With the same daemon running, `GET /status`
 on the metrics port returned `HTTP/1.1 200 OK` and a JSON body.
 `GET /snippets/verification-probe` returned `HTTP/1.1 404 Not Found`.
 The probe path is only a probe, not a proposed route. The source agrees:
 `route` in `crates/manta-server/src/metrics_http.rs` matches `/metrics`,
-`/healthz` and `/status` and answers 404 to everything else, which its
-unit test `route_serves_status_json_metrics_text_and_404s_everything_else`
-also asserts.
+`/healthz` and `/status` and answers 404 to everything else. Its unit
+test `route_serves_status_json_metrics_text_and_404s_everything_else`
+asserts `/status` and `/metrics` and the 404s; `/healthz` is covered by
+its own tests in the same file.
 
 **WebSocket resume.** `cargo test -p manta-server --locked --test
 json_stream_acceptance a_reconnecting_ws_client_receives_what_it_missed`
@@ -81,11 +83,18 @@ These are read from the code, not observed at runtime.
 - A `Spot` (`crates/manta-spot/src/validator.rs`, `pub struct Spot`)
   carries a track ID and one sample timestamp, `sample_ts`. It carries no
   word interval and no samples.
-- The word's interval exists only in the MAN-207 observation draft
-  (`observation_draft` in the same file): a `SampleSpan` from the word's
-  first character to its word boundary
-  (`crates/manta-spot/src/observation.rs`), with the input identity and
-  the observation epoch. The emitted spot does not keep it.
+- The word's interval is held in the live validator, not only in the
+  MAN-207 draft: each word keeps its `start_ts` and `end_ts` (the word's
+  sample span) while it sits in its track's window of 16 recent words
+  (`WORD_WINDOW`), and the spot path works out the input with
+  `input_of(track_id)` just before it builds the `Spot`. The emitted
+  spot keeps neither the span nor the input. The MAN-207 observation
+  draft (`observation_draft` in the same file) is the only output that
+  carries the span out of the validator, as a `SampleSpan` from the
+  word's first character
+  to its word boundary (`crates/manta-spot/src/observation.rs`), with
+  the input identity and the observation epoch; it runs only under
+  `manta decode --observations`, never `manta run`.
 - The live engine reads into one reused chunk buffer
   (`crates/manta-engine/src/listen.rs`, the read loop in
   `listen_with_observers`). Apart from MAN-309's opt-in session recording
@@ -113,7 +122,10 @@ These are read from the code, not observed at runtime.
 
 A future clip therefore needs, per spot: the word's sample span, the input
 it came from, and that input's clock, held across stalls and delayed
-publication. The spot alone does not give an operator any of the three.
+publication. The spot carries none of the three: `timestamp` and
+`frequency` locate the signal only coarsely, and only a single-input
+session's `sample_ts` is already on that input's own clock
+(`SourceClock::IDENTITY`).
 
 ## D3. The workaround an operator has today
 
@@ -132,11 +144,18 @@ the ticket wants to remove, and it works now, within two limits:
 - It is a fresh decode of the recording, not the live decode that made
   the spot.
 - A recording replayed on its own puts the spans on that recording's
-  sample clock, so they index the file directly. A multi-input session
-  records one file per `[[input]]`. Replaying several of them together
-  starts every file at the first input's start time, not at each
-  receiver's original start (MAN-13, the same guide). Spans from a joint
-  replay then need D2's clock mapping before they index a file.
+  sample clock, so a span indexes the file directly only while no `gap`
+  record precedes it. After one, the span sits ahead of its file index
+  by the sum of the `missing_samples` of all earlier gaps: the file
+  stores only the samples received, while replay timestamps continue
+  past the missing ones (the same guide). A multi-input session records
+  one file per `[[input]]` that sets `record_iq`; recording is opt-in
+  per input.
+  Replaying several files together starts every file at the first
+  input's start time, not at each receiver's original start (MAN-13,
+  the same guide). `--observations` takes one recording, so no current
+  command writes observation spans from a joint replay; if one ever
+  does, its spans need D2's clock mapping before they index a file.
 
 ## D4. Disposition
 
