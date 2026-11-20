@@ -228,6 +228,23 @@ impl DaemonHandle {
         self.log.lock_state().lines.clone()
     }
 
+    /// After the child exits, waits up to `timeout` for the collector to
+    /// finish draining stderr, then returns its final snapshot.
+    pub fn stderr_after_eof(&self, timeout: Duration) -> String {
+        let (state, _) = self
+            .log
+            .changed
+            .wait_timeout_while(self.log.lock_state(), timeout, |state| !state.eof)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.eof,
+            "stderr collector did not finish within {timeout:?}; {}",
+            self.log.dump_state(&state)
+        );
+        drop(state);
+        self.stderr_so_far()
+    }
+
     /// Waits up to `timeout` for a stderr line containing every one of
     /// `needles` (as `common::expect_line`), and returns it. Lines are
     /// kept, not consumed: a later wait can still find an earlier line.

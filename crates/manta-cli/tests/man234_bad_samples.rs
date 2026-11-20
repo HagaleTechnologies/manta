@@ -310,13 +310,19 @@ fn metric_value(body: &str, metric_with_labels: &str) -> Option<f64> {
 const BAD_METRIC: &str = r#"manta_input_bad_samples_total{source="file"}"#;
 
 /// Starts `manta run --loop` on `wav` with a `[server]` table, and scrapes
-/// `/metrics` until `done(value)` holds or 20 s pass. Returns the last
-/// value seen and the child's stderr.
+/// `/metrics` until `done(value)` holds or 20 s pass. After a successful
+/// scrape, waits for the expected warning if one was given. Returns the
+/// last value seen and the collected stderr.
 ///
 /// MAN-570: the daemon binds port 0 on every listener and reports what it
 /// got in its `listening:` banner, so no released port number is handed
 /// on for another process to claim first.
-fn daemon_bad_samples(dir: &Path, wav: &Path, done: impl Fn(f64) -> bool) -> (f64, String) {
+fn daemon_bad_samples(
+    dir: &Path,
+    wav: &Path,
+    expected_warning: Option<&str>,
+    done: impl Fn(f64) -> bool,
+) -> (f64, String) {
     let cfg_path = dir.join(format!(
         "{}.toml",
         wav.file_stem().unwrap().to_string_lossy()
@@ -351,11 +357,16 @@ fn daemon_bad_samples(dir: &Path, wav: &Path, done: impl Fn(f64) -> bool) -> (f6
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Give the first-sample warning line time to arrive on the pipe.
-    std::thread::sleep(Duration::from_millis(200));
-    let stderr = daemon.stderr_so_far();
-    let value = last.unwrap_or_else(|| panic!("{BAD_METRIC} never scraped; stderr:\n{stderr}"));
-    (value, stderr)
+    let value = last.unwrap_or_else(|| {
+        panic!(
+            "{BAD_METRIC} never scraped; stderr:\n{}",
+            daemon.stderr_so_far()
+        )
+    });
+    if let Some(warning) = expected_warning.filter(|_| done(value)) {
+        daemon.next_line_containing(&[warning], Duration::from_secs(10));
+    }
+    (value, daemon.stderr_so_far())
 }
 
 #[test]
@@ -363,13 +374,14 @@ fn daemon_publishes_bad_samples_from_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let fixtures = write_fixtures(tmp.path());
 
-    let (clean, stderr) = daemon_bad_samples(tmp.path(), &fixtures[0].1, |_| true);
+    let (clean, stderr) = daemon_bad_samples(tmp.path(), &fixtures[0].1, None, |_| true);
     assert_eq!(clean, 0.0, "first scrape on clean input; stderr:\n{stderr}");
 
-    let (bad, stderr) = daemon_bad_samples(tmp.path(), &fixtures[3].1, |v| v >= 1.0);
-    assert!(bad >= 1.0, "{BAD_METRIC} = {bad}; stderr:\n{stderr}");
-    assert!(
-        stderr.contains("counted in manta_input_bad_samples_total"),
-        "stderr:\n{stderr}"
+    let (bad, stderr) = daemon_bad_samples(
+        tmp.path(),
+        &fixtures[3].1,
+        Some("counted in manta_input_bad_samples_total"),
+        |v| v >= 1.0,
     );
+    assert!(bad >= 1.0, "{BAD_METRIC} = {bad}; stderr:\n{stderr}");
 }

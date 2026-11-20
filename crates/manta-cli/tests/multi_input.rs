@@ -357,9 +357,7 @@ fn multi_input_daemon_publishes_each_inputs_hearing() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    // The pipe may still hold the daemon's final lines right after exit.
-    std::thread::sleep(Duration::from_millis(200));
-    let stderr = daemon.stderr_so_far();
+    let stderr = daemon.stderr_after_eof(Duration::from_secs(10));
     assert!(status.success(), "{stderr}");
     let stdout = std::fs::read_to_string(&stdout_path).unwrap();
     let want: BTreeMap<String, usize> = [("JA1ABC", 1), ("W1AW", 1), ("ZL2XYZ", 1)]

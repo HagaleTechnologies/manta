@@ -1,7 +1,7 @@
 //! MAN-306 acceptance through the real daemon and a broadcast-aware Metis fake.
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::process::{Child, Command, Stdio};
+use std::net::{TcpStream, UdpSocket};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -85,32 +85,20 @@ impl Drop for FakeDiscoveryRadio {
     }
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-fn manta() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_manta"));
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"MANTA_") {
-            command.env_remove(key);
-        }
-    }
-    command
-}
+#[path = "man570/daemon.rs"]
+mod daemon;
+#[path = "common/launch.rs"]
+mod launch;
+use daemon::spawn_daemon_reporting_ports;
+use launch::manta;
 
 fn configured_command(
     port: u16,
     flags: bool,
     mac: Option<&str>,
-    metrics: u16,
 ) -> (tempfile::NamedTempFile, Command) {
     let mut file = tempfile::NamedTempFile::new().unwrap();
-    write!(file, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = {metrics}\n").unwrap();
+    write!(file, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n").unwrap();
     let mut command = manta();
     command.args(["run", "--config"]).arg(file.path());
     if flags {
@@ -163,31 +151,20 @@ fn healthy(port: u16) -> bool {
 
 fn assert_streams(macs: Vec<[u8; 6]>, flags: bool, mac: Option<&str>) {
     let radio = FakeDiscoveryRadio::new(macs);
-    let held = TcpListener::bind("127.0.0.1:0").unwrap();
-    let metrics = held.local_addr().unwrap().port();
-    let (_file, mut command) = configured_command(radio.port, flags, mac, metrics);
-    drop(held);
-    let stderr = tempfile::tempfile().unwrap();
-    let mut child = ChildGuard(
-        command
-            .stdout(Stdio::null())
-            .stderr(stderr.try_clone().unwrap())
-            .spawn()
-            .unwrap(),
-    );
+    let (_file, mut command) = configured_command(radio.port, flags, mac);
     let deadline = Instant::now() + Duration::from_secs(15);
+    command.stdout(Stdio::null());
+    let mut child = spawn_daemon_reporting_ports(command, Duration::from_secs(15));
     loop {
-        if healthy(metrics) {
+        if healthy(child.ports.metrics) {
             break;
         }
-        let exited = child.0.try_wait().unwrap();
+        let exited = child.child().try_wait().unwrap();
         if exited.is_some() || Instant::now() >= deadline {
-            use std::io::{Seek, SeekFrom};
-            let mut stderr = stderr;
-            stderr.seek(SeekFrom::Start(0)).unwrap();
-            let mut text = String::new();
-            stderr.read_to_string(&mut text).unwrap();
-            panic!("radio did not stream; exit {exited:?}: {text}");
+            panic!(
+                "radio did not stream; exit {exited:?}: {}",
+                child.stderr_so_far()
+            );
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -205,7 +182,7 @@ fn a_single_radio_streams_without_an_address_from_flags_and_config() {
 fn two_radios_require_a_choice_and_mac_pinning_streams_from_flags_and_config() {
     for flags in [false, true] {
         let radio = FakeDiscoveryRadio::new(vec![MAC_A, MAC_B]);
-        let (_file, mut command) = configured_command(radio.port, flags, None, 0);
+        let (_file, mut command) = configured_command(radio.port, flags, None);
         let out = command.output().unwrap();
         assert_eq!(out.status.code(), Some(1));
         let error = String::from_utf8_lossy(&out.stderr);
@@ -241,7 +218,7 @@ fn two_radios_require_a_choice_and_mac_pinning_streams_from_flags_and_config() {
 fn no_radio_is_an_actionable_error_within_five_seconds() {
     let radio = FakeDiscoveryRadio::new(vec![]);
     for flags in [false, true] {
-        let (_file, mut command) = configured_command(radio.port, flags, None, 0);
+        let (_file, mut command) = configured_command(radio.port, flags, None);
         let start = Instant::now();
         let out = command.output().unwrap();
         assert!(start.elapsed() < Duration::from_secs(5));
