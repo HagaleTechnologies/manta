@@ -4,7 +4,10 @@
 //! File inputs only, so it runs on every platform.
 
 mod common;
-use common::{manta, spawn_daemon_reporting_ports};
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::spawn_daemon_reporting_ports;
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::collections::BTreeMap;

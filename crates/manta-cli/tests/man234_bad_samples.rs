@@ -14,9 +14,11 @@
 //! report `NO_SIGNAL`. Clean: `decode` exit 0, `run --json` 75 lines,
 //! `doctor` `WEAK_NO_DECODE`.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::spawn_daemon_reporting_ports;
+use daemon::spawn_daemon_reporting_ports;
 
 use manta_testkit::vectors::{self, VectorSpec};
 use num_complex::Complex32;

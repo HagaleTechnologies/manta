@@ -9,9 +9,12 @@
 //! docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md).
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{manta, spawn_daemon_reporting_ports, DaemonHandle};
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
+use launch::manta;
 
 use manta_input::ka9q::wire::{self, ChannelStatus, Encoding, RtpHeader};
 use num_complex::Complex32;

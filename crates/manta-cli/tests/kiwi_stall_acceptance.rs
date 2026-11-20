@@ -1,5 +1,7 @@
 //! MAN-489: a ping-fed Kiwi outage settles a held call before resume.
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
@@ -95,7 +97,7 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
         .args(["--kiwi-freq-hz", "14025000", "--json", "--config"])
         .arg(cfg)
         .stdout(Stdio::piped());
-    let mut daemon = common::spawn_daemon_reporting_ports(command, Duration::from_secs(30));
+    let mut daemon = daemon::spawn_daemon_reporting_ports(command, Duration::from_secs(30));
     let stdout = daemon.take_stdout().expect("stdout was piped");
     let (spot_tx, spots) = mpsc::channel();
     let out_reader = std::thread::spawn(move || {

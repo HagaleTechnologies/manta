@@ -4,6 +4,8 @@
 //! reason. Runs at production durations (about 35 to 40 s): no test knob
 //! reaches the window from outside the process.
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -109,7 +111,7 @@ fn a_kiwi_sending_only_unknown_tags_is_reconnected_with_reason_no_usable_samples
         .args(["--kiwi-freq-hz", "14025000", "--config"])
         .arg(&cfg)
         .stdout(Stdio::null());
-    let child = common::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let child = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
     let metrics = child.ports.metrics;
     let started = Instant::now();
 

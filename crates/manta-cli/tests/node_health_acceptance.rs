@@ -12,9 +12,12 @@
 //! checks the steady-state "decoding fine" path, which is what a real
 //! liveness probe sees for nearly all of a node's life.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{manta, spawn_daemon_reporting_ports, unreachable_target_ports};
+use daemon::{spawn_daemon_reporting_ports, unreachable_target_ports};
+use launch::manta;
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::io::{Read, Write};
