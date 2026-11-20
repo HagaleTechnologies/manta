@@ -78,11 +78,14 @@ to the daemon's own port-0 bind.
 All in this Linux container, on the candidate tree:
 
 - Scratch mutation (a scratch `.rs` under `tests/` with an old call, an
-  aliased import and the old HPSDR/Docker inline forms, never compiled):
-  `no_integration_test_uses_released_free_ports` failed naming
-  `zzz_scratch_guard_mutation.rs:4` and `:17`;
-  `no_test_releases_an_ephemeral_port_for_reuse` failed naming the file.
-  Unmutated: `--test shared_test_helpers` passes 10/10.
+  aliased import and the old HPSDR/Docker inline forms, never compiled,
+  deleted after the run): `no_integration_test_uses_released_free_ports`
+  and `no_test_releases_an_ephemeral_port_for_reuse` both failed naming
+  that scratch file. The red path is pinned in-tree by
+  `the_scan_names_a_fixture_that_restores_the_old_call` in
+  `crates/manta-cli/tests/shared_test_helpers.rs`: a restored call is
+  named even with no definition of the helper anywhere. Unmutated:
+  `--test shared_test_helpers` passes 11/11.
 - Scratch in `daemon_port_handoff.rs`: with a competing listener holding a
   concrete port, a port-zero daemon started and reported its trio, and the
   concrete-port daemon exited 1 with `error: binding the metrics server

@@ -103,11 +103,11 @@ fn uses_free_ports_token(line: &str) -> bool {
         .any(|token| token == "free_ports")
 }
 
-#[test]
-fn no_integration_test_uses_released_free_ports() {
-    // doctor_checks.rs keeps its private allocator (MAN-333, MAN-410).
+/// `file:line` for every scanned line that uses the removed `free_ports`
+/// token. `doctor_checks.rs` keeps its private allocator (MAN-333, MAN-410).
+fn free_ports_hits(sources: &[(String, String)]) -> Vec<String> {
     let mut hits = Vec::new();
-    for (rel, text) in sources() {
+    for (rel, text) in sources {
         if rel == "doctor_checks.rs" {
             continue;
         }
@@ -117,6 +117,12 @@ fn no_integration_test_uses_released_free_ports() {
             }
         }
     }
+    hits
+}
+
+#[test]
+fn no_integration_test_uses_released_free_ports() {
+    let hits = free_ports_hits(&sources());
     assert!(
         hits.is_empty(),
         "the removed `free_ports()` releases its ports before the daemon binds \
@@ -125,6 +131,23 @@ fn no_integration_test_uses_released_free_ports() {
          bound ports from the daemon's `listening:` banner \
          (`spawn_daemon_reporting_ports`), or take a concrete port from the \
          claimed band (`src/test_ports.rs`): {hits:?}"
+    );
+}
+
+/// MAN-569 AC2's red path, pinned in-tree: an incident fixture that restores
+/// the old released-port call is named `file:line` by the scan even though no
+/// definition of the helper exists anywhere in the scanned sources. The
+/// scratch mutation the decision record describes was a whole file under
+/// `tests/` deleted after its red run; this keeps that proof in the tree.
+#[test]
+fn the_scan_names_a_fixture_that_restores_the_old_call() {
+    let sources = [(
+        "zzz_restored_incident_fixture.rs".to_string(),
+        "let ports = launch::free_ports();\nlet metrics = ports[2];\n".to_string(),
+    )];
+    assert_eq!(
+        free_ports_hits(&sources),
+        ["zzz_restored_incident_fixture.rs:1".to_string()]
     );
 }
 
