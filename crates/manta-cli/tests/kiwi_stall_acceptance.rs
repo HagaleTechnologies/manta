@@ -83,13 +83,11 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             std::thread::sleep(Duration::from_millis(25));
         }
     });
-    let held: [TcpListener; 3] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    let [telnet, json, metrics] = held.each_ref().map(|l| l.local_addr().unwrap().port());
-    drop(held);
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
-    std::fs::write(&cfg, format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n")).unwrap();
+    std::fs::write(&cfg, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n").unwrap();
     let mut command = common::manta();
+    command.env("RUST_LOG", "info");
     let mut child = command
         .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())
@@ -102,12 +100,16 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let child = common::KillOnDrop(child);
+    let (banner_tx, banner) = mpsc::channel();
     let (ready_tx, ready) = mpsc::channel();
     let (errors_tx, errors) = mpsc::channel();
     let err_reader = std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if line.contains("listening:") {
+                let _ = banner_tx.send(());
+            }
             if line.contains("manta: listening;") {
-                let _ = ready_tx.send(());
+                let _ = ready_tx.send(line.clone());
             }
             let _ = errors_tx.send(line);
         }
@@ -122,7 +124,11 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             }
         }
     });
-    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    banner.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(ready
+        .recv_timeout(Duration::from_secs(30))
+        .unwrap()
+        .contains("manta: listening;"));
     go.send(()).unwrap();
     let mut previous_ts = None;
     for call in ["W1AW", "K1ABC"] {
