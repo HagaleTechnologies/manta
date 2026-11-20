@@ -9,9 +9,16 @@
 //! datagrams from `base+11`, paced at real time. A real `manta` child
 //! is pointed at `--hpsdr-port <base>`, with no `--hpsdr-protocol`.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
+<<<<<<< HEAD
 use launch::{manta, spawn_daemon_reporting_ports};
+=======
+use daemon::spawn_daemon_reporting_ports;
+use launch::manta;
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 
 use manta_input::IqSource;
 use num_complex::Complex32;
@@ -853,7 +860,10 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
         }
     });
     let stderr_now = || daemon.stderr_so_far();
+<<<<<<< HEAD
     daemon.next_line_containing(&["manta: listening on 2 inputs"], Duration::from_secs(30));
+=======
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))

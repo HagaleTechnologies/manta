@@ -7,7 +7,14 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
+<<<<<<< HEAD
 use common::{manta, spawn_daemon_reporting_ports, DaemonHandle};
+=======
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 
 use common::ka9q::*;
 use std::io::{BufRead, BufReader, Read, Write};

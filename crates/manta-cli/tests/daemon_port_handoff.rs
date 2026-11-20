@@ -6,6 +6,7 @@
 //! released port number is ever handed on for the daemon to bind.
 
 mod common;
+<<<<<<< HEAD
 
 use common::{manta, spawn_daemon_reporting_ports, DaemonHandle};
 use std::collections::HashSet;
@@ -14,6 +15,17 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc;
+=======
+#[path = "man570/daemon.rs"]
+mod daemon;
+
+use common::manta;
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 use std::time::Duration;
 
 /// A short, quiet 48 kHz mono WAV: enough input for the daemon to open
@@ -54,6 +66,7 @@ fn spawn_daemon(dir: &Path, wav: &Path, name: &str) -> DaemonHandle {
     spawn_daemon_reporting_ports(cmd, Duration::from_secs(30))
 }
 
+<<<<<<< HEAD
 fn connect_to_daemon(port: u16) -> TcpStream {
     TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(10))
         .unwrap_or_else(|err| panic!("connect to daemon on port {port}: {err}"))
@@ -62,6 +75,11 @@ fn connect_to_daemon(port: u16) -> TcpStream {
 /// The body of a `GET /metrics` on `port`.
 fn scrape_metrics(port: u16) -> String {
     let mut stream = connect_to_daemon(port);
+=======
+/// The body of a `GET /metrics` on `port`.
+fn scrape_metrics(port: u16) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -85,6 +103,7 @@ fn two_simultaneous_daemons_get_distinct_reported_ports() {
     let (a_dir, b_dir) = (dir.path().join("a"), dir.path().join("b"));
     std::fs::create_dir(&a_dir).unwrap();
     std::fs::create_dir(&b_dir).unwrap();
+<<<<<<< HEAD
     std::thread::scope(|scope| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -147,6 +166,46 @@ fn check_daemons(a: &DaemonHandle, b: &DaemonHandle) {
     );
     for port in [a.ports.telnet, a.ports.json, b.ports.telnet, b.ports.json] {
         connect_to_daemon(port);
+=======
+    // Genuinely concurrent: each spawn blocks until its own daemon's
+    // banner lands, so both daemons bind while the other is starting.
+    let a = {
+        let (dir, wav) = (a_dir, wav.clone());
+        std::thread::spawn(move || spawn_daemon(&dir, &wav, "a"))
+    };
+    let b = {
+        let (dir, wav) = (b_dir, wav.clone());
+        std::thread::spawn(move || spawn_daemon(&dir, &wav, "b"))
+    };
+    let (a, b) = (
+        a.join().expect("daemon a spawned"),
+        b.join().expect("daemon b spawned"),
+    );
+
+    let a_ports = (a.ports.telnet, a.ports.json, a.ports.metrics);
+    let b_ports = (b.ports.telnet, b.ports.json, b.ports.metrics);
+    // Distinct per listener, not merely as a triple: equal metrics ports
+    // with one other port differing would pass a triple comparison and
+    // both scrapes below could hit the same daemon (the round-2 proof
+    // gap).
+    assert_ne!(
+        a.ports.metrics, b.ports.metrics,
+        "the daemons share a metrics listener"
+    );
+    assert_ne!(
+        a.ports.telnet, b.ports.telnet,
+        "the daemons share a telnet listener"
+    );
+    assert_ne!(
+        a.ports.json, b.ports.json,
+        "the daemons share a JSON listener"
+    );
+    for (name, ports) in [("a", a_ports), ("b", b_ports)] {
+        assert!(
+            ports.0 != 0 && ports.1 != 0 && ports.2 != 0,
+            "{name}: {ports:?}"
+        );
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
     }
 
     // Both metrics endpoints serve, on the ports each banner reported.

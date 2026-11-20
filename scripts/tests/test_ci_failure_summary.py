@@ -1,4 +1,4 @@
-"""Contracts for Windows failure classification and job summaries."""
+"""Contracts for CI failure classification and job summaries."""
 import importlib.util
 import json
 from pathlib import Path
@@ -145,9 +145,13 @@ class RenderTests(unittest.TestCase):
     def test_failing_test_row_names_os_shard_binary_test_and_class(self):
         record = {'index': 2, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
                    'failedTests': ['health_escapes_peer_text'], 'failureExcerpts': {'health_escapes_peer_text': 'panic'}}]}
-        out = s.render('windows-latest', [(Path('shard.json'), record)])
-        for expected in ('Windows (windows-latest)', '| 2 | health_command | health_escapes_peer_text | port reuse |', '<details>'):
-            self.assertIn(expected, out)
+        for runner, heading in (('windows-latest', 'Windows (windows-latest)'),
+                                ('ubuntu-latest', 'Linux (ubuntu-latest)'),
+                                ('macos-latest', 'macOS (macos-latest)'),
+                                ('other-runner', 'other-runner')):
+            out = s.render(runner, [(Path('shard.json'), record)])
+            for expected in (heading, '| 2 | health_command | health_escapes_peer_text | port reuse |', '<details>'):
+                self.assertIn(expected, out)
 
     def test_missing_shard_evidence_is_named(self):
         self.assertIn('shard 1: missing evidence', s.render('windows-latest', [], expect_shards=2))

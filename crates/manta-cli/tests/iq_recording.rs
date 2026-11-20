@@ -4,7 +4,14 @@
 //! V1 fixtures, no hardware.
 
 mod common;
+<<<<<<< HEAD
 use common::{manta, spawn_daemon_reporting_ports};
+=======
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::spawn_daemon_reporting_ports;
+>>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 
 use manta_input::recording_format::MetadataRecord;
 use manta_input::{metadata_path, EndReason, RecordingHeader};

@@ -4303,7 +4303,7 @@ fn claude_md_pre_push_commands_are_ci_full_commands() {
                 assert!(doc("scripts/ci-shards.py").contains(
                     "['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json']"
                 ));
-                assert!(ci_runs.contains("cargo test --workspace --doc --locked"));
+                assert!(ci.contains("cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log"));
                 continue;
             }
             assert!(

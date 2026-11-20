@@ -10,8 +10,8 @@ Linux/ARM/headless platforms it has no native build for.
 Needs Rust 1.98.0 (`rust-toolchain.toml`), `git`, and on Linux `libasound2-dev`
 and `pkg-config`. Before pushing, run `bash scripts/pre-push.sh`: this list in
 CI order, stopping at the first failure (`--fast`: fmt, clippy on changed crates).
-`ci-full.yml`'s `*-support` and `*-shards` jobs cover the three OS checks. Windows support
-runs only `test_package_release`; native smoke runs `ci_shards_windows`. Linux-only: `ci_gates`, `decisions_index`, `verify_dependabot_diff_safe`.
+CI runs all-package doctests separately; the final local workspace test covers them.
+Windows support: `test_package_release`; smoke: `ci_shards_windows`. Linux-only: `ci_gates`, `decisions_index`, `verify_dependabot_diff_safe`.
 
 ```sh
 bash scripts/check-rust-toolchain-pin.sh && cargo fmt --all --check
