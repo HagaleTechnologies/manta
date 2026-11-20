@@ -111,11 +111,7 @@ fn a_kiwi_sending_only_unknown_tags_is_reconnected_with_reason_no_usable_samples
         .args(["--kiwi-freq-hz", "14025000", "--config"])
         .arg(&cfg)
         .stdout(Stdio::null());
-<<<<<<< HEAD
-    let child = common::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
-=======
     let child = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
->>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
     let metrics = child.ports.metrics;
     let started = Instant::now();
 

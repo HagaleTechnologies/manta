@@ -19,12 +19,8 @@
 mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-<<<<<<< HEAD
-use launch::{manta, spawn_daemon_reporting_ports};
-=======
 use daemon::spawn_daemon_reporting_ports;
 use launch::manta;
->>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};

@@ -36,14 +36,19 @@ MAN-523 D1 documents a separate START-ordering race. The cause of the cited
 
 The fixtures migrated to port zero write `telnet_port = 0`,
 `json_port = 0` and `metrics_port = 0`. They use
-`spawn_daemon_reporting_ports` (`crates/manta-cli/tests/common/launch.rs`)
-to read the bound addresses from the daemon's `listening:` banner. The
-kernel assigns each port in the same operation that binds it. Docker and
-existing claimed-band callers keep their concrete-port configuration.
-The launcher pins the child's `RUST_LOG` to `info` for the bind banner,
-collects stderr on a thread, and kills and reaps the child on drop.
-Fixtures such as Kiwi and multi-radio Protocol 2 wait for the later
-pipeline readiness message before starting their streams.
+`spawn_daemon_reporting_ports` (`crates/manta-cli/tests/man570/daemon.rs`,
+main's MAN-570 leaf) to read the bound addresses from the daemon's
+`listening:` banner. The kernel assigns each port in the same operation
+that binds it. Docker and existing claimed-band callers keep their
+concrete-port configuration. The launcher pins the child's `RUST_LOG` to
+`info` for the bind banner, collects stderr on a thread, and kills and
+reaps the child on drop. Fixtures such as Kiwi and multi-radio Protocol 2
+wait for the later pipeline readiness message before starting their
+streams. The launcher leaf lives outside `tests/common/` on purpose:
+`scripts/socket-test-repeat.py`'s closure walk treats every `.rs` file
+under `tests/common/` as part of every `mod common;` target, so a helper
+added there puts every test of those ~40 targets into CI's socket-repeat
+set, which is what timed the shard jobs out on PR #601.
 
 ### D2. A concrete port a config shares between two commands comes from the claimed band
 
@@ -54,14 +59,18 @@ command read, so it needs one concrete number: it takes it from
 band coordinates cooperating test processes and MAN-523 D2's foreign-TCP
 limitation still applies to it.
 
-### D3. The source guard rejects the removed helper, however it arrives
+### D3. The source guard rejects the helper's use, however it arrives
 
 `shared_test_helpers.rs`'s `no_integration_test_uses_released_free_ports`
 matches the exact identifier token `free_ports` — lines split on non-ASCII-
 alphanumeric/underscore characters — so qualified calls, unqualified calls,
 grouped and aliased imports and re-exports all match, while `free_port`
 (singular, the claimed band) and `find_free_ports` do not. Standalone `//`
-comment lines are exempt; `doctor_checks.rs` keeps its private allocator.
+comment lines are exempt. `doctor_checks.rs` keeps its private allocator,
+and `common/launch.rs` — with `common/mod.rs`'s re-export — keeps the
+shared definition for fixtures that hold no daemon (main's MAN-570 landed
+that definition; no current caller hands its numbers to a child). Every
+other file that names the token fails the scan.
 `no_test_releases_an_ephemeral_port_for_reuse` keeps matching the inline
 release shapes (HPSDR discovery's bind/read/drop, the three-listener array,
 the Docker temporary listener), with Docker off the pending list.

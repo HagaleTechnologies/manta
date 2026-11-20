@@ -87,9 +87,9 @@ fn only_common_launch_scrubs_manta_variables() {
     );
 }
 
-/// MAN-569: whether a source line uses the removed released-port helper,
-/// however it is qualified, imported, aliased or re-exported. The line is
-/// matched on the exact ASCII identifier token `free_ports`: it is split on
+/// MAN-569: whether a source line uses the released-port helper, however
+/// it is qualified, imported, aliased or re-exported. The line is matched
+/// on the exact ASCII identifier token `free_ports`: it is split on
 /// every character that is not an ASCII alphanumeric or `_`, so qualifiers
 /// (`launch::`), turbofish (`::<3>()`), braces and aliases need no special
 /// handling, while `free_port` (the claimed band, singular) and
@@ -103,12 +103,16 @@ fn uses_free_ports_token(line: &str) -> bool {
         .any(|token| token == "free_ports")
 }
 
-/// `file:line` for every scanned line that uses the removed `free_ports`
-/// token. `doctor_checks.rs` keeps its private allocator (MAN-333, MAN-410).
+/// `file:line` for every scanned line that uses the `free_ports` token.
+/// `doctor_checks.rs` keeps its private allocator (MAN-333, MAN-410), and
+/// `common/launch.rs` (with `common/mod.rs`'s re-export) keeps the
+/// definition for fixtures that hold no daemon (MAN-570's main): every
+/// other file that names it is handing a released number on.
 fn free_ports_hits(sources: &[(String, String)]) -> Vec<String> {
+    const DEFINITION_SITES: [&str; 3] = ["doctor_checks.rs", "common/launch.rs", "common/mod.rs"];
     let mut hits = Vec::new();
     for (rel, text) in sources {
-        if rel == "doctor_checks.rs" {
+        if DEFINITION_SITES.contains(&rel.as_str()) {
             continue;
         }
         for (index, line) in text.lines().enumerate() {
@@ -125,7 +129,7 @@ fn no_integration_test_uses_released_free_ports() {
     let hits = free_ports_hits(&sources());
     assert!(
         hits.is_empty(),
-        "the removed `free_ports()` releases its ports before the daemon binds \
+        "the `free_ports()` helper releases its ports before a daemon binds \
          them, and a sibling socket can take the number in between: write \
          `telnet_port = 0`, `json_port = 0` and `metrics_port = 0` and read the \
          bound ports from the daemon's `listening:` banner \
@@ -356,10 +360,10 @@ fn pending_released_ports_still_release_one() {
 }
 
 #[test]
-fn only_common_launch_defines_spawn_daemon_reporting_ports() {
-    let found = offenders(&["fn spawn_daemon_reporting_ports"], &["common/launch.rs"]);
+fn only_man570_daemon_defines_spawn_daemon_reporting_ports() {
+    let found = offenders(&["fn spawn_daemon_reporting_ports"], &["man570/daemon.rs"]);
     assert!(
         found.is_empty(),
-        "use common/launch.rs's daemon launcher: {found:?}"
+        "use man570/daemon.rs's daemon launcher: {found:?}"
     );
 }

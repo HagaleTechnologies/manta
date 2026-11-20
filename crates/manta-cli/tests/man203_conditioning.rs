@@ -23,11 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-<<<<<<< HEAD
-use launch::spawn_daemon_reporting_ports;
-=======
 use daemon::spawn_daemon_reporting_ports;
->>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
 use support::near_centre_scene;
 
 /// The scene MAN-203 measured (docs/DECISIONS/2026-11-03): one 6 dB

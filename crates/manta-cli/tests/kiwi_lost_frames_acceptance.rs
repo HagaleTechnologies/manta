@@ -86,11 +86,7 @@ fn first_spot(samples: Arc<Vec<Complex32>>, skip: &'static [u32]) -> (serde_json
         .args(["--kiwi-freq-hz", "14025000", "--json", "--config"])
         .arg(&cfg)
         .stdout(Stdio::piped());
-<<<<<<< HEAD
-    let mut daemon = common::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
-=======
     let mut daemon = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
->>>>>>> f9ce1657d4338e65a6778fa130dc8d93b5c17d84
     let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spots) = mpsc::channel();
     std::thread::spawn(move || {
