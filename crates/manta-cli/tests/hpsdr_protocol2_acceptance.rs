@@ -9,16 +9,19 @@
 //! datagrams from `base+11`, paced at real time. A real `manta` child
 //! is pointed at `--hpsdr-port <base>`, with no `--hpsdr-protocol`.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{free_ports, manta};
+use daemon::spawn_daemon_reporting_ports;
+use launch::manta;
 
 use manta_input::IqSource;
 use num_complex::Complex32;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -65,15 +68,6 @@ fn wav_samples(path: &Path) -> Vec<Complex32> {
             return out;
         }
         out.extend_from_slice(&buf[..n]);
-    }
-}
-
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
     }
 }
 
@@ -451,17 +445,16 @@ fn live_run(
         },
         done_tx,
     );
-    let [telnet_port, json_port, metrics_port] = free_ports();
+    // MAN-570: port 0 on every listener; the ports the daemon really
+    // bound come from its `listening:` banner.
     let cfg = dir.join("manta.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
-        ),
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
     )
     .unwrap();
-    let mut child = manta()
-        .args(["run", "--hpsdr-host", "127.0.0.1", "--hpsdr-port"])
+    let mut cmd = manta();
+    cmd.args(["run", "--hpsdr-host", "127.0.0.1", "--hpsdr-port"])
         .arg(fake.base.to_string())
         .args([
             "--hpsdr-freq-hz",
@@ -472,27 +465,10 @@ fn live_run(
             "--config",
         ])
         .arg(&cfg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let _guard = ChildGuard(child);
-
-    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (ready_tx, ready_rx) = mpsc::channel();
-    {
-        let err_lines = err_lines.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if line.contains(READY_MARKER) {
-                    let _ = ready_tx.send(());
-                }
-                err_lines.lock().unwrap().push(line);
-            }
-        });
-    }
+        .stdout(Stdio::piped());
+    let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let metrics_port = daemon.ports.metrics;
+    let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spot_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -503,16 +479,14 @@ fn live_run(
             }
         }
     });
-    let stderr_now = || err_lines.lock().unwrap().join("\n");
+    let stderr_now = || daemon.stderr_so_far();
     let explain_now = || {
         explain(
             &stderr_now(),
             &scrape_metrics(metrics_port).unwrap_or_default(),
         )
     };
-    ready_rx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_else(|_| panic!("manta never printed {READY_MARKER:?}; {}", explain_now()));
+    daemon.next_line_containing(&[READY_MARKER], Duration::from_secs(30));
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
@@ -852,10 +826,10 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
             )
         })
         .collect();
-    let [telnet_port, json_port, metrics_port] = free_ports();
-    let mut text = format!(
-        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
-    );
+    // MAN-570: port 0 on every listener; the ports the daemon really
+    // bound come from its `listening:` banner (here the `inputs=` shape,
+    // which still names telnet=, json= and metrics=).
+    let mut text = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n".to_string();
     for (name, radio) in ["a", "b"].iter().zip(&radios) {
         text += &format!(
             "\n[[input]]\nname = \"{name}\"\ntype = \"hpsdr\"\nhost = \"127.0.0.1\"\nport = {}\nfreq_hz = 14000000.0\nrate_hz = 192000.0\n",
@@ -864,25 +838,13 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
     }
     let cfg = dir.path().join("manta.toml");
     std::fs::write(&cfg, text).unwrap();
-    let mut child = manta()
-        .args(["run", "--json", "--config"])
+    let mut cmd = manta();
+    cmd.args(["run", "--json", "--config"])
         .arg(&cfg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let _guard = ChildGuard(child);
-    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    {
-        let err_lines = err_lines.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                err_lines.lock().unwrap().push(line);
-            }
-        });
-    }
+        .stdout(Stdio::piped());
+    let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let metrics_port = daemon.ports.metrics;
+    let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spot_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -893,7 +855,7 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
             }
         }
     });
-    let stderr_now = || err_lines.lock().unwrap().join("\n");
+    let stderr_now = || daemon.stderr_so_far();
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
@@ -976,11 +938,12 @@ fn a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume() 
         done,
     );
     let dir = tempfile::tempdir().unwrap();
-    let [telnet, json, metrics] = free_ports();
+    // MAN-570: port 0 on every listener; the ports the daemon really
+    // bound come from its `listening:` banner.
     let cfg = dir.path().join("manta.toml");
-    std::fs::write(&cfg, format!("[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n")).unwrap();
-    let mut child = manta()
-        .args(["run", "--hpsdr-host", "127.0.0.1", "--hpsdr-port"])
+    std::fs::write(&cfg, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n").unwrap();
+    let mut cmd = manta();
+    cmd.args(["run", "--hpsdr-host", "127.0.0.1", "--hpsdr-port"])
         .arg(fake.base.to_string())
         .args([
             "--hpsdr-freq-hz",
@@ -991,24 +954,9 @@ fn a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume() 
             "--config",
         ])
         .arg(cfg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let _child = ChildGuard(child);
-    let (ready_tx, ready) = mpsc::channel();
-    let errors = Arc::new(Mutex::new(Vec::new()));
-    let err = errors.clone();
-    let stderr_reader = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.contains(READY_MARKER) {
-                let _ = ready_tx.send(());
-            }
-            err.lock().unwrap().push(line);
-        }
-    });
+        .stdout(Stdio::piped());
+    let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spots) = mpsc::channel();
     let stdout_reader = thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -1019,14 +967,14 @@ fn a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume() 
             }
         }
     });
-    ready.recv_timeout(Duration::from_secs(30)).unwrap();
+    daemon.next_line_containing(&[READY_MARKER], Duration::from_secs(30));
     go.store(true, Ordering::SeqCst);
     for (episode, call) in ["W1AW", "K1ABC"].into_iter().enumerate() {
         let last_send = pauses.recv_timeout(Duration::from_secs(20)).unwrap();
         assert!(spots.try_recv().is_err(), "held tail spotted before stall");
         let (spot, received) = spots
             .recv_timeout(Duration::from_secs(5).saturating_sub(last_send.elapsed()))
-            .unwrap_or_else(|e| panic!("{e}: {:?}", errors.lock().unwrap()));
+            .unwrap_or_else(|e| panic!("{e}: {}", daemon.stderr_so_far()));
         assert_eq!(spot.0, call);
         assert!(received.duration_since(last_send) < Duration::from_secs(5));
         let start = if episode == 0 {
@@ -1040,15 +988,13 @@ fn a_protocol2_held_tail_spots_within_five_seconds_before_same_session_resume() 
             "held word keeps its sample timestamp: {spot:?}"
         );
         assert!(spots.try_recv().is_err());
-        assert!(!errors
-            .lock()
-            .unwrap()
-            .iter()
+        assert!(!daemon
+            .stderr_so_far()
+            .lines()
             .any(|l| l.contains(" lost: ") || l.contains(" reconnected after ")));
         resume.send(()).unwrap();
     }
     drop(fake);
-    drop(_child);
+    drop(daemon);
     stdout_reader.join().unwrap();
-    stderr_reader.join().unwrap();
 }

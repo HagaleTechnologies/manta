@@ -9,7 +9,10 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
-use common::{free_ports, manta};
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::spawn_daemon_reporting_ports;
 
 use common::ka9q::*;
 
@@ -157,42 +160,22 @@ fn run_against_fake(skip: std::ops::Range<usize>) -> FakeRun {
     let data_port = free_udp_port();
     let mut fake = FakeRadiod::status_only(group, channel_status(group, data_port, false));
 
-    let [telnet_port, json_port, metrics_port] = free_ports();
+    // MAN-570: port 0 on every listener; the ports the daemon really
+    // bound come from its `listening:` banner.
     let cfg = dir.path().join("manta.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
-        ),
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
     )
     .unwrap();
-    let mut child = manta()
-        .args(["run", "--ka9q-group"])
+    let mut cmd = manta();
+    cmd.args(["run", "--ka9q-group"])
         .arg(group.to_string())
         .args(["--ka9q-port", &data_port.to_string(), "--json", "--config"])
         .arg(&cfg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let _guard = ChildGuard(child);
-
-    // stderr: signal the ready line, keep every line for the final check.
-    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (ready_tx, ready_rx) = mpsc::channel();
-    {
-        let err_lines = err_lines.clone();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if line.contains(READY_MARKER) {
-                    let _ = ready_tx.send(());
-                }
-                err_lines.lock().unwrap().push(line);
-            }
-        });
-    }
+        .stdout(Stdio::piped());
+    let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spot_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -203,14 +186,8 @@ fn run_against_fake(skip: std::ops::Range<usize>) -> FakeRun {
             }
         }
     });
-    ready_rx
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap_or_else(|_| {
-            panic!(
-                "manta never printed {READY_MARKER:?}; stderr:\n{}",
-                err_lines.lock().unwrap().join("\n")
-            )
-        });
+    // The ready line, on the stderr the helper keeps for the final check.
+    daemon.next_line_containing(&[READY_MARKER], Duration::from_secs(30));
 
     // The source has joined and accepted the status: start RTP from sample
     // 0 at 2x real time, dropping the packets in `skip`.
@@ -219,18 +196,13 @@ fn run_against_fake(skip: std::ops::Range<usize>) -> FakeRun {
 
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| {
-            panic!(
-                "no spot within 60 s; stderr:\n{}",
-                err_lines.lock().unwrap().join("\n")
-            )
-        });
+        .unwrap_or_else(|_| panic!("no spot within 60 s; stderr:\n{}", daemon.stderr_so_far()));
 
     done_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     // Let the last packets and a metrics tick land.
     let deadline = Instant::now() + Duration::from_secs(10);
     let body = loop {
-        let body = scrape_metrics(metrics_port).unwrap_or_default();
+        let body = scrape_metrics(daemon.ports.metrics).unwrap_or_default();
         let ok = metric_value(&body, r#"manta_source_health{source="ka9q"}"#) == Some(1)
             && metric_value(&body, r#"manta_input_dropped_packets_total{source="ka9q"}"#)
                 .unwrap_or(0)
@@ -243,7 +215,7 @@ fn run_against_fake(skip: std::ops::Range<usize>) -> FakeRun {
         }
         thread::sleep(Duration::from_millis(200));
     };
-    let stderr = err_lines.lock().unwrap().join("\n");
+    let stderr = daemon.stderr_so_far();
     FakeRun {
         file_call,
         file_freq,

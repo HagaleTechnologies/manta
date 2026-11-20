@@ -9,20 +9,21 @@
 //!   Scenario: A bad mode value is refused by `manta config check` with the
 //!             exact key error.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
 #[path = "../../manta-engine/tests/support/man203.rs"]
 mod support;
 
 use manta_testkit::sensitivity::{CENTER_FREQ_HZ, SAMPLE_RATE_HZ};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use launch::free_ports;
+use daemon::spawn_daemon_reporting_ports;
 use support::near_centre_scene;
 
 /// The scene MAN-203 measured (docs/DECISIONS/2026-11-03): one 6 dB
@@ -180,16 +181,6 @@ fn bad_conditioning_mode_is_refused_by_config_check() {
     );
 }
 
-/// Kills and reaps the daemon child on drop, including on a failing assert.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// `GET <path>` over a raw TCP connection; returns the body.
 fn http_get(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
@@ -319,7 +310,6 @@ fn run_daemon_publishes_the_conditioned_samples_metric_from_startup() {
     let tmp = tempfile::tempdir().unwrap();
     let (wav, _, _) = fixtures(tmp.path());
     for multi in [false, true] {
-        let [telnet_port, json_port, metrics_port] = free_ports();
         let cfg = tmp.path().join("daemon.toml");
         let mut inputs = format!("[{}]\n{}type = \"file\"\npath = {:?}\niq = true\nrealtime = true\nloop = true\ndc_block = \"apply\"\n",
             if multi { "[input]" } else { "input" },
@@ -327,16 +317,15 @@ fn run_daemon_publishes_the_conditioned_samples_metric_from_startup() {
         if multi {
             inputs.push_str(&format!("[[input]]\nname = \"rx2\"\ntype = \"file\"\npath = {:?}\niq = true\nrealtime = true\nloop = true\n", wav));
         }
-        std::fs::write(&cfg, format!("{inputs}\n[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n")).unwrap();
-        let log = tmp.path().join("daemon.stderr");
-        let child = Command::new(env!("CARGO_BIN_EXE_manta"))
-            .args(["run", "--config"])
+        std::fs::write(&cfg, format!("{inputs}\n[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n")).unwrap();
+        // MAN-570: port 0 plus the banner-reported port, never a released
+        // number another process could claim first.
+        let mut cmd = launch::manta();
+        cmd.args(["run", "--config"])
             .arg(&cfg)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(File::create(&log).unwrap()))
-            .spawn()
-            .unwrap();
-        let _guard = ChildGuard(child);
+            .stdout(Stdio::null());
+        let daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(25));
+        let metrics_port = daemon.ports.metrics;
         let source = if multi { "rx1" } else { "file" };
         let metric = format!("manta_input_conditioned_samples_total{{source=\"{source}\",stage=\"dc\",mark=\"corrected\"}}");
         let deadline = Instant::now() + Duration::from_secs(25);
@@ -368,7 +357,7 @@ fn run_daemon_publishes_the_conditioned_samples_metric_from_startup() {
         assert!(
             seen.is_some_and(|n| n > 0.0),
             "{metric}: {seen:?}; {}",
-            std::fs::read_to_string(&log).unwrap()
+            daemon.stderr_so_far()
         );
     }
 }

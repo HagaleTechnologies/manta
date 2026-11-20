@@ -9,13 +9,15 @@
 //! Before MAN-529 the gapped spot came out 12,288 samples (128 ms) early
 //! (measured on `de39a71`).
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
 use num_complex::Complex32;
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// Speed of the fake stream against real time.
@@ -69,42 +71,23 @@ fn first_spot(samples: Arc<Vec<Complex32>>, skip: &'static [u32]) -> (serde_json
         })
     };
 
-    let [telnet, json, metrics] = common::free_ports();
+    // MAN-570: port 0 on every listener; the daemon reports the ports it
+    // really bound in its `listening:` banner.
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n[spot]\nallowlist = [\"W1AW\"]\n"
-        ),
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n[spot]\nallowlist = [\"W1AW\"]\n",
     )
     .unwrap();
-    let mut child = common::manta()
-        .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
+    let mut cmd = common::manta();
+    cmd.args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())
         .args(["--kiwi-freq-hz", "14025000", "--json", "--config"])
         .arg(&cfg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let child = common::KillOnDrop(child);
-
-    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let (ready_tx, ready) = mpsc::channel();
-    {
-        let err_lines = err_lines.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if line.contains("manta: listening;") {
-                    let _ = ready_tx.send(());
-                }
-                err_lines.lock().unwrap().push(line);
-            }
-        });
-    }
+        .stdout(Stdio::piped());
+    let mut daemon = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spots) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -115,17 +98,15 @@ fn first_spot(samples: Arc<Vec<Complex32>>, skip: &'static [u32]) -> (serde_json
             }
         }
     });
-    let stderr_now = || err_lines.lock().unwrap().join("\n");
-    ready
-        .recv_timeout(Duration::from_secs(60))
-        .unwrap_or_else(|_| panic!("manta never became ready; stderr:\n{}", stderr_now()));
+    let stderr_now = || daemon.stderr_so_far();
+    daemon.next_line_containing(&["manta: listening;"], Duration::from_secs(60));
     go_tx.send(()).unwrap();
     let spot = spots
         .recv_timeout(Duration::from_secs(120))
         .unwrap_or_else(|_| panic!("no spot within 120 s; stderr:\n{}", stderr_now()));
     let err = stderr_now();
     stop.store(true, Ordering::Relaxed);
-    drop(child);
+    drop(daemon);
     fake.join().unwrap();
     (spot, err)
 }

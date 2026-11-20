@@ -14,17 +14,18 @@
 //! report `NO_SIGNAL`. Clean: `decode` exit 0, `run --json` 75 lines,
 //! `doctor` `WEAK_NO_DECODE`.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::free_ports;
+use daemon::spawn_daemon_reporting_ports;
 
 use manta_testkit::vectors::{self, VectorSpec};
 use num_complex::Complex32;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -281,16 +282,6 @@ fn check_still_rejects_nonfinite_input() {
     assert!(stderr.contains("nonfinite input sample"), "{stderr}");
 }
 
-/// Kills and reaps the daemon child on drop, including on a failing assert.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// `GET <path>` over a raw TCP connection; returns the body.
 fn http_get(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
@@ -321,34 +312,29 @@ const BAD_METRIC: &str = r#"manta_input_bad_samples_total{source="file"}"#;
 /// Starts `manta run --loop` on `wav` with a `[server]` table, and scrapes
 /// `/metrics` until `done(value)` holds or 20 s pass. Returns the last
 /// value seen and the child's stderr.
+///
+/// MAN-570: the daemon binds port 0 on every listener and reports what it
+/// got in its `listening:` banner, so no released port number is handed
+/// on for another process to claim first.
 fn daemon_bad_samples(dir: &Path, wav: &Path, done: impl Fn(f64) -> bool) -> (f64, String) {
-    let [telnet_port, json_port, metrics_port] = free_ports();
     let cfg_path = dir.join(format!(
         "{}.toml",
         wav.file_stem().unwrap().to_string_lossy()
     ));
     std::fs::write(
         &cfg_path,
-        format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
-             telnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\n"
-        ),
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+         telnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
     )
     .unwrap();
-    let stderr_path = dir.join(format!(
-        "{}.stderr.log",
-        wav.file_stem().unwrap().to_string_lossy()
-    ));
-    let child = Command::new(env!("CARGO_BIN_EXE_manta"))
-        .args(["run", "--source-iq", "--loop", "--source"])
+    let mut cmd = launch::manta();
+    cmd.args(["run", "--source-iq", "--loop", "--source"])
         .arg(wav)
         .arg("--config")
         .arg(&cfg_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(File::create(&stderr_path).unwrap()))
-        .spawn()
-        .expect("spawn manta run");
-    let _guard = ChildGuard(child);
+        .stdout(Stdio::null());
+    let daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(20));
+    let metrics_port = daemon.ports.metrics;
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = None;
     loop {
@@ -365,9 +351,9 @@ fn daemon_bad_samples(dir: &Path, wav: &Path, done: impl Fn(f64) -> bool) -> (f6
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Give the first-sample warning line time to reach the log file.
+    // Give the first-sample warning line time to arrive on the pipe.
     std::thread::sleep(Duration::from_millis(200));
-    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let stderr = daemon.stderr_so_far();
     let value = last.unwrap_or_else(|| panic!("{BAD_METRIC} never scraped; stderr:\n{stderr}"));
     (value, stderr)
 }

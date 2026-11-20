@@ -9,9 +9,12 @@
 //! docs/DECISIONS/2026-10-13-man140-ka9q-radio-input.md).
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{free_ports, manta};
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
+use launch::manta;
 
 use manta_input::ka9q::wire::{self, ChannelStatus, Encoding, RtpHeader};
 use num_complex::Complex32;
@@ -20,9 +23,9 @@ use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket};
 use std::path::Path;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -182,15 +185,6 @@ impl Drop for FakeChannel {
     }
 }
 
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn http_get(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
@@ -211,53 +205,35 @@ fn metric_value(body: &str, metric_with_labels: &str) -> Option<u64> {
 }
 
 /// One `[[input]]` per `(name, ssrc)`, all on `group:port`, plus a
-/// `[server]` on loopback with a 1 s status line.
-fn write_config(dir: &Path, group: Ipv4Addr, port: u16, channels: &[(&str, u32)]) -> (u16, u16) {
-    let [telnet_port, json_port, metrics_port] = free_ports();
-    let mut cfg = format!(
-        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\njson_port = {json_port}\nmetrics_port = {metrics_port}\nstatus_interval_secs = 1\n"
-    );
+/// `[server]` on loopback with a 1 s status line. MAN-570: every listener
+/// binds port 0; the daemon reports the ports it really bound in its
+/// `listening:` banner, which `Daemon::start` reads.
+fn write_config(dir: &Path, group: Ipv4Addr, port: u16, channels: &[(&str, u32)]) {
+    let mut cfg = "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\nstatus_interval_secs = 1\n".to_string();
     for (name, ssrc) in channels {
         cfg.push_str(&format!(
             "\n[[input]]\nname = \"{name}\"\ntype = \"ka9q\"\ngroup = \"{group}\"\nport = {port}\nssrc = {ssrc}\n"
         ));
     }
     std::fs::write(dir.join("manta.toml"), cfg).unwrap();
-    (json_port, metrics_port)
 }
 
 /// A running `manta run --json --config manta.toml`: its spots, and every
-/// stderr line with the time it arrived.
+/// stderr line with the time it arrived (kept by the MAN-570 launch
+/// helper, which also carries the banner-reported ports).
 struct Daemon {
-    _guard: ChildGuard,
+    daemon: DaemonHandle,
     spots: mpsc::Receiver<(Instant, serde_json::Value)>,
-    stderr: Arc<Mutex<Vec<(Instant, String)>>>,
 }
 
 impl Daemon {
     fn start(dir: &Path) -> Self {
-        let mut child = manta()
-            .args(["run", "--json", "--config"])
+        let mut cmd = manta();
+        cmd.args(["run", "--json", "--config"])
             .arg(dir.join("manta.toml"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr_pipe = child.stderr.take().unwrap();
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        let (ready_tx, ready_rx) = mpsc::channel();
-        {
-            let stderr = stderr.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
-                    if line.contains(READY_MARKER) {
-                        let _ = ready_tx.send(());
-                    }
-                    stderr.lock().unwrap().push((Instant::now(), line));
-                }
-            });
-        }
+            .stdout(Stdio::piped());
+        let mut handle = spawn_daemon_reporting_ports(cmd, Duration::from_secs(60));
+        let stdout = handle.child().stdout.take().unwrap();
         let (spot_tx, spots) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -269,32 +245,28 @@ impl Daemon {
             }
         });
         let daemon = Self {
-            _guard: ChildGuard(child),
+            daemon: handle,
             spots,
-            stderr,
         };
-        if ready_rx.recv_timeout(Duration::from_secs(60)).is_err() {
-            panic!(
-                "manta never printed {READY_MARKER:?}; stderr:\n{}",
-                daemon.stderr_text()
-            );
-        }
+        daemon
+            .daemon
+            .next_line_containing(&[READY_MARKER], Duration::from_secs(60));
         daemon
     }
 
     fn stderr_text(&self) -> String {
-        let lines = self.stderr.lock().unwrap();
-        lines
-            .iter()
-            .map(|(_, l)| l.as_str())
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.daemon.stderr_so_far()
+    }
+
+    /// The port the daemon reported for `/metrics` in its banner.
+    fn metrics_port(&self) -> u16 {
+        self.daemon.ports.metrics
     }
 
     /// When the first stderr line containing `needle` arrived.
     fn line_at(&self, needle: &str) -> Option<Instant> {
-        let lines = self.stderr.lock().unwrap();
-        lines
+        self.daemon
+            .stderr_lines_so_far()
             .iter()
             .find(|(_, l)| l.contains(needle))
             .map(|(at, _)| *at)
@@ -340,7 +312,7 @@ fn two_ka9q_channels_on_one_radiod_feed_one_spot_stream() {
     let data_port = free_udp_port();
     let mut twenty = FakeChannel::start(group, data_port, 14_000_000, 14_000_000.0);
     let mut forty = FakeChannel::start(group, data_port, 7_000_000, 7_000_000.0);
-    let (_, metrics_port) = write_config(
+    write_config(
         dir.path(),
         group,
         data_port,
@@ -371,7 +343,7 @@ fn two_ka9q_channels_on_one_radiod_feed_one_spot_stream() {
             other => panic!("unexpected spot {other}: {spot}"),
         }
     }
-    let body = http_get(metrics_port, "/metrics").unwrap_or_default();
+    let body = http_get(daemon.metrics_port(), "/metrics").unwrap_or_default();
     assert_eq!(
         metric_value(&body, r#"manta_source_health{source="20m"}"#),
         Some(1),
@@ -402,13 +374,12 @@ fn one_of_three_ka9q_inputs_stopping_leaves_the_others_spotting() {
     let mut a = FakeChannel::start(group, data_port, 14_000_000, 14_000_000.0);
     let mut b = FakeChannel::start(group, data_port, 7_000_000, 7_000_000.0);
     let mut c = FakeChannel::start(group, data_port, 21_000_000, 21_000_000.0);
-    let (json_port, metrics_port) = write_config(
+    write_config(
         dir.path(),
         group,
         data_port,
         &[("a", 14_000_000), ("b", 7_000_000), ("c", 21_000_000)],
     );
-    let _ = json_port;
     let daemon = Daemon::start(dir.path());
 
     a.stream(
@@ -439,7 +410,7 @@ fn one_of_three_ka9q_inputs_stopping_leaves_the_others_spotting() {
     let err = daemon.stderr_text();
     assert!(err.contains("2 of 3 inputs decoding"), "{err}");
 
-    let body = http_get(metrics_port, "/metrics").unwrap_or_default();
+    let body = http_get(daemon.metrics_port(), "/metrics").unwrap_or_default();
     for (source, want) in [("a", 1), ("b", 1), ("c", 0)] {
         assert_eq!(
             metric_value(
@@ -455,7 +426,7 @@ fn one_of_three_ka9q_inputs_stopping_leaves_the_others_spotting() {
         "{body}"
     );
     assert_eq!(metric_value(&body, "manta_healthy"), Some(1), "{body}");
-    let health = http_get(metrics_port, "/healthz").unwrap_or_default();
+    let health = http_get(daemon.metrics_port(), "/healthz").unwrap_or_default();
     assert_eq!(health.lines().next(), Some("ok"), "{health}");
     assert!(
         health.lines().any(|l| l == "source c: unhealthy"),

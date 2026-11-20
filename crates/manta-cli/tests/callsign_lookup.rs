@@ -7,7 +7,10 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
-use common::{free_ports, manta};
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
 
 use common::ka9q::*;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -140,9 +143,7 @@ fn lookup_table(mock: &QrzMock) -> String {
 /// A live `run` on a fake radiod looping V1 at 2x real time.
 struct LiveRun {
     _fake: FakeRadiod,
-    _child: ChildGuard,
-    metrics_port: u16,
-    err_lines: Arc<Mutex<Vec<String>>>,
+    daemon: DaemonHandle,
     /// Each spot's JSON and when stdout carried it.
     spot_rx: mpsc::Receiver<(serde_json::Value, Instant)>,
     done_rx: mpsc::Receiver<()>,
@@ -155,43 +156,28 @@ impl LiveRun {
         let group = unique_group();
         let data_port = free_udp_port();
         let mut fake = FakeRadiod::status_only(group, channel_status(group, data_port, false));
-        let [telnet_port, json_port, metrics_port] = free_ports();
+        // MAN-570: port 0 on every listener; the ports the daemon really
+        // bound come from its `listening:` banner.
         let cfg = dir.join("manta.toml");
         std::fs::write(
             &cfg,
             format!(
                 "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
-                 metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet_port}\n\
-                 json_port = {json_port}\nmetrics_port = {metrics_port}\n\n{}",
+                 metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\n\
+                 json_port = 0\nmetrics_port = 0\n\n{}",
                 lookup_table(mock)
             ),
         )
         .unwrap();
-        let mut child = manta()
-            .args(["run", "--ka9q-group"])
+        let mut cmd = manta();
+        cmd.args(["run", "--ka9q-group"])
             .arg(group.to_string())
             .args(["--ka9q-port", &data_port.to_string(), "--json", "--config"])
             .arg(&cfg)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let guard = ChildGuard(child);
-        let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let (ready_tx, ready_rx) = mpsc::channel();
-        {
-            let err_lines = err_lines.clone();
-            thread::spawn(move || {
-                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                    if line.contains(READY_MARKER) {
-                        let _ = ready_tx.send(());
-                    }
-                    err_lines.lock().unwrap().push(line);
-                }
-            });
-        }
+            .stdout(Stdio::piped());
+        let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+        let stdout = daemon.child().stdout.take().unwrap();
+        daemon.next_line_containing(&[READY_MARKER], Duration::from_secs(30));
         let (spot_tx, spot_rx) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -202,37 +188,27 @@ impl LiveRun {
                 }
             }
         });
-        ready_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap_or_else(|_| {
-                panic!(
-                    "manta never printed {READY_MARKER:?}; stderr:\n{}",
-                    err_lines.lock().unwrap().join("\n")
-                )
-            });
         // Looping, so batches keep running (and releasing held spots)
         // after the first pass.
         let (done_tx, done_rx) = mpsc::channel();
         fake.stream(group, data_port, samples, 2.0, None, true, done_tx);
         Self {
             _fake: fake,
-            _child: guard,
-            metrics_port,
-            err_lines,
+            daemon,
             spot_rx,
             done_rx,
         }
     }
 
     fn stderr(&self) -> String {
-        self.err_lines.lock().unwrap().join("\n")
+        self.daemon.stderr_so_far()
     }
 
     /// Polls `/metrics` until `ready` holds or `budget` passes.
     fn metrics_until(&self, budget: Duration, ready: impl Fn(&str) -> bool) -> String {
         let deadline = Instant::now() + budget;
         loop {
-            let body = scrape_metrics(self.metrics_port).unwrap_or_default();
+            let body = scrape_metrics(self.daemon.ports.metrics).unwrap_or_default();
             if ready(&body) || Instant::now() >= deadline {
                 return body;
             }
@@ -267,7 +243,7 @@ fn scenario_1_a_call_qrz_does_not_list_is_not_spotted() {
         run.spot_rx.try_recv().is_err(),
         "a call QRZ.com does not list was spotted"
     );
-    let body = scrape_metrics(run.metrics_port).unwrap_or_default();
+    let body = scrape_metrics(run.daemon.ports.metrics).unwrap_or_default();
     for (metric, want) in [
         (r#"manta_callsign_lookups_total{outcome="not_found"}"#, 1),
         (r#"manta_callsign_lookups_total{outcome="found"}"#, 0),

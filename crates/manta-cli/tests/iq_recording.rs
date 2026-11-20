@@ -4,13 +4,17 @@
 //! V1 fixtures, no hardware.
 
 mod common;
-use common::{free_ports, manta};
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::spawn_daemon_reporting_ports;
 
 use manta_input::recording_format::MetadataRecord;
 use manta_input::{metadata_path, EndReason, RecordingHeader};
 use num_complex::Complex32;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Output, Stdio};
+use std::time::Duration;
 
 fn run_ok(args: &[&std::ffi::OsStr]) -> Output {
     let out = manta().args(args).output().unwrap();
@@ -211,28 +215,35 @@ fn a_recording_replays_to_the_same_spots_on_every_run() {
 
     // With the spot servers up (the epoch and spot ids come from the
     // recording), the original and the copy replay identically, run after
-    // run.
+    // run. MAN-570: port 0 on every listener; the daemon reports the
+    // ports it really bound in its `listening:` banner.
     let served = |p: &Path| {
-        let [telnet, json, metrics] = free_ports();
         let cfg = dir.path().join("server.toml");
         std::fs::write(
             &cfg,
-            format!(
-                "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
-                 telnet_port = {telnet}\njson_port = {json}\nmetrics_port = {metrics}\n"
-            ),
+            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+             telnet_port = 0\njson_port = 0\nmetrics_port = 0\n",
         )
         .unwrap();
-        run_ok(&[
-            "run".as_ref(),
-            "--config".as_ref(),
-            cfg.as_os_str(),
-            "--source".as_ref(),
-            p.as_os_str(),
-            "--source-iq".as_ref(),
-            "--json".as_ref(),
-        ])
-        .stdout
+        let mut cmd = manta();
+        cmd.args(["run", "--config"])
+            .arg(&cfg)
+            .arg("--source")
+            .arg(p)
+            .args(["--source-iq", "--json"])
+            .stdout(Stdio::piped());
+        let mut daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(60));
+        let stdout = daemon.child().stdout.take().unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut out).unwrap();
+        let status = daemon.child().wait().unwrap();
+        assert!(
+            status.success(),
+            "manta run --config {:?} failed: {}",
+            cfg,
+            daemon.stderr_so_far()
+        );
+        out
     };
     let first_served = served(&rec);
     assert!(String::from_utf8_lossy(&first_served).contains("W1AW"));

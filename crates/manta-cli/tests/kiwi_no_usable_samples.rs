@@ -4,6 +4,8 @@
 //! reason. Runs at production durations (about 35 to 40 s): no test knob
 //! reaches the window from outside the process.
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -89,42 +91,50 @@ fn a_kiwi_sending_only_unknown_tags_is_reconnected_with_reason_no_usable_samples
         std::thread::spawn(move || serve_unknown_tags(&listener, &done, &accepted))
     };
 
-    let [telnet, json, metrics] = common::free_ports::<3>();
+    // MAN-570: port 0 on every listener; the daemon reports the ports it
+    // really bound in its `listening:` banner, so no released port number
+    // is handed on for another process to claim first.
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(
         &cfg,
-        format!(
-            "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
-             metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = {telnet}\njson_port = {json}\n\
-             metrics_port = {metrics}\n"
-        ),
+        "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\n\
+         metrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\n\
+         metrics_port = 0\n",
     )
     .unwrap();
-    let mut command = common::manta();
-    let mut child = command
-        .env("RUST_LOG", "info")
-        .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
+    let mut cmd = common::manta();
+    // No `RUST_LOG` here: the launcher pins the child's filter so the
+    // banner it waits for always passes it.
+    cmd.args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())
         .args(["--kiwi-freq-hz", "14025000", "--config"])
         .arg(&cfg)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stderr = common::line_channel(child.stderr.take().unwrap());
-    let child = common::KillOnDrop(child);
+        .stdout(Stdio::null());
+    let child = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+    let metrics = child.ports.metrics;
     let started = Instant::now();
 
-    common::expect_line(&stderr, &["manta: listening;"], Duration::from_secs(30));
+    child.next_line_containing(&["manta: listening;"], Duration::from_secs(30));
     let listening = Instant::now();
 
     // 1. The window, not something earlier, ended the connection.
-    let (lost, before) = common::expect_line_all(
-        &stderr,
+    let lost = child.next_line_containing(
         &["source kiwi lost:", "no usable samples"],
         WAIT.saturating_sub(started.elapsed()),
     );
+    // Keep every line before THE matching loss -- an earlier loss with a
+    // different reason must land in `before` and fail the assertion
+    // below, not end the window early and hide itself (round 2: the
+    // slice stopped at a loss of any reason).
+    let is_expected_loss =
+        |line: &str| line.contains("source kiwi lost:") && line.contains("no usable samples");
+    let before: Vec<String> = child
+        .stderr_lines_so_far()
+        .into_iter()
+        .map(|(_, line)| line)
+        .take_while(|line| !is_expected_loss(line))
+        .collect();
     let after = listening.elapsed();
     assert!(
         after >= Duration::from_secs(28),
