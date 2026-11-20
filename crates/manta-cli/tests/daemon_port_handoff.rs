@@ -6,8 +6,11 @@
 //! released port number is ever handed on for the daemon to bind.
 
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
-use common::{manta, spawn_daemon_reporting_ports, DaemonHandle};
+use common::manta;
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

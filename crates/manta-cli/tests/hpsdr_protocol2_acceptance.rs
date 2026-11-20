@@ -9,9 +9,12 @@
 //! datagrams from `base+11`, paced at real time. A real `manta` child
 //! is pointed at `--hpsdr-port <base>`, with no `--hpsdr-protocol`.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-use launch::{manta, spawn_daemon_reporting_ports};
+use daemon::spawn_daemon_reporting_ports;
+use launch::manta;
 
 use manta_input::IqSource;
 use num_complex::Complex32;
