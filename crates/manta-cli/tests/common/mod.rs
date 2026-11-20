@@ -4,8 +4,9 @@
 //! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
 //! MAN-252), and a fake metrics listener (`health_command.rs` and
 //! `status_command.rs`, MAN-285). The `manta()` launcher, its `MANTA_*`
-//! scrub and `free_ports()` live in the `std`-only leaf `launch.rs`
-//! (MAN-549), re-exported here. The V8/V8w/VC3 pileup fixture and gates
+//! scrub and MAN-570's banner-discovery daemon launcher
+//! (`spawn_daemon_reporting_ports`) live in the `std`-only leaf
+//! `launch.rs`, re-exported here. The V8/V8w/VC3 pileup fixture and gates
 //! (`golden_v8.rs`, `golden_v8w.rs`, `golden_vc3.rs`, MAN-521) live in
 //! `pileup.rs`.
 // Each test binary compiles this module separately and uses only part of it.
@@ -23,11 +24,15 @@ pub mod ipfix;
 pub mod wsjtx;
 
 /// MAN-549: the shared launcher and port reservation, a `std`-only leaf
-/// that roots without `mod common;` include by path.
+/// that roots without `mod common;` include by path. MAN-570: also the
+/// banner-discovery daemon launcher (`spawn_daemon_reporting_ports`).
 mod launch;
 // Unused in the roots that include `common` for its other helpers only.
 #[allow(unused_imports)]
-pub use launch::{free_ports, manta, without_manta_env};
+pub use launch::{
+    manta, spawn_daemon_reporting_ports, unreachable_target_ports, without_manta_env, DaemonHandle,
+    ReportedPorts, UnreachableTarget,
+};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};

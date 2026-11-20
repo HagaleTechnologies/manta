@@ -14,26 +14,13 @@
 
 #[path = "common/launch.rs"]
 mod launch;
-use launch::free_ports;
+use launch::{manta, spawn_daemon_reporting_ports, unreachable_target_ports};
 
 use manta_testkit::scene::{render_scene, SignalSpec};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
-
-/// Kills and reaps the daemon child process on drop, including on a
-/// failing assertion, so a failing assert never leaks a `manta` process
-/// into the CI runner.
-struct ChildGuard(Child);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// `GET <path>` over a raw TCP connection, generalized from
 /// `hpsdr_metrics_acceptance.rs`'s `scrape_metrics` to cover `/healthz` too.
@@ -116,7 +103,17 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
     let wav_path = tmp.path().join("cw48k.wav");
     write_cw_fixture(&wav_path);
 
-    let [telnet_port, json_port, metrics_port, uplink1_port, uplink2_port] = free_ports();
+    // MAN-570: the daemon trio binds port 0 and reports the ports it got.
+    // MAN-570 round 2: the two uplink targets are connect targets that
+    // must stay unreachable, and a merely released `free_ports()` number
+    // can be re-dealt by the kernel to this daemon's own port-0 bind --
+    // observed as its telnet listener answering the dial and
+    // `manta_uplink_target_connected` reporting 1. Each target port is
+    // pinned bound with no listener, so it is never claimed and never
+    // answers. The guards outlive the daemon (declared before, dropped
+    // after it).
+    let [uplink1, uplink2] = unreachable_target_ports();
+    let (uplink1_port, uplink2_port) = (uplink1.port, uplink2.port);
 
     let mut cfg_file = tempfile::NamedTempFile::new().unwrap();
     write!(
@@ -125,9 +122,9 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
         [server]
         station_callsign = "W1AW"
         bind_addr = "127.0.0.1"
-        telnet_port = {telnet_port}
-        json_port = {json_port}
-        metrics_port = {metrics_port}
+        telnet_port = 0
+        json_port = 0
+        metrics_port = 0
 
         [[rbn_uplink]]
         enabled = true
@@ -143,20 +140,17 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
     .unwrap();
     cfg_file.flush().unwrap();
 
-    let stderr_path = tmp.path().join("manta.stderr.log");
-    let child = Command::new(env!("CARGO_BIN_EXE_manta"))
-        .arg("run")
+    let mut cmd = manta();
+    cmd.arg("run")
         .arg("--source")
         .arg(&wav_path)
         .arg("--dial-freq-hz")
         .arg("14025000")
         .arg("--config")
         .arg(cfg_file.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(File::create(&stderr_path).unwrap()))
-        .spawn()
-        .expect("spawn manta run child process");
-    let _child_guard = ChildGuard(child);
+        .stdout(Stdio::null());
+    let _daemon = spawn_daemon_reporting_ports(cmd, Duration::from_secs(20));
+    let metrics_port = _daemon.ports.metrics;
 
     let spot_metric = r#"manta_spots_by_band_total{band="20m",type="cq"}"#;
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -170,10 +164,10 @@ fn node_health_is_observable_from_metrics_and_healthz_alone() {
             }
         }
         if Instant::now() >= deadline {
-            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
             panic!(
                 "no 20m CQ spot became visible within 20s; last scrape:\n{last_metrics_body}\n\
-                 child stderr:\n{stderr}"
+                 child stderr:\n{}",
+                _daemon.stderr_so_far()
             );
         }
         std::thread::sleep(Duration::from_millis(100));

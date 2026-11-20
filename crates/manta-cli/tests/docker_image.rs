@@ -7,6 +7,9 @@
 //! docs/DECISIONS/2026-10-11-man81-docker-config-mount-and-healthcheck.md.
 
 mod common;
+#[cfg(unix)]
+#[path = "../src/test_ports.rs"]
+mod test_ports;
 
 use std::path::{Path, PathBuf};
 
@@ -801,11 +804,7 @@ fn bare_start_runs_the_mounted_config_and_its_health_check_tracks_it() {
 
     // The shipped example, edited the way packaging/README.md says, plus a
     // file source and a TOML-set metrics port a fixed-port probe would miss.
-    let metrics_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let metrics_port = test_ports::free_port();
     let mut text = doc("manta.example.toml");
     let station = "\nstation_callsign = \"N0CALL\"\n";
     assert_eq!(text.matches(station).count(), 1);
