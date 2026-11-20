@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize Windows CI evidence without changing the job verdict."""
+"""Summarize CI evidence without changing the job verdict."""
 import argparse
 import json
 import os
@@ -222,7 +222,9 @@ def render(os_name, evidence, shard=None, expect_shards=None, needs=None):
         for name, item in needs.items():
             if item.get('result') != 'success':
                 other.append(f'{name}: {item.get("result", "missing")}')
-    title = f'### Windows ({os_name}): '
+    platform = {'ubuntu-latest': 'Linux (ubuntu-latest)', 'macos-latest': 'macOS (macos-latest)',
+                'windows-latest': 'Windows (windows-latest)'}.get(os_name, os_name)
+    title = f'### {platform}: '
     if not rows and not other:
         return title + f'no failures ({len(seen)} shards, {binaries} binaries)\n'
     lines = [title + f'{len(rows)} failing tests, {len(other)} other failures', '', '| Shard | Binary | Test | Class | Matched by |', '|---|---|---|---|---|']

@@ -8,9 +8,9 @@
 #   bash scripts/pre-push.sh --list   print the full gate's commands for this host; run nothing
 #
 # Order: the support job's steps, then `cargo test --workspace --locked` last. CI
-# runs the workspace tests in its separate *-shards jobs and the doctests as
-# `cargo test --workspace --doc --locked`; one local `cargo test --workspace`
-# covers both, and running it last puts the slowest step after the quick ones.
+# runs workspace tests in *-shards and a separate `--no-fail-fast` doctest pass
+# in *-support. One final local `cargo test --workspace --locked` covers both
+# without a second local doctest run; it follows the quicker checks.
 # On macOS the three suites CI runs only on Linux (ci_gates, decisions_index,
 # verify_dependabot_diff_safe) are skipped. scripts/tests/test_ci_gates.py
 # (PrePushScriptTests) fails when this list and ci-full.yml or CLAUDE.md drift.
