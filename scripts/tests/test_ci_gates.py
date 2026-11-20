@@ -1284,7 +1284,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             self.assertIn('shard: [0, 1, 2, 3, 4, 5, 6, 7]', '\n'.join(shards))
             self.assertIn('fail-fast: false', '\n'.join(shards))
             self.assertNotIn('max-parallel', '\n'.join(shards))
-            self.assertEqual(wf.field(shards, 'timeout-minutes'), '50')  # MAN-523: room for ten repeats
+            self.assertEqual(wf.field(shards, 'timeout-minutes'), '90')  # MAN-523/568: room for ten repeats, whole helper-wide targets included
             self.assertEqual(wf.field(shards, 'needs'), f'{platform}-build')
             self.assertTrue(any('scripts/ci-shards.py --count 8' in (wf.run_body(s) or '')
                                 and '--from-bundle' in (wf.run_body(s) or '') for s in wf.steps(shards)))
