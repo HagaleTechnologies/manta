@@ -1,9 +1,9 @@
-//! MAN-549: the one `manta` launcher and the one port reservation the
+//! MAN-549: the one `manta` launcher and port handoff helpers the
 //! integration tests share. A leaf that needs only `std`: a root that wants
 //! nothing else from `common` includes it alone with
 //! `#[path = "common/launch.rs"] mod launch;`, and so does not link what the
 //! rest of `common` pulls in (`manta_input`, `regex`, `tungstenite`).
-//! `common/mod.rs` re-exports all three functions for the roots that
+//! `common/mod.rs` re-exports these functions for the roots that
 //! already say `mod common;`.
 // Each test binary compiles this file separately and uses only part of it.
 #![allow(dead_code)]
@@ -35,23 +35,6 @@ pub fn without_manta_env(mut cmd: Command) -> Command {
     cmd
 }
 
-/// `N` distinct loopback TCP ports nothing listens on right now. All `N`
-/// listeners are held until every port is read: releasing each before
-/// binding the next lets the OS hand the same port out twice (Windows
-/// does, and then the config is rejected as "two servers cannot share a
-/// port", MAN-371). MAN-570: the ports are free only until this returns,
-/// so they are for numbers nobody must claim or dial back, never for a
-/// bind the daemon performs -- a daemon gets `*_port = 0` and reports
-/// what it bound via [`spawn_daemon_reporting_ports`] -- and never for a
-/// connect target the daemon dials: the kernel can re-deal a released
-/// number to that very daemon's port-0 bind, so a target that must stay
-/// unreachable takes [`unreachable_target_ports`] instead.
-/// `doctor_checks.rs` keeps its own band allocator (MAN-333, MAN-410).
-pub fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
-}
-
 /// A loopback port that stays dialable-but-unreachable, and unclaimable,
 /// until this guard is dropped (MAN-570 round 2). The port is pinned by
 /// one side of a connected socket pair: an established socket keeps the
@@ -66,9 +49,8 @@ pub struct UnreachableTarget {
 }
 
 /// `N` loopback ports a daemon dials but never reaches, and no other
-/// process can claim either. [`free_ports`] releases its numbers, and a
-/// released number is exactly what the allocator loves to re-deal to a
-/// port-0 bind (observed on loopback: the daemon's own telnet listener
+/// process can claim either. The allocator can re-deal a released ephemeral
+/// number to a port-0 bind (observed on loopback: the daemon's own telnet listener
 /// answered its uplink dial).
 pub fn unreachable_target_ports<const N: usize>() -> [UnreachableTarget; N] {
     std::array::from_fn(|_| {

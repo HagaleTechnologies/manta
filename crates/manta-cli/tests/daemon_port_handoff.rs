@@ -8,10 +8,12 @@
 mod common;
 
 use common::{manta, spawn_daemon_reporting_ports, DaemonHandle};
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::Duration;
 
 /// A short, quiet 48 kHz mono WAV: enough input for the daemon to open
@@ -78,44 +80,68 @@ fn two_simultaneous_daemons_get_distinct_reported_ports() {
     let (a_dir, b_dir) = (dir.path().join("a"), dir.path().join("b"));
     std::fs::create_dir(&a_dir).unwrap();
     std::fs::create_dir(&b_dir).unwrap();
-    // Genuinely concurrent: each spawn blocks until its own daemon's
-    // banner lands, so both daemons bind while the other is starting.
-    let a = {
-        let (dir, wav) = (a_dir, wav.clone());
-        std::thread::spawn(move || spawn_daemon(&dir, &wav, "a"))
-    };
-    let b = {
-        let (dir, wav) = (b_dir, wav.clone());
-        std::thread::spawn(move || spawn_daemon(&dir, &wav, "b"))
-    };
-    let (a, b) = (
-        a.join().expect("daemon a spawned"),
-        b.join().expect("daemon b spawned"),
-    );
+    std::thread::scope(|scope| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let churn = scope.spawn(move || {
+            let mut first = true;
+            while matches!(stop_rx.try_recv(), Err(mpsc::TryRecvError::Empty)) {
+                let client = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(1);
+                loop {
+                    match listener.accept() {
+                        Ok((server, _)) => {
+                            drop(server);
+                            break;
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(e) => panic!("churn accept failed: {e}"),
+                    }
+                }
+                drop(client);
+                if first {
+                    ready_tx.send(()).unwrap();
+                    first = false;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let a = scope.spawn(|| spawn_daemon(&a_dir, &wav, "a"));
+        let b = scope.spawn(|| spawn_daemon(&b_dir, &wav, "b"));
+        let a = a.join().expect("daemon a spawned");
+        let b = b.join().expect("daemon b spawned");
+        drop(stop_tx);
+        churn.join().expect("loopback churn completed");
+        check_daemons(&a, &b);
+    });
+}
 
+fn check_daemons(a: &DaemonHandle, b: &DaemonHandle) {
     let a_ports = (a.ports.telnet, a.ports.json, a.ports.metrics);
     let b_ports = (b.ports.telnet, b.ports.json, b.ports.metrics);
-    // Distinct per listener, not merely as a triple: equal metrics ports
-    // with one other port differing would pass a triple comparison and
-    // both scrapes below could hit the same daemon (the round-2 proof
-    // gap).
-    assert_ne!(
-        a.ports.metrics, b.ports.metrics,
-        "the daemons share a metrics listener"
+    let ports = [
+        a_ports.0, a_ports.1, a_ports.2, b_ports.0, b_ports.1, b_ports.2,
+    ];
+    assert!(
+        ports.iter().all(|port| *port != 0),
+        "zero listener: {ports:?}"
     );
-    assert_ne!(
-        a.ports.telnet, b.ports.telnet,
-        "the daemons share a telnet listener"
+    assert_eq!(
+        ports.into_iter().collect::<HashSet<_>>().len(),
+        6,
+        "duplicate listener: {ports:?}"
     );
-    assert_ne!(
-        a.ports.json, b.ports.json,
-        "the daemons share a JSON listener"
-    );
-    for (name, ports) in [("a", a_ports), ("b", b_ports)] {
-        assert!(
-            ports.0 != 0 && ports.1 != 0 && ports.2 != 0,
-            "{name}: {ports:?}"
-        );
+    for port in [a.ports.telnet, a.ports.json, b.ports.telnet, b.ports.json] {
+        TcpStream::connect(("127.0.0.1", port)).unwrap();
     }
 
     // Both metrics endpoints serve, on the ports each banner reported.

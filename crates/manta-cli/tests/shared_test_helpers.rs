@@ -1,5 +1,5 @@
 //! MAN-549: the integration tests share one `MANTA_*` scrub and one port
-//! reservation (`common/launch.rs`), and the golden tests share one
+//! launcher (`common/launch.rs`), and the golden tests share one
 //! `word_boundary_fraction` (`manta_testkit::cer`). A new test copies
 //! whichever variant it finds, so these source scans keep one to find.
 
@@ -41,7 +41,7 @@ fn sources() -> Vec<(String, String)> {
 /// limit; the follow-up deletes each copy (include `common/launch.rs` by
 /// `#[path]` and `use launch::manta;`) and empties this list. Never add to
 /// it.
-const PENDING_LAUNCHER_COPIES: [&str; 18] = [
+const PENDING_LAUNCHER_COPIES: [&str; 17] = [
     "build_identity.rs",
     "cli.rs",
     "cli_json_consumers.rs",
@@ -51,7 +51,6 @@ const PENDING_LAUNCHER_COPIES: [&str; 18] = [
     "decode_sidecar.rs",
     "ftx_acceptance.rs",
     "grade_cmd.rs",
-    "hpsdr_discovery.rs",
     "iq_correction.rs",
     "live_audio_errors.rs",
     "live_state_acceptance.rs",
@@ -89,15 +88,12 @@ fn only_common_launch_scrubs_manta_variables() {
 }
 
 #[test]
-fn only_common_launch_and_doctor_checks_define_free_ports() {
+fn only_doctor_checks_defines_free_ports() {
     // doctor_checks.rs keeps its private port band (MAN-333, MAN-410).
-    let found = offenders(
-        &["fn free_ports"],
-        &["common/launch.rs", "doctor_checks.rs"],
-    );
+    let found = offenders(&["fn free_ports"], &["doctor_checks.rs"]);
     assert!(
         found.is_empty(),
-        "use common/launch.rs's `free_ports()`: {found:?}"
+        "only doctor_checks.rs may define `free_ports()`: {found:?}"
     );
 }
 
@@ -160,7 +156,11 @@ fn pending_launcher_copies_are_still_copies() {
 /// MAN-523 (after MAN-410 and MAN-508): the shapes that bind an ephemeral
 /// port, release it and hand its number on for later use. A sibling test
 /// can bind the freed number first. Compared with all whitespace removed.
-const RELEASED_EPHEMERAL_PORT: [&str; 4] = [
+const RELEASED_EPHEMERAL_PORT: [&str; 6] = [
+    // The metrics listener is released before a configured daemon binds it.
+    "letmetrics=held.local_addr().unwrap().port();let(_file,mutcommand)=configured_command(radio.port,flags,mac,metrics);drop(held);",
+    // Three listeners collected into an array and then released.
+    "letports=held.each_ref().map(|listener|listener.local_addr().unwrap().port());drop(held);",
     // The listener is a temporary, dropped at the end of the statement.
     "TcpListener::bind(\"127.0.0.1:0\").unwrap().local_addr()",
     "UdpSocket::bind(\"127.0.0.1:0\").unwrap().local_addr()",
@@ -173,10 +173,9 @@ const RELEASED_EPHEMERAL_PORT: [&str; 4] = [
 /// Sources that still release an ephemeral port: test-only UDP and TCP
 /// ports whose collision MAN-523 has not seen. Never add to it; a file
 /// that stops matching must leave it.
-const PENDING_RELEASED_PORTS: [&str; 5] = [
+const PENDING_RELEASED_PORTS: [&str; 4] = [
     "cli.rs",
     "common/ka9q.rs",
-    "docker_image.rs",
     "multi_input_ka9q.rs",
     "n1mm_spectrum.rs",
 ];
@@ -219,10 +218,18 @@ fn the_released_port_shapes_match_the_copies_man523_removed() {
     for copy in removed {
         assert!(releases_an_ephemeral_port(copy), "missed:\n{copy}");
     }
+    let extra = [
+        "let metrics = held.local_addr().unwrap().port(); let (_file, mut command) = configured_command(radio.port, flags, mac, metrics); drop(held);",
+        "let ports = held.each_ref().map(|listener| listener.local_addr().unwrap().port()); drop(held);",
+    ];
+    for shape in extra {
+        assert!(releases_an_ephemeral_port(shape), "missed:\n{shape}");
+    }
     let held = [
         // A listener kept alive by the caller.
         "let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n\
          let port = listener.local_addr().unwrap().port();\n",
+        "let metrics = held.local_addr().unwrap().port(); let _live = &held;",
         // The claimed band.
         "let port = crate::test_ports::free_port();\n",
     ];
@@ -262,5 +269,14 @@ fn pending_released_ports_still_release_one() {
     assert!(
         stale.is_empty(),
         "remove from PENDING_RELEASED_PORTS, they no longer release a port: {stale:?}"
+    );
+}
+
+#[test]
+fn only_common_launch_defines_spawn_daemon_reporting_ports() {
+    let found = offenders(&["fn spawn_daemon_reporting_ports"], &["common/launch.rs"]);
+    assert!(
+        found.is_empty(),
+        "use common/launch.rs's daemon launcher: {found:?}"
     );
 }

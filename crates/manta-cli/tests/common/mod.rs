@@ -4,7 +4,7 @@
 //! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
 //! MAN-252), and a fake metrics listener (`health_command.rs` and
 //! `status_command.rs`, MAN-285). The `manta()` launcher, its `MANTA_*`
-//! scrub, `free_ports()` and MAN-570's banner-discovery daemon launcher
+//! scrub and MAN-570's banner-discovery daemon launcher
 //! (`spawn_daemon_reporting_ports`) live in the `std`-only leaf
 //! `launch.rs`, re-exported here. The V8/V8w/VC3 pileup fixture and gates
 //! (`golden_v8.rs`, `golden_v8w.rs`, `golden_vc3.rs`, MAN-521) live in
@@ -30,8 +30,8 @@ mod launch;
 // Unused in the roots that include `common` for its other helpers only.
 #[allow(unused_imports)]
 pub use launch::{
-    free_ports, manta, spawn_daemon_reporting_ports, unreachable_target_ports, without_manta_env,
-    DaemonHandle, ReportedPorts, UnreachableTarget,
+    manta, spawn_daemon_reporting_ports, unreachable_target_ports, without_manta_env, DaemonHandle,
+    ReportedPorts, UnreachableTarget,
 };
 
 use std::io::{BufRead, BufReader, Read, Write};
