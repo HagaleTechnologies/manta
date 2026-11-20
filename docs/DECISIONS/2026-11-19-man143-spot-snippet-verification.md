@@ -89,12 +89,18 @@ These are read from the code, not observed at runtime.
   (`WORD_WINDOW`), and the spot path works out the input with
   `input_of(track_id)` just before it builds the `Spot`. The emitted
   spot keeps neither the span nor the input. The MAN-207 observation
-  draft (`observation_draft` in the same file) is the only output that
-  carries the span out of the validator, as a `SampleSpan` from the
-  word's first character
-  to its word boundary (`crates/manta-spot/src/observation.rs`), with
-  the input identity and the observation epoch; it runs only under
-  `manta decode --observations`, never `manta run`.
+  draft (`observation_draft` in the same file)
+  includes the input identity and observation epoch. While the word is
+  in the track's window, the draft puts its timestamps into a
+  `SampleSpan` from the word's first character to its word boundary.
+  The CLI writes observation records only with `manta decode --observations`.
+  The MAN-208 refinement scheduler also queries the validator each
+  batch. `refine_candidates` returns qualifying retained words'
+  `(start_ts, end_ts)` as `RefineCandidate.span`, which the scheduler
+  uses to select replay ranges from retained decoder inputs
+  (`crates/manta-engine/src/refine.rs`). Refinement runs by default in
+  live single- and multi-input `manta run` and offline `manta decode`.
+  The setting `[decode.refine] enabled = false` disables it.
 - The live engine reads into one reused chunk buffer
   (`crates/manta-engine/src/listen.rs`, the read loop in
   `listen_with_observers`). Apart from MAN-309's opt-in session recording
