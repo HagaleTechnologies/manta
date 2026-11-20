@@ -35,12 +35,11 @@ pub fn without_manta_env(mut cmd: Command) -> Command {
     cmd
 }
 
-/// A loopback port that stays dialable-but-unreachable, and unclaimable,
-/// until this guard is dropped (MAN-570 round 2). The port is pinned by
-/// one side of a connected socket pair: an established socket keeps the
-/// port bound -- so the kernel's port-0 allocator can never hand it to
-/// the daemon the test points at it -- while the listener that produced
-/// it is gone, so every connect is refused.
+/// A loopback connect target held by a connected socket pair (MAN-570).
+/// The connected socket keeps the port out of automatic port-zero
+/// allocation. Dropping the original listener leaves no socket accepting
+/// new connections. An explicit bind with address reuse can take the port
+/// on Linux.
 pub struct UnreachableTarget {
     /// The pinned port, for the daemon's connect-target config.
     pub port: u16,
@@ -48,10 +47,9 @@ pub struct UnreachableTarget {
     _accepted: TcpStream,
 }
 
-/// `N` loopback ports a daemon dials but never reaches, and no other
-/// process can claim either. The allocator can re-deal a released ephemeral
-/// number to a port-0 bind (observed on loopback: the daemon's own telnet listener
-/// answered its uplink dial).
+/// Holds `N` loopback connect targets out of automatic port-zero allocation.
+/// Without a guard, the daemon's own telnet listener can receive the released
+/// port and answer its uplink dial.
 pub fn unreachable_target_ports<const N: usize>() -> [UnreachableTarget; N] {
     std::array::from_fn(|_| {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -234,6 +232,23 @@ impl DaemonHandle {
             .map(|(_, l)| l.as_str())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// After the child exits, waits up to `timeout` for the collector to
+    /// finish draining stderr, then returns its final snapshot.
+    pub fn stderr_after_eof(&self, timeout: Duration) -> String {
+        let (state, _) = self
+            .log
+            .changed
+            .wait_timeout_while(self.log.lock_state(), timeout, |state| !state.eof)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.eof,
+            "stderr collector did not finish within {timeout:?}; {}",
+            self.log.dump_state(&state)
+        );
+        drop(state);
+        self.stderr_so_far()
     }
 
     /// Every stderr line so far with the time it arrived, for ordering

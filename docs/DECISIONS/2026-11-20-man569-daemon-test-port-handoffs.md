@@ -23,27 +23,27 @@ test's code:
   `two_radios_require_a_choice_and_mac_pinning_streams_from_flags_and_config`,
   run 42912967540 (Ubuntu shard 7): `metrics_port = 45903`.
 
-Each took its ports from `launch::free_ports()`, which bound ephemeral
-listeners, read their numbers and dropped them before returning; the child
-daemon bound later, and any sibling socket could take the number in between.
-`hpsdr_discovery.rs` and `docker_image.rs` had the same shape inline. The
-`multi_input_hpsdr.rs` outage failures are not this: MAN-523 D1 records a
-separate START-ordering race there, and this ticket does not touch them.
+The bad-sample and QRZ tests used `launch::free_ports()`, which bound
+ephemeral listeners, read their numbers and dropped them before returning.
+`hpsdr_discovery.rs` and `docker_image.rs` did this inline. A sibling
+socket could take the number before the child daemon bound it.
+MAN-523 D1 documents a separate START-ordering race. The cause of the cited
+`multi_input_hpsdr.rs` outage failures remains unknown.
 
 ## Decisions
 
 ### D1. Daemon listeners bind port zero; the test reads what the daemon reports
 
-Every fixture that starts a `manta` daemon writes `telnet_port = 0`,
-`json_port = 0` and `metrics_port = 0` and launches through
-`spawn_daemon_reporting_ports` (`crates/manta-cli/tests/common/launch.rs`),
-which reads the bound addresses from the daemon's `listening:` banner. The
-kernel chooses and the daemon holds each port in the same bind, so there is no
-interval where a number exists unowned. The launcher pins the child's
-`RUST_LOG` to `info` (the banner is an INFO record), drains stderr to EOF on a
-thread and keeps every line for failure diagnostics, and kills and reaps the
-child on drop. Fixtures keep their separate readiness waits:
-`listening:` is not pipeline readiness.
+The fixtures migrated to port zero write `telnet_port = 0`,
+`json_port = 0` and `metrics_port = 0`. They use
+`spawn_daemon_reporting_ports` (`crates/manta-cli/tests/common/launch.rs`)
+to read the bound addresses from the daemon's `listening:` banner. The
+kernel assigns each port in the same operation that binds it. Docker and
+existing claimed-band callers keep their concrete-port configuration.
+The launcher pins the child's `RUST_LOG` to `info` for the bind banner,
+collects stderr on a thread, and kills and reaps the child on drop.
+Fixtures such as Kiwi and multi-radio Protocol 2 wait for the later
+pipeline readiness message before starting their streams.
 
 ### D2. A concrete port a config shares between two commands comes from the claimed band
 
@@ -69,9 +69,9 @@ the Docker temporary listener), with Docker off the pending list.
 ### D4. Uplink targets that must stay unreachable pin their ports
 
 `node_health_acceptance.rs`'s two disconnected-uplink destinations come from
-`unreachable_target_ports`: a connected socket pair holds each port bound with
-no listener, so connects are refused and the kernel cannot re-deal the number
-to the daemon's own port-0 bind.
+`unreachable_target_ports`. After the listener closes, a connected socket pair
+keeps its port out of automatic port-zero allocation. An explicit bind with
+address reuse can still take that port on Linux.
 
 ## Verification
 
@@ -98,10 +98,14 @@ All in this Linux container, on the candidate tree:
 - The migrated binaries named in the ticket's verification suite passed on
   Linux, including `RUST_LOG=warn` around the MAN-234 daemon (the launcher
   re-pins the child's filter).
+- With a delayed stderr reader, the bad-sample and multi-input hearing tests
+  failed before the repair and passed with the warning and EOF waits. With
+  the multi-radio Protocol 2 readiness message delayed, the first sample
+  datagram followed that message after the repair. The six-listener test
+  passed five more runs with a timeout on each endpoint connection.
 - The source audit `rg 'free_ports|TcpListener::bind|...'` over
   `crates/manta-cli/tests` leaves only held listeners, the claimed band, the
   pending MAN-523 list and `doctor_checks.rs`.
 
 macOS and the Ubuntu shards are unverified here; the required checks run on
-the pull request. The `multi_input_hpsdr.rs` outage remains MAN-523 D1's open
-question.
+the pull request.

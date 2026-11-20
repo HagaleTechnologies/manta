@@ -54,9 +54,14 @@ fn spawn_daemon(dir: &Path, wav: &Path, name: &str) -> DaemonHandle {
     spawn_daemon_reporting_ports(cmd, Duration::from_secs(30))
 }
 
+fn connect_to_daemon(port: u16) -> TcpStream {
+    TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(10))
+        .unwrap_or_else(|err| panic!("connect to daemon on port {port}: {err}"))
+}
+
 /// The body of a `GET /metrics` on `port`.
 fn scrape_metrics(port: u16) -> String {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut stream = connect_to_daemon(port);
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -141,7 +146,7 @@ fn check_daemons(a: &DaemonHandle, b: &DaemonHandle) {
         "duplicate listener: {ports:?}"
     );
     for port in [a.ports.telnet, a.ports.json, b.ports.telnet, b.ports.json] {
-        TcpStream::connect(("127.0.0.1", port)).unwrap();
+        connect_to_daemon(port);
     }
 
     // Both metrics endpoints serve, on the ports each banner reported.

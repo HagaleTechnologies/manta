@@ -853,6 +853,7 @@ fn lone_protocol2_radios_in_a_multi_input_run_are_discovered_and_stream() {
         }
     });
     let stderr_now = || daemon.stderr_so_far();
+    daemon.next_line_containing(&["manta: listening on 2 inputs"], Duration::from_secs(30));
     go.store(true, Ordering::SeqCst);
     let spot = spot_rx
         .recv_timeout(Duration::from_secs(60))
