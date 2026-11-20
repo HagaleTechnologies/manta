@@ -1282,6 +1282,31 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                 evidence = json.loads((root/'support-evidence.json').read_text())
                 self.assertEqual({f['crate'] for f in evidence['doctestFailures']}, {'a', 'b'})
 
+    def test_support_record_survives_a_failed_checkout(self):
+        # A failed checkout leaves neither doctest-output.log nor scripts/, and the
+        # upload step is if-no-files-found: error, so the record must still be written.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos', 'windows'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                support = wf.job_block(text, f'{platform}-support')
+                record = next(s for s in wf.steps(support)
+                              if wf.field(s, 'name') == 'Record support and doctest results')
+                bindir = os.path.join(tmp, 'bin')
+                os.mkdir(bindir)
+                for name in ('python', 'python3'):
+                    os.symlink(sys.executable, os.path.join(bindir, name))
+                env = {**os.environ, 'PATH': bindir + os.pathsep + os.environ['PATH'],
+                       'SUPPORT_RESULT': 'failure', 'DOCTEST_RESULT': 'skipped', 'SUPPORT_STARTED': '1',
+                       'GITHUB_RUN_ID': '1', 'RUNNER_OS': platform}
+                subprocess.run(['bash', '-c', wf.run_body(record)], cwd=root, env=env, check=True)
+                evidence = json.loads((root/'support-evidence.json').read_text())
+                self.assertEqual(evidence['conclusion'], 'failure')
+                self.assertEqual(evidence['doctests'], 'skipped')
+                self.assertEqual(evidence['doctestFailures'], [])
+                self.assertEqual(evidence['omittedDoctestFailures'], 0)
+                self.assertEqual(evidence['doctestOutputTail'], '')
+
     def test_failure_summary_is_wired_fail_open(self):
         text = wf.read('ci-full.yml')
         for platform in ('ubuntu', 'macos', 'windows'):
