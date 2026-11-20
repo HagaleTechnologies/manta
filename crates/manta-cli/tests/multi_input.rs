@@ -310,16 +310,11 @@ const HEARING_FAMILIES: [&str; 4] = [
 /// the exact attribution is pinned by the unit tests beside each counter.
 #[test]
 fn multi_input_daemon_publishes_each_inputs_hearing() {
-<<<<<<< HEAD
-    let (dir, a, b) = fixtures();
+    let (a, b) = fixtures();
+    let dir = tempfile::tempdir().unwrap();
     // MAN-570: port 0 on every listener; the ports the daemon really
     // bound come from its `listening:` banner, so no released port number
     // is handed on for another process to claim first.
-=======
-    let (a, b) = fixtures();
-    let dir = tempfile::tempdir().unwrap();
-    let [telnet_port, json_port, metrics_port] = free_ports();
->>>>>>> b486f53b1bec5c85fa4c1ffa4a4605a83bf5fca4
     let config = write_config(
         dir.path(),
         "hearing.toml",
