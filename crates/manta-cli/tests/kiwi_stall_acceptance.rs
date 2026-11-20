@@ -83,52 +83,20 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             std::thread::sleep(Duration::from_millis(25));
         }
     });
-<<<<<<< HEAD
     // MAN-570: the daemon binds port 0 on every listener and reports the
     // assigned ports in its `listening:` banner.
-=======
->>>>>>> 7fa3a5280d229528bb022aee98f2d8fd9c0dc6d9
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("manta.toml");
     std::fs::write(&cfg, "[server]\nstation_callsign = \"W1AW\"\nbind_addr = \"127.0.0.1\"\nmetrics_bind_addr = \"127.0.0.1\"\ntelnet_port = 0\njson_port = 0\nmetrics_port = 0\n[spot]\nallowlist = [\"W1AW\", \"K1ABC\"]\n").unwrap();
     let mut command = common::manta();
-<<<<<<< HEAD
     command
-=======
-    command.env("RUST_LOG", "info");
-    let mut child = command
->>>>>>> 7fa3a5280d229528bb022aee98f2d8fd9c0dc6d9
         .args(["run", "--kiwi-host", "127.0.0.1", "--kiwi-port"])
         .arg(port.to_string())
         .args(["--kiwi-freq-hz", "14025000", "--json", "--config"])
         .arg(cfg)
-<<<<<<< HEAD
         .stdout(Stdio::piped());
     let mut daemon = common::spawn_daemon_reporting_ports(command, Duration::from_secs(30));
     let stdout = daemon.take_stdout().expect("stdout was piped");
-=======
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let child = common::KillOnDrop(child);
-    let (banner_tx, banner) = mpsc::channel();
-    let (ready_tx, ready) = mpsc::channel();
-    let (errors_tx, errors) = mpsc::channel();
-    let err_reader = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if line.contains("listening:") {
-                let _ = banner_tx.send(());
-            }
-            if line.contains("manta: listening;") {
-                let _ = ready_tx.send(line.clone());
-            }
-            let _ = errors_tx.send(line);
-        }
-    });
->>>>>>> 7fa3a5280d229528bb022aee98f2d8fd9c0dc6d9
     let (spot_tx, spots) = mpsc::channel();
     let out_reader = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -139,16 +107,8 @@ fn a_kiwi_held_tail_spots_within_five_seconds_before_same_session_resume() {
             }
         }
     });
-<<<<<<< HEAD
     // Start the timed stream only after the daemon reaches its readiness marker.
     daemon.next_line_containing(&["manta: listening;"], Duration::from_secs(30));
-=======
-    banner.recv_timeout(Duration::from_secs(30)).unwrap();
-    assert!(ready
-        .recv_timeout(Duration::from_secs(30))
-        .unwrap()
-        .contains("manta: listening;"));
->>>>>>> 7fa3a5280d229528bb022aee98f2d8fd9c0dc6d9
     go.send(()).unwrap();
     let mut previous_ts = None;
     for call in ["W1AW", "K1ABC"] {
