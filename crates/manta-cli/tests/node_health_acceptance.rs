@@ -16,12 +16,8 @@
 mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-<<<<<<< HEAD
-use launch::{manta, spawn_daemon_reporting_ports, unreachable_target_ports};
-=======
 use daemon::{spawn_daemon_reporting_ports, unreachable_target_ports};
 use launch::manta;
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::io::{Read, Write};

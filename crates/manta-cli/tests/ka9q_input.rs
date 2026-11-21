@@ -9,14 +9,10 @@
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod common;
-<<<<<<< HEAD
-use common::{manta, spawn_daemon_reporting_ports};
-=======
 #[path = "man570/daemon.rs"]
 mod daemon;
 use common::manta;
 use daemon::spawn_daemon_reporting_ports;
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 use common::ka9q::*;
 

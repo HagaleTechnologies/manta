@@ -18,11 +18,7 @@
 mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
-<<<<<<< HEAD
-use launch::spawn_daemon_reporting_ports;
-=======
 use daemon::spawn_daemon_reporting_ports;
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 use manta_testkit::vectors::{self, VectorSpec};
 use num_complex::Complex32;
@@ -314,28 +310,19 @@ fn metric_value(body: &str, metric_with_labels: &str) -> Option<f64> {
 const BAD_METRIC: &str = r#"manta_input_bad_samples_total{source="file"}"#;
 
 /// Starts `manta run --loop` on `wav` with a `[server]` table, and scrapes
-<<<<<<< HEAD
-/// `/metrics` until `done(value)` holds or 20 s pass. Returns the last
-/// value seen and the child's stderr.
-=======
 /// `/metrics` until `done(value)` holds or 20 s pass. After a successful
 /// scrape, waits for the expected warning if one was given. Returns the
 /// last value seen and the collected stderr.
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 ///
 /// MAN-570: the daemon binds port 0 on every listener and reports what it
 /// got in its `listening:` banner, so no released port number is handed
 /// on for another process to claim first.
-<<<<<<< HEAD
-fn daemon_bad_samples(dir: &Path, wav: &Path, done: impl Fn(f64) -> bool) -> (f64, String) {
-=======
 fn daemon_bad_samples(
     dir: &Path,
     wav: &Path,
     expected_warning: Option<&str>,
     done: impl Fn(f64) -> bool,
 ) -> (f64, String) {
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     let cfg_path = dir.join(format!(
         "{}.toml",
         wav.file_stem().unwrap().to_string_lossy()
@@ -370,13 +357,6 @@ fn daemon_bad_samples(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-<<<<<<< HEAD
-    // Give the first-sample warning line time to arrive on the pipe.
-    std::thread::sleep(Duration::from_millis(200));
-    let stderr = daemon.stderr_so_far();
-    let value = last.unwrap_or_else(|| panic!("{BAD_METRIC} never scraped; stderr:\n{stderr}"));
-    (value, stderr)
-=======
     let value = last.unwrap_or_else(|| {
         panic!(
             "{BAD_METRIC} never scraped; stderr:\n{}",
@@ -387,7 +367,6 @@ fn daemon_bad_samples(
         daemon.next_line_containing(&[warning], Duration::from_secs(10));
     }
     (value, daemon.stderr_so_far())
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 }
 
 #[test]

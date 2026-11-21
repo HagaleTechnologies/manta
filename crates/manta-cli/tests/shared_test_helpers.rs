@@ -125,14 +125,6 @@ fn free_ports_hits(sources: &[(String, String)]) -> Vec<String> {
 }
 
 #[test]
-<<<<<<< HEAD
-fn only_doctor_checks_defines_free_ports() {
-    // doctor_checks.rs keeps its private port band (MAN-333, MAN-410).
-    let found = offenders(&["fn free_ports"], &["doctor_checks.rs"]);
-    assert!(
-        found.is_empty(),
-        "only doctor_checks.rs may define `free_ports()`: {found:?}"
-=======
 fn no_integration_test_uses_released_free_ports() {
     let hits = free_ports_hits(&sources());
     assert!(
@@ -143,7 +135,6 @@ fn no_integration_test_uses_released_free_ports() {
          bound ports from the daemon's `listening:` banner \
          (`spawn_daemon_reporting_ports`), or take a concrete port from the \
          claimed band (`src/test_ports.rs`): {hits:?}"
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     );
 }
 
@@ -369,18 +360,10 @@ fn pending_released_ports_still_release_one() {
 }
 
 #[test]
-<<<<<<< HEAD
-fn only_common_launch_defines_spawn_daemon_reporting_ports() {
-    let found = offenders(&["fn spawn_daemon_reporting_ports"], &["common/launch.rs"]);
-    assert!(
-        found.is_empty(),
-        "use common/launch.rs's daemon launcher: {found:?}"
-=======
 fn only_man570_daemon_defines_spawn_daemon_reporting_ports() {
     let found = offenders(&["fn spawn_daemon_reporting_ports"], &["man570/daemon.rs"]);
     assert!(
         found.is_empty(),
         "use man570/daemon.rs's daemon launcher: {found:?}"
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     );
 }

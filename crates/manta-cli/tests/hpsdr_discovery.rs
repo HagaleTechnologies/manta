@@ -85,18 +85,12 @@ impl Drop for FakeDiscoveryRadio {
     }
 }
 
-<<<<<<< HEAD
-#[path = "common/launch.rs"]
-mod launch;
-use launch::{manta, spawn_daemon_reporting_ports};
-=======
 #[path = "man570/daemon.rs"]
 mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
 use daemon::spawn_daemon_reporting_ports;
 use launch::manta;
->>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 fn configured_command(
     port: u16,
