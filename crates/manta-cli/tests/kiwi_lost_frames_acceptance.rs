@@ -9,6 +9,8 @@
 //! Before MAN-529 the gapped spot came out 12,288 samples (128 ms) early
 //! (measured on `de39a71`).
 mod common;
+#[path = "man570/daemon.rs"]
+mod daemon;
 
 use num_complex::Complex32;
 use std::io::{BufRead, BufReader};
@@ -84,7 +86,11 @@ fn first_spot(samples: Arc<Vec<Complex32>>, skip: &'static [u32]) -> (serde_json
         .args(["--kiwi-freq-hz", "14025000", "--json", "--config"])
         .arg(&cfg)
         .stdout(Stdio::piped());
+<<<<<<< HEAD
     let mut daemon = common::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+=======
+    let mut daemon = daemon::spawn_daemon_reporting_ports(cmd, Duration::from_secs(30));
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     let stdout = daemon.child().stdout.take().unwrap();
     let (spot_tx, spots) = mpsc::channel();
     std::thread::spawn(move || {

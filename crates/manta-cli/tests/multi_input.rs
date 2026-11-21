@@ -4,7 +4,14 @@
 //! File inputs only, so it runs on every platform.
 
 mod common;
+<<<<<<< HEAD
 use common::{manta, spawn_daemon_reporting_ports};
+=======
+#[path = "man570/daemon.rs"]
+mod daemon;
+use common::manta;
+use daemon::spawn_daemon_reporting_ports;
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 use manta_testkit::scene::{render_scene, SignalSpec};
 use std::collections::BTreeMap;
@@ -312,7 +319,13 @@ const HEARING_FAMILIES: [&str; 4] = [
 fn multi_input_daemon_publishes_each_inputs_hearing() {
     let (a, b) = fixtures();
     let dir = tempfile::tempdir().unwrap();
+<<<<<<< HEAD
 
+=======
+    // MAN-570: port 0 on every listener; the ports the daemon really
+    // bound come from its `listening:` banner, so no released port number
+    // is handed on for another process to claim first.
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     let config = write_config(
         dir.path(),
         "hearing.toml",
@@ -352,9 +365,13 @@ fn multi_input_daemon_publishes_each_inputs_hearing() {
         }
         std::thread::sleep(Duration::from_millis(50));
     };
+<<<<<<< HEAD
     // The pipe may still hold the daemon's final lines right after exit.
     std::thread::sleep(Duration::from_millis(200));
     let stderr = daemon.stderr_so_far();
+=======
+    let stderr = daemon.stderr_after_eof(Duration::from_secs(10));
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     assert!(status.success(), "{stderr}");
     let stdout = std::fs::read_to_string(&stdout_path).unwrap();
     let want: BTreeMap<String, usize> = [("JA1ABC", 1), ("W1AW", 1), ("ZL2XYZ", 1)]

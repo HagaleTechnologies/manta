@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+from pathlib import Path
 import shutil
 import re
 import shlex
@@ -59,7 +60,7 @@ class RustdocGateTests(unittest.TestCase):
         doc = next(i for i, s in enumerate(all_steps)
                    if (wf.run_body(s) or "").strip() == "cargo doc --no-deps --workspace --locked")
         tests = next(i for i, s in enumerate(all_steps)
-                     if (wf.run_body(s) or "").strip() == "cargo test --workspace --doc --locked")
+                     if wf.field(s, "id") == "doctests")
         self.assertLess(doc, tests)
 
     def test_this_module_runs_in_the_required_test_job(self):
@@ -1234,43 +1235,130 @@ class MainAlertWatchTests(unittest.TestCase):
 
 
 class ShardedRequiredChecksTests(unittest.TestCase):
-    def test_windows_doctests_run_every_package(self):
+    def test_doctests_run_every_package(self):
         text = wf.read('ci-full.yml')
         for platform in ('ubuntu', 'macos', 'windows'):
             support = wf.job_block(text, f'{platform}-support')
-            command = 'cargo test --workspace --doc --locked' + (' --no-fail-fast' if platform == 'windows' else '')
-            matches = [step for step in wf.steps(support) if
-                       (wf.run_body(step) or '').strip() == command or
-                       (platform == 'windows' and
-                        f'{command} 2>&1 | tee doctest-output.log' in (wf.run_body(step) or ''))]
+            matches = [step for step in wf.steps(support)
+                       if wf.field(step, 'id') == 'doctests']
             self.assertEqual(len(matches), 1)
-            self.assertEqual(wf.field(matches[0], 'id'), 'doctests')
-            if platform == 'windows':
-                self.assertIn('set -o pipefail', wf.run_body(matches[0]))
+            step = matches[0]
+            self.assertEqual(wf.field(step, 'shell'), 'bash')
+            self.assertIsNone(wf.field(step, 'continue-on-error'))
+            if platform != 'windows':
+                self.assertEqual(wf.field(wf.sub(step, 'env'), 'CARGO_TERM_COLOR'), 'never')
+            self.assertIn('set -o pipefail', wf.run_body(step))
+            self.assertIn('cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log', wf.run_body(step))
+            record = next(s for s in wf.steps(support)
+                          if wf.field(s, 'name') == 'Record support and doctest results')
+            for key in ('parse_doctest_failures', 'doctestFailures', 'omittedDoctestFailures', 'doctestOutputTail'):
+                self.assertIn(key, wf.run_body(record))
 
-    def test_windows_failure_summary_is_wired_fail_open(self):
+    def test_unix_doctest_failure_keeps_both_packages(self):
         text = wf.read('ci-full.yml')
-        shards = wf.steps(wf.job_block(text, 'windows-shards'))
-        summary = [step for step in shards if 'scripts/ci-failure-summary.py' in (wf.run_body(step) or '')]
-        self.assertEqual(len(summary), 1)
-        self.assertIn('--shard ${{ matrix.shard }}', wf.run_body(summary[0]))
-        self.assertEqual(wf.field(summary[0], 'if'), 'always()')
-        self.assertEqual(wf.field(summary[0], 'continue-on-error'), 'true')
-        self.assertIsNotNone(wf.field(summary[0], 'timeout-minutes'))
-        aggregate = wf.job_block(text, 'windows-aggregate')
-        steps = wf.steps(aggregate)
-        self.assertIn('length == 3', wf.run_body(steps[0]))
-        self.assertEqual(wf.field(aggregate, 'timeout-minutes'), '10')
-        for step in steps[1:]:
-            self.assertEqual(wf.field(step, 'if'), 'always()')
-            self.assertEqual(wf.field(step, 'continue-on-error'), 'true')
-            self.assertIsNotNone(wf.field(step, 'timeout-minutes'))
-        self.assertIn('--expect-shards 8', wf.run_body(steps[-1]))
-        self.assertIn('persist-credentials: false', '\n'.join(steps[1]))
-        self.assertIn('sparse-checkout-cone-mode: false', '\n'.join(steps[1]))
-        self.assertIn('pattern: shard-windows-latest-*', '\n'.join(aggregate))
-        self.assertIn('name: build-windows-latest', '\n'.join(aggregate))
-        self.assertIn('name: support-windows', '\n'.join(aggregate))
+        for platform in ('ubuntu', 'macos'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/'rust-toolchain.toml').write_text((Path(ROOT)/'rust-toolchain.toml').read_text())
+                (root/'Cargo.toml').write_text('[workspace]\nmembers = ["a", "b"]\nresolver = "2"\n')
+                for crate in ('a', 'b'):
+                    (root/crate/'src').mkdir(parents=True)
+                    (root/crate/'Cargo.toml').write_text(f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n')
+                    (root/crate/'src/lib.rs').write_text(f'/// ```\n/// assert!(false, "{crate} failed");\n/// ```\npub fn marker() {{}}\n')
+                subprocess.run(['cargo', 'generate-lockfile', '--offline'], cwd=root, check=True, capture_output=True)
+                (root/'scripts').mkdir()
+                for name in ('ci-failure-summary.py', 'ci-flake-classes.json'):
+                    shutil.copyfile(Path(ROOT)/'scripts'/name, root/'scripts'/name)
+                support = wf.job_block(text, f'{platform}-support')
+                step = wf.step_by_id(support, 'doctests')
+                env = {**os.environ, 'CARGO_TERM_COLOR': wf.field(wf.sub(step, 'env'), 'CARGO_TERM_COLOR')}
+                proc = subprocess.run(['bash', '-c', wf.run_body(step)], cwd=root, env=env, text=True, capture_output=True)
+                self.assertNotEqual(proc.returncode, 0)
+                for crate in ('a', 'b'):
+                    self.assertIn(f'Doc-tests {crate}', proc.stdout)
+                record = next(s for s in wf.steps(support) if wf.field(s, 'name') == 'Record support and doctest results')
+                env.update(SUPPORT_RESULT='failure', DOCTEST_RESULT='failure', SUPPORT_STARTED='1', GITHUB_RUN_ID='1', RUNNER_OS=platform)
+                subprocess.run(['bash', '-c', wf.run_body(record)], cwd=root, env=env, check=True)
+                evidence = json.loads((root/'support-evidence.json').read_text())
+                self.assertEqual({f['crate'] for f in evidence['doctestFailures']}, {'a', 'b'})
+
+    def test_support_record_survives_a_failed_checkout(self):
+        # A failed checkout leaves neither doctest-output.log nor scripts/, and the
+        # upload step is if-no-files-found: error, so the record must still be written.
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos', 'windows'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                support = wf.job_block(text, f'{platform}-support')
+                record = next(s for s in wf.steps(support)
+                              if wf.field(s, 'name') == 'Record support and doctest results')
+                bindir = os.path.join(tmp, 'bin')
+                os.mkdir(bindir)
+                for name in ('python', 'python3'):
+                    os.symlink(sys.executable, os.path.join(bindir, name))
+                env = {**os.environ, 'PATH': bindir + os.pathsep + os.environ['PATH'],
+                       'SUPPORT_RESULT': 'failure', 'DOCTEST_RESULT': 'skipped', 'SUPPORT_STARTED': '1',
+                       'GITHUB_RUN_ID': '1', 'RUNNER_OS': platform}
+                subprocess.run(['bash', '-c', wf.run_body(record)], cwd=root, env=env, check=True)
+                evidence = json.loads((root/'support-evidence.json').read_text())
+                self.assertEqual(evidence['conclusion'], 'failure')
+                self.assertEqual(evidence['doctests'], 'skipped')
+                self.assertEqual(evidence['doctestFailures'], [])
+                self.assertEqual(evidence['omittedDoctestFailures'], 0)
+                self.assertEqual(evidence['doctestOutputTail'], '')
+
+    def test_failure_summary_is_wired_fail_open(self):
+        text = wf.read('ci-full.yml')
+        for platform in ('ubuntu', 'macos', 'windows'):
+            shards = wf.steps(wf.job_block(text, f'{platform}-shards'))
+            runner = next(s for s in shards if 'ci-shards.py --count 8 --shard' in (wf.run_body(s) or ''))
+            self.assertIsNone(wf.field(runner, 'continue-on-error'))
+            summary = [s for s in shards if 'scripts/ci-failure-summary.py' in (wf.run_body(s) or '')]
+            self.assertEqual(len(summary), 1)
+            self.assertIn('--shard ${{ matrix.shard }}', wf.run_body(summary[0]))
+            self.assertEqual(wf.field(summary[0], 'if'), 'always()')
+            self.assertEqual(wf.field(summary[0], 'continue-on-error'), 'true')
+            if platform != 'windows':
+                self.assertEqual(wf.field(summary[0], 'timeout-minutes'), '1')
+            aggregate = wf.job_block(text, f'{platform}-aggregate')
+            steps = wf.steps(aggregate)
+            self.assertIn('length == 3', wf.run_body(steps[0]))
+            self.assertEqual(wf.field(aggregate, 'timeout-minutes'), '10')
+            for step in steps[1:]:
+                self.assertEqual(wf.field(step, 'if'), 'always()')
+                self.assertEqual(wf.field(step, 'continue-on-error'), 'true')
+                self.assertIsNotNone(wf.field(step, 'timeout-minutes'))
+            self.assertIn('--expect-shards 8', wf.run_body(steps[-1]))
+            self.assertIn('persist-credentials: false', '\n'.join(steps[1]))
+            self.assertIn('sparse-checkout-cone-mode: false', '\n'.join(steps[1]))
+            self.assertIn(f'pattern: shard-{platform}-latest-*', '\n'.join(aggregate))
+            self.assertIn(f'name: build-{platform}-latest', '\n'.join(aggregate))
+            self.assertIn(f'name: support-{platform}', '\n'.join(aggregate))
+
+    def test_unix_summary_steps_render_a_classified_failure(self):
+        text = wf.read('ci-full.yml')
+        record = {'index': 3, 'results': [{'key': 'pkg::test::health_command', 'exitCode': 1,
+                  'failedTests': ['health_escapes_peer_text'], 'failureExcerpts': {'health_escapes_peer_text': 'Address already in use'}}]}
+        for platform in ('ubuntu', 'macos'):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/'scripts').mkdir()
+                for name in ('ci-failure-summary.py', 'ci-flake-classes.json'):
+                    shutil.copyfile(Path(ROOT)/'scripts'/name, root/'scripts'/name)
+                (root/'shard-evidence').mkdir()
+                (root/'shard-evidence'/f'{platform}-latest-3.json').write_text(json.dumps(record))
+                (root/f'{platform}-evidence/shards').mkdir(parents=True)
+                (root/f'{platform}-evidence/shards/3.json').write_text(json.dumps(record))
+                summary = root/'summary.md'
+                env = {**os.environ, 'GITHUB_STEP_SUMMARY': str(summary), 'RESULTS': json.dumps({f'{platform}-shards': {'result': 'failure'}})}
+                for job in (f'{platform}-shards', f'{platform}-aggregate'):
+                    steps = wf.steps(wf.job_block(text, job))
+                    step = next(s for s in steps if 'scripts/ci-failure-summary.py' in (wf.run_body(s) or ''))
+                    body = wf.run_body(step).replace('${{ matrix.os }}', f'{platform}-latest').replace('${{ matrix.shard }}', '3')
+                    subprocess.run(['bash', '-c', body], cwd=root, env=env, check=True)
+                rendered = summary.read_text()
+                self.assertEqual(rendered.count('| 3 | health_command | health_escapes_peer_text | port reuse |'), 2)
+                self.assertEqual(rendered.count(f'{"Linux" if platform == "ubuntu" else "macOS"} ({platform}-latest)'), 2)
 
     def test_unix_graph_is_complete_and_independent(self):
         text = wf.read('ci-full.yml')
@@ -1299,11 +1387,7 @@ class ShardedRequiredChecksTests(unittest.TestCase):
             upload = next(s for s in wf.steps(shards) if 'actions/upload-artifact@' in (wf.field(s, 'uses') or ''))
             self.assertEqual(wf.field(upload, 'if'), 'always()')
             support = wf.job_block(text, f'{platform}-support')
-            doctest_command = 'cargo test --workspace --doc --locked' + (' --no-fail-fast' if platform == 'windows' else '')
-            doctest_steps = [step for step in wf.steps(support) if
-                             (wf.run_body(step) or '').strip() == doctest_command or
-                             (platform == 'windows' and
-                              f'{doctest_command} 2>&1 | tee doctest-output.log' in (wf.run_body(step) or ''))]
+            doctest_steps = [step for step in wf.steps(support) if wf.field(step, 'id') == 'doctests']
             self.assertEqual(len(doctest_steps), 1)
             self.assertEqual(steps_running(support, 'cargo test --workspace --locked'), [])
             self.assertFalse(any('--no-run' in (wf.run_body(s) or '') or 'ci-shards.py' in (wf.run_body(s) or '')
@@ -1381,10 +1465,9 @@ class ShardedRequiredChecksTests(unittest.TestCase):
                     outputs = dict(line.rstrip('\n').split('=', 1) for line in f if line.strip())
                 env.update(SUPPORT_RESULT='success', DOCTEST_RESULT='success', SUPPORT_STARTED=outputs['epoch'],
                            GITHUB_RUN_ID='1', RUNNER_OS=platform)
-                if platform == 'windows':
-                    os.mkdir(os.path.join(tmp, 'scripts'))
-                    for name in ('ci-failure-summary.py', 'ci-flake-classes.json'):
-                        shutil.copyfile(os.path.join(ROOT, 'scripts', name), os.path.join(tmp, 'scripts', name))
+                os.mkdir(os.path.join(tmp, 'scripts'))
+                for name in ('ci-failure-summary.py', 'ci-flake-classes.json'):
+                    shutil.copyfile(os.path.join(ROOT, 'scripts', name), os.path.join(tmp, 'scripts', name))
                 subprocess.run(['bash', '-c', wf.run_body(record)], cwd=tmp, env=env, check=True)
                 completed = time.time()
                 with open(os.path.join(tmp, 'support-evidence.json'), encoding='utf-8') as f:
@@ -1617,6 +1700,8 @@ def ci_support_commands():
     for s in wf.steps(wf.job_block(wf.read("ci-full.yml"), "ubuntu-support")):
         if wf.field(s, "name") == "Record support and doctest results":
             break
+        if wf.field(s, "id") == "doctests":
+            continue
         body = (wf.run_body(s) or "").strip()
         started = started or body == "scripts/check-rust-toolchain-pin.sh"
         if not started or not body:
@@ -1673,8 +1758,7 @@ class PrePushScriptTests(unittest.TestCase):
     the script in the same PR."""
 
     def test_full_list_is_ci_support_order_then_workspace_tests(self):
-        expected = [cmd for cmd, _ in ci_support_commands()
-                    if cmd != "cargo test --workspace --doc --locked"]
+        expected = [cmd for cmd, _ in ci_support_commands()]
         expected.append("cargo test --workspace --locked")
         self.assertEqual(pre_push_list(), expected)
 

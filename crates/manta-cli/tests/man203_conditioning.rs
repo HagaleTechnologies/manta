@@ -9,6 +9,8 @@
 //!   Scenario: A bad mode value is refused by `manta config check` with the
 //!             exact key error.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
 #[path = "../../manta-engine/tests/support/man203.rs"]
@@ -21,7 +23,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+<<<<<<< HEAD
 use launch::spawn_daemon_reporting_ports;
+=======
+use daemon::spawn_daemon_reporting_ports;
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 use support::near_centre_scene;
 
 /// The scene MAN-203 measured (docs/DECISIONS/2026-11-03): one 6 dB

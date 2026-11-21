@@ -383,8 +383,10 @@ jobs:
           import json, os, runpy, time
           from pathlib import Path
           output = Path('doctest-output.log')
-          failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
-              output.read_text(encoding='utf-8', errors='replace') if output.exists() else '')
+          failures, omitted, tail = [], 0, ''
+          if output.exists():
+              failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+                  output.read_text(encoding='utf-8', errors='replace'))
           if os.environ['DOCTEST_RESULT'] == 'success':
               tail = ''
           Path('support-evidence.json').write_text(json.dumps(dict(
@@ -869,7 +871,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
       - id: doctests
-        run: cargo test --workspace --doc --locked
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
       - if: runner.os != 'Windows'
@@ -964,10 +971,18 @@ jobs:
           SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python3 - <<'PYTHON'
-          import json, os, time
+          import json, os, runpy, time
           from pathlib import Path
+          output = Path('doctest-output.log')
+          failures, omitted, tail = [], 0, ''
+          if output.exists():
+              failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+                  output.read_text(encoding='utf-8', errors='replace'))
+          if os.environ['DOCTEST_RESULT'] == 'success':
+              tail = ''
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              doctestFailures=failures, omittedDoctestFailures=omitted, doctestOutputTail=tail,
               started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
@@ -1259,6 +1274,10 @@ jobs:
           name: shard-${{ matrix.os }}-${{ matrix.shard }}
           path: shard-evidence/*.json
           if-no-files-found: error
+      - run: python3 scripts/ci-failure-summary.py --os ${{ matrix.os }} --shard ${{ matrix.shard }} --append "$GITHUB_STEP_SUMMARY" shard-evidence
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
   ubuntu-aggregate:
     name: test (ubuntu-latest)
     needs: [ubuntu-support, ubuntu-build, ubuntu-shards]
@@ -1268,13 +1287,50 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login))
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every OS dependency to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS" | jq -e 'length == 3 and all(.[]; .result == "success")'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/ci-failure-summary.py
+            scripts/ci-flake-classes.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          pattern: shard-ubuntu-latest-*
+          path: ubuntu-evidence/shards
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: build-ubuntu-latest
+          path: ubuntu-evidence/build
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: support-ubuntu
+          path: ubuntu-evidence/support
+      - run: python3 scripts/ci-failure-summary.py --os ubuntu-latest --expect-shards 8 --needs-env RESULTS --append "$GITHUB_STEP_SUMMARY" ubuntu-evidence
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          RESULTS: ${{ toJSON(needs) }}
   macos-support:
     if: >-
       github.event_name != 'pull_request' ||
@@ -1402,7 +1458,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --locked
       - id: doctests
-        run: cargo test --workspace --doc --locked
+        shell: bash
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          set -o pipefail
+          cargo test --workspace --doc --locked --no-fail-fast 2>&1 | tee doctest-output.log
       # MAN-323: the FT8/FT4 decoder (pancetta-ft8 behind the `ftx` feature) rides the required
       # test check on Linux and macOS. MSVC cannot compile ft8_lib's VLAs, so Windows skips it.
       - if: runner.os != 'Windows'
@@ -1497,10 +1558,18 @@ jobs:
           SUPPORT_STARTED: ${{ steps.support-start.outputs.epoch }}
         run: |
           python3 - <<'PYTHON'
-          import json, os, time
+          import json, os, runpy, time
           from pathlib import Path
+          output = Path('doctest-output.log')
+          failures, omitted, tail = [], 0, ''
+          if output.exists():
+              failures, omitted, tail = runpy.run_path('scripts/ci-failure-summary.py')['parse_doctest_failures'](
+                  output.read_text(encoding='utf-8', errors='replace'))
+          if os.environ['DOCTEST_RESULT'] == 'success':
+              tail = ''
           Path('support-evidence.json').write_text(json.dumps(dict(
               conclusion=os.environ['SUPPORT_RESULT'], doctests=os.environ['DOCTEST_RESULT'],
+              doctestFailures=failures, omittedDoctestFailures=omitted, doctestOutputTail=tail,
               started=int(os.environ['SUPPORT_STARTED']) if os.environ.get('SUPPORT_STARTED') else None,
               completed=time.time(), run=os.environ['GITHUB_RUN_ID'], os=os.environ['RUNNER_OS'])))
           PYTHON
@@ -1792,6 +1861,10 @@ jobs:
           name: shard-${{ matrix.os }}-${{ matrix.shard }}
           path: shard-evidence/*.json
           if-no-files-found: error
+      - run: python3 scripts/ci-failure-summary.py --os ${{ matrix.os }} --shard ${{ matrix.shard }} --append "$GITHUB_STEP_SUMMARY" shard-evidence
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
   macos-aggregate:
     name: test (macos-latest)
     needs: [macos-support, macos-build, macos-shards]
@@ -1801,13 +1874,50 @@ jobs:
       github.event.pull_request.head.repo.full_name != github.repository ||
       !contains(fromJSON('["thagale","catalyst-cloud-connector[bot]"]'), github.event.pull_request.user.login))
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Require every OS dependency to succeed
         env:
           RESULTS: ${{ toJSON(needs) }}
         run: |
           echo "$RESULTS" | jq -e 'length == 3 and all(.[]; .result == "success")'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            scripts/ci-failure-summary.py
+            scripts/ci-flake-classes.json
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          pattern: shard-macos-latest-*
+          path: macos-evidence/shards
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: build-macos-latest
+          path: macos-evidence/build
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        with:
+          name: support-macos
+          path: macos-evidence/support
+      - run: python3 scripts/ci-failure-summary.py --os macos-latest --expect-shards 8 --needs-env RESULTS --append "$GITHUB_STEP_SUMMARY" macos-evidence
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          RESULTS: ${{ toJSON(needs) }}
   # Same MAN-243 routing as `test` above (Dependabot plus every PR wait-for-codex.yml won't
   # dispatch) -- not itself a required check, but matches this job's own pre-migration behavior
   # (ran for a Dependabot PR too, gated only by codex-clean's tolerant skip) rather than silently

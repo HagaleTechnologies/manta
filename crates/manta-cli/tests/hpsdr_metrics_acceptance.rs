@@ -15,9 +15,16 @@
 //! every 100 ms keeps the daemon alive for tens of minutes -- orders of
 //! magnitude more headroom than this test needs.
 
+#[path = "man570/daemon.rs"]
+mod daemon;
 #[path = "common/launch.rs"]
 mod launch;
+<<<<<<< HEAD
 use launch::{manta, spawn_daemon_reporting_ports};
+=======
+use daemon::spawn_daemon_reporting_ports;
+use launch::manta;
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, UdpSocket};

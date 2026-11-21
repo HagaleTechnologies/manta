@@ -6,8 +6,16 @@
 //! released port number is ever handed on for the daemon to bind.
 
 mod common;
+<<<<<<< HEAD
 
 use common::{manta, spawn_daemon_reporting_ports, DaemonHandle};
+=======
+#[path = "man570/daemon.rs"]
+mod daemon;
+
+use common::manta;
+use daemon::{spawn_daemon_reporting_ports, DaemonHandle};
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -54,9 +62,20 @@ fn spawn_daemon(dir: &Path, wav: &Path, name: &str) -> DaemonHandle {
     spawn_daemon_reporting_ports(cmd, Duration::from_secs(30))
 }
 
+<<<<<<< HEAD
 /// The body of a `GET /metrics` on `port`.
 fn scrape_metrics(port: u16) -> String {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+=======
+fn connect_to_daemon(port: u16) -> TcpStream {
+    TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_secs(10))
+        .unwrap_or_else(|err| panic!("connect to daemon on port {port}: {err}"))
+}
+
+/// The body of a `GET /metrics` on `port`.
+fn scrape_metrics(port: u16) -> String {
+    let mut stream = connect_to_daemon(port);
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
@@ -141,7 +160,11 @@ fn check_daemons(a: &DaemonHandle, b: &DaemonHandle) {
         "duplicate listener: {ports:?}"
     );
     for port in [a.ports.telnet, a.ports.json, b.ports.telnet, b.ports.json] {
+<<<<<<< HEAD
         TcpStream::connect(("127.0.0.1", port)).unwrap();
+=======
+        connect_to_daemon(port);
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     }
 
     // Both metrics endpoints serve, on the ports each banner reported.

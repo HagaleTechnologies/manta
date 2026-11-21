@@ -87,14 +87,106 @@ fn only_common_launch_scrubs_manta_variables() {
     );
 }
 
+/// MAN-569: whether a source line uses the released-port helper, however
+/// it is qualified, imported, aliased or re-exported. The line is matched
+/// on the exact ASCII identifier token `free_ports`: it is split on
+/// every character that is not an ASCII alphanumeric or `_`, so qualifiers
+/// (`launch::`), turbofish (`::<3>()`), braces and aliases need no special
+/// handling, while `free_port` (the claimed band, singular) and
+/// `find_free_ports` are different tokens and do not match. A standalone
+/// `//` comment line names the helper only in prose.
+fn uses_free_ports_token(line: &str) -> bool {
+    if line.trim_start().starts_with("//") {
+        return false;
+    }
+    line.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|token| token == "free_ports")
+}
+
+/// `file:line` for every scanned line that uses the `free_ports` token.
+/// `doctor_checks.rs` keeps its private allocator (MAN-333, MAN-410), and
+/// `common/launch.rs` (with `common/mod.rs`'s re-export) keeps the
+/// definition for fixtures that hold no daemon (MAN-570's main): every
+/// other file that names it is handing a released number on.
+fn free_ports_hits(sources: &[(String, String)]) -> Vec<String> {
+    const DEFINITION_SITES: [&str; 3] = ["doctor_checks.rs", "common/launch.rs", "common/mod.rs"];
+    let mut hits = Vec::new();
+    for (rel, text) in sources {
+        if DEFINITION_SITES.contains(&rel.as_str()) {
+            continue;
+        }
+        for (index, line) in text.lines().enumerate() {
+            if uses_free_ports_token(line) {
+                hits.push(format!("{rel}:{}", index + 1));
+            }
+        }
+    }
+    hits
+}
+
 #[test]
+<<<<<<< HEAD
 fn only_doctor_checks_defines_free_ports() {
     // doctor_checks.rs keeps its private port band (MAN-333, MAN-410).
     let found = offenders(&["fn free_ports"], &["doctor_checks.rs"]);
     assert!(
         found.is_empty(),
         "only doctor_checks.rs may define `free_ports()`: {found:?}"
+=======
+fn no_integration_test_uses_released_free_ports() {
+    let hits = free_ports_hits(&sources());
+    assert!(
+        hits.is_empty(),
+        "the `free_ports()` helper releases its ports before a daemon binds \
+         them, and a sibling socket can take the number in between: write \
+         `telnet_port = 0`, `json_port = 0` and `metrics_port = 0` and read the \
+         bound ports from the daemon's `listening:` banner \
+         (`spawn_daemon_reporting_ports`), or take a concrete port from the \
+         claimed band (`src/test_ports.rs`): {hits:?}"
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     );
+}
+
+/// MAN-569 AC2's red path, pinned in-tree: an incident fixture that restores
+/// the old released-port call is named `file:line` by the scan even though no
+/// definition of the helper exists anywhere in the scanned sources. The
+/// scratch mutation the decision record describes was a whole file under
+/// `tests/` deleted after its red run; this keeps that proof in the tree.
+#[test]
+fn the_scan_names_a_fixture_that_restores_the_old_call() {
+    let sources = [(
+        "zzz_restored_incident_fixture.rs".to_string(),
+        "let ports = launch::free_ports();\nlet metrics = ports[2];\n".to_string(),
+    )];
+    assert_eq!(
+        free_ports_hits(&sources),
+        ["zzz_restored_incident_fixture.rs:1".to_string()]
+    );
+}
+
+#[test]
+fn released_free_ports_guard_matches_imports_and_calls() {
+    let caught = [
+        "let ports = launch::free_ports();",
+        "let trio = common::free_ports::<3>();",
+        "let ports = free_ports();",
+        "use common::{free_ports, manta};",
+        "use common::free_ports as pick_ports;",
+        "pub use common::free_ports;",
+    ];
+    for line in caught {
+        assert!(uses_free_ports_token(line), "missed: {line}");
+    }
+    let allowed = [
+        "// let ports = free_ports();",
+        "/// `free_ports` is gone; read the banner instead.",
+        "let port = test_ports::free_port();",
+        "let ports = find_free_ports();",
+        "let note = free_ports_note;",
+    ];
+    for line in allowed {
+        assert!(!uses_free_ports_token(line), "flagged: {line}");
+    }
 }
 
 #[test]
@@ -208,6 +300,10 @@ fn the_released_port_shapes_match_the_copies_man523_removed() {
         // health_command.rs's `free_port()`.
         "fn free_port() -> u16 {\n    TcpListener::bind(\"127.0.0.1:0\")\n        .unwrap()\n        \
          .local_addr()\n        .unwrap()\n        .port()\n}\n",
+        // docker_image.rs's temporary metrics listener, whose number the
+        // mounted TOML and the health command shared.
+        "let metrics_port = std::net::TcpListener::bind(\"127.0.0.1:0\")\n    .unwrap()\n    \
+         .local_addr()\n    .unwrap()\n    .port();\n",
         // list_http.rs's `a_closed_port_is_connection_refused`.
         "let port = {\n    let listener = TcpListener::bind(\"127.0.0.1:0\").unwrap();\n    \
          listener.local_addr().unwrap().port()\n};\n",
@@ -273,10 +369,18 @@ fn pending_released_ports_still_release_one() {
 }
 
 #[test]
+<<<<<<< HEAD
 fn only_common_launch_defines_spawn_daemon_reporting_ports() {
     let found = offenders(&["fn spawn_daemon_reporting_ports"], &["common/launch.rs"]);
     assert!(
         found.is_empty(),
         "use common/launch.rs's daemon launcher: {found:?}"
+=======
+fn only_man570_daemon_defines_spawn_daemon_reporting_ports() {
+    let found = offenders(&["fn spawn_daemon_reporting_ports"], &["man570/daemon.rs"]);
+    assert!(
+        found.is_empty(),
+        "use man570/daemon.rs's daemon launcher: {found:?}"
+>>>>>>> 7a597d3d948a366c350f8eebd609e3ad6e7f4f15
     );
 }
