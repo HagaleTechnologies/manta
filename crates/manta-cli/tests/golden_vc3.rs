@@ -4,10 +4,11 @@
 //! these from `golden_v8_v8w.rs` so V8 (`golden_v8.rs`), V8w
 //! (`golden_v8w.rs`) and VC3 run as separate binaries on separate CI
 //! shards; the scene is rendered once per binary
-//! (`common::pileup::fixture`).
+//! (`pileup::fixture`).
 
-mod common;
-use common::pileup::*;
+#[path = "common/pileup.rs"]
+mod pileup;
+use pileup::*;
 
 /// MAN-312 (SPEC §7.2 VC3): the V8w scene plus a pinned crash train
 /// (`manta_testkit::crash::vc3`, train seed `0x3333`, 47 crashes of 1-10 ms
@@ -44,13 +45,13 @@ fn vc3_pileup_fading_with_crashes_spots_no_bogus_callsigns() {
     assert!(failures.is_empty(), "VC3: {}", failures.join(" | "));
 }
 
-/// MAN-317 on VC3; see `common::pileup::prior_on_stays_at_zero_bogus`.
+/// MAN-317 on VC3; see `pileup::prior_on_stays_at_zero_bogus`.
 #[test]
 fn vc3_with_prior_on_stays_at_zero_bogus() {
     prior_on_stays_at_zero_bogus("VC3");
 }
 
-/// MAN-200 on VC3; see `common::pileup::repetition_fusion_on_stays_at_zero_bogus`.
+/// MAN-200 on VC3; see `pileup::repetition_fusion_on_stays_at_zero_bogus`.
 #[test]
 fn vc3_with_repetition_fusion_on_stays_at_zero_bogus() {
     repetition_fusion_on_stays_at_zero_bogus("VC3");

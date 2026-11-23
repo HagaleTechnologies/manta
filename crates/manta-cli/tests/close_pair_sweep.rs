@@ -1,6 +1,7 @@
 //! MAN-112 reproducible measurements. Run with --ignored --nocapture.
-mod common;
-use common::decode::{per_track, promoted_track_ids, streaming_report};
+#[path = "common/decode.rs"]
+mod decode;
+use decode::{per_track, promoted_track_ids, streaming_report};
 use manta_testkit::vectors::{close_pair, single_at_offset, VectorSpec};
 
 fn measure(spec: VectorSpec, label: String, steered: bool) {

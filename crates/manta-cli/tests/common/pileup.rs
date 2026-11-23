@@ -10,6 +10,8 @@
 //! MAN-521 split the one `golden_v8_v8w` binary into `golden_v8`,
 //! `golden_v8w` and `golden_vc3` so CI can place each scene on its own
 //! shard, and renders each scene once per binary instead of once per test.
+// Each test binary compiles this file separately and uses only part of it.
+#![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};

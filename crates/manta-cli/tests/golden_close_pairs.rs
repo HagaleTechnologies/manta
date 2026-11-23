@@ -1,6 +1,7 @@
 //! MAN-112: two independent signals must keep distinct, accurate tracks.
-mod common;
-use common::decode::{decode_report, per_track, promoted_track_ids};
+#[path = "common/decode.rs"]
+mod decode;
+use decode::{decode_report, per_track, promoted_track_ids};
 
 fn check(a: f64, spacing: f64, sa: f64, sb: f64) {
     let spec = manta_testkit::vectors::close_pair("close_pair", a, spacing, sa, sb);

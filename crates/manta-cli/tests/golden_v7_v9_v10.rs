@@ -5,8 +5,9 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-mod common;
-use common::decode::{decode_report, per_track, promoted_track_ids};
+#[path = "common/decode.rs"]
+mod decode;
+use decode::{decode_report, per_track, promoted_track_ids};
 
 // Codex review, PR #303: a track promoted and then merged or closed
 // before decoding a character is invisible to `per_track`, so V51's

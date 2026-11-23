@@ -4,13 +4,16 @@
 //! MAN-521 moved these from `golden_v8_v8w.rs` so V8 (`golden_v8.rs`), V8w
 //! and VC3 (`golden_vc3.rs`) run as separate binaries on separate CI
 //! shards; the scene is rendered once per binary
-//! (`common::pileup::fixture`).
+//! (`pileup::fixture`).
 
 use std::collections::HashSet;
 
-mod common;
-use common::decode::per_track;
-use common::pileup::*;
+#[path = "common/decode.rs"]
+mod decode;
+#[path = "common/pileup.rs"]
+mod pileup;
+use decode::per_track;
+use pileup::*;
 
 /// SPEC §7's V8w row states three independent pass criteria; this is the
 /// second, "0 bogus callsigns". It is deliberately a test of its own, NOT
@@ -219,13 +222,13 @@ fn v8w_pileup_fading_decodes_90pct_of_strong_signals_with_hsmm_engine() {
     }
 }
 
-/// MAN-317 on V8w; see `common::pileup::prior_on_stays_at_zero_bogus`.
+/// MAN-317 on V8w; see `pileup::prior_on_stays_at_zero_bogus`.
 #[test]
 fn v8w_with_prior_on_stays_at_zero_bogus() {
     prior_on_stays_at_zero_bogus("V8w");
 }
 
-/// MAN-200 on V8w; see `common::pileup::repetition_fusion_on_stays_at_zero_bogus`.
+/// MAN-200 on V8w; see `pileup::repetition_fusion_on_stays_at_zero_bogus`.
 #[test]
 fn v8w_with_repetition_fusion_on_stays_at_zero_bogus() {
     repetition_fusion_on_stays_at_zero_bogus("V8w");
