@@ -174,16 +174,19 @@ reliability comparison against the macOS baseline in issues #166/#167/
   straight after the write lets Windows reset the connection before the
   client reads the reply (os error 10054, "forcibly closed"), which made
   `health_command` flake on about 1 in 8 Windows merge-queue runs (MAN-156).
-- A test that needs several free ports must hold every listener until it
-  has read them all (`free_ports::<N>()` in `node_health_acceptance.rs`,
-  `hpsdr_metrics_acceptance.rs` and `ka9q_input.rs`). Windows hands a
-  just-released port straight back out, so picking ports one at a time
-  can pick the same port twice and the config is rejected (#302, MAN-371).
-  `tests/doctor_checks.rs` and the unit tests instead draw "nothing here"
-  ports from private claimed bands (`tests/doctor_checks.rs`,
-  `src/test_ports.rs`; MAN-333, MAN-410, MAN-383), because a held listener
-  reads as "in use" to doctor's probe. Delete the single-port helper once
-  nothing calls it, or `clippy -D warnings` fails on dead code.
+- Never hand a child daemon a port number the test has already released.
+  Windows hands a just-released port straight back out, and a sibling
+  socket can take it before the daemon binds (#302, MAN-371, MAN-569). A
+  daemon a test starts binds `telnet_port = 0`, `json_port = 0` and
+  `metrics_port = 0` and reports what it got
+  (`spawn_daemon_reporting_ports` in `tests/man570/daemon.rs`). A connect
+  target that must stay unreachable comes from `unreachable_target_ports`
+  in the same file, and a concrete port two commands share comes from the
+  claimed band (`src/test_ports.rs`). `tests/doctor_checks.rs` draws its
+  "nothing here" ports from its own private band (MAN-333, MAN-410,
+  MAN-383), because a held listener reads as "in use" to doctor's probe.
+  There is no shared `free_ports()` (MAN-588); `shared_test_helpers.rs`
+  fails on a new one.
 
 ## Known gaps
 

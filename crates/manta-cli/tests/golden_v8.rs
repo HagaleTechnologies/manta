@@ -3,12 +3,13 @@
 //! checks on the V8 scene. MAN-521 moved these from `golden_v8_v8w.rs`
 //! so V8, V8w (`golden_v8w.rs`) and VC3 (`golden_vc3.rs`) run as separate
 //! binaries on separate CI shards; the scene is rendered once per binary
-//! (`common::pileup::fixture`).
+//! (`pileup::fixture`).
 
 use std::collections::HashSet;
 
-mod common;
-use common::pileup::*;
+#[path = "common/pileup.rs"]
+mod pileup;
+use pileup::*;
 
 #[test]
 fn v8_pileup_validates_at_least_45_of_50_with_no_bogus_calls() {
@@ -89,13 +90,13 @@ fn v8_pileup_validates_at_least_45_of_50_with_hsmm_engine() {
     );
 }
 
-/// MAN-317 on V8; see `common::pileup::prior_on_stays_at_zero_bogus`.
+/// MAN-317 on V8; see `pileup::prior_on_stays_at_zero_bogus`.
 #[test]
 fn v8_with_prior_on_stays_at_zero_bogus() {
     prior_on_stays_at_zero_bogus("V8");
 }
 
-/// MAN-200 on V8; see `common::pileup::repetition_fusion_on_stays_at_zero_bogus`.
+/// MAN-200 on V8; see `pileup::repetition_fusion_on_stays_at_zero_bogus`.
 #[test]
 fn v8_with_repetition_fusion_on_stays_at_zero_bogus() {
     repetition_fusion_on_stays_at_zero_bogus("V8");

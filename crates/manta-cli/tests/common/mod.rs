@@ -3,11 +3,13 @@
 //! a fake KiwiSDR for live-source daemons (`config_reload.rs`;
 //! `list_refresh.rs`, MAN-316; `signal_shutdown.rs`'s reconnect stall,
 //! MAN-252), and a fake metrics listener (`health_command.rs` and
-//! `status_command.rs`, MAN-285). The `manta()` launcher, its `MANTA_*`
-//! scrub and `free_ports()` live in the `std`-only leaf `launch.rs`
-//! (MAN-549), re-exported here. The V8/V8w/VC3 pileup fixture and gates
-//! (`golden_v8.rs`, `golden_v8w.rs`, `golden_vc3.rs`, MAN-521) live in
-//! `pileup.rs`.
+//! `status_command.rs`, MAN-285). The `manta()` launcher and its `MANTA_*`
+//! scrub live in the `std`-only leaf `launch.rs` (MAN-549), re-exported
+//! here. `pileup.rs` (the V8/V8w/VC3 pileup fixture, MAN-521) and
+//! `decode.rs` (the golden decode helpers) sit in this directory but are
+//! not modules of `common`: the golden roots include them by `#[path]`, so
+//! those roots, which bind no socket, stay out of CI's socket-repeat set
+//! (MAN-588, `shared_test_helpers.rs`).
 // Each test binary compiles this module separately and uses only part of it.
 #![allow(dead_code)]
 
@@ -22,12 +24,12 @@ pub mod ka9q;
 pub mod ipfix;
 pub mod wsjtx;
 
-/// MAN-549: the shared launcher and port reservation, a `std`-only leaf
-/// that roots without `mod common;` include by path.
+/// MAN-549: the shared launcher, a `std`-only leaf that roots without
+/// `mod common;` include by path.
 mod launch;
 // Unused in the roots that include `common` for its other helpers only.
 #[allow(unused_imports)]
-pub use launch::{free_ports, manta, without_manta_env};
+pub use launch::{manta, without_manta_env};
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -485,9 +487,3 @@ pub fn http_reply(status: &str, body: &str) -> Vec<u8> {
     )
     .into_bytes()
 }
-
-pub mod decode;
-
-/// MAN-521: the V8/V8w/VC3 pileup scenes, rendered once per binary, and the
-/// gates `golden_v8.rs`, `golden_v8w.rs` and `golden_vc3.rs` share.
-pub mod pileup;

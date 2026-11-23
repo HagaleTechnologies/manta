@@ -1,14 +1,14 @@
-//! MAN-549: the one `manta` launcher and the one port reservation the
-//! integration tests share. A leaf that needs only `std`: a root that wants
-//! nothing else from `common` includes it alone with
-//! `#[path = "common/launch.rs"] mod launch;`, and so does not link what the
-//! rest of `common` pulls in (`manta_input`, `regex`, `tungstenite`).
-//! `common/mod.rs` re-exports all three functions for the roots that
-//! already say `mod common;`.
+//! MAN-549: the one `manta` launcher the integration tests share. A leaf
+//! that needs only `std`: a root that wants nothing else from `common`
+//! includes it alone with `#[path = "common/launch.rs"] mod launch;`, and
+//! so does not link what the rest of `common` pulls in (`manta_input`,
+//! `regex`, `tungstenite`). `common/mod.rs` re-exports both functions for
+//! the roots that already say `mod common;`. There is no shared port
+//! helper here (MAN-588): a daemon a test starts binds port 0 and reports
+//! its ports through `man570/daemon.rs`'s `spawn_daemon_reporting_ports`.
 // Each test binary compiles this file separately and uses only part of it.
 #![allow(dead_code)]
 
-use std::net::TcpListener;
 use std::process::Command;
 
 /// The binary under test, with every `MANTA_*` variable of the test
@@ -30,15 +30,4 @@ pub fn without_manta_env(mut cmd: Command) -> Command {
         }
     }
     cmd
-}
-
-/// `N` distinct loopback TCP ports nothing listens on right now. All `N`
-/// listeners are held until every port is read: releasing each before
-/// binding the next lets the OS hand the same port out twice (Windows
-/// does, and then the config is rejected as "two servers cannot share a
-/// port", MAN-371). The ports are free only until this returns.
-/// `doctor_checks.rs` keeps its own band allocator (MAN-333, MAN-410).
-pub fn free_ports<const N: usize>() -> [u16; N] {
-    let held: [TcpListener; N] = std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").unwrap());
-    held.map(|l| l.local_addr().unwrap().port())
 }

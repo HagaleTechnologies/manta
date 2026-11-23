@@ -1,3 +1,6 @@
+// Each test binary compiles this file separately and uses only part of it.
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 pub fn decode_report(

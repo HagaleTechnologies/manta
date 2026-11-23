@@ -1,4 +1,4 @@
-//! MAN-549: the integration tests share one `MANTA_*` scrub and one port
+//! MAN-549: the integration tests share one `MANTA_*` scrub and one `manta`
 //! launcher (`common/launch.rs`), and the golden tests share one
 //! `word_boundary_fraction` (`manta_testkit::cer`). A new test copies
 //! whichever variant it finds, so these source scans keep one to find.
@@ -103,13 +103,13 @@ fn uses_free_ports_token(line: &str) -> bool {
         .any(|token| token == "free_ports")
 }
 
-/// `file:line` for every scanned line that uses the `free_ports` token.
-/// `doctor_checks.rs` keeps its private allocator (MAN-333, MAN-410), and
-/// `common/launch.rs` (with `common/mod.rs`'s re-export) keeps the
-/// definition for fixtures that hold no daemon (MAN-570's main): every
-/// other file that names it is handing a released number on.
+/// `file:line` for every scanned line that uses or defines the `free_ports`
+/// token. Only `doctor_checks.rs` keeps one, its private band allocator
+/// (MAN-333, MAN-410). MAN-588 deleted the shared released-port definition
+/// from `common/launch.rs` and its `common/mod.rs` re-export, so a definition,
+/// re-export or call anywhere else brings a released number back.
 fn free_ports_hits(sources: &[(String, String)]) -> Vec<String> {
-    const DEFINITION_SITES: [&str; 3] = ["doctor_checks.rs", "common/launch.rs", "common/mod.rs"];
+    const DEFINITION_SITES: [&str; 1] = ["doctor_checks.rs"];
     let mut hits = Vec::new();
     for (rel, text) in sources {
         if DEFINITION_SITES.contains(&rel.as_str()) {
@@ -134,7 +134,7 @@ fn no_integration_test_uses_released_free_ports() {
          `telnet_port = 0`, `json_port = 0` and `metrics_port = 0` and read the \
          bound ports from the daemon's `listening:` banner \
          (`spawn_daemon_reporting_ports`), or take a concrete port from the \
-         claimed band (`src/test_ports.rs`): {hits:?}"
+         claimed band (`src/test_ports.rs`); do not define a new `free_ports`: {hits:?}"
     );
 }
 
@@ -152,6 +152,39 @@ fn the_scan_names_a_fixture_that_restores_the_old_call() {
     assert_eq!(
         free_ports_hits(&sources),
         ["zzz_restored_incident_fixture.rs:1".to_string()]
+    );
+}
+
+/// MAN-588's red path: a definition or re-export restored in the files that
+/// used to hold the shared helper, or a new definition in another root, is
+/// named `file:line`; `doctor_checks.rs`'s private allocator is not.
+#[test]
+fn the_scan_names_a_restored_definition_or_re_export() {
+    let sources = [
+        (
+            "common/launch.rs".to_string(),
+            "pub fn free_ports<const N: usize>() -> [u16; N] {\n".to_string(),
+        ),
+        (
+            "common/mod.rs".to_string(),
+            "pub use launch::{free_ports, manta, without_manta_env};\n".to_string(),
+        ),
+        (
+            "zzz_new_port_helper.rs".to_string(),
+            "fn free_ports() -> [u16; 3] {\n".to_string(),
+        ),
+        (
+            "doctor_checks.rs".to_string(),
+            "fn free_ports<const N: usize>() -> [u16; N] {\n".to_string(),
+        ),
+    ];
+    assert_eq!(
+        free_ports_hits(&sources),
+        [
+            "common/launch.rs:1".to_string(),
+            "common/mod.rs:1".to_string(),
+            "zzz_new_port_helper.rs:1".to_string(),
+        ]
     );
 }
 
@@ -177,6 +210,68 @@ fn released_free_ports_guard_matches_imports_and_calls() {
     ];
     for line in allowed {
         assert!(!uses_free_ports_token(line), "flagged: {line}");
+    }
+}
+
+/// MAN-588: whether a source line declares the `decode` or `pileup` module.
+/// Matched on adjacent identifier tokens, so `pub mod decode;`,
+/// `pub(crate) mod pileup;` and `mod decode;` match and `mod decoder;` or a
+/// `//` comment does not.
+fn declares_golden_leaf(line: &str) -> bool {
+    if line.trim_start().starts_with("//") {
+        return false;
+    }
+    let tokens: Vec<&str> = line
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    tokens
+        .windows(2)
+        .any(|w| w[0] == "mod" && (w[1] == "decode" || w[1] == "pileup"))
+}
+
+/// MAN-588: `common/decode.rs` and `common/pileup.rs` bind no socket, and
+/// neither do the golden roots that use them. Reached through `mod common;`,
+/// whose closure binds (`fake_server`, `ka9q`), they made those roots
+/// socket-repeat candidates (MAN-523 D3), so any edit under `tests/common/`
+/// repeated every golden scene ten times and timed shards out (#606). The
+/// roots include the two leaves by `#[path]`, and `common/mod.rs` declares
+/// neither.
+#[test]
+fn common_mod_leaves_the_golden_decode_helpers_to_path_includes() {
+    let hits: Vec<String> = sources()
+        .into_iter()
+        .filter(|(rel, _)| rel == "common/mod.rs")
+        .flat_map(|(rel, text)| {
+            text.lines()
+                .enumerate()
+                .filter(|(_, line)| declares_golden_leaf(line))
+                .map(|(index, _)| format!("{rel}:{}", index + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "include `common/decode.rs` and `common/pileup.rs` by \
+         `#[path = \"common/decode.rs\"] mod decode;` in the root that needs them, \
+         not through `mod common;`: a root that binds no socket then stays out of \
+         CI's socket-repeat set: {hits:?}"
+    );
+}
+
+#[test]
+fn golden_leaf_matcher_matches_module_declarations_only() {
+    for line in ["pub mod decode;", "mod pileup;", "pub(crate) mod decode;"] {
+        assert!(declares_golden_leaf(line), "missed: {line}");
+    }
+    for line in [
+        "// pub mod decode;",
+        "/// `pub mod pileup;` is gone.",
+        "mod decoder;",
+        "mod ipfix;",
+        "use decode::per_track;",
+    ] {
+        assert!(!declares_golden_leaf(line), "flagged: {line}");
     }
 }
 
