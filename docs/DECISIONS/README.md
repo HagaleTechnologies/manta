@@ -21,6 +21,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-11-23 | MAN-588 | [MAN-588: no shared released-port free_ports(), and the golden roots include their helpers by path](2026-11-23-man588-no-shared-free-ports.md) |
 | 2026-11-20 | MAN-569 | [MAN-569: daemon integration tests bind port zero or claim a band, never a released number](2026-11-20-man569-daemon-test-port-handoffs.md) |
 | 2026-11-19 | MAN-551 | [MAN-551: Windows O1 readout and failure audit](2026-11-19-man551-windows-o1-readout.md) |
 | 2026-11-19 | MAN-143 | [MAN-143: a spot carries no signal snippet today, and clip work stays parked](2026-11-19-man143-spot-snippet-verification.md) |
