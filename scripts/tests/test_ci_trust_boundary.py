@@ -478,7 +478,7 @@ def fetch_depth(event_name):
     return gh_or(gh_and(event_name != "workflow_dispatch", 1), 0)
 
 
-def test_job_head(job):
+def job_head(job):
     """(checkout step, step after it) for one of ci-full.yml's test jobs."""
     job_steps = steps(job_block(read("ci-full.yml"), job))
     return job_steps[0], (job_steps[1] if len(job_steps) > 1 else None)
@@ -509,7 +509,7 @@ class CiFullDispatchMergeWiringTests(unittest.TestCase):
     def test_merge_step_follows_checkout_in_every_test_job(self):
         for job in CI_TEST_JOBS:
             with self.subTest(job=job):
-                checkout, step = test_job_head(job)
+                checkout, step = job_head(job)
                 self.assertTrue((field(checkout, "uses") or "").startswith("actions/checkout@"),
                                 f"{job}: the first step is not actions/checkout")
                 self.assertIsNotNone(step, f"{job}: no merge-main step after checkout")
@@ -527,7 +527,7 @@ class CiFullDispatchMergeWiringTests(unittest.TestCase):
     def test_checkout_fetches_full_history_only_on_dispatch(self):
         for job in CI_TEST_JOBS:
             with self.subTest(job=job):
-                checkout, _ = test_job_head(job)
+                checkout, _ = job_head(job)
                 with_block = sub(checkout, "with")
                 self.assertIsNotNone(with_block, f"{job}: checkout has no with: block")
                 self.assertEqual(field(with_block, "fetch-depth"), FETCH_DEPTH)
