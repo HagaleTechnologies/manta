@@ -41,12 +41,13 @@ rustfft = "6.4"
 # MAN-323: the FT8/FT4 cycle decoder (PAN-176), behind manta's optional `ftx`
 # feature. The contract is pancetta's docs/decoder-crate.md at the pinned commit
 # (dispensa Q-0085: a pinned git dependency on that stable surface, default
-# features only). Pin rule (decision D1 in
-# docs/DECISIONS/2026-11-01-man323-ft8-ft4-from-band-streams.md): a
-# `pancetta-ft8-v*` tag when one exists, else PR #550's merge commit, else its
-# head. MAN-485 moves this to PR #550's merge commit (merged untagged;
-# no pancetta-ft8-v* tag exists as of 2026-11-05).
-pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "7f8078b19d759e24f50adb1efd0b3fd75371a39d" }
+# features only). Pin rule (D1 in
+# docs/DECISIONS/2026-11-01-man323-ft8-ft4-from-band-streams.md, extended by
+# docs/DECISIONS/2026-11-24-man573-pancetta-off-chrono.md): a `pancetta-ft8-v*` tag
+# when one exists, else the merge commit of the newest pancetta PR manta needs.
+# MAN-573 moves this to PR #731's merge commit (PAN-441, which drops chrono; no
+# pancetta-ft8-v* tag exists as of 2026-11-24).
+pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf" }
 
 cpal = "0.18"
 # MAN-530: manta-owned tagged capture ring (already locked through coppa-audio).

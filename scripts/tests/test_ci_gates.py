@@ -375,6 +375,11 @@ class DenyPolicyTests(unittest.TestCase):
         for lic in allow:
             self.assertNotRegex(lic, r"GPL|MPL|EUPL|CDDL|SSPL|CC-BY-SA")
 
+    def test_license_exceptions_name_one_crate_version(self):
+        # MAN-573: a licence outside `allow` passes only for a named crate at one version.
+        self.assertEqual([(e["crate"], e["allow"]) for e in self.cfg["licenses"].get("exceptions", [])],
+                         [("option-ext@0.2.0", ["MPL-2.0"])])
+
     def test_sources_are_crates_io_coppa_and_pancetta(self):
         src = self.cfg["sources"]
         self.assertEqual(src["unknown-registry"], "deny")
