@@ -3,6 +3,14 @@
 [project]
 linear_team = "MAN"
 
+# Rust workspace phases build and test the whole tree (clippy + tests), which can
+# exceed the self-hosted per-slot default (24 GiB) and get the session stopped
+# (slot_disk_exceeded). 36 GiB gives headroom; every GiB is reserved up front against
+# rigel's free disk, so keep it tight and raise only with measured peaks.
+# Self-hosted runners only.
+[runner]
+disk_budget_gib = 36
+
 # Mirrors .github/workflows/ci-full.yml and rust-toolchain.toml. CI builds and
 # tests with no environment variables, so none are declared. The soapy feature
 # leg (extra SDR system packages) is not part of verify; HPSDR runs in the default gate.
