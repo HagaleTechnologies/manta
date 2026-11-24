@@ -27,10 +27,17 @@ no `pancetta-ft8-v*` tag.
 
 MAN-323 D1 named PR #550 because that was the PR manta needed. The rule now
 reads: a `pancetta-ft8-v*` tag when one exists, else the merge commit of the
-newest pancetta PR manta needs. PR #731 is that PR, and its merge commit is
-the smallest step from the old pin `7f8078b1`. The `Cargo.toml` comment
-points here. `cargo update -p pancetta-ft8` was the only lock update. It
-moved `pancetta-core` and `pancetta-ft8` to 0.9.7, removed `chrono`, `time`,
+newest pancetta PR manta needs. A PR is "needed" when it delivers a fix or
+API manta depends on, and each pin move names that PR and its reason in a
+decision record, as this one does. PR #731 is that PR: it removes chrono.
+Its merge commit is an earlier commit than pancetta `main`, but it is not a
+dependency-only change. It is 160 pancetta commits past `7f8078b1`, and
+they change the decoder too (new subtraction and AP passes, PAN-313 budget
+scheduling, about 5,000 inserted lines under `pancetta-ft8/src/`). Manta's
+check on that is the `ftx` gate in Verification. `ftx` is off by default and
+is not in release builds. The `Cargo.toml` comment points here.
+`cargo update -p pancetta-ft8` was the only lock update. It moved
+`pancetta-core` and `pancetta-ft8` to 0.9.7, removed `chrono`, `time`,
 `time-core`, `deranged`, `num-conv`, `powerfmt`, `iana-time-zone`,
 `iana-time-zone-haiku`, `android_system_properties` and
 `core-foundation-sys`, and added `jiff`, `jiff-core`, `jiff-static`,
