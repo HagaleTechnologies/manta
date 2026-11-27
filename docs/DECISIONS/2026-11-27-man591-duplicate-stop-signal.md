@@ -22,10 +22,17 @@ the stop store and timing decision, preserving MAN-232's nested-handler rule.
 
 The 130 / 143 / 129 exit-status row in MAN-232 now applies to a second
 SIGINT / SIGTERM / SIGHUP (where SIGHUP is a stop signal) at least 500 ms
-after the first. A duplicate inside that window drains and exits 0.
+after the first. A duplicate inside that window is part of the same stop
+request: it neither forces an exit nor changes the drain, which determines
+the exit status as without it (0 when it completes, 141 when a closed
+stdout stopped the run first).
 
 Windows console handling remains unchanged. A forced exit or SIGKILL still
-skips recording finalization and leaves a `.partial` that replay refuses.
+ends the process without waiting for recording finalization: a recording
+whose sidecar was already published stays replayable, because publication
+happens on the writer thread and can precede process exit (the recording
+guide's shutdown notes describe how); one still finalizing leaves a
+`.partial` that replay refuses.
 
 ## Evidence
 

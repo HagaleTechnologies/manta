@@ -126,11 +126,16 @@ which replay refuses.
 
 One SIGINT or SIGTERM finalizes a live recording, including when sent by
 GNU `timeout -s INT` or `timeout -s TERM`. A second stop signal 500 ms or
-more after the first forces an immediate exit without finalization. SIGKILL
-does the same. The payload remains, but its `.meta.jsonl.partial` sidecar
-is incomplete and replay refuses it. To recover an interrupted capture,
-move or copy the payload away from its `.partial` and specify its original
-format, sample rate and dial frequency, for example:
+more after the first, or a SIGKILL, ends the process at once without
+waiting for finalization. What is left depends on how far finalization
+got: the writer can publish the sidecar before the process exits — it
+finishes while the run drains, as the shutdown notes below describe — and
+a forced exit after publication leaves a complete, replayable recording
+with no `.partial`, while one before it leaves the payload with an
+incomplete `.meta.jsonl.partial` sidecar, which replay refuses. To recover
+an interrupted capture whose sidecar was never published, move or copy the
+payload away from its `.partial` and specify its original format, sample
+rate and dial frequency, for example:
 
 ```sh
 manta run --source capture.cf32 --source-iq --iq-format cf32 --sample-rate-hz 96000 --dial-freq-hz 7030000
