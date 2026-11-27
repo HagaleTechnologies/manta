@@ -2322,44 +2322,400 @@ mod tests {
     /// samples. Before the fix the second pause re-anchored the window, the
     /// bound fell to about 0.2 s (8,355 datagrams), and the jump read as a
     /// restart of a few tens of thousands of samples.
+    ///
+    /// MAN-583: the two-batch shape this test settled on (MAN-551, after
+    /// the Windows run 40923755629 no-IQ stall) is now load-bearing. The
+    /// receive queue is pinned to a request measured from a per-datagram
+    /// cost on the running OS, under which a 50-datagram batch fits and an
+    /// un-drained 100-datagram burst loses its tail. The split schedule
+    /// below must keep passing under that queue, and the un-split control
+    /// must starve into the typed hard no-IQ error: the same error the
+    /// Windows run hit, observed instead of panicked on. A fixed byte pin
+    /// would not be portable (macOS accounts the ~1.4 KiB datagram at
+    /// roughly an mbuf cluster), so the request is calibrated here.
     #[test]
     fn a_second_pause_while_a_park_drains_keeps_its_anchor() {
-        let fake = FakeP2Radio::start();
-        let mut src = open(&fake);
-        fake.send_iq(0);
-        read_one(&mut src);
-        thread::sleep(Duration::from_secs(4));
-        // Two 50-datagram batches, not one un-drained burst of 100: the
-        // 2026-10-29 Windows run lost the tail of the 100-datagram burst
-        // (about 229 KB of kernel receive accounting against a capped
-        // effective buffer; MAN-497 measured the 4 MiB request capped near
-        // 425 KB on Linux), the drain starved, and read_one panicked on the
-        // no-IQ watchdog. The parked 4 s itself never ticks that clock
-        // (D13): the stall clock runs only while a read waits. Splitting
-        // the sends halves the peak queue while keeping the datagram
-        // order, both pauses, and the 50 datagrams queued across the
-        // second pause.
-        for s in 1..51 {
-            fake.send_iq(s);
+        // MAN-583: every helper stays inside this one test. Code outside a
+        // test function counts as a shared change to the socket-test
+        // repeat selector, which would select every test of this module;
+        // local helpers keep the failure-registry entry
+        // (scripts/ci-flake-classes.json) and normal libtest discovery.
+        /// Datagrams in the un-split burst (the Windows incident's shape).
+        const BURST: usize = 100;
+        /// Datagrams per split batch (the committed schedule's shape).
+        const BATCH: usize = 50;
+        /// Preferred queue capacity, for headroom on both sides: the batch
+        /// fits with room and the burst loses 25 of its tail.
+        const TARGET: usize = 75;
+        /// Loopback settle after a probe's sends, before its drain.
+        const SETTLE: Duration = Duration::from_millis(20);
+
+        // The probe's drain ends on its read timeout, which Unix reports
+        // as `WouldBlock` and Windows as `TimedOut` (`classify_recv_error`
+        // and discovery's probe accept both too).
+        fn drained(e: &io::Error) -> bool {
+            matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
         }
-        for _ in 0..50 {
-            read_one(&mut src);
+        // Checked on every OS, so a narrowed match fails here and not only
+        // on Windows, where every probe would panic once drained.
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            assert!(
+                drained(&io::Error::from(kind)),
+                "the probe drain must end on the {kind:?} read timeout"
+            );
         }
-        for s in 51..101 {
-            fake.send_iq(s);
+
+        // One probe: `count` numbered fixture datagrams sent with no
+        // reader draining them, the same settle the fixture uses, then a
+        // bounded drain that ends on the read timeout. Returns the
+        // effective receive-buffer size the OS reported and how many
+        // datagrams survived in order.
+        fn probe(request: usize, count: usize) -> (usize, usize) {
+            let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind the probe receiver");
+            let sender = UdpSocket::bind("127.0.0.1:0").expect("bind the probe sender");
+            let to = receiver.local_addr().expect("the probe receiver's address");
+            socket2::SockRef::from(&receiver)
+                .set_recv_buffer_size(request)
+                .unwrap_or_else(|e| panic!("set the probe receive buffer to {request}: {e}"));
+            let effective = socket2::SockRef::from(&receiver)
+                .recv_buffer_size()
+                .unwrap_or_else(|e| panic!("read back the probe receive buffer: {e}"));
+            receiver
+                .set_read_timeout(Some(SETTLE))
+                .expect("set the probe read timeout");
+            for seq in 0..count {
+                let sent = sender
+                    .send_to(&iq_datagram(seq as u32), to)
+                    .unwrap_or_else(|e| panic!("probe send {seq} of {count}: {e}"));
+                assert_eq!(sent, wire::IQ_DATAGRAM_LEN, "probe send {seq} length");
+            }
+            thread::sleep(SETTLE);
+            let mut buf = vec![0u8; 65536];
+            let mut delivered = 0usize;
+            loop {
+                match receiver.recv_from(&mut buf) {
+                    Ok((n, from)) => {
+                        assert_eq!(from, sender.local_addr().unwrap(), "probe datagram sender");
+                        assert_eq!(n, wire::IQ_DATAGRAM_LEN, "probe datagram length");
+                        let seq = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                        assert_eq!(
+                            seq, delivered as u32,
+                            "probe datagrams must deliver an in-order prefix"
+                        );
+                        delivered += 1;
+                    }
+                    Err(e) if drained(&e) => break,
+                    Err(e) => panic!("probe receive after {delivered} delivered: {e}"),
+                }
+            }
+            (effective, delivered)
         }
-        thread::sleep(Duration::from_millis(200));
-        for _ in 0..50 {
-            read_one(&mut src);
+
+        // Verify one request twice on fresh sockets: each round is a
+        // separate 50- and 100-datagram probe, all at one effective size.
+        // The request qualifies when both rounds deliver the whole batch
+        // and only part of the burst. A round that disagrees with the
+        // other, or a readback that differs between probes, fails
+        // calibration: one request cannot measure two ways. The 100-burst
+        // counts are recorded in `measured` for the search and the
+        // failure message.
+        fn verify(
+            request: usize,
+            measured: &mut Vec<(usize, usize, usize)>,
+        ) -> Option<(usize, [usize; 4])> {
+            let (eff_a, d50a) = probe(request, BATCH);
+            let (eff_b, d100a) = probe(request, BURST);
+            let (eff_c, d50b) = probe(request, BATCH);
+            let (eff_d, d100b) = probe(request, BURST);
+            for eff in [eff_b, eff_c, eff_d] {
+                assert_eq!(
+                    eff, eff_a,
+                    "probe readbacks differ at request {request}: {eff_a} vs {eff}"
+                );
+            }
+            if !measured.iter().any(|&(r, _, _)| r == request) {
+                measured.push((request, eff_a, d100a));
+            }
+            assert_eq!(
+                (d50a, d100a),
+                (d50b, d100b),
+                "inconsistent confirmation at request {request} (effective {eff_a}): \
+                 round 1 ({d50a}, {d100a}), round 2 ({d50b}, {d100b})"
+            );
+            (d50a == BATCH && (BATCH..BURST).contains(&d100a))
+                .then_some((eff_a, [d50a, d100a, d50b, d100b]))
         }
-        let jump = 101 + 11_000;
-        fake.send_iq(jump);
-        assert_eq!(read_one(&mut src), (jump, 238));
-        assert_eq!(src.take_missing_samples(), None);
-        assert_eq!(src.take_discontinuity(), Some(11_000 * 238));
-        let stats = src.gap_stats();
-        assert_eq!(stats.dropped_packets, 11_000);
-        assert_eq!(stats.gaps_detected, 1);
+
+        // The bounded search: at most 12 distinct requests (search probes
+        // and confirmations together), from one datagram's length to the
+        // source's own 4 MiB open() request. Start at 64 datagrams' worth,
+        // steer by the delivered count (up when nothing survived, down
+        // when the whole burst fit), and aim each estimate at TARGET
+        // queued datagrams.
+        let len = wire::IQ_DATAGRAM_LEN;
+        let max_request = RCVBUF_BYTES;
+        let mut measured: Vec<(usize, usize, usize)> = Vec::new();
+        let mut request = 64 * len;
+        let mut selected: Option<(usize, usize, [usize; 4])> = None;
+        for _ in 0..16 {
+            if selected.is_some() || measured.len() >= 12 {
+                break;
+            }
+            let delivered = match measured.iter().find(|&&(r, _, _)| r == request) {
+                Some(&(_, _, d)) => d,
+                None => {
+                    let m = probe(request, BURST);
+                    measured.push((request, m.0, m.1));
+                    m.1
+                }
+            };
+            if delivered == 0 {
+                // Zero deliveries give the cost estimate no denominator.
+                request = (request * 2).min(max_request);
+                continue;
+            }
+            if delivered == BURST {
+                // The whole burst fit: move down. A hundred deliveries are
+                // no cost estimate either.
+                request = (request / 2).max(len);
+                continue;
+            }
+            // 0 < delivered < BURST: the per-datagram cost is
+            // `effective / delivered`, so TARGET queued datagrams cost
+            // `request * TARGET / delivered` in request units (the
+            // observed requested/reported ratio cancels out). Verify the
+            // estimate on fresh sockets.
+            let est = ((request as u64 * TARGET as u64 / delivered as u64) as usize)
+                .clamp(len, max_request);
+            if measured.len() >= 12 && !measured.iter().any(|&(r, _, _)| r == est) {
+                break;
+            }
+            match verify(est, &mut measured) {
+                Some((effective, counts)) => selected = Some((est, effective, counts)),
+                None => request = est,
+            }
+        }
+        if selected.is_none() {
+            // The estimate path did not settle. Re-verify what was already
+            // measured inside the window, closest to TARGET first: those
+            // requests held the batch and dropped part of the burst.
+            let mut candidates: Vec<(usize, usize)> = measured
+                .iter()
+                .filter_map(|&(r, _, d)| ((BATCH..BURST).contains(&d)).then_some((r, d)))
+                .collect();
+            candidates.sort_by_key(|&(_, d)| d.abs_diff(TARGET));
+            for (r, _) in candidates.into_iter().take(3) {
+                if let Some((effective, counts)) = verify(r, &mut measured) {
+                    selected = Some((r, effective, counts));
+                    break;
+                }
+            }
+        }
+        let Some((request, effective, counts)) = selected else {
+            panic!(
+                "MAN-583: no receive-buffer request held a {BATCH}-datagram batch while \
+                 dropping part of a {BURST}-datagram burst on {} ({len}-byte datagrams); \
+                 measured (request, effective bytes, delivered of {BURST}): {measured:?}",
+                std::env::consts::OS
+            );
+        };
+        println!(
+            "MAN-583 queue control on {}: request {request} bytes, effective {effective} \
+             bytes; probes delivered {} and {} of {BATCH}, {} and {} of {BURST}",
+            std::env::consts::OS,
+            counts[0],
+            counts[2],
+            counts[1],
+            counts[3]
+        );
+
+        // One fixture read into a big buffer: `Ok(Some((seq, 238)))` for
+        // one datagram's samples (the fake encodes the sequence in every
+        // sample, so a read never straddles two datagrams), `Ok(None)` for
+        // the soft stall's one `Ok(0)` return, whose `take_stalled` flag
+        // the caller must consume, and `Err` for the source's own hard
+        // failure. The old `read_one` unwrap panicked on the no-IQ
+        // watchdog; the control must observe that error instead.
+        fn read_iq(src: &mut Protocol2IqSource) -> Result<Option<(u32, usize)>> {
+            let mut buf = vec![Complex32::new(0.0, 0.0); BIG];
+            let n = src.read(&mut buf)?;
+            if n == 0 {
+                return Ok(None);
+            }
+            assert_eq!(n, wire::SAMPLES_PER_DATAGRAM, "one read's sample count");
+            let seq = seq_of(&buf[..n]);
+            assert!(
+                buf[..n]
+                    .iter()
+                    .all(|s| (s.re * wire::P2_IQ_FULL_SCALE).round() as u32 == seq),
+                "a read straddled two datagrams"
+            );
+            Ok(Some((seq, n)))
+        }
+
+        // Read until datagram `seq`'s samples arrive. Both drains use this
+        // shape: the one soft-stall return is handled (its report must be
+        // pending) and the read continues, so a batch that cannot drain
+        // fails with the source's own hard no-IQ error -- the Windows
+        // incident's -- instead of a panic in an unwrap. A second
+        // zero-sample return cannot carry a report, so it fails here too.
+        fn expect_iq(src: &mut Protocol2IqSource, seq: u32, batch: &str) {
+            loop {
+                match read_iq(src) {
+                    Ok(Some((got, n))) => {
+                        assert_eq!((got, n), (seq, 238), "{batch} must drain in order");
+                        return;
+                    }
+                    Ok(None) => {
+                        assert!(
+                            src.take_stalled(),
+                            "{batch}'s outage must report through take_stalled"
+                        );
+                    }
+                    Err(e) => panic!("{batch} must drain: {e:#}"),
+                }
+            }
+        }
+
+        // Pin one fixture's receive queue to the measured request, and
+        // hold the source and its fake for their whole lifetime so no
+        // other test reclaims their ports.
+        fn pin(src: &Protocol2IqSource, request: usize, effective: usize) {
+            socket2::SockRef::from(&src.socket)
+                .set_recv_buffer_size(request)
+                .unwrap_or_else(|e| panic!("pin the fixture receive queue to {request}: {e}"));
+            assert_eq!(
+                socket2::SockRef::from(&src.socket)
+                    .recv_buffer_size()
+                    .expect("read back the fixture receive queue"),
+                effective,
+                "the fixture's effective receive buffer must match the probe's"
+            );
+        }
+
+        // The positive control: the committed split schedule under the
+        // measured queue. Both batches drain in order with their exact
+        // sequences, and the 11,000-datagram jump is still a loss from the
+        // original park.
+        {
+            let fake = FakeP2Radio::start();
+            let mut src = open(&fake);
+            pin(&src, request, effective);
+            fake.send_iq(0);
+            expect_iq(&mut src, 0, "the priming read");
+            thread::sleep(Duration::from_secs(4));
+            // Two 50-datagram batches, not one un-drained burst of 100: the
+            // 2026-10-29 Windows run lost the tail of the 100-datagram burst
+            // (about 229 KB of kernel receive accounting against a capped
+            // effective buffer; MAN-497 measured the 4 MiB request capped near
+            // 425 KB on Linux), the drain starved, and read_one panicked on the
+            // no-IQ watchdog. The parked 4 s itself never ticks that clock
+            // (D13): the stall clock runs only while a read waits. Splitting
+            // the sends halves the peak queue while keeping the datagram
+            // order, both pauses, and the 50 datagrams queued across the
+            // second pause.
+            for s in 1..51 {
+                fake.send_iq(s);
+            }
+            for seq in 1..51 {
+                expect_iq(&mut src, seq, "the first batch");
+            }
+            for s in 51..101 {
+                fake.send_iq(s);
+            }
+            thread::sleep(Duration::from_millis(200));
+            for seq in 51..101 {
+                expect_iq(&mut src, seq, "the second batch");
+            }
+            let jump = 101 + 11_000;
+            fake.send_iq(jump);
+            expect_iq(&mut src, jump, "the jump read");
+            assert_eq!(src.take_missing_samples(), None);
+            assert_eq!(src.take_discontinuity(), Some(11_000 * 238));
+            let stats = src.gap_stats();
+            assert_eq!(stats.dropped_packets, 11_000);
+            assert_eq!(stats.gaps_detected, 1);
+        }
+
+        // The failing control: the same fixture, the same measured queue,
+        // and the old schedule -- one un-drained 100-datagram burst before
+        // any read, the Windows incident's shape. The queue loses the
+        // burst's tail, the drain starves, and the reads must return the
+        // typed hard no-IQ error after the one soft report, with the jump
+        // withheld so fresh IQ cannot rescue the drain.
+        {
+            let fake = FakeP2Radio::start();
+            let mut src = open(&fake);
+            pin(&src, request, effective);
+            fake.send_iq(0);
+            expect_iq(&mut src, 0, "the priming read");
+            thread::sleep(Duration::from_secs(4));
+            for s in 1..101 {
+                fake.send_iq(s);
+            }
+            // The probe's settle: the whole burst is queued before the
+            // drain starts, exactly as the calibration measured it.
+            thread::sleep(SETTLE);
+            let mut delivered = 0usize;
+            let mut soft = 0usize;
+            let hard = loop {
+                match read_iq(&mut src) {
+                    Ok(Some((seq, n))) => {
+                        assert_eq!(
+                            (seq, n),
+                            ((delivered as u32) + 1, 238),
+                            "the un-split drain must deliver a contiguous prefix"
+                        );
+                        delivered += 1;
+                        assert!(
+                            delivered < BURST,
+                            "the un-split burst survived the measured queue: all {BURST} \
+                             datagrams delivered, so the control proves nothing"
+                        );
+                        if delivered == BATCH {
+                            // The second pause, after half the backlog
+                            // drained: the same 200 ms as the split case.
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                    }
+                    Ok(None) => {
+                        soft += 1;
+                        assert_eq!(
+                            soft, 1,
+                            "at most one soft-stall return per outage, got a second"
+                        );
+                        assert!(
+                            src.take_stalled(),
+                            "the outage must report through take_stalled"
+                        );
+                    }
+                    Err(e) => break e,
+                }
+            };
+            assert_eq!(
+                soft, 1,
+                "the starved drain must report the outage once before the hard error"
+            );
+            assert!(
+                (BATCH..BURST).contains(&delivered),
+                "the un-split drain delivered {delivered} of {BURST} under queue {request} \
+                 bytes (effective {effective}); the failure must sit in the last half of \
+                 the backlog"
+            );
+            assert!(
+                crate::is_no_usable_samples(&hard),
+                "the starved drain must return the typed no-IQ error after {delivered} \
+                 delivered under queue {request} bytes (effective {effective}): {hard:#}"
+            );
+            assert!(
+                hard.to_string()
+                    .contains("stalled: no IQ datagram for 10 s"),
+                "the hard error must be the no-IQ watchdog, the Windows incident's: {hard:#}"
+            );
+        }
     }
 
     /// MAN-423: a source read without pause keeps the fixed allowance: a
