@@ -9,13 +9,11 @@ macOS CI twice, each time on a different HPSDR timing test:
 `multi_input_hpsdr` at line 367, then `hpsdr_protocol2_acceptance` at
 line 519. rtrb is a ring buffer, so a behaviour change looked possible.
 
-The premise does not survive inspection. manta's only rtrb calls build
-the audio capture ring (`crates/manta-input/src/audio_capture.rs:76`,
-`:101`, `:105`, `:134`, `:138`); HPSDR protocol 1 queues samples in a
-`VecDeque` (`crates/manta-input/src/hpsdr.rs:767`) and protocol 2 in a
+Manta uses rtrb for audio capture. HPSDR protocol 1 queues samples in a
+`VecDeque` (`crates/manta-input/src/hpsdr.rs:767`). Protocol 2 uses a
 `Vec` plus a look-ahead `VecDeque`
-(`crates/manta-input/src/hpsdr/proto2/mod.rs:211`, `:234`). No rtrb call
-sits on the HPSDR path. And the same `multi_input_hpsdr` line 367
+(`crates/manta-input/src/hpsdr/proto2/mod.rs:212`, `:234`). The same
+`multi_input_hpsdr` line 367
 failure fired in #588's merge group, a PR with no Rust change, so the
 macOS failure pre-dates the bump: it is the starvation flake MAN-558
 measured at about 16 percent of macOS shard 3 runs. A starved receiver
@@ -31,15 +29,25 @@ rtrb` comment is a separate hand step after merge.
 ## Decisions
 
 - **D1 — the ticket's question: no reviewed rtrb 0.4 change explains
-  the macOS timing failures.** The 0.4.0 release notes restore the
-  synchronization behavior of `is_abandoned()` (by replacing `Arc`) and
-  make `ReadChunk::commit()`/`commit_all()` panic-safe; 0.4.1 avoids a
-  double-free when forgetting a `ReadChunkIntoIter`. manta's ring calls
-  none of those APIs: `rg` finds rtrb only in
-  `crates/manta-input/src/audio_capture.rs` and the two Cargo.toml
-  files, with `RingBuffer::new` at `:76`, `slots` at `:101` and `:134`,
-  `push` at `:105` and `read_chunk` at `:138`. The HPSDR path uses the
-  `VecDeque`/`Vec` structures cited above, not the ring. The failures
+  the macOS timing failures.** Version 0.4.0 restores synchronization
+  between dropping one end of the ring and calling `is_abandoned()` on
+  the other. It also includes the panic-safety fix for
+  `ReadChunk::commit` and `commit_all`, which is already present in the
+  previous lockfile version, 0.3.6. Version 0.4.1 fixes a double-free
+  when a `ReadChunkIntoIter` is forgotten.
+  [0.4.0 release notes](https://github.com/mgeier/rtrb/releases/tag/0.4.0)
+  [0.3.6 source](https://docs.rs/rtrb/0.3.6/src/rtrb/chunks.rs.html#964-1000)
+  [0.4.1 release notes](https://github.com/mgeier/rtrb/releases/tag/0.4.1)
+
+  Manta's audio capture ring uses `RingBuffer::new`, `slots`, `push`,
+  and `read_chunk`. The reader accesses the chunk through `as_slices`
+  and releases the copied prefix with `chunk.commit(got)`
+  (`crates/manta-input/src/audio_capture.rs:76`, `:101`, `:105`, `:134`,
+  `:138`, `:141`, `:156`). `TaggedFrame` is `Copy`, so dropping a frame
+  cannot panic. The reader counts frames within the chunk, so `got`
+  stays within its length. The audio ring has no call to `is_abandoned`
+  or `commit_all` and does not use `ReadChunkIntoIter`. HPSDR uses the
+  `VecDeque` and `Vec` queues above. The failures
   are the pre-existing starvation flake: #588's merge group failed the
   same line with no Rust change, and MAN-558 measured the flake at
   about 16 percent of macOS shard 3 runs and 169,511 dropped datagrams
