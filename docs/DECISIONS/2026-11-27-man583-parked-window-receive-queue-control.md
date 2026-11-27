@@ -31,7 +31,8 @@ The test calibrates on the running OS with the fixture's own datagram:
 fresh IPv4 loopback UDP sockets, the receiver's `SO_RCVBUF` set through
 `socket2::SockRef` after bind and read back, `wire::IQ_DATAGRAM_LEN`
 datagrams sent with no reader draining, a 20 ms loopback settle, then a
-bounded drain that ends on `WouldBlock` and checks sender, length and
+bounded drain that ends on the read timeout (`WouldBlock` on Unix,
+`TimedOut` on Windows) and checks sender, length and
 in-order sequence on every receive. The search starts at 64 datagrams'
 worth, steers up on zero deliveries and down on a hundred, and estimates
 the request for 75 queued datagrams as `request * 75 / delivered` (the

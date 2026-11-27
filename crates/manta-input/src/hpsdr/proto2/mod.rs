@@ -2350,11 +2350,29 @@ mod tests {
         /// Loopback settle after a probe's sends, before its drain.
         const SETTLE: Duration = Duration::from_millis(20);
 
+        // The probe's drain ends on its read timeout, which Unix reports
+        // as `WouldBlock` and Windows as `TimedOut` (`classify_recv_error`
+        // and discovery's probe accept both too).
+        fn drained(e: &io::Error) -> bool {
+            matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            )
+        }
+        // Checked on every OS, so a narrowed match fails here and not only
+        // on Windows, where every probe would panic once drained.
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            assert!(
+                drained(&io::Error::from(kind)),
+                "the probe drain must end on the {kind:?} read timeout"
+            );
+        }
+
         // One probe: `count` numbered fixture datagrams sent with no
         // reader draining them, the same settle the fixture uses, then a
-        // bounded drain that ends on `WouldBlock`. Returns the effective
-        // receive-buffer size the OS reported and how many datagrams
-        // survived in order.
+        // bounded drain that ends on the read timeout. Returns the
+        // effective receive-buffer size the OS reported and how many
+        // datagrams survived in order.
         fn probe(request: usize, count: usize) -> (usize, usize) {
             let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind the probe receiver");
             let sender = UdpSocket::bind("127.0.0.1:0").expect("bind the probe sender");
@@ -2389,7 +2407,7 @@ mod tests {
                         );
                         delivered += 1;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) if drained(&e) => break,
                     Err(e) => panic!("probe receive after {delivered} delivered: {e}"),
                 }
             }
