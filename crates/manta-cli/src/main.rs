@@ -1849,24 +1849,55 @@ fn merge_cli_engine(
     file_decode
 }
 
-/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix), MAN-232:
+/// MAN-78 (supersedes MAN-85's ctrlc `termination` feature on Unix), MAN-232,
+/// MAN-591:
 /// SIGINT and SIGTERM always drain; SIGHUP drains too unless this is a daemon
 /// (`[server]`), where it requests a reload instead -- the returned `Signals`
 /// buffers it for `reload::spawn`. Each stop signal gets ONE handler action:
-/// store `stop` (the drain watches it), then atomically `swap` `signalled`
-/// to `true` and `_exit(128 + signal)` if it was already set. One action,
+/// store `stop` (the drain watches it), then atomically record the first
+/// signal's time. A second signal at least 500 ms later calls `_exit(128 +
+/// signal)`. Earlier duplicates count as the same stop request because GNU
+/// `timeout` sends both a child and a process-group signal. One action,
 /// not separate store/check/arm registrations, because (a) a signal
 /// delivered between separate registrations would run only some of them,
 /// and (b) handlers for *different* signals nest (signal-hook installs with
-/// an empty `sa_mask`), so a load-then-store pair lets two concurrent stop
-/// signals both see "not yet signalled" and neither exit. The swap makes
-/// "first or second?" a single atomic decision. So the first stop signal
-/// only requests the drain, and any second one ends the process from
+/// an empty `sa_mask`), so a load-then-store pair would lose the first time.
+/// The compare-exchange makes that a single atomic decision. A later signal
+/// ends the process from
 /// inside the handler -- the one place that still runs while the decode
 /// thread is blocked in a stdout write (SA_RESTART restarts that write, and
-/// std retries EINTR anyway). Only these handlers set `signalled`: a closed
+/// std retries EINTR anyway). Only these handlers set `first_stop_ns`: a closed
 /// stdout and the post-loop `stop_ready` store set `stop` without arming it.
 /// Installed before the `listening:` banner (MAN-122 round 6).
+#[cfg(unix)]
+const DUPLICATE_STOP_SIGNAL_WINDOW_NS: u64 = 500_000_000;
+
+/// CLOCK_MONOTONIC nanoseconds; zero is reserved for "no stop signal yet".
+#[cfg(unix)]
+fn monotonic_ns() -> u64 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes to this stack-local timespec and is
+    // async-signal-safe. CLOCK_MONOTONIC is available on supported Unix targets.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    if result != 0 {
+        return 1;
+    }
+    ((time.tv_sec as u64) * 1_000_000_000 + time.tv_nsec as u64).max(1)
+}
+
+/// True if a stop signal is late enough to force an immediate exit.
+#[cfg(unix)]
+fn stop_signal_forces_exit(first_ns: &std::sync::atomic::AtomicU64, now_ns: u64) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    match first_ns.compare_exchange(0, now_ns, SeqCst, SeqCst) {
+        Ok(_) => false,
+        Err(first) => now_ns.saturating_sub(first) >= DUPLICATE_STOP_SIGNAL_WINDOW_NS,
+    }
+}
+
 #[cfg(unix)]
 fn install_unix_signal_handlers(
     stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1874,24 +1905,22 @@ fn install_unix_signal_handlers(
 ) -> Result<Option<signal_hook::iterator::Signals>> {
     use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
     use std::sync::atomic::Ordering;
-    let signalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_stop_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut stop_signals = vec![(SIGINT, "SIGINT"), (SIGTERM, "SIGTERM")];
     if !daemon {
         stop_signals.push((SIGHUP, "SIGHUP"));
     }
     for (signal, name) in stop_signals {
         let stop = stop.clone();
-        let signalled = signalled.clone();
+        let first_stop_ns = first_stop_ns.clone();
         // SAFETY: the action runs in signal context, so it may only do
-        // async-signal-safe work. It does: two lock-free atomic operations
-        // on `AtomicBool`s it owns (via `Arc` clones, never freed while
-        // registered) and `low_level::exit`, which is `_exit(2)` --
-        // async-signal-safe and skipping at-exit hooks. No allocation, no
-        // locks, no I/O.
+        // async-signal-safe work: a lock-free atomic store, clock_gettime,
+        // a lock-free compare-exchange and, when needed, `_exit(2)`.
+        // The Arcs stay alive while registered. No allocation, locks or I/O.
         unsafe {
             signal_hook::low_level::register(signal, move || {
                 stop.store(true, Ordering::SeqCst);
-                if signalled.swap(true, Ordering::SeqCst) {
+                if stop_signal_forces_exit(&first_stop_ns, monotonic_ns()) {
                     signal_hook::low_level::exit(128 + signal);
                 }
             })

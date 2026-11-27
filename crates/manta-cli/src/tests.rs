@@ -10,6 +10,18 @@ use manta_server::spot_message::geography_is_unresolved;
 use manta_server::spot_message::station_geography_unresolved;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+#[test]
+fn stop_signal_forces_exit_only_half_a_second_after_the_first() {
+    use std::sync::atomic::AtomicU64;
+    let first = AtomicU64::new(0);
+    assert!(!stop_signal_forces_exit(&first, 1));
+    assert!(!stop_signal_forces_exit(&first, 2));
+    assert!(!stop_signal_forces_exit(&first, 499_000_001));
+    assert!(stop_signal_forces_exit(&first, 500_000_001));
+    assert!(stop_signal_forces_exit(&first, 600_000_001));
+}
+
 #[test]
 fn cli_definition_passes_clap_debug_assert() {
     Cli::command().debug_assert();

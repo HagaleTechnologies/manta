@@ -3411,6 +3411,33 @@ fn iq_recording_guide_explains_a_missed_spot() {
     assert!(guide.contains("](../OBSERVATIONS.md)"));
 }
 
+/// MAN-591: the duplicate-stop-signal record and the recording guide state
+/// the bounds the runtime really has, not unconditional ones. A duplicate
+/// within the window joins the first stop request and the drain picks the
+/// exit status (141, not 0, when a blocked stdout's reader closed); a
+/// forced exit loses the sidecar only when publication had not happened
+/// yet, because the writer can publish before the process exits.
+#[test]
+fn man591_shutdown_docs_bound_the_duplicate_and_forced_exit() {
+    let record = squash_whitespace(&doc(
+        "docs/DECISIONS/2026-11-27-man591-duplicate-stop-signal.md",
+    ));
+    assert!(
+        !record.contains("drains and exits 0"),
+        "a duplicate must not promise exit 0: the drain's own status governs"
+    );
+    assert!(record.contains("part of the same stop request"));
+    assert!(record.contains("which determines the exit status"));
+    assert!(record.contains("whose sidecar was already published stays replayable"));
+
+    let guide = squash_whitespace(&doc("docs/GUIDES/iq-recording.md"));
+    assert!(guide.contains("without waiting for finalization"));
+    assert!(
+        guide.contains("a forced exit after publication leaves a complete, replayable recording")
+    );
+    assert!(guide.contains("whose sidecar was never published"));
+}
+
 #[test]
 fn docs_index_links_every_runbook() {
     let targets = link_targets(&doc(DOCS_INDEX));

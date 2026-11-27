@@ -171,13 +171,14 @@ fn daemon_config(dir: &Path) -> PathBuf {
 
 /// A daemon over the shared fixture: `run` with `--config` (a `[server]`
 /// table) and `--json`, so its stdout is the event stream under test.
-fn spawn_daemon(cfg: &Path, stdout: Stdio) -> Child {
+fn spawn_daemon(cfg: &Path, stdout: Stdio, extra_args: &[&OsStr]) -> Child {
     Command::new(env!("CARGO_BIN_EXE_manta"))
         .args(["run", "--source"])
         .arg(fixture_wav())
         .args(["--dial-freq-hz", "14060000", "--config"])
         .arg(cfg)
         .arg("--json")
+        .args(extra_args)
         .env("RUST_LOG", "info")
         .stdout(stdout)
         .stderr(Stdio::piped())
@@ -204,7 +205,7 @@ fn a_signal_at_the_startup_banner_still_exits_through_the_drain() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = daemon_config(dir.path());
 
-    let spawn = || spawn_daemon(&cfg_path, Stdio::null());
+    let spawn = || spawn_daemon(&cfg_path, Stdio::null(), &[]);
 
     // Same control rationale as `assert_signal_drains_and_exits_zero`: a
     // fixture that reached EOF inside the test window would exit 0 on its
@@ -521,7 +522,7 @@ fn decode_with_a_closed_stderr_still_writes_its_full_output_and_exits_zero() {
 fn a_daemon_whose_stderr_reader_left_still_exits_zero_through_the_drain() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = daemon_config(dir.path());
-    let mut child = spawn_daemon(&cfg_path, Stdio::null());
+    let mut child = spawn_daemon(&cfg_path, Stdio::null(), &[]);
     // Drops the stderr reader at readiness: from here on, every stderr
     // write the daemon makes fails with EPIPE.
     await_ready(&mut child);
@@ -586,7 +587,7 @@ fn a_reader_that_exits_early_stops_run_through_the_drain_with_141() {
 fn a_daemon_whose_stdout_reader_exits_drains_and_exits_141() {
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = daemon_config(dir.path());
-    let mut child = spawn_daemon(&cfg_path, Stdio::piped());
+    let mut child = spawn_daemon(&cfg_path, Stdio::piped(), &[]);
     let stderr_reader = child.stderr.take().expect("stderr piped");
     let stderr = std::thread::spawn(move || {
         let mut text = String::new();
@@ -618,20 +619,17 @@ fn a_daemon_whose_stdout_reader_exits_drains_and_exits_141() {
 /// later, because `SA_RESTART` restarts the blocked write. The read end is
 /// returned and must be held unread until the test is done with the child:
 /// dropping it would EPIPE the child into a stop instead.
-fn blocked_run_after_one_signal(
-    daemon: bool,
-    sig: libc::c_int,
-    name: &str,
-) -> (Child, std::io::PipeReader) {
+fn blocked_run(daemon: bool, extra_args: &[&OsStr]) -> (Child, std::io::PipeReader) {
     let dir = tempfile::tempdir().unwrap();
     let (read_end, write_end) = full_pipe();
     let mut child = if daemon {
-        spawn_daemon(&daemon_config(dir.path()), stdio_of(write_end))
+        spawn_daemon(&daemon_config(dir.path()), stdio_of(write_end), extra_args)
     } else {
         Command::new(env!("CARGO_BIN_EXE_manta"))
             .args(["run", "--source"])
             .arg(fixture_wav())
             .arg("--json")
+            .args(extra_args)
             .stdout(stdio_of(write_end))
             .stderr(Stdio::piped())
             .spawn()
@@ -639,6 +637,15 @@ fn blocked_run_after_one_signal(
     };
     await_ready(&mut child);
     std::thread::sleep(Duration::from_millis(500));
+    (child, read_end)
+}
+
+fn blocked_run_after_one_signal(
+    daemon: bool,
+    sig: libc::c_int,
+    name: &str,
+) -> (Child, std::io::PipeReader) {
+    let (mut child, read_end) = blocked_run(daemon, &[]);
     assert!(
         child.try_wait().unwrap().is_none(),
         "manta exited before {name} -- it never blocked on the full stdout pipe"
@@ -651,6 +658,40 @@ fn blocked_run_after_one_signal(
          proves nothing, or the forced exit fired on the first signal"
     );
     (child, read_end)
+}
+
+fn duplicate_signal_still_drains_recording(daemon: bool, sig: libc::c_int) {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("blocked.cf32");
+    let (mut child, mut read_end) = blocked_run(daemon, &["--record-iq".as_ref(), rec.as_os_str()]);
+    assert!(child.try_wait().unwrap().is_none());
+    unsafe { assert_eq!(libc::kill(child.id() as i32, sig), 0) };
+    std::thread::sleep(Duration::from_millis(50));
+    unsafe { assert_eq!(libc::kill(child.id() as i32, sig), 0) };
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "duplicate signal forced an exit"
+    );
+    let reader = std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = read_end.read_to_end(&mut sink);
+    });
+    let status = wait_bounded(&mut child, EXIT_BUDGET).expect("recording did not drain");
+    reader.join().unwrap();
+    assert_eq!(status.code(), Some(0), "{status:?}");
+    assert!(manta_input::metadata_path(&rec).exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+}
+
+#[test]
+fn a_duplicate_sigint_within_half_a_second_still_drains_a_recording_run() {
+    duplicate_signal_still_drains_recording(false, libc::SIGINT);
+}
+
+#[test]
+fn a_duplicate_sigterm_within_half_a_second_still_drains_a_recording_daemon() {
+    duplicate_signal_still_drains_recording(true, libc::SIGTERM);
 }
 
 /// Ticket scenario 3, the Gherkin's daemon: two SIGTERMs one second apart,
