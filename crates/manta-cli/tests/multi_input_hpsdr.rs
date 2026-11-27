@@ -386,10 +386,20 @@ fn wait_until_progress<P: PartialEq + Clone + std::fmt::Debug>(
 /// 3-4 vCPU CI runner they saturate the box when run concurrently and the
 /// spot waits starve (MAN-454). Heavy tests take this for their whole body.
 static HEAVY: Mutex<()> = Mutex::new(());
-fn queue_drop_lines(metrics: &str) -> Vec<String> {
+/// Every input-loss series the wait diagnostics print: queue drops, kernel
+/// datagram drops, and gap events. Under the macOS starvation flake the
+/// queue series stays at zero while the kernel drops the datagrams, so a
+/// failure that prints only the queue series cannot say what happened
+/// (MAN-558, MAN-572).
+fn input_loss_lines(metrics: &str) -> Vec<String> {
+    const PREFIXES: [&str; 3] = [
+        "manta_input_queue_dropped_samples_total",
+        "manta_input_dropped_packets_total",
+        "manta_input_gaps_detected_total",
+    ];
     metrics
         .lines()
-        .filter(|line| line.starts_with("manta_input_queue_dropped_samples_total"))
+        .filter(|line| PREFIXES.iter().any(|prefix| line.starts_with(prefix)))
         .map(|line| line.to_string())
         .collect()
 }
@@ -565,9 +575,9 @@ fn four_bands_tune_four_receivers_and_share_stdout_json_and_health() {
         },
         || {
             format!(
-                "spots {:?}; queue {}; {}",
+                "spots {:?}; input loss {}; {}",
                 daemon.output.lock().unwrap(),
-                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                input_loss_lines(&request(ports[2], "/metrics")).join("; "),
                 daemon.errors.lock().unwrap()
             )
         },
@@ -748,9 +758,9 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         },
         || {
             format!(
-                "spots {:?}; queue {}; {}",
+                "spots {:?}; input loss {}; {}",
                 daemon.output.lock().unwrap(),
-                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                input_loss_lines(&request(ports[2], "/metrics")).join("; "),
                 daemon.errors.lock().unwrap()
             )
         },
@@ -793,9 +803,9 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         },
         || {
             format!(
-                "spots {:?}; queue {}; {}",
+                "spots {:?}; input loss {}; {}",
                 daemon.output.lock().unwrap(),
-                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                input_loss_lines(&request(ports[2], "/metrics")).join("; "),
                 daemon.errors.lock().unwrap()
             )
         },
@@ -825,9 +835,9 @@ fn a_radio_outage_preserves_other_radio_output_and_restores_transformed_receiver
         },
         || {
             format!(
-                "spots {:?}; queue {}; {}",
+                "spots {:?}; input loss {}; {}",
                 daemon.output.lock().unwrap(),
-                queue_drop_lines(&request(ports[2], "/metrics")).join("; "),
+                input_loss_lines(&request(ports[2], "/metrics")).join("; "),
                 daemon.errors.lock().unwrap()
             )
         },
@@ -994,7 +1004,7 @@ fn wait_until_fixed_budget_still_panics() {
 }
 
 #[test]
-fn queue_drop_lines_extracts_only_the_queue_drop_series() {
+fn input_loss_lines_extracts_the_three_loss_series() {
     let body = concat!(
         "# HELP manta_input_queue_dropped_samples_total Samples dropped from a bounded queue.\n",
         "# TYPE manta_input_queue_dropped_samples_total counter\n",
@@ -1002,15 +1012,19 @@ fn queue_drop_lines_extracts_only_the_queue_drop_series() {
         "not a metric line at all\n",
         "manta_input_queue_dropped_samples_total{source=\"80m\"} 12\n",
         "manta_input_queue_dropped_samples_total{source=\"40m\"} 0\n",
+        "manta_input_dropped_packets_total{source=\"80m\"} 169511\n",
+        "manta_input_gaps_detected_total{source=\"40m\"} 10825\n",
     );
     assert_eq!(
-        queue_drop_lines(body),
+        input_loss_lines(body),
         vec![
             "manta_input_queue_dropped_samples_total{source=\"80m\"} 12".to_string(),
             "manta_input_queue_dropped_samples_total{source=\"40m\"} 0".to_string(),
+            "manta_input_dropped_packets_total{source=\"80m\"} 169511".to_string(),
+            "manta_input_gaps_detected_total{source=\"40m\"} 10825".to_string(),
         ]
     );
-    assert!(queue_drop_lines("").is_empty());
+    assert!(input_loss_lines("").is_empty());
 }
 
 #[test]

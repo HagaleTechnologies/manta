@@ -50,8 +50,9 @@ rustfft = "6.4"
 pancetta-ft8 = { git = "https://github.com/HagaleTechnologies/pancetta.git", rev = "d0c2ff4714cf4a4a45e1818e1b820b6dc2c0febf" }
 
 cpal = "0.18"
-# MAN-530: manta-owned tagged capture ring (already locked through coppa-audio).
-rtrb = "0.3.5"
+# MAN-530: manta-owned tagged capture ring. MAN-572 bumped it by hand to
+# 0.4.1; the pinned coppa keeps its own 0.3 copy, so the lock holds both.
+rtrb = "0.4.1"
 ctrlc = "3"
 signal-hook = { version = "0.4", default-features = false, features = ["iterator"] }
 libc = "0.2"
