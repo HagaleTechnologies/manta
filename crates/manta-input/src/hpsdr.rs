@@ -96,6 +96,10 @@ const MIC_AUX_BYTES: usize = 2;
 /// 2^23 - 1: the 24-bit signed full-scale divisor reference clients use to
 /// normalize HPSDR IQ samples (spike doc).
 const IQ_FULL_SCALE: f32 = 8_388_607.0;
+/// Requested `SO_RCVBUF` for the protocol 1 IQ socket (MAN-572): protocol 2
+/// (D5) and ka9q already request the same 4 MiB. A smaller grant is not an
+/// error.
+const RCVBUF_BYTES: usize = 4 << 20;
 
 /// UDP read timeout: bounds how long a single socket read blocks, so
 /// `read()` stays responsive to repeated calls rather than hanging forever
@@ -1093,6 +1097,13 @@ impl HpsdrDevice {
             .find(|a| a.is_ipv4())
             .ok_or_else(|| anyhow::anyhow!("HPSDR needs an IPv4 endpoint"))?;
         let socket = crate::local_bind::bind_udp_for(peer.ip()).context("bind HPSDR UDP socket")?;
+        // MAN-572: request receive-buffer headroom on the IQ socket the way
+        // protocol 2 (D5) and ka9q already do. A loaded runner deschedules
+        // the reader, the kernel receive buffer overflows, and the samples
+        // never reach the in-process queue, so the queue-drop counter stays
+        // at zero while the input vanishes. A smaller grant is not an error
+        // (MAN-558 finding 4).
+        let _ = socket2::SockRef::from(&socket).set_recv_buffer_size(RCVBUF_BYTES);
         socket
             .set_read_timeout(Some(READ_TIMEOUT))
             .context("set HPSDR UDP read timeout")?;
