@@ -124,6 +124,18 @@ recording is finalized with `"reason":"backpressure"` and replays as the
 contiguous part it holds. A failed write leaves the `.partial` metadata,
 which replay refuses.
 
+One SIGINT or SIGTERM finalizes a live recording, including when sent by
+GNU `timeout -s INT` or `timeout -s TERM`. A second stop signal 500 ms or
+more after the first forces an immediate exit without finalization. SIGKILL
+does the same. The payload remains, but its `.meta.jsonl.partial` sidecar
+is incomplete and replay refuses it. To recover an interrupted capture,
+move or copy the payload away from its `.partial` and specify its original
+format, sample rate and dial frequency, for example:
+
+```sh
+manta run --source capture.cf32 --source-iq --iq-format cf32 --sample-rate-hz 96000 --dial-freq-hz 7030000
+```
+
 At shutdown, `run` closes its recordings when decoding ends and gives
 them 5 s in total to finish, however many inputs record. They finish
 while the clients drain, so only what the drain leaves of those 5 s is

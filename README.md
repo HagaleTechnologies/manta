@@ -872,8 +872,10 @@ commands are not all converted yet: a closed output can still make
 `bench`, `calibrate`, `completions`, `config`, `grade`, `health` or `check`
 exit 101, and a closed stdout makes `devices` exit 1. Output to a reader
 that is still open but not reading waits for it; to stop such a run, send
-SIGINT or SIGTERM twice: the second ends manta at once, without the drain
-(exit 130 for SIGINT, 143 for SIGTERM).
+SIGINT or SIGTERM again at least half a second after the first: that ends
+manta at once, without the drain (exit 130 for SIGINT, 143 for SIGTERM). A
+stop signal within half a second of the first, such as the copy GNU
+`timeout` sends, counts as the same stop request.
 See [closed or stalled output](docs/DECISIONS/2026-10-14-man232-closed-and-stalled-output.md).
 
 `decode` prints decoded text on stdout and a measurement summary on stderr.

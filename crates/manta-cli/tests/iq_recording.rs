@@ -1233,6 +1233,89 @@ fn a_stop_signal_finalizes_the_recording() {
     assert_eq!(std::fs::metadata(&rec).unwrap().len(), sample_count * 8);
 }
 
+#[cfg(unix)]
+fn timeout_style_stop_keeps_the_recording_replayable(sig: libc::c_int) {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let rec = dir.path().join("capture.cf32");
+    let mut child = manta()
+        .args(["run", "--source"])
+        .arg(common::fixture_wav())
+        .arg("--record-iq")
+        .arg(&rec)
+        .process_group(0)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stderr = child.stderr.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line.contains("recording IQ to") {
+                let _ = tx.send(());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    rx.recv_timeout(Duration::from_secs(60))
+        .expect("recording did not start");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "fixture ended before signal"
+    );
+    let pid = child.id() as i32;
+    unsafe {
+        assert_eq!(libc::kill(pid, sig), 0);
+        assert_eq!(libc::kill(-pid, sig), 0);
+    }
+    let status =
+        common::wait_bounded(&mut child, Duration::from_secs(60)).expect("recording did not stop");
+    let stderr = reader.join().unwrap();
+    assert_eq!(status.code(), Some(0), "{status:?}: {stderr}");
+    assert!(
+        stderr.contains(&format!("recording finished: {}", rec.display())),
+        "{stderr}"
+    );
+    assert!(metadata_path(&rec).exists());
+    assert!(!manta_input::partial_metadata_path(&rec).exists());
+    let recs = records(&rec);
+    let Some(MetadataRecord::End {
+        sample_count,
+        reason,
+    }) = recs.last()
+    else {
+        panic!("no end record: {recs:?}");
+    };
+    assert_eq!(*reason, EndReason::Stopped);
+    assert!(*sample_count > 0);
+    assert_eq!(sample_count * 8, std::fs::metadata(&rec).unwrap().len());
+    run_ok(&[
+        "run".as_ref(),
+        "--source".as_ref(),
+        rec.as_os_str(),
+        "--source-iq".as_ref(),
+    ]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timeout_style_sigint_keeps_the_recording_replayable() {
+    timeout_style_stop_keeps_the_recording_replayable(libc::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_timeout_style_sigterm_keeps_the_recording_replayable() {
+    timeout_style_stop_keeps_the_recording_replayable(libc::SIGTERM);
+}
+
 /// MAN-453, scenario 3: a stop during a long recorded outage in a
 /// real-time replay ends the run within 2 s, and the recording it was
 /// making is finalized. The replayed recording holds 3 s of samples, a
