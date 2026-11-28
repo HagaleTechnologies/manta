@@ -119,7 +119,7 @@ jobs:
     steps:
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -2037,7 +2037,7 @@ jobs:
       # token lives an hour and the Windows leg can run longer than that.
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
@@ -2087,7 +2087,7 @@ jobs:
       # token lives an hour and the Windows leg can run longer than that.
       - name: Mint a hagale-agent installation token for the test check-runs
         id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: 4696353
           private-key: ${{ secrets.HAGALE_AGENT_APP_PRIVATE_KEY }}
