@@ -31,7 +31,7 @@
 # release-publish.yml passes, so `manta --version`, `decoderVersion` and
 # `manta_build_info` name it; without the arg they report `unknown`.
 
-FROM rust:1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS builder
+FROM rust:1-slim-bookworm@sha256:7c7d4eb4d05b7781187a327809466cfddf29753f6defdc3d19a0e291951b7a37 AS builder
 
 # `git` is a BUILD-TIME requirement here, not a convenience: this repo's
 # own .cargo/config.toml sets `[net] git-fetch-with-cli = true`, and it is
