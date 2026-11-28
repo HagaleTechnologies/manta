@@ -21,6 +21,7 @@ regenerate it: `python3 scripts/decisions-index.py --write`. See
 
 | Date | Ticket | Title |
 |---|---|---|
+| 2026-11-24 | MAN-573 | [MAN-573: pancetta-ft8 moves to PAN-441's merge commit, chrono leaves the lock, and option-ext gets an MPL-2.0 exception](2026-11-24-man573-pancetta-off-chrono.md) |
 | 2026-11-23 | MAN-588 | [MAN-588: no shared released-port free_ports(), and the golden roots include their helpers by path](2026-11-23-man588-no-shared-free-ports.md) |
 | 2026-11-20 | MAN-569 | [MAN-569: daemon integration tests bind port zero or claim a band, never a released number](2026-11-20-man569-daemon-test-port-handoffs.md) |
 | 2026-11-19 | MAN-551 | [MAN-551: Windows O1 readout and failure audit](2026-11-19-man551-windows-o1-readout.md) |
